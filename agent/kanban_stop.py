@@ -1,10 +1,10 @@
 """Turn-end guard for kanban workers.
 
-Kanban workers must end with ``kanban_complete`` or ``kanban_block``. Models
-(especially GLM / Qwen families) sometimes narrate the next step
-("Let me write the report now") and stop with ``finish_reason=stop`` and no
-tool calls. Hermes treats that as a clean exit → ``rc=0`` → dispatcher
-``protocol_violation``.
+Kanban workers must end with a terminal board tool that hands the card to
+whoever owns it next. Models (especially GLM / Qwen families) sometimes
+narrate the next step ("Let me write the report now") and stop with
+``finish_reason=stop`` and no tool calls. Hermes treats that as a clean
+exit → ``rc=0`` → dispatcher ``protocol_violation``.
 
 This module is policy-only: when a kanban worker tries to finish without a
 terminal board tool, return a bounded synthetic nudge so the conversation
@@ -17,7 +17,21 @@ import os
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+# Every tool that hands the card off and ends this worker's responsibility
+# for it — not just the two that close it out.  A build worker legitimately
+# finishes with ``kanban_request_review`` (goals.py's continuation and
+# finalize prompts tell it to, for code changes needing same-card review),
+# and a review agent finishes with ``kanban_request_changes`` (the
+# force-loaded sdlc-review skill's decision table tells it to).  Both move
+# the task out of ``running``, so treating them as non-terminal fired this
+# guard at a worker that had already done the right thing — nudging it to
+# call ``kanban_complete`` on a card it must not close.
+_TERMINAL_KANBAN_TOOLS = frozenset({
+    "kanban_complete",
+    "kanban_block",
+    "kanban_request_review",
+    "kanban_request_changes",
+})
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
