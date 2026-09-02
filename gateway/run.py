@@ -14439,10 +14439,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # transcription is forwarded without requiring /voice join.
                 self._bind_voice_input_callback(adapter)
                 connected_count += 1
+                _degraded = adapter.send_path_degraded
                 self._update_platform_runtime_status(
-                    platform.value, platform_state="connected", error_code=None, error_message=None,
+                    platform.value,
+                    platform_state="retrying" if _degraded else "connected",
+                    error_code=None,
+                    error_message=adapter.DEGRADED_STATUS_MESSAGE if _degraded else None,
                 )
-                logger.info("\u2713 %s connected", platform.value)
+                logger.info("\u2713 %s connected%s", platform.value, " (degraded)" if _degraded else "")
             else:  # outcome == "failed"
                 logger.warning("\u2717 %s failed to connect", platform.value)
                 # Defensive cleanup: a failed connect() may have allocated resources
@@ -16203,15 +16207,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._bind_voice_input_callback(adapter)
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
+                        # connect() returning True does not mean the adapter's
+                        # receive path is confirmed -- Telegram's degraded
+                        # reconnect returns True so the gateway stays up while
+                        # its own ladder retries. Stamping "connected" here
+                        # would undo the adapter's accurate status (#101391).
+                        _degraded = adapter.send_path_degraded
                         self._update_platform_runtime_status(
                             platform.value,
-                            platform_state="connected",
+                            platform_state="retrying" if _degraded else "connected",
                             error_code=None,
-                            error_message=None,
+                            error_message=adapter.DEGRADED_STATUS_MESSAGE if _degraded else None,
                             needs_attention=False,
                             retrying_since=None,
                         )
-                        logger.info("✓ %s reconnected successfully", platform.value)
+                        if _degraded:
+                            logger.info("⚠ %s reconnected in degraded mode (receive path not yet confirmed)", platform.value)
+                        else:
+                            logger.info("✓ %s reconnected successfully", platform.value)
 
                         # Final responses rejected while this adapter was down
                         # are still owned by this live process, so startup
@@ -24715,8 +24728,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # init on the loop thread before the first read.
                 await self._warm_goals_session_db("loop wakeup")
 
+                # Every SessionDB call in this scan runs off the loop thread.
+                # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) that
+                # take the writer lock; a slow writer elsewhere (FTS merge, WAL
+                # checkpoint, a long flush) holding it while the watcher blocked
+                # the loop on the same lock froze the gateway for 90+ s until
+                # the liveness watchdog force-exited. list_active_loops() reads
+                # via _read_ctx (lock-free under WAL) but still convoys on the
+                # writer lock when WAL is unavailable, so it goes off-loop too.
+                # _run_in_executor_with_context keeps the profile HERMES_HOME
+                # override alive under multiplex, like the warm-up above.
+                active_loops = await self._run_in_executor_with_context(list_active_loops)
+
                 now = time.time()
-                for sid, state in list_active_loops():
+                for sid, state in active_loops:
                     if state.awaiting_response or now < state.next_due_at:
                         continue
                     route = state.route or {}
@@ -24764,7 +24789,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     mgr = LoopManager(session_id=sid)
                     if not mgr.is_due(now):
                         continue
-                    wakeup = mgr.fire_tick()
+                    wakeup = await self._run_in_executor_with_context(mgr.fire_tick)
                     if not wakeup:
                         continue
                     try:
@@ -24784,7 +24809,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # path and never hit the post-turn completion hook —
                         # complete the tick immediately (caps + scheduling).
                         if wakeup.lstrip().startswith("/"):
-                            mgr.complete_tick("")
+                            await self._run_in_executor_with_context(mgr.complete_tick, "")
                     except Exception as exc:
                         logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
                         try:

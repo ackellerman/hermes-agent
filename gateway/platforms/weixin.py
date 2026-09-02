@@ -302,6 +302,10 @@ class ContextTokenStore:
     def __init__(self, hermes_home: str):
         self._root = _account_dir(hermes_home)
         self._cache: Dict[str, str] = {}
+        # Serializes the offloaded flushes so two concurrent set() calls
+        # cannot land their writes out of order (last-writer-wins would drop
+        # the newer token from disk).
+        self._persist_lock = asyncio.Lock()
 
     def _path(self, account_id: str) -> Path:
         return self._root / f"{account_id}.context-tokens.json"
@@ -329,17 +333,27 @@ class ContextTokenStore:
     def get(self, account_id: str, user_id: str) -> Optional[str]:
         return self._cache.get(self._key(account_id, user_id))
 
-    def set(self, account_id: str, user_id: str, token: str) -> None:
+    async def set(self, account_id: str, user_id: str, token: str) -> None:
         self._cache[self._key(account_id, user_id)] = token
-        self._persist(account_id)
+        # atomic_json_write() calls os.fsync(), which blocks until the write
+        # reaches stable storage. _process_message runs on the event loop for
+        # every inbound message, so offload the flush the same way #83906 did
+        # for the other gateway persist paths. The payload is snapshotted here,
+        # on the loop, so the worker never iterates ``_cache`` while another
+        # message task mutates it; the lock keeps flushes in mutation order.
+        async with self._persist_lock:
+            payload = self._payload(account_id)
+            await asyncio.to_thread(self._persist, account_id, payload)
 
-    def _persist(self, account_id: str) -> None:
+    def _payload(self, account_id: str) -> Dict[str, str]:
         prefix = f"{account_id}:"
-        payload = {
+        return {
             key[len(prefix) :]: value
             for key, value in self._cache.items()
             if key.startswith(prefix)
         }
+
+    def _persist(self, account_id: str, payload: Dict[str, str]) -> None:
         try:
             atomic_json_write(self._path(account_id), payload)
         except Exception as exc:
@@ -1501,7 +1515,7 @@ class WeixinAdapter(BasePlatformAdapter):
 
         context_token = str(message.get("context_token") or "").strip()
         if context_token:
-            self._token_store.set(self._account_id, sender_id, context_token)
+            await self._token_store.set(self._account_id, sender_id, context_token)
         asyncio.create_task(self._maybe_fetch_typing_ticket(sender_id, context_token or None))
 
         media_paths: List[str] = []
