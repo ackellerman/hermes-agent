@@ -326,6 +326,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_set_wd.add_argument("path", nargs="?", default=None,
                           help="Absolute path to use as default workdir. Omit to clear.")
 
+    b_set_orch = boards_sub.add_parser(
+        "set-orchestrator",
+        help="Set the profile that resumes decomposed roots on a board",
+    )
+    b_set_orch.add_argument("slug")
+    b_set_orch.add_argument("profile", nargs="?", default=None,
+                            help="Installed profile name. Omit to clear the board override.")
+
     b_export = boards_sub.add_parser(
         "export",
         help="Export a board to a portable .tar.gz archive",
@@ -1306,6 +1314,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_rename(args)
     if sub == "set-default-workdir":
         return _cmd_boards_set_default_workdir(args)
+    if sub == "set-orchestrator":
+        return _cmd_boards_set_orchestrator(args)
     if sub == "export":
         return _cmd_boards_export(args)
     if sub == "import":
@@ -1482,6 +1492,50 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
         print(f"Board {normed!r} default workdir set to {new_val!r}.")
     else:
         print(f"Board {normed!r} default workdir cleared.")
+    return 0
+
+
+def _cmd_boards_set_orchestrator(args: argparse.Namespace) -> int:
+    try:
+        normed = kb._normalize_board_slug(args.slug)
+    except ValueError as exc:
+        print(f"kanban boards set-orchestrator: {exc}", file=sys.stderr)
+        return 2
+    if not normed or not kb.board_exists(normed):
+        print(
+            f"kanban boards set-orchestrator: board {args.slug!r} does not exist",
+            file=sys.stderr,
+        )
+        return 1
+
+    profile = (args.profile or "").strip()
+    if profile:
+        try:
+            from hermes_cli import profiles
+            if not profiles.profile_exists(profile):
+                print(
+                    f"kanban boards set-orchestrator: profile {profile!r} does not exist",
+                    file=sys.stderr,
+                )
+                return 1
+        except Exception as exc:
+            print(
+                f"kanban boards set-orchestrator: could not validate profile: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+
+    meta = kb.write_board_metadata(normed, orchestrator_profile=profile)
+    if meta.get("orchestrator_profile"):
+        print(
+            f"Board {normed!r} decomposed roots will resume with "
+            f"{meta['orchestrator_profile']!r}."
+        )
+    else:
+        print(
+            f"Board {normed!r} orchestrator override cleared; decomposition "
+            "will use the global or active-profile fallback."
+        )
     return 0
 
 

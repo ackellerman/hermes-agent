@@ -178,11 +178,20 @@ def _load_config() -> dict:
 
 
 def _resolve_orchestrator_profile(cfg: dict) -> str:
-    """Resolve which profile owns the root/orchestration task after fan-out.
+    """Resolve the profile that resumes a decomposed root.
 
-    Falls back to the active default profile when ``kanban.orchestrator_profile``
-    is unset, so a task is never stranded for lack of an orchestrator.
+    The board's metadata owns coordination for that board.  The legacy global
+    setting remains a fallback for boards that have no explicit coordinator;
+    the active profile is the final fallback so a root is never unassigned.
     """
+    try:
+        board_meta = kb.read_board_metadata(kb.get_current_board())
+        board_explicit = (board_meta.get("orchestrator_profile") or "").strip()
+        if board_explicit and profiles_mod.profile_exists(board_explicit):
+            return board_explicit
+    except Exception:
+        pass
+
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get("orchestrator_profile") or "").strip()
     if explicit:
@@ -191,7 +200,6 @@ def _resolve_orchestrator_profile(cfg: dict) -> str:
                 return explicit
         except Exception:
             pass
-    # Fall back to the active default profile.
     try:
         return profiles_mod.get_active_profile_name() or "default"
     except Exception:

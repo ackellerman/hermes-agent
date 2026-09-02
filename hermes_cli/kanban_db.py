@@ -845,6 +845,10 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "icon": "",
         "color": "",
         "default_workdir": None,
+        # Optional profile that resumes a decomposed root after this board's
+        # child graph completes. Board scope prevents a global coordinator from
+        # taking ownership of unrelated workstreams.
+        "orchestrator_profile": None,
         # Optional first-class Project this board is scoped to. When set, new
         # tasks inherit it (deterministic worktree + branch under the project's
         # primary repo) and ``default_workdir`` mirrors the project's primary
@@ -877,6 +881,7 @@ def write_board_metadata(
     color: Optional[str] = None,
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
+    orchestrator_profile: Optional[str] = None,
     project_id: Optional[str] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
@@ -906,6 +911,10 @@ def write_board_metadata(
         meta["archived"] = bool(archived)
     if default_workdir is not None:
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
+    if orchestrator_profile is not None:
+        meta["orchestrator_profile"] = (
+            str(orchestrator_profile).strip() or None
+        )
     if project_id is not None:
         meta["project_id"] = str(project_id) if project_id else None
     if not meta.get("created_at"):
