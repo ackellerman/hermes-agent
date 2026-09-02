@@ -6,4 +6,4 @@ the local patch after upstream has merged it and the emitted behavior is verifie
 
 | Upstream PR | Local commit | Purpose | Added | Remove when |
 |---|---|---|---|---|
-| https://github.com/NousResearch/hermes-agent/pull/97753 (source `d8702aa07577`) | 1a9a6a2f9c69 | Treat `kanban_request_review` and `kanban_request_changes` as terminal in the stop guard; preserve a non-terminal-tool regression control. | 2026-09-02 | PR merged and the live upstream source contains both terminal tools. |
+| https://github.com/NousResearch/hermes-agent/pull/97753 (source `d8702aa07577`) | 8470a5a0dc | Treat `kanban_request_review` and `kanban_request_changes` as terminal in the stop guard; preserve a non-terminal-tool regression control. | 2026-09-02 | PR merged and the live upstream source contains both terminal tools. |
