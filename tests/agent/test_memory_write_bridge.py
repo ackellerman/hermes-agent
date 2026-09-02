@@ -20,6 +20,7 @@ class _RecordingProvider(MemoryProvider):
 
     def __init__(self) -> None:
         self.calls = []
+        self.evict_calls = []
 
     @property
     def name(self) -> str:
@@ -42,6 +43,13 @@ class _RecordingProvider(MemoryProvider):
             "action": action,
             "target": target,
             "content": content,
+            "metadata": dict(metadata or {}),
+        })
+
+    def on_memory_evict(self, content, target, *, metadata=None):
+        self.evict_calls.append({
+            "content": content,
+            "target": target,
             "metadata": dict(metadata or {}),
         })
 
@@ -102,3 +110,130 @@ def test_build_metadata_callback_is_merged_per_op():
             "metadata": {"session_id": "s1", "tool_name": "memory"},
         }
     ]
+
+
+class _RaisingEvictProvider(_RecordingProvider):
+    """External provider whose on_memory_evict raises — must not propagate."""
+
+    def on_memory_evict(self, content, target, *, metadata=None):
+        raise RuntimeError("evict boom")
+
+
+class _BuiltinProvider(_RecordingProvider):
+    @property
+    def name(self) -> str:
+        return "builtin"
+
+
+# --- Eviction fan-out (terminal dropped-fact shape) -------------------------
+
+
+def test_evict_fires_on_terminal_done_for_add():
+    mgr, provider = _manager_with_provider()
+    mgr.notify_memory_tool_write(
+        json.dumps({"success": False, "done": True, "error": "consolidation failed"}),
+        {"action": "add", "target": "memory", "content": "would-be-dropped fact"},
+    )
+    # terminal failure is NOT mirrored as a successful write...
+    assert provider.calls == []
+    # ...but the would-be-dropped fact is handed to the eviction path.
+    assert provider.evict_calls == [
+        {
+            "content": "would-be-dropped fact",
+            "target": "memory",
+            "metadata": {"eviction_reason": "consolidation failed"},
+        }
+    ]
+
+
+def test_evict_fires_for_batched_replace_and_add_with_old_text():
+    mgr, provider = _manager_with_provider()
+    mgr.notify_memory_tool_write(
+        {"success": False, "done": True, "error": "at capacity"},
+        {
+            "operations": [
+                {"action": "replace", "content": "updated fact", "old_text": "old"},
+                {"action": "add", "content": "new fact"},
+            ]
+        },
+        build_metadata=lambda: {"session_id": "s1", "tool_name": "memory"},
+    )
+    assert provider.evict_calls == [
+        {
+            "content": "updated fact",
+            "target": "memory",
+            "metadata": {
+                "session_id": "s1",
+                "tool_name": "memory",
+                "eviction_reason": "at capacity",
+                "old_text": "old",
+            },
+        },
+        {
+            "content": "new fact",
+            "target": "memory",
+            "metadata": {
+                "session_id": "s1",
+                "tool_name": "memory",
+                "eviction_reason": "at capacity",
+            },
+        },
+    ]
+
+
+def test_evict_never_fires_for_remove():
+    mgr, provider = _manager_with_provider()
+    mgr.notify_memory_tool_write(
+        {"success": False, "done": True, "error": "boom"},
+        {"action": "remove", "target": "memory", "old_text": "stale"},
+    )
+    # a failed remove leaves the store unchanged — nothing was dropped.
+    assert provider.evict_calls == []
+
+
+@pytest.mark.parametrize("tool_result", [
+    {"success": False},                  # no `done` — transient/unknown
+    {"success": True, "staged": True},   # staged for approval — not a commit
+    {"success": False, "done": False},   # explicit non-terminal failure
+    None,
+    [],
+    object(),
+    "not-json",
+])
+def test_evict_skips_non_terminal_tool_result_shapes(tool_result):
+    mgr, provider = _manager_with_provider()
+    mgr.notify_memory_tool_write(
+        tool_result,
+        {"action": "add", "target": "memory", "content": "fact"},
+    )
+    assert provider.evict_calls == []
+
+
+def test_evict_exception_is_contained_and_loop_continues():
+    mgr = MemoryManager()
+    raising = _RaisingEvictProvider()
+    recording = _RecordingProvider()
+    # bypass the one-external-provider limit to exercise per-provider fault
+    # isolation across two non-builtin providers.
+    mgr._providers.extend([raising, recording])
+    mgr.notify_memory_tool_write(
+        {"success": False, "done": True, "error": "cap"},
+        {"action": "add", "content": "fact", "target": "memory"},
+    )
+    # the raising provider's exception is swallowed; the recording provider
+    # still received its eviction call.
+    assert raising.evict_calls == []
+    assert recording.evict_calls == [
+        {"content": "fact", "target": "memory", "metadata": {"eviction_reason": "cap"}}
+    ]
+
+
+def test_evict_skips_builtin_provider():
+    mgr = MemoryManager()
+    builtin = _BuiltinProvider()
+    mgr.add_provider(builtin)
+    mgr.notify_memory_tool_write(
+        {"success": False, "done": True, "error": "cap"},
+        {"action": "add", "content": "fact", "target": "memory"},
+    )
+    assert builtin.evict_calls == []
