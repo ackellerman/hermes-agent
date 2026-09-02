@@ -397,6 +397,20 @@ class MemoryProvider(ABC):
         Use to mirror built-in memory writes to your backend.
         """
 
+    def on_memory_evict(
+        self,
+        content: str,
+        target: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Called when the built-in memory tool would DROP a fact — i.e. a write
+        was rejected at capacity and consolidation failed (the terminal
+        'save skipped' result). Archive the would-be-dropped content to a
+        durable store so nothing is silently lost. Default is no-op.
+        """
+        return None
+
     def backup_paths(self) -> List[str]:
         """Return extra on-disk paths this provider stores OUTSIDE HERMES_HOME.
 

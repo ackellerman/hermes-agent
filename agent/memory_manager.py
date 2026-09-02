@@ -1289,6 +1289,7 @@ class MemoryManager:
         mirrored op.
         """
         if not self._memory_tool_result_succeeded(tool_result):
+            self._notify_memory_evict(tool_result, tool_args, build_metadata=build_metadata)
             return
 
         target = str(tool_args.get("target") or "memory")
@@ -1321,6 +1322,68 @@ class MemoryManager:
                 )
             except Exception as e:
                 logger.debug("notify_memory_tool_write failed for op %s: %s", action, e)
+
+    def _notify_memory_evict(
+        self,
+        tool_result: Any,
+        tool_args: Dict[str, Any],
+        *,
+        build_metadata: Optional[Callable[[], Dict[str, Any]]] = None,
+    ) -> None:
+        """Fire ``on_memory_evict`` when the built-in memory tool TERMINALLY
+        failed to consolidate a write. The terminal shape carries no content
+        (memory_tool.py: ``{"success": False, "done": True, "error": ...}``),
+        so content/target come from ``tool_args`` — same op-expansion as
+        ``notify_memory_tool_write``. Staged/transient failures are NOT
+        terminal drops (the model can retry within the turn) and never
+        trigger eviction. Exceptions never propagate to the agent loop.
+        """
+        result = tool_result
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:
+                return
+        if not isinstance(result, dict) or result.get("done") is not True:
+            return
+
+        target = str(tool_args.get("target") or "memory")
+        operations = tool_args.get("operations")
+        if isinstance(operations, list) and operations:
+            raw_operations = operations
+        else:
+            raw_operations = [{
+                "action": tool_args.get("action"),
+                "content": tool_args.get("content"),
+                "old_text": tool_args.get("old_text"),
+            }]
+
+        for op in raw_operations:
+            if not isinstance(op, dict):
+                continue
+            action = str(op.get("action") or "")
+            # add + replace fire the evict; remove does NOT — a failed remove
+            # leaves the store unchanged, nothing was dropped.
+            if action not in {"add", "replace"}:
+                continue
+            content = str(op.get("content") or "")
+            metadata = dict(build_metadata() if build_metadata else {})
+            metadata["eviction_reason"] = result.get("error")
+            old_text = op.get("old_text")
+            if old_text:
+                metadata["old_text"] = str(old_text)
+            for provider in self._providers:
+                if provider.name == "builtin":
+                    continue
+                try:
+                    # the ABC signature has keyword-only metadata; safe to always
+                    # pass keyword — the no-op default accepts it.
+                    provider.on_memory_evict(content, target, metadata=metadata)
+                except Exception as e:
+                    logger.debug(
+                        "Memory provider '%s' on_memory_evict failed: %s",
+                        provider.name, e,
+                    )
 
     def on_delegation(self, task: str, result: str, *,
                       child_session_id: str = "", **kwargs) -> None:
