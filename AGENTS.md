@@ -1324,6 +1324,28 @@ updater, serve/dashboard, and the gateway is being replaced by a
 gateway-owned control socket (#92091). Do not add new scan heuristics
 without checking that design; scans are the fallback layer.
 
+### Local integration overlay
+
+This installation runs Hermes from `local/hermes-overlay`, not directly from
+`main`. It is the only branch the live checkout and gateways may use. The
+overlay carries narrow, tested local fixes while `hermes update` merges current
+`origin/main` into it; every carried patch must be recorded in
+`UPSTREAM-PENDING.md` with its upstream PR or an explicit operator exception
+and a removal condition.
+
+- Never check the live checkout out to an implementation, review, or PR topic
+  branch. Create such work in a separate linked worktree; the live checkout
+  remains on `local/hermes-overlay` throughout.
+- Before any `hermes update`, restart, or gateway action, verify the live
+  checkout is clean and `git branch --show-current` prints
+  `local/hermes-overlay`. Do not update from a topic branch.
+- After local review, merge or cherry-pick the approved patch into the overlay,
+  verify its runtime behavior, then open or maintain the upstream PR in
+  parallel. Upstream acceptance is not a gate on local use.
+- When upstream ships an equivalent fix, update the overlay, verify the
+  upstream behavior, remove the duplicate local patch and its ledger row, and
+  return to `main` only when the overlay has no carried patches.
+
 ### Gateway lifecycle vs. the Desktop app
 
 `hermes serve` (control plane, desktop-spawned child) dies with the app
