@@ -229,6 +229,11 @@ def _connect(board: Optional[str] = None):
 
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
 
+# Overlay K4: most-recent runs included in the kanban_show payload. The
+# worker_context block already carries the last 10 attempts; the raw
+# array exists for tooling, not for re-reading 98 blocked runs per call.
+_SHOW_MAX_RUNS = 10
+
 
 def _goal_judge_available() -> bool:
     """True when an auxiliary client is configured for the goal judge.
@@ -566,6 +571,11 @@ def _handle_show(args: dict, **kw) -> str:
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
+            # Overlay K4: bound the raw arrays. Every comment and every run
+            # was sent on each call (and the last 30 comments AGAIN inside
+            # worker_context); a 98-run card measured ~36K tokens re-sent
+            # ~12 times per goal turn. Most-recent N, totals alongside,
+            # full log via `hermes kanban show`.
             return json.dumps({
                 "task": _task_dict(task),
                 "parents": parents,
@@ -573,14 +583,16 @@ def _handle_show(args: dict, **kw) -> str:
                 "comments": [
                     {"author": c.author, "body": c.body,
                      "created_at": c.created_at}
-                    for c in comments
+                    for c in comments[-kb._CTX_MAX_COMMENTS:]
                 ],
+                "comments_total": len(comments),
                 "events": [
                     {"kind": e.kind, "payload": e.payload,
                      "created_at": e.created_at, "run_id": e.run_id}
                     for e in events[-50:]   # cap; full log via CLI
                 ],
-                "runs": [_run_dict(r) for r in runs],
+                "runs": [_run_dict(r) for r in runs[-_SHOW_MAX_RUNS:]],
+                "runs_total": len(runs),
                 # Also surface the worker's own context block so the
                 # agent can include it directly if it wants. This is
                 # the same string build_worker_context returns to the
