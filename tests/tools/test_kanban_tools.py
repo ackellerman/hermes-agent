@@ -228,6 +228,49 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+def test_block_dependency_requires_depends_on_and_writes_edge(worker_env):
+    """Overlay K1: a dependency block is an edge or it does not exist.
+
+    The tool must (a) refuse kind=dependency without depends_on, naming the
+    argument in the error so the worker self-heals in one turn; (b) pass
+    depends_on through to the kernel so the edge lands and the card cannot be
+    re-promoted until the parent is done.
+    """
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="gate", assignee="test-worker")
+    finally:
+        conn.close()
+
+    out = kt._handle_block({"reason": f"await {parent}", "kind": "dependency"})
+    d = json.loads(out)
+    assert d.get("ok") is False or "error" in d
+    assert "depends_on" in json.dumps(d)
+
+    out = kt._handle_block({
+        "reason": f"await {parent}", "kind": "dependency",
+        "depends_on": [parent],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["status"] == "todo"
+    assert d["depends_on"] == [parent]
+    conn = kb.connect()
+    try:
+        parents = {
+            r["parent_id"] for r in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id=?", (worker_env,)
+            ).fetchall()
+        }
+        assert parents == {parent}
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, worker_env).status == "todo"
+    finally:
+        conn.close()
+
+
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     """Set up an isolated HERMES_HOME with one claimed goal_mode task,
     matching the pattern used by the kanban_complete judge gate tests."""

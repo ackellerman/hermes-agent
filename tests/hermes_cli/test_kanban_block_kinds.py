@@ -89,7 +89,10 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = _running_task(conn, title="child")
         kb.link_tasks(conn, parent_id=parent, child_id=child)
-        kb.block_task(conn, child, reason="wait", kind="dependency")
+        # Overlay K1: a dependency block names its parents (the edge already
+        # exists here; INSERT OR IGNORE keeps it idempotent).
+        kb.block_task(conn, child, reason="wait", kind="dependency",
+                      depends_on=[parent])
         assert kb.get_task(conn, child).status == "todo"
         # Finish the parent, then let recompute_ready run.
         with kb.write_txn(conn):
