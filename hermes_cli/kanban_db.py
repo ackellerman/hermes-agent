@@ -6270,6 +6270,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    depends_on: Optional[Iterable[str]] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6282,6 +6283,16 @@ def block_task(
       ``todo`` so the existing parent-gating / ``recompute_ready`` machinery
       promotes it automatically once its parents finish. No human, no cron, no
       retry storm. This is Dale's "Type 2 — dependency blocked".
+
+      **A dependency is an edge or it does not exist** (overlay, 2026-09-04):
+      ``depends_on`` is REQUIRED and names the task ids being waited on. The
+      kernel writes them as ``task_links`` parents in the same transaction.
+      Without the edge, ``recompute_ready`` sees ``all([])`` and re-promotes
+      the card on every dispatcher tick — one card was cold-spawned 97 times
+      in 2.4 h waiting on a parent that existed only in its block reason.
+      Refused with :class:`ValueError` when ``depends_on`` is missing/empty,
+      names an unknown task, names a task that is already done/archived
+      (nothing to wait on), or would create a cycle.
 
     * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
@@ -6302,6 +6313,20 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    dep_ids: list[str] = []
+    if kind == "dependency":
+        dep_ids = [str(d).strip() for d in (depends_on or []) if str(d).strip()]
+        if not dep_ids:
+            raise ValueError(
+                "kind='dependency' requires depends_on=[<task id>, ...] naming "
+                "the task(s) this one is waiting on. A dependency named only "
+                "in the reason text is invisible to the scheduler and the card "
+                "would be re-dispatched every tick. Re-call kanban_block with "
+                "depends_on=['t_...'] — or, if nothing on the board gates this "
+                "work, use kind='needs_input' and say what is missing."
+            )
+        if task_id in dep_ids:
+            raise ValueError("a task cannot depend on itself")
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -6328,6 +6353,28 @@ def block_task(
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
         if kind == "dependency":
+            # Validate every named parent BEFORE any state moves, so a refusal
+            # leaves the card exactly where it was (still running/ready).
+            missing = _find_missing_parents(conn, dep_ids)
+            if missing:
+                raise ValueError(f"unknown task(s): {', '.join(missing)}")
+            open_deps: list[str] = []
+            for dep in dep_ids:
+                dep_status = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (dep,)
+                ).fetchone()["status"]
+                if dep_status in ("done", "archived"):
+                    raise ValueError(
+                        f"depends_on names {dep} which is already {dep_status} — "
+                        f"there is nothing to wait on. Re-read the board; if the "
+                        f"work is still not unblocked, the real blocker is "
+                        f"something else (use kind='needs_input')."
+                    )
+                if _would_cycle(conn, dep, task_id):
+                    raise ValueError(
+                        f"linking {dep} -> {task_id} would create a cycle"
+                    )
+                open_deps.append(dep)
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -6344,6 +6391,19 @@ def block_task(
             )
             if cur.rowcount != 1:
                 return False
+            # The edge IS the dependency. Same transaction as the park, so a
+            # crash between the two cannot leave a parked card with no parent.
+            for dep in open_deps:
+                conn.execute(
+                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
+                    "VALUES (?, ?)",
+                    (dep, task_id),
+                )
+                _append_event(
+                    conn, task_id, "linked",
+                    {"parent": dep, "child": task_id, "via": "dependency_block"},
+                )
+            _inherit_notify_subs(conn, task_id, tuple(open_deps))
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -6359,6 +6419,7 @@ def block_task(
                     "reason": reason,
                     "kind": kind,
                     "source_status": source_status,
+                    "depends_on": open_deps,
                 },
                 run_id=run_id,
             )

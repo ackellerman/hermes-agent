@@ -879,11 +879,15 @@ def _handle_block(args: dict, **kw) -> str:
                 f"completion judge will evaluate it."
             )
         try:
+            depends_on = args.get("depends_on")
+            if isinstance(depends_on, str):
+                depends_on = [depends_on]
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
+                depends_on=depends_on,
             )
             if not ok:
                 return tool_error(
@@ -899,6 +903,7 @@ def _handle_block(args: dict, **kw) -> str:
                 run_id=run.id if run else None,
                 status=landed.status if landed else "blocked",
                 block_kind=kind,
+                depends_on=list(depends_on) if kind == "dependency" else None,
             )
         finally:
             conn.close()
@@ -1910,8 +1915,21 @@ KANBAN_BLOCK_SCHEMA = {
                 "enum": ["dependency", "needs_input", "capability", "transient"],
                 "description": (
                     "Why you're blocked. 'dependency' waits in todo and "
-                    "resumes automatically; the others surface to a human. "
-                    "Omit only if none apply."
+                    "resumes automatically when every task in depends_on is "
+                    "done (depends_on is REQUIRED for this kind); the others "
+                    "surface to a human. Omit only if none apply."
+                ),
+            },
+            "depends_on": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "REQUIRED with kind='dependency': the task id(s) this "
+                    "task is waiting on, e.g. ['t_1a2b3c4d']. The scheduler "
+                    "links them as parents and will not re-dispatch this task "
+                    "until they are all done. A dependency mentioned only in "
+                    "`reason` is invisible to the scheduler and the task would "
+                    "be re-dispatched every tick."
                 ),
             },
             "board": _board_schema_prop(),

@@ -683,6 +683,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "triage to break unblock loops. Omit for a generic block."
         ),
     )
+    p_block.add_argument(
+        "--depends-on", nargs="+", default=None, metavar="TASK_ID",
+        help=(
+            "REQUIRED with --kind dependency: the task id(s) being waited on. "
+            "They are linked as parents so the task is not re-dispatched until "
+            "they are done. A dependency named only in the reason text is "
+            "invisible to the scheduler."
+        ),
+    )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
@@ -2511,15 +2520,24 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            try:
+                ok = kb.block_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    kind=kind,
+                    expected_run_id=_worker_run_id_for(tid),
+                    depends_on=getattr(args, "depends_on", None),
+                )
+            except ValueError as e:
+                # Refused before any state moved (e.g. --kind dependency with
+                # no/unknown/done --depends-on). Say exactly what to re-run.
+                print(f"cannot block {tid}: {e}", file=sys.stderr)
+                failed.append(tid)
+                continue
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
-            if not kb.block_task(
-                conn,
-                tid,
-                reason=reason,
-                kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            if not ok:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
