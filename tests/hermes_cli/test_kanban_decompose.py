@@ -221,3 +221,41 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+
+
+def test_decompose_refuses_worked_card_before_calling_llm(kanban_home, monkeypatch):
+    """Overlay K3: a card that reached triage by block-loop escalation (it has
+    runs) must be refused BEFORE any LLM planning call — otherwise the tick
+    re-plans and re-fails it every 60 s."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="worked", assignee="laforge")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="laforge") is not None
+        kb.block_task(conn, tid, reason="stuck", kind="needs_input")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+
+    import sys, types
+
+    def _no_llm(*a, **k):
+        raise AssertionError("LLM planner must not be called for a worked card")
+
+    # decompose_task imports agent.auxiliary_client.call_llm lazily; plant a
+    # module whose call_llm explodes so any planning attempt is loud.
+    fake = types.ModuleType("agent.auxiliary_client")
+    fake.call_llm = _no_llm
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", fake)
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+    assert outcome.ok is False
+    assert "not a fresh card" in outcome.reason
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+        assert kb.get_task(conn, tid).assignee == "laforge"

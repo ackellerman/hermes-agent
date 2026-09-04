@@ -291,12 +291,31 @@ def decompose_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
+        # Overlay K3: refuse worked cards BEFORE spending an LLM call on a
+        # plan the DB will reject anyway (and would re-attempt every tick).
+        worked = None
+        if task is not None:
+            n_runs = conn.execute(
+                "SELECT count(*) FROM task_runs WHERE task_id = ?", (task_id,)
+            ).fetchone()[0]
+            n_edges = conn.execute(
+                "SELECT count(*) FROM task_links WHERE parent_id = ? OR child_id = ?",
+                (task_id, task_id),
+            ).fetchone()[0]
+            if n_runs or n_edges:
+                worked = (
+                    f"not a fresh card ({n_runs} run(s), {n_edges} edge(s)): "
+                    f"it reached triage by escalation, not by intake. "
+                    f"Unblock, reassign, or archive it; do not re-plan."
+                )
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+    if worked:
+        return DecomposeOutcome(task_id, False, worked)
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
