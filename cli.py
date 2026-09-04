@@ -21681,7 +21681,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             logger.warning("invalid HERMES_KANBAN_RUN_ID=%r", raw_run_id)
 
     from hermes_cli import kanban_db as _kb
-    from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
+    from hermes_cli.goals import run_kanban_goal_loop as _run_loop, resolve_kanban_max_turns as _resolve_turns
 
     # Resolve goal text from the card (title + body = the acceptance
     # criteria the judge evaluates against).
@@ -21703,7 +21703,12 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     if not goal_text:
         return
 
-    max_turns = task.goal_max_turns or _DEF_TURNS
+    try:
+        from hermes_cli.config import load_config_readonly as _load_cfg
+        _cfg = _load_cfg() or {}
+    except Exception:
+        _cfg = {}
+    max_turns = _resolve_turns(task, _cfg)
 
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(

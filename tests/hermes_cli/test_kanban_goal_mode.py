@@ -298,3 +298,24 @@ class TestCLIJudgeGate:
         assert complete_calls == [], "an unachievable goal must never reach complete_task"
         assert "unachievable" in err.lower()
         assert "kanban block" in err.lower()
+
+
+# ---------------------------------------------------------------------------
+# Overlay K5: kanban worker turn budget honours config (card > config > default)
+# ---------------------------------------------------------------------------
+
+def test_kanban_worker_max_turns_precedence(monkeypatch):
+    """The kanban worker path hard-wired DEFAULT_MAX_TURNS (20) and ignored
+    ``goals.max_turns`` in config.yaml; each 'turn' is an unbounded agent
+    conversation (248 API calls measured for one 20-turn run on 2026-09-04).
+    Precedence must be: card.goal_max_turns > config goals.kanban_max_turns
+    > goals.max_turns > goals.DEFAULT_KANBAN_MAX_TURNS."""
+    import types
+    r = goals.resolve_kanban_max_turns
+    assert r(types.SimpleNamespace(goal_max_turns=7), {"goals": {"max_turns": 20}}) == 7
+    assert r(types.SimpleNamespace(goal_max_turns=None), {"goals": {"kanban_max_turns": 6, "max_turns": 20}}) == 6
+    assert r(types.SimpleNamespace(goal_max_turns=None), {"goals": {"max_turns": 12}}) == 12
+    assert r(types.SimpleNamespace(goal_max_turns=None), {}) == goals.DEFAULT_KANBAN_MAX_TURNS
+    assert r(types.SimpleNamespace(goal_max_turns=0), {}) == goals.DEFAULT_KANBAN_MAX_TURNS
+    assert r(None, {"goals": {"max_turns": "bad"}}) == goals.DEFAULT_KANBAN_MAX_TURNS
+    assert goals.DEFAULT_KANBAN_MAX_TURNS < goals.DEFAULT_MAX_TURNS

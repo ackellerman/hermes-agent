@@ -40,7 +40,7 @@ import threading
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
 
@@ -52,6 +52,38 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
+
+# Overlay K5: kanban goal-mode workers get a smaller default than the
+# interactive /goal loop. A kanban "turn" is a full agent conversation
+# with unbounded tool iterations (one 20-turn run measured 248 API calls
+# and 25M input tokens on 2026-09-04); the judge already re-reads the
+# card each turn, so 8 turns is a budget, not a ceiling to fill.
+DEFAULT_KANBAN_MAX_TURNS = 8
+
+
+def resolve_kanban_max_turns(task: Any, cfg: Optional[Mapping[str, Any]]) -> int:
+    """Turn budget for a kanban goal-mode worker.
+
+    Precedence: ``task.goal_max_turns`` (per card) > ``goals.kanban_max_turns``
+    > ``goals.max_turns`` > :data:`DEFAULT_KANBAN_MAX_TURNS`. Non-positive or
+    non-integer values fall through to the next level.
+    """
+    def _pos_int(v: Any) -> Optional[int]:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return None
+        return n if n > 0 else None
+
+    card = _pos_int(getattr(task, "goal_max_turns", None)) if task is not None else None
+    if card:
+        return card
+    goals_cfg = (cfg or {}).get("goals") or {}
+    for key in ("kanban_max_turns", "max_turns"):
+        n = _pos_int(goals_cfg.get(key))
+        if n:
+            return n
+    return DEFAULT_KANBAN_MAX_TURNS
 DEFAULT_JUDGE_TIMEOUT = 30.0
 # Judge output budget. The freeform judge returns a one-line JSON verdict, but
 # reasoning models (deepseek-v4, qwq, etc.) burn tokens on hidden reasoning
