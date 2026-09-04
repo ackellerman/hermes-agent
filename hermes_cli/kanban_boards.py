@@ -155,6 +155,32 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_boards_set_orchestrator(args: argparse.Namespace) -> int:
+    normed, rc = _board_slug_arg(args, "set-orchestrator", must_exist=True)
+    if rc:
+        return rc
+    profile = (args.profile or "").strip()
+    if profile:
+        try:
+            from hermes_cli import profiles
+            if not profiles.profile_exists(profile):
+                return _err(
+                    f"kanban boards set-orchestrator: profile {profile!r} does not exist"
+                )
+        except Exception as exc:
+            return _err(
+                f"kanban boards set-orchestrator: could not validate profile: {exc}"
+            )
+    meta = kb.write_board_metadata(normed, orchestrator_profile=profile)
+    if meta.get("orchestrator_profile"):
+        print(f"Board {normed!r} decomposed roots will resume with "
+              f"{meta['orchestrator_profile']!r}.")
+    else:
+        print(f"Board {normed!r} orchestrator override cleared; decomposition "
+              "will use the global or active-profile fallback.")
+    return 0
+
+
 def _cmd_boards_export(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_transfer
     from hermes_cli.sizefmt import format_bytes
@@ -209,6 +235,7 @@ _BOARD_HANDLERS = {
     "show": _cmd_boards_show, "current": _cmd_boards_show,
     "rename": _cmd_boards_rename,
     "set-default-workdir": _cmd_boards_set_default_workdir,
+    "set-orchestrator": _cmd_boards_set_orchestrator,
     "export": _cmd_boards_export,
     "import": _cmd_boards_import,
 }

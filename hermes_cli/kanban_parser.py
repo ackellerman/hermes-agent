@@ -110,6 +110,10 @@ _BOARD_SPECS = [
         _SLUG,
         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),
     ], help="Set the default workspace path for tasks on a board"),
+    _cmd("set-orchestrator", [
+        _SLUG,
+        _arg("profile", nargs="?", default=None, help="Installed profile name. Omit to clear the board override."),
+    ], help="Set the profile that resumes decomposed roots on a board"),
     _cmd("export", [
         _arg("slug", nargs="?", help="Board to export (default: the current board)"),
         _arg("-o", "--output", help="Archive path (default: ./<slug>.tar.gz)"),
@@ -297,6 +301,12 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _arg("--depends-on", nargs="+", metavar="TASK_ID", help=(
+            "REQUIRED with --kind dependency: the task id(s) being waited on. "
+            "They are linked as parents so the task is not re-dispatched until "
+            "they are done. A dependency named only in the reason text is "
+            "invisible to the scheduler."
+        )),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
