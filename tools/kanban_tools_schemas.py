@@ -190,8 +190,21 @@ KANBAN_BLOCK_SCHEMA = _schema(
             "enum": ["dependency", "needs_input", "capability", "transient"],
             "description": (
                 "Why you're blocked. 'dependency' waits in todo and "
-                "resumes automatically; the others surface to a human. "
-                "Omit only if none apply."
+                "resumes automatically when every task in depends_on is "
+                "done (depends_on is REQUIRED for this kind); the others "
+                "surface to a human. Omit only if none apply."
+            ),
+        },
+        "depends_on": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "REQUIRED with kind='dependency': the task id(s) this "
+                "task is waiting on, e.g. ['t_1a2b3c4d']. The scheduler "
+                "links them as parents and will not re-dispatch this task "
+                "until they are all done. A dependency mentioned only in "
+                "`reason` is invisible to the scheduler and the task would "
+                "be re-dispatched every tick."
             ),
         },
     },
