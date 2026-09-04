@@ -101,6 +101,8 @@ import {
   GatewayClient,
   RECONNECT_BASE_MS,
   RECONNECT_MAX_MS,
+  REQUEST_TIMEOUT_MS,
+  SESSION_COMPRESS_TIMEOUT_MS,
   WS_HEARTBEAT_DEAD_MS,
   WS_HEARTBEAT_INTERVAL_MS
 } from '../gatewayClient.js'
@@ -622,5 +624,41 @@ describe('GatewayClient websocket attach mode', () => {
     await vi.advanceTimersByTimeAsync(WS_HEARTBEAT_DEAD_MS + RECONNECT_MAX_MS + 1000)
     expect(FakeWebSocket.instances.length).toBe(1) // no reconnect attempted
     vi.useRealTimers()
+  })
+
+  it('gives session.compress the long compress budget, not the generic RPC timeout', { timeout: 20000 }, async () => {
+    // A manual /compress over a large transcript summarizes for minutes while the
+    // gateway keeps working; the desktop client waits SESSION_COMPRESS_TIMEOUT_MS
+    // (660s) for exactly this reason. The TUI used the generic 120s default and
+    // reported "timeout: session.compress" while the compaction was still
+    // landing — a false failure that invites a second /compress on top of the
+    // first.
+    vi.useFakeTimers()
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+    const gw = new GatewayClient()
+
+    try {
+      gw.start()
+      const socket = FakeWebSocket.instances[0]!
+
+      socket.open()
+      let settled: string | null = null
+
+      const req = gw
+        .request('session.compress', { session_id: 's1' })
+        .then(() => (settled = 'resolved'))
+        .catch((e: Error) => (settled = e.message))
+
+      await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS + 1000)
+      expect(settled).toBeNull() // still waiting — generic timeout must not fire
+
+      await vi.advanceTimersByTimeAsync(SESSION_COMPRESS_TIMEOUT_MS)
+      await req
+      expect(settled).toContain('still running in the gateway')
+      expect(settled).toContain('Do not re-run /compress')
+    } finally {
+      gw.kill()
+      vi.useRealTimers()
+    }
   })
 })
