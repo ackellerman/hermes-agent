@@ -128,6 +128,81 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     assert turns == []  # no extra turns
 
 
+def test_judge_transport_failure_does_not_spend_worker_turns(monkeypatch):
+    """Overlay K2. On 2026-09-04 three sessions each burned 19 full worker
+    turns in ~10 s because judge_goal returned transport_failed=True (judge
+    RateLimitError) and the loop treated it as a plain 'continue', re-sending
+    the whole context per turn until the 20-turn budget was gone — then
+    sticky-blocked the card as 'budget exhausted', which tripped the block
+    loop and triage. A judge that cannot be reached is not evidence about
+    the work: the loop must NOT run another worker turn on it, and after
+    DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES it must block as transient
+    naming the judge, not the worker."""
+    calls = {"n": 0}
+
+    def _down_judge(goal, response, subgoals=None, background_processes=None, **_kw):
+        calls["n"] += 1
+        return "continue", "judge error: RateLimitError", False, None, True
+
+    monkeypatch.setattr(goals, "judge_goal", _down_judge)
+    monkeypatch.setattr(goals, "_judge_retry_sleep", lambda s: None)
+    turns: list = []
+    blocks: list = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: turns.append(p) or "still working",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocks.append(r),
+        first_response="first",
+        max_turns=20,
+    )
+    assert turns == [], f"worker turns were spent on an unreachable judge: {len(turns)}"
+    assert calls["n"] == goals.DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES
+    assert res["outcome"] == "blocked_judge_unreachable"
+    assert res["turns_used"] == 1  # only the first (real) turn counts
+    assert len(blocks) == 1 and "judge" in blocks[0].lower()
+    assert "RateLimitError" in blocks[0]
+
+
+def test_judge_transport_failure_then_recovery_continues_normally(monkeypatch):
+    """A transient judge blip (below the limit) is retried at the judge, not
+    at the worker: one transport failure then a real 'continue' → exactly
+    one worker turn, then 'done' → finalize nudge."""
+    seq = [
+        ("continue", "judge error: timeout", False, None, True),
+        ("continue", "keep going", False, None, False),
+        ("done", "looks complete", False, None, False),
+    ]
+
+    def _judge(goal, response, subgoals=None, background_processes=None, **_kw):
+        return seq.pop(0) if seq else ("done", "done", False, None, False)
+
+    monkeypatch.setattr(goals, "judge_goal", _judge)
+    monkeypatch.setattr(goals, "_judge_retry_sleep", lambda s: None)
+    turns: list = []
+    status = {"s": "running"}
+
+    def _run_turn(p):
+        turns.append(p)
+        if len(turns) >= 2:
+            status["s"] = "done"
+        return "progress"
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=_run_turn,
+        task_status_fn=lambda: status["s"],
+        block_fn=lambda r: pytest.fail(f"should not block: {r}"),
+        first_response="first",
+        max_turns=20,
+    )
+    assert res["outcome"] == "completed_by_worker"
+    assert len(turns) == 2
+
+
 
 
 

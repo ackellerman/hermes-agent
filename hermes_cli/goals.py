@@ -79,6 +79,12 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # run until the turn budget, wasting every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
 
+
+def _judge_retry_sleep(seconds: float) -> None:
+    """Backoff between judge re-tries after a transport failure (K2).
+    Module-level so tests can stub it; never a worker turn."""
+    time.sleep(seconds)
+
 # Quality gates: deterministic shell commands that must pass before the goal
 # judge may declare the goal done. Defaults mirror the bounded-autonomy
 # pattern (per-gate retry limit + timeout, bounded output fed back to the
@@ -2257,6 +2263,13 @@ def run_kanban_goal_loop(
     # The first turn already consumed one unit of budget.
     turns_used = 1
     nudged_to_finalize = False
+    # Overlay K2: consecutive judge transport failures. A judge that cannot
+    # be reached is not evidence about the work; spending a full worker turn
+    # (the whole context, re-sent) on every judge error burned 19 turns in
+    # ~10 s on three cards on 2026-09-04 and sticky-blocked each as "budget
+    # exhausted". Retry the judge, not the worker; after the limit, block as
+    # transient naming the judge so the dispatcher's cooldown handles it.
+    judge_transport_failures = 0
 
     while True:
         # Did the worker terminate the task itself this turn?
@@ -2291,6 +2304,44 @@ def run_kanban_goal_loop(
         # via kanban_complete / kanban_block, not by parking), so a WAIT
         # verdict is treated as CONTINUE here.
         verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+        if _transport_failed:
+            judge_transport_failures += 1
+            _log(
+                f"kanban goal loop: judge unreachable "
+                f"({judge_transport_failures}/{DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES}): "
+                f"{_truncate(reason, 120)}; not spending a worker turn"
+            )
+            if judge_transport_failures >= DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES:
+                try:
+                    block_fn(
+                        f"Goal-mode judge unreachable {judge_transport_failures} "
+                        f"times in a row ({_truncate(reason, 200)}). The worker's "
+                        f"last turn was not evaluated; no worker turns were spent. "
+                        f"This is a provider/judge outage, not a defect in the "
+                        f"work — unblock when the judge provider is healthy.",
+                        kind="transient",
+                    )
+                except TypeError:
+                    # Legacy block_fn without a kind parameter.
+                    try:
+                        block_fn(
+                            f"Goal-mode judge unreachable {judge_transport_failures} "
+                            f"times in a row ({_truncate(reason, 200)}); no worker "
+                            f"turns were spent."
+                        )
+                    except Exception as exc:
+                        _log(f"kanban goal loop: block_fn failed ({exc})")
+                except Exception as exc:
+                    _log(f"kanban goal loop: block_fn failed ({exc})")
+                return {
+                    "outcome": "blocked_judge_unreachable",
+                    "turns_used": turns_used,
+                    "reason": f"judge transport failed x{judge_transport_failures}: {reason}",
+                }
+            # Brief pause, then re-judge the SAME response. No worker turn.
+            _judge_retry_sleep(min(2.0 * judge_transport_failures, 10.0))
+            continue
+        judge_transport_failures = 0
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
