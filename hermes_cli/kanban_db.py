@@ -7617,6 +7617,33 @@ def decompose_triage_task(
             return None
         if root_row["status"] != "triage":
             return None
+        # Overlay K3 (2026-09-04): decomposition is for FRESH cards only.
+        # Block-loop escalation routes worked cards to triage; re-planning
+        # one duplicates its graph (6 duplicate children on t_2b796e9a) and
+        # steals its owner. Any run or any edge means "not a rough idea".
+        n_runs = conn.execute(
+            "SELECT count(*) FROM task_runs WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+        if n_runs:
+            raise ValueError(
+                f"{task_id} has run history ({n_runs} run(s)) and cannot be "
+                f"decomposed: it is a worked card that landed in triage, not a "
+                f"rough idea. Read its last run/comments and either unblock it "
+                f"(hermes kanban unblock {task_id}), reassign it, or archive it."
+            )
+        n_edges = conn.execute(
+            "SELECT count(*) FROM task_links WHERE parent_id = ? OR child_id = ?",
+            (task_id, task_id),
+        ).fetchone()[0]
+        if n_edges:
+            raise ValueError(
+                f"{task_id} already has {n_edges} graph edge(s) and cannot be "
+                f"decomposed again: its plan exists. Unblock or archive it "
+                f"instead of creating a duplicate fan-out."
+            )
+        existing_assignee = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()["assignee"]
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
@@ -7705,10 +7732,12 @@ def decompose_triage_task(
                 (cid, task_id),
             )
 
-        # Flip the root: triage -> todo, set assignee to the orchestrator.
+        # Flip the root: triage -> todo. The orchestrator takes ownership
+        # only of an UNOWNED root (K3): a card that already names its
+        # owner keeps it — decomposition adds a plan, it does not steal.
         sets = ["status = 'todo'"]
         params: list[Any] = []
-        if root_assignee is not None:
+        if root_assignee is not None and not (existing_assignee or "").strip():
             sets.append("assignee = ?")
             params.append(root_assignee)
         params.append(task_id)
