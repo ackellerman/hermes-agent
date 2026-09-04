@@ -16,6 +16,25 @@ const MAX_BUFFERED_EVENTS = 2000
 const MAX_LOG_PREVIEW = 240
 const STARTUP_TIMEOUT_MS = Math.max(5000, parseInt(process.env.HERMES_TUI_STARTUP_TIMEOUT_MS ?? '15000', 10) || 15000)
 const REQUEST_TIMEOUT_MS = Math.max(30000, parseInt(process.env.HERMES_TUI_RPC_TIMEOUT_MS ?? '120000', 10) || 120000)
+// Manual /compress summarizes the whole transcript; over a few hundred
+// messages that is minutes, not seconds, and the gateway keeps working after
+// the client gives up. Mirror the desktop client's SESSION_COMPRESS_TIMEOUT_MS
+// (apps/desktop/src/app/session/hooks/use-prompt-actions/slash.ts) and, on
+// expiry, say what is actually true instead of "timeout".
+export const SESSION_COMPRESS_TIMEOUT_MS = 660_000
+
+const PER_METHOD_TIMEOUT_MS: Record<string, number> = {
+  'session.compress': Math.max(REQUEST_TIMEOUT_MS, SESSION_COMPRESS_TIMEOUT_MS)
+}
+
+const PER_METHOD_TIMEOUT_MESSAGE: Record<string, string> = {
+  'session.compress':
+    'timeout: session.compress — compression is still running in the gateway; the summary will appear when it lands. Do not re-run /compress (that would summarize the summary).'
+}
+
+const requestTimeoutMs = (method: string): number => PER_METHOD_TIMEOUT_MS[method] ?? REQUEST_TIMEOUT_MS
+const requestTimeoutMessage = (method: string): string => PER_METHOD_TIMEOUT_MESSAGE[method] ?? `timeout: ${method}`
+export { REQUEST_TIMEOUT_MS }
 const WS_CONNECTING = 0
 const WS_OPEN = 1
 const WS_CLOSING = 2
@@ -758,7 +777,7 @@ export class GatewayClient extends EventEmitter {
 
     if (p) {
       this.pending.delete(id)
-      p.reject(new Error(`timeout: ${p.method}`))
+      p.reject(new Error(requestTimeoutMessage(p.method)))
     }
   }
 
@@ -841,7 +860,7 @@ export class GatewayClient extends EventEmitter {
       ws =>
         new Promise<T>((resolve, reject) => {
           const id = `r${++this.reqId}`
-          const timeout = setTimeout(this.onTimeout, REQUEST_TIMEOUT_MS, id)
+          const timeout = setTimeout(this.onTimeout, requestTimeoutMs(method), id)
 
           timeout.unref?.()
           this.pending.set(id, {
@@ -895,7 +914,7 @@ export class GatewayClient extends EventEmitter {
     const id = `r${++this.reqId}`
 
     return new Promise<T>((resolve, reject) => {
-      const timeout = setTimeout(this.onTimeout, REQUEST_TIMEOUT_MS, id)
+      const timeout = setTimeout(this.onTimeout, requestTimeoutMs(method), id)
 
       timeout.unref?.()
 
