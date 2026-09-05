@@ -452,6 +452,7 @@ def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> N
         reason="dependency: parent contract is being refreshed",
         kind="dependency",
         expected_run_id=review.current_run_id,
+        depends_on=[parent_id],  # overlay K1: the dependency is an edge, named explicitly
     )
     waiting = kb.get_task(conn, task_id)
     assert waiting is not None
