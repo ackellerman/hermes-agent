@@ -152,24 +152,6 @@ def _resolve_profile_from_cfg(cfg: dict, key: str) -> str:
         return "default"
 
 
-def _resolve_orchestrator_profile(cfg: dict) -> str:
-    """Resolve the profile that resumes a decomposed root.
-
-    The board's metadata owns coordination for that board (overlay
-    ``f1e0a5b74d2``). The legacy global ``kanban.orchestrator_profile``
-    remains a fallback for boards that have no explicit coordinator; the
-    active profile is the final fallback so a root is never unassigned.
-    """
-    try:
-        board_meta = kb.read_board_metadata(kb.get_current_board())
-        board_explicit = (board_meta.get("orchestrator_profile") or "").strip()
-        if board_explicit and profiles_mod.profile_exists(board_explicit):
-            return board_explicit
-    except Exception:
-        pass
-    return _resolve_profile_from_cfg(cfg, "orchestrator_profile")
-
-
 def _build_roster() -> tuple[list[dict], set[str]]:
     """``(roster_for_prompt, valid_assignee_names)``; entries are
     ``{name, description, has_description}``."""
@@ -223,7 +205,7 @@ def _load_routing() -> _Routing:
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     roster, valid_names = _build_roster()
     return _Routing(
-        orchestrator=_resolve_orchestrator_profile(cfg),
+        orchestrator=_resolve_profile_from_cfg(cfg, "orchestrator_profile"),
         default_assignee=_resolve_profile_from_cfg(cfg, "default_assignee"),
         auto_promote=bool(kanban_cfg.get("auto_promote_children", True)),
         roster=roster,
@@ -325,24 +307,6 @@ def decompose_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
-
-    # Overlay K3: refuse worked cards BEFORE spending an LLM call on a
-    # plan the DB will reject anyway (and would re-attempt every tick).
-    with kbc.connect_closing() as conn:
-        n_runs = conn.execute(
-            "SELECT count(*) FROM task_runs WHERE task_id = ?", (task_id,)
-        ).fetchone()[0]
-        n_edges = conn.execute(
-            "SELECT count(*) FROM task_links WHERE parent_id = ? OR child_id = ?",
-            (task_id, task_id),
-        ).fetchone()[0]
-    if n_runs or n_edges:
-        return DecomposeOutcome(
-            task_id, False,
-            f"not a fresh card ({n_runs} run(s), {n_edges} edge(s)): "
-            f"it reached triage by escalation, not by intake. "
-            f"Unblock, reassign, or archive it; do not re-plan.",
-        )
 
     routing = _load_routing()
     raw, reason = _call_aux(

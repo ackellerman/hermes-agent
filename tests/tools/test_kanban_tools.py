@@ -1206,28 +1206,3 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         conn.close()
 
 
-def test_show_payload_is_bounded_on_a_long_thread(worker_env):
-    """Overlay K4. kanban_show sent every comment AND the last 30 again inside
-    worker_context, plus every run; a 98-run card measured 142K chars (~36K
-    tokens) re-sent on every one of ~12 API calls per turn. Bound the raw
-    arrays to what worker_context already carries; the CLI has the full log.
-    """
-    from tools import kanban_tools as kt
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        for i in range(80):
-            kb.add_comment(conn, worker_env, "chatty", f"comment {i} " + "x" * 400)
-        for i in range(60):
-            kb._synthesize_ended_run(
-                conn, worker_env, outcome="blocked", summary=f"run {i} " + "y" * 300,
-            )
-    finally:
-        conn.close()
-    d = json.loads(kt._handle_show({}))
-    assert len(d["comments"]) <= kb._CTX_MAX_COMMENTS
-    assert d["comments"][-1]["body"].startswith("comment 79")   # most recent kept
-    assert d["comments_total"] == 80
-    assert len(d["runs"]) <= kt._SHOW_MAX_RUNS
-    assert d["runs_total"] >= 60
-    assert d["runs"][-1]["summary"].startswith("run 59")        # most recent kept
