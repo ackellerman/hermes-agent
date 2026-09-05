@@ -4050,7 +4050,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
     from hermes_cli import kanban_db as _kb
     from hermes_cli import kanban_db_connect as _kbc
-    from hermes_cli.goals import run_kanban_goal_loop as _run_loop, resolve_kanban_max_turns as _resolve_turns
+    from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
 
     # Goal text = title + body (the acceptance criteria the judge evaluates against).
     with _kbc.connect_closing() as conn:
@@ -4061,13 +4061,6 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     goal_text = "\n\n".join(p for p in (task.title or "", task.body) if p).strip()
     if not goal_text:
         return
-
-    try:
-        from hermes_cli.config import load_config_readonly as _load_cfg
-        _cfg = _load_cfg() or {}
-    except Exception:
-        _cfg = {}
-    max_turns = _resolve_turns(task, _cfg)
 
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
@@ -4087,7 +4080,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
     _run_loop(
         task_id=task_id, goal_text=goal_text, run_turn=_run_turn, task_status_fn=_task_status, block_fn=_block,
-        max_turns=max_turns, first_response=first_response or "",
+        max_turns=task.goal_max_turns or _DEF_TURNS, first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
     )
 

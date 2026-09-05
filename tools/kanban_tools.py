@@ -338,11 +338,6 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
 
-# Overlay K4: most-recent runs included in the kanban_show payload. The
-# worker_context block already carries the last 10 attempts; the raw array
-# exists for tooling, not for re-reading 98 blocked runs per call.
-_SHOW_MAX_RUNS = 10
-
 
 def _goal_judge_available() -> bool:
     """``judge_goal`` fails open (no auxiliary model -> ``"continue"``), which is
@@ -497,30 +492,18 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
-    """Full task state: row, parents, children, recent comments, recent runs, last 50 events."""
+    """Full task state: row, parents, children, comments, runs, last 50 events."""
     tid = _require_task_id(args)
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
-        # Overlay K4: bound the raw arrays. Every comment and every run was
-        # sent on each call (and the last 30 comments AGAIN inside
-        # worker_context); a 98-run card measured ~36K tokens re-sent
-        # ~12 times per goal turn. Most-recent N, totals alongside,
-        # full log via `hermes kanban show`.
-        comments = kb.list_comments(conn, tid)
-        runs = kb.list_runs(conn, tid)
         return json.dumps({
             "task": _fields(task, _TASK_FIELDS),
             "parents": kb.parent_ids(conn, tid),
             "children": kb.child_ids(conn, tid),
-            "comments": [
-                _fields(c, _COMMENT_FIELDS)
-                for c in comments[-kb._CTX_MAX_COMMENTS:]
-            ],
-            "comments_total": len(comments),
+            "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
             # Capped; full log via CLI.
             "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
-            "runs": [_fields(r, _RUN_FIELDS) for r in runs[-_SHOW_MAX_RUNS:]],
-            "runs_total": len(runs),
+            "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
             # Same string build_worker_context hands the dispatcher at spawn time.
             "worker_context": kb.build_worker_context(conn, tid)})
 

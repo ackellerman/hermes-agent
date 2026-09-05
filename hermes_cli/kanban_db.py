@@ -538,10 +538,6 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "icon": "",
         "color": "",
         "default_workdir": None,
-        # Optional profile that resumes a decomposed root after this board's
-        # child graph completes. Board scope prevents a global coordinator from
-        # taking ownership of unrelated workstreams.
-        "orchestrator_profile": None,
         # Project scope: new tasks inherit it (deterministic worktree + branch).
         "project_id": None,
         "created_at": None,
@@ -565,8 +561,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
 def write_board_metadata(
     board: Optional[str], *, name: Optional[str] = None, description: Optional[str] = None,
     icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
-    default_workdir: Optional[str] = None, orchestrator_profile: Optional[str] = None,
-    project_id: Optional[str] = None,
+    default_workdir: Optional[str] = None, project_id: Optional[str] = None,
 ) -> dict:
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
     set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
@@ -586,8 +581,6 @@ def write_board_metadata(
     for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
         if value is not None:
             meta[key] = str(value) if value else None
-    if orchestrator_profile is not None:
-        meta["orchestrator_profile"] = str(orchestrator_profile).strip() or None
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -3782,33 +3775,6 @@ def decompose_triage_task(
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
             return None
-        # Overlay K3 (2026-09-04): decomposition is for FRESH cards only.
-        # Block-loop escalation routes worked cards to triage; re-planning
-        # one duplicates its graph (6 duplicate children on t_2b796e9a) and
-        # steals its owner. Any run or any edge means "not a rough idea".
-        n_runs = conn.execute(
-            "SELECT count(*) FROM task_runs WHERE task_id = ?", (task_id,)
-        ).fetchone()[0]
-        if n_runs:
-            raise ValueError(
-                f"{task_id} has run history ({n_runs} run(s)) and cannot be "
-                f"decomposed: it is a worked card that landed in triage, not a "
-                f"rough idea. Read its last run/comments and either unblock it "
-                f"(hermes kanban unblock {task_id}), reassign it, or archive it."
-            )
-        n_edges = conn.execute(
-            "SELECT count(*) FROM task_links WHERE parent_id = ? OR child_id = ?",
-            (task_id, task_id),
-        ).fetchone()[0]
-        if n_edges:
-            raise ValueError(
-                f"{task_id} already has {n_edges} graph edge(s) and cannot be "
-                f"decomposed again: its plan exists. Unblock or archive it "
-                f"instead of creating a duplicate fan-out."
-            )
-        existing_assignee = conn.execute(
-            "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()["assignee"]
         child_ids = [
             _insert_decomposed_child(conn, task_id, root_row, child, author, now)
             for child in children
@@ -3823,12 +3789,10 @@ def decompose_triage_task(
         # than computing leaves; cycle-free since the root is only ever a child).
         for cid in child_ids:
             _link(conn, cid, task_id)
-        # Flip the root triage -> todo. The orchestrator takes ownership
-        # only of an UNOWNED root (K3): a card that already names its
-        # owner keeps it — decomposition adds a plan, it does not steal.
+        # Flip the root triage -> todo, assignee -> orchestrator.
         sets = ["status = 'todo'"]
         params: list[Any] = []
-        if root_assignee is not None and not (existing_assignee or "").strip():
+        if root_assignee is not None:
             sets.append("assignee = ?")
             params.append(root_assignee)
         params.append(task_id)
