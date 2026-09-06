@@ -60,14 +60,22 @@ def _err(msg: str, rc: int = 1) -> int:
 
 def _bulk_apply(ids: Iterable[str], op: Callable[[str], Any],
                 ok_msg: Callable[[str], str], fail_msg: Callable[[str], str]) -> int:
-    """Run ``op(tid) -> bool`` per id, print ok/fail lines, exit 1 if any failed."""
+    """Run ``op(tid) -> bool`` per id, print ok/fail lines, exit 1 if any failed.
+
+    ``fail_msg(tid)`` returning ``None`` means the op already printed a specific,
+    actionable refusal for that id; the generic line is suppressed rather than
+    printed underneath it (two messages for one failure, the second uselessly
+    vague, trains readers to ignore both).
+    """
     failed = False
     for tid in ids:
         if op(tid):
             print(ok_msg(tid))
         else:
             failed = True
-            print(fail_msg(tid), file=sys.stderr)
+            msg = fail_msg(tid)
+            if msg:
+                print(msg, file=sys.stderr)
     return 1 if failed else 0
 
 

@@ -132,3 +132,24 @@ def test_unblock_survives_kind_deliberately(kanban_home, tmp_path):
     assert kb.block_task(conn, t, reason="again", kind="needs_input")
     ev = [e for e in kb.list_events(conn, t) if e.kind == "block_loop_detected"]
     assert ev and ev[-1].payload["recurrences"] == 2
+
+
+def test_refusal_prints_once_with_repair(kanban_home, capsys) -> None:
+    """A refused block prints ONE message: the specific reason + the edge repair.
+
+    The generic bulk 'cannot block <id>' line under it was a second, vaguer
+    message for the same failure — suppressed via fail_msg -> None.
+    """
+    import argparse
+    from hermes_cli import kanban as kcli
+    with kbc.connect_closing() as conn:
+        parent = kb.create_task(conn, title="p", assignee="w")
+        child = kb.create_task(conn, title="c", assignee="w", parents=[parent])
+        assert kb.get_task(conn, child).status == "todo"
+    args = argparse.Namespace(task_id=child, reason=["waiting"], kind=None,
+                              ids=None, depends_on=None)
+    rc = kcli._cmd_block(args)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert err.count("cannot block") == 1, err
+    assert "status='todo'" in err and "kanban link" in err, err
