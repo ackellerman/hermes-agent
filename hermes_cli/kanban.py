@@ -901,6 +901,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
     ids = _bulk_ids(args)
     depends_on = getattr(args, "depends_on", None)
     suffix = f": {reason}" if reason else ""
+    explained: set[str] = set()  # ids whose refusal op() already printed in full
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
             # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
@@ -922,6 +923,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 # Refused before any state moved (e.g. --kind dependency with
                 # no/unknown/done --depends-on). Say exactly what to re-run.
                 print(f"cannot block {tid}: {e}", file=sys.stderr)
+                explained.add(tid)
                 return False
             if not ok:
                 row = kb.get_task(conn, tid)
@@ -933,12 +935,15 @@ def _cmd_block(args: argparse.Namespace) -> int:
                     f"it when the parent completes.",
                     file=sys.stderr,
                 )
+                explained.add(tid)
                 return False
             if ok and reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
             return ok
 
-        return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+        # None => op already printed the specific reason + repair for this id.
+        return _bulk_apply(ids, op, ok_msg,
+                           lambda tid: None if tid in explained else f"cannot block {tid}")
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
