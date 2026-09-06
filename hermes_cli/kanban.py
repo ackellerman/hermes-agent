@@ -923,6 +923,17 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 # no/unknown/done --depends-on). Say exactly what to re-run.
                 print(f"cannot block {tid}: {e}", file=sys.stderr)
                 return False
+            if not ok:
+                row = kb.get_task(conn, tid)
+                st = row.status if row else "?"
+                print(
+                    f"cannot block {tid}: no blockable state from status={st!r}. "
+                    f"If you meant to gate it on a parent, use an edge instead: "
+                    f"hermes kanban link <parent-id> {tid} — the kernel promotes "
+                    f"it when the parent completes.",
+                    file=sys.stderr,
+                )
+                return False
             if ok and reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
             return ok
