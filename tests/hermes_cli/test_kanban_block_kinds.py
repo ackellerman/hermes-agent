@@ -114,3 +114,21 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_unblock_survives_kind_deliberately(kanban_home, tmp_path):
+    """block_kind/block_recurrences SURVIVE unblock by design: resetting them is
+    the amnesia that let a cron unblock<->re-block loop unbounded (the breaker
+    at BLOCK_RECURRENCE_LIMIT depends on the memory). Status is the authority
+    on 'is it blocked now'; consumers must read status, not block_kind."""
+    conn = kb.connect(tmp_path / "b.db")
+    t = kb.create_task(conn, title="x", assignee="w")
+    assert kb.block_task(conn, t, reason="waiting on human", kind="needs_input")
+    assert kb.unblock_task(conn, t)
+    row = kb.get_task(conn, t)
+    assert row.status in ("todo", "ready")          # not blocked any more
+    assert row.block_kind == "needs_input"          # memory survives, on purpose
+    # and the breaker still counts across the unblock:
+    assert kb.block_task(conn, t, reason="again", kind="needs_input")
+    ev = [e for e in kb.list_events(conn, t) if e.kind == "block_loop_detected"]
+    assert ev and ev[-1].payload["recurrences"] == 2

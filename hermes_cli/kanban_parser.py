@@ -297,7 +297,7 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
-        _arg("--depends-on", nargs="+", metavar="TASK_ID", help=(
+        _arg("--depends-on", nargs="*", metavar="TASK_ID", help=(
             "REQUIRED with --kind dependency: the task id(s) being waited on. "
             "They are linked as parents so the task is not re-dispatched until "
             "they are done. A dependency named only in the reason text is "
