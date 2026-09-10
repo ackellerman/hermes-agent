@@ -1091,6 +1091,41 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _validate_assignee(assignee: Optional[str]) -> Optional[str]:
+    """Refuse a ``create_task`` assignee that is not a real Hermes profile.
+
+    Every create path (CLI, plugin tool call, ``fanout.py``) converges on
+    ``create_task``; a card whose assignee names no real profile sits in
+    ``ready`` forever while the dispatcher silently skips it on every tick
+    (``kanban_db_dispatch``'s ``profile_exists`` guard). Validate here so the
+    refusal happens at create time, not at dispatch, on every path.
+
+    ``None``/empty are returned unchanged — unassigned cards are legitimate
+    (``kanban.default_assignee`` may claim them later). A real profile passes
+    through. Anything else raises a ``ValueError`` naming the repair (the same
+    shape as the governance plugin's Rule 2 message) and listing up to ~10 real
+    profile names. Control-plane lanes need no carve-out: the fleet's
+    sweep-heal pass rewrites historical role-labeled rows by direct UPDATE,
+    which never routes through this function.
+
+    The lazy import keeps the dispatch-time-visible ``profile_exists`` patch
+    (see tests/conftest.py and each sub-conftest's ``all_assignees_spawnable``)
+    in effect for tests that create with synthetic assignees.
+    """
+    if not assignee:
+        return assignee
+    from hermes_cli.profiles import list_profile_names, profile_exists
+
+    if profile_exists(assignee):
+        return assignee
+    real = list_profile_names()
+    listing = ", ".join(real[:10]) if real else "(no profiles found)"
+    raise ValueError(
+        f"assignee {assignee!r} is not a real Hermes profile; the dispatcher "
+        f"would silently skip this card every tick; use one of: {listing}"
+    )
+
+
 def _resolve_project_link(
     conn: sqlite3.Connection, project_id: Optional[str], project_source_task_id: Optional[str],
     workspace_kind: str, workspace_path: Optional[str],
@@ -1244,6 +1279,7 @@ def create_task(
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    _validate_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:

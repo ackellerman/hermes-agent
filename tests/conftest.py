@@ -1749,3 +1749,36 @@ def _moa_caches_isolated():
     yield
     moa._preset_cache.clear()
     moa._runtime_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_profile_exists(monkeypatch):
+    """Refuse non-real profile names for the kanban create gate by default.
+
+    ``create_task`` now refuses an assignee that is not a real Hermes profile
+    (SPEC-0031 — the refusal lands in ``kanban_db._validate_assignee`` so every
+    create path hits it). Under the hermetic HERMES_HOME sandbox there are no
+    named profile directories, so the real ``profile_exists`` already refuses
+    every synthetic name and passes only ``default`` (and any profile dir a
+    test deliberately creates). This autouse fixture makes that REFUSING
+    semantic explicit and frozen for the whole suite — the gate is ACTIVE in
+    tests by default, so a test that creates a card with a bogus assignee
+    cannot silently pass.
+
+    Sub-conftests that use synthetic assignees (tests/hermes_cli, gateway,
+    tools, plugins, tui_gateway) re-allow them via their own autouse
+    ``all_assignees_spawnable`` fixture (patches ``profile_exists`` → True),
+    which overrides this stub for tests in those trees. Genuinely-assignee-
+    sensitive tests keep explicit control by patching ``profile_exists``
+    themselves (e.g. tests/hermes_cli/test_kanban_host_cap.py).
+    """
+    from hermes_cli import profiles as _profiles
+
+    _real_profile_exists = _profiles.profile_exists
+
+    def _refuse(name: str) -> bool:
+        # Hermetic: only real profile dirs (under the sandboxed HERMES_HOME)
+        # and 'default' pass. Synthetic names raise the gate's ValueError.
+        return _real_profile_exists(name)
+
+    monkeypatch.setattr(_profiles, "profile_exists", _refuse)

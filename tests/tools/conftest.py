@@ -14,6 +14,20 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def all_assignees_spawnable(monkeypatch):
+    """Re-allow synthetic assignees for tools kanban tests.
+
+    ``create_task`` refuses non-profile assignees (SPEC-0031), and the
+    top-level ``_hermetic_profile_exists`` stub in tests/conftest.py keeps that
+    gate ACTIVE by default. Tools tests create cards with synthetic assignees,
+    so this autouse fixture re-allows them (overrides the refusing stub).
+    Tests that genuinely need refusal patch ``profile_exists`` themselves.
+    """
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+
+
+@pytest.fixture(autouse=True)
 def _no_host_browser_use_cli():
     """Keep the host's browser-use/uvx install out of tests.
 

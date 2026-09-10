@@ -213,7 +213,14 @@ def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
 
 
 def _park_in_review(conn: sqlite3.Connection, title: str, assignee: str) -> str:
-    tid = kb.create_task(conn, title=title, assignee=assignee)
+    # create_task now refuses non-profile assignees (SPEC-0031, _validate_assignee).
+    # A human-review lane is a control-plane lane: per the spec r4 decision the
+    # fleet-side mechanism is direct UPDATE, never create_task. Mirror the fleet's
+    # sweep path: create valueless (None = legitimate, unclaimed), then write the
+    # human assignee by direct UPDATE (bypasses _validate_assignee, row content
+    # identical to the pre-gate path).
+    tid = kb.create_task(conn, title=title, assignee=None)
+    conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (assignee, tid))
     _set_task_status(conn, tid, "review")
     return tid
 
