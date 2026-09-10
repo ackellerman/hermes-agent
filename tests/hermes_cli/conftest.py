@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.
 
@@ -14,6 +14,13 @@ def all_assignees_spawnable(monkeypatch):
     patch, the dispatcher's profile-exists guard (PR #20105) routes
     those tasks into ``skipped_nonspawnable`` instead of spawning, which
     would break tests that assert spawn behavior.
+
+    Autouse (SPEC-0031): ``create_task`` now refuses non-profile assignees,
+    and tests/conftest.py's top-level ``_hermetic_profile_exists`` stub keeps
+    that gate ACTIVE by default. This autouse fixture re-allows synthetic
+    names for this tree (which is where the assignee-using dispatcher tests
+    live), overriding the refusing stub. Tests that genuinely need refusal
+    patch ``profile_exists`` themselves (e.g. test_kanban_host_cap.py).
     """
     from hermes_cli import profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
