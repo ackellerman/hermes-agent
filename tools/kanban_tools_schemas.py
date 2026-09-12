@@ -491,11 +491,6 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "the profile's provider and will fail if it belongs "
                 "to a different one. Requires 'model'."
         )),
-        "spec": _prop("string", (
-                "Optional path to the specification file to attach. When "
-                "provided, the governance layer validates the file and "
-                "attaches it post-create."
-        )),
     },
     ["title", "assignee"],
 )
