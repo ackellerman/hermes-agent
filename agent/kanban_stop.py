@@ -13,6 +13,7 @@ loop continues instead of exiting.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
@@ -52,15 +53,47 @@ def _tool_call_name(tc: Any) -> str:
     return str((getattr(fn, "name", "") if fn is not None else getattr(tc, "name", "")) or "")
 
 
+def _terminal_tool_result_succeeded(message: dict) -> bool:
+    """True unless a structured tool result explicitly reports an error.
+
+    Terminal lifecycle tools are executed before the next loop-head check. A
+    pre-tool governance refusal is represented as a normal ``role=tool`` row
+    whose JSON payload has ``error``; attempted is not completed, so it must
+    return to the model for repair rather than latch the turn at that row.
+    """
+    content = message.get("content")
+    if not isinstance(content, str):
+        return True
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        return True
+    return not (isinstance(payload, dict) and payload.get("error"))
+
+
 def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
-    """True if this conversation already invoked a terminal kanban tool."""
+    """True only after a terminal kanban tool has completed successfully.
+
+    A terminal call rejected by policy leaves a tool-error row in the
+    transcript. Latching on the attempted call strands that row at the tail,
+    suppresses the repair model call, and causes TUI resume to replay stale
+    commentary. Require the matching successful result instead.
+    """
+    terminal_call_ids = set()
     for msg in filter(lambda m: isinstance(m, dict), messages or ()):
-        role = msg.get("role")
-        if role == "assistant" and any(
-            _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS for tc in msg.get("tool_calls") or []
+        if msg.get("role") == "assistant":
+            terminal_call_ids.update(
+                str(tc.get("id") or "")
+                for tc in msg.get("tool_calls") or []
+                if _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS
+            )
+            continue
+        if (
+            msg.get("role") == "tool"
+            and str(msg.get("name") or "") in _TERMINAL_KANBAN_TOOLS
+            and str(msg.get("tool_call_id") or "") in terminal_call_ids
+            and _terminal_tool_result_succeeded(msg)
         ):
-            return True
-        if role == "tool" and str(msg.get("name") or "") in _TERMINAL_KANBAN_TOOLS:
             return True
     return False
 

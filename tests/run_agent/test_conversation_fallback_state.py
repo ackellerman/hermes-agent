@@ -205,3 +205,54 @@ def test_bare_tool_marker_is_not_reused_as_final_response():
         f"Expected 3 API calls (including nudge), got: {result['api_calls']}."
     )
 
+
+def test_substantive_tool_with_visible_prose_is_never_replayed_after_empty_followup():
+    """A lifecycle handoff's commentary is not a completed user-facing answer.
+
+    Regression for the TUI replay loop: a model can emit visible prose alongside
+    ``kanban_complete``; if that tool is rejected, an empty follow-up must take
+    the normal post-tool nudge path. Reusing the commentary as a final response
+    produces a zero-API stale replay for every later user message.
+    """
+    with (
+        patch("model_tools.get_tool_definitions", return_value=_tool_defs("kanban_complete")),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1/",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    agent.valid_tool_names = {"kanban_complete"}
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            content="Landing the terminal close on the wedged card.",
+            finish_reason="tool_calls",
+            tool_calls=[_tool_call("kanban_complete", "complete1")],
+        ),
+        _response(content="", finish_reason="stop"),
+        _response(content="The completion was rejected; I need evidence metadata.", finish_reason="stop"),
+    ]
+
+    with (
+        patch("model_tools.handle_function_call", return_value='{"error": "governance Rule 3"}'),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("close the card")
+
+    assert result["final_response"] == "The completion was rejected; I need evidence metadata."
+    assert result["final_response"] != "Landing the terminal close on the wedged card."
+    assert result["api_calls"] == 3
+    assert result["turn_exit_reason"].startswith("text_response")
+
