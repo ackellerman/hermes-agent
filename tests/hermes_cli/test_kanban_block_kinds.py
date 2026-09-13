@@ -79,6 +79,24 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         assert payload.get("kind") == "capability"
 
 
+def test_budget_kind_escalates_like_other_typed_kinds(kanban_home: Path) -> None:
+    """AC6: 'budget' participates in the unblock-loop breaker identically to
+    the existing typed kinds — same-kind re-block after an unblock counts, and
+    the second one escalates with kind='budget' (no breaker change needed)."""
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="budget")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="x", kind="budget")
+        events = [e for e in kb.list_events(conn, tid)
+                  if e.kind == "block_loop_detected"]
+        assert events, "expected a block_loop_detected event"
+        payload = events[-1].payload or {}
+        assert payload.get("recurrences") == 2
+        assert payload.get("kind") == "budget"
+
+
 # ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------
