@@ -125,6 +125,30 @@ def test_no_nudge_after_handoff_tool(clear_kanban_env, tool_name, who):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def test_rejected_terminal_tool_does_not_latch_or_suppress_repair(clear_kanban_env):
+    """A governance rejection is a repairable tool result, not terminal success."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "Landing the terminal close.",
+            "tool_calls": [{
+                "id": "complete-1",
+                "type": "function",
+                "function": {"name": "kanban_complete", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_complete",
+            "tool_call_id": "complete-1",
+            "content": '{"error": "governance Rule 3: evidence metadata required"}',
+        },
+    ]
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
 def test_nudge_still_fires_for_non_terminal_kanban_tool(clear_kanban_env):
     """Widening the set must not swallow the case the guard exists for."""
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
