@@ -1,0 +1,33 @@
+{
+  "mode": "offline",
+  "scores": {
+    "corrections": {
+      "labeled": 1,
+      "recalled": 1,
+      "recall": 1.0
+    },
+    "commitments": {
+      "labeled": 1,
+      "recalled": 1,
+      "recall": 1.0
+    },
+    "decisions": {
+      "labeled": 1,
+      "recalled": 1,
+      "recall": 1.0
+    },
+    "artifacts": {
+      "labeled": 1,
+      "recalled": 1,
+      "recall": 1.0
+    },
+    "world_effects": {
+      "labeled": 1,
+      "recalled": 1,
+      "recall": 1.0
+    }
+  },
+  "correction_recall_headline": 1.0,
+  "ac8_pass": true,
+  "note": "offline mode validates scoring machinery; spec \u00a74 item 5 requires the ONLINE run for merge numbers"
+}

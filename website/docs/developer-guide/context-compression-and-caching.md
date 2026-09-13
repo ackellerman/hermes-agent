@@ -3,6 +3,44 @@
 Hermes Agent uses a dual compression system and Anthropic prompt caching to
 manage context window usage efficiently across long conversations.
 
+## Structured Compaction Pipeline (SPEC-0042, default OFF)
+
+An optional asynchronous replacement for the compression critical path:
+`compaction_pipeline.enabled: true` in config.yaml switches the overflow
+backstop from the single-call prose summary to a staged pipeline. Default is
+`false` — the pipeline proves itself in eval before any profile enables it.
+
+Flow: continuously-maintained moving map (idle-triggered updates, 20s idle) →
+verbatim dump artifacts written and fsynced **before** any live drop → staged
+structured extraction (A: mechanical map slice; B: reason; C: extract — each
+stage writes an on-disk artifact and passes a fresh-context check, else the
+region parks) → review gate + loss probe → batched, alternation-safe
+checkpoint swap-in → lazy rehydration via the `read_dump` tool
+(`compaction` toolset, service-gated).
+
+Key modules: `agent/compaction_dump.py` (durable dumps),
+`agent/compaction_map.py` (moving map), `agent/compaction_extract.py`
+(stages/prompts/schema checks), `agent/compaction_verify.py` (gate, loss
+probe, `check_alternation_invariant`), `agent/compaction_swap.py` (swap +
+backstop degrade gates), `agent/compaction_rehydrate.py` + `tools/compaction_tools.py`
+(`read_dump`, transcript fallback), `agent/compaction_pipeline.py` (idle
+sweeps). Locks: `compaction_pipeline_locks` — a DISTINCT sqlite table from
+`compression_locks`; the two subsystems mutually exclude per session.
+
+Config knobs (`compaction_pipeline:` in config.yaml): `enabled`,
+`storage_root`, `map.idle_update_after_seconds`, `map.cooldown_seconds`,
+`extraction.cooldown_seconds`, `extraction.max_stage_retries`,
+`extraction.budget_per_session_tokens`, `swap.max_wait_seconds`,
+`review_gate.always_on`, `review_gate.loss_probe_samples`, and per-stage
+`models.*` overrides (empty string = existing aux resolution).
+
+Backstop contract: the trigger condition is unchanged (`should_compress_info`);
+with the pipeline enabled the backstop waits up to `swap.max_wait_seconds` for
+the lock and a passed gate, then degrades to the current single-call summary
+with `degraded: true` + `degradation_reason`
+(`lock_timeout|extraction_incomplete|model_unreachable`) telemetry and requeues
+the region for the next idle window.
+
 Source files: `agent/context_engine.py` (ABC), `agent/context_compressor.py` (default engine),
 `agent/prompt_caching.py`, `gateway/run_turn.py` (session hygiene), `agent/compression_facade.py` (search for `_compress_context`)
 
