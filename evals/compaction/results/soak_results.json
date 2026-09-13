@@ -1,11 +1,14 @@
 {
   "mode": "soak",
-  "turns_run": 30,
+  "turns_run": 400,
   "transcripts": [
     "<transcripts loaded>"
   ],
-  "total_messages_processed": 300,
-  "wall_seconds": 0.47,
+  "transcript_count": 5,
+  "transcript_sha256": "aab34b8026e3b6b598c84d07d91c4fa65eae9224ce733849296feb011fc2a162",
+  "transcript_source": "operator",
+  "total_messages_processed": 4000,
+  "wall_seconds": 6.75,
   "invariants": {
     "ordering_swap_refuses_incomplete": true,
     "lock_discipline_no_leak": true,
@@ -18,8 +21,8 @@
   "violations": [],
   "turn_log_tail": [
     {
-      "tick": 27,
-      "dump_id": "0027-b4ff1b63",
+      "tick": 397,
+      "dump_id": "0397-b4ff1b63",
       "swapped_len": 11,
       "map_covers_after": {
         "start_msg": 10,
@@ -28,8 +31,8 @@
       "map_entries_after": 0
     },
     {
-      "tick": 28,
-      "dump_id": "0028-b4ff1b63",
+      "tick": 398,
+      "dump_id": "0398-b4ff1b63",
       "swapped_len": 11,
       "map_covers_after": {
         "start_msg": 10,
@@ -38,8 +41,8 @@
       "map_entries_after": 0
     },
     {
-      "tick": 29,
-      "dump_id": "0029-b4ff1b63",
+      "tick": 399,
+      "dump_id": "0399-b4ff1b63",
       "swapped_len": 11,
       "map_covers_after": {
         "start_msg": 10,
