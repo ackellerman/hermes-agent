@@ -459,6 +459,16 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+-- SPEC-0042 AC-14: DISTINCT pipeline lock table — same column shape as
+-- compression_locks but a separate CREATE TABLE (never a discriminator column
+-- on a shared table); the two locks must be distinct tables/rows/objects.
+CREATE TABLE IF NOT EXISTS compaction_pipeline_locks (
+    session_id TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS session_turn_leases (
     conversation_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
