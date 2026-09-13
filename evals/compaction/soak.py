@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import shutil
 import sys
@@ -120,6 +121,24 @@ def _load_transcripts(replay_dir) -> list:
             if msgs:
                 transcripts.append(msgs)
     return transcripts[:3]
+
+
+def _transcript_set_provenance(replay_dir) -> dict:
+    """Compute count + sha256 over the source transcript files (before the fresh
+    temp copy), so a receipt can honestly pin WHAT was consumed (AC-30). Synthetic
+    default (no --replay-dir) is recorded distinctly so a default run can never
+    masquerade as an operator-supplied one."""
+    if not replay_dir:
+        return {"transcript_count": 0, "transcript_sha256": "", "transcript_source": "synthetic"}
+    files = sorted(Path(replay_dir).glob("*.json"))
+    files = [f for f in files if "ground_truth" not in f.name]
+    h = hashlib.sha256()
+    for f in files:
+        h.update(f.read_bytes())
+        h.update(b"\n")
+    return {"transcript_count": len(files),
+            "transcript_sha256": h.hexdigest(),
+            "transcript_source": "operator" if files else "synthetic"}
 
 
 def run(*, turns: int, storage_root: Path, db, replay_dir=None) -> dict:
@@ -225,10 +244,14 @@ def run(*, turns: int, storage_root: Path, db, replay_dir=None) -> dict:
         "batched_single_mutation": not any("mutation count" in v for v in violations),
         "alternation_on_swap": not any("alternation violation" in v for v in violations),
     }
+    prov = _transcript_set_provenance(replay_dir)
     return {
         "mode": "soak",
         "turns_run": turns,
         "transcripts": _load_transcripts(replay_dir) and ["<transcripts loaded>"],
+        "transcript_count": prov["transcript_count"],
+        "transcript_sha256": prov["transcript_sha256"],
+        "transcript_source": prov["transcript_source"],
         "total_messages_processed": total_messages,
         "wall_seconds": round(elapsed, 2),
         "invariants": invariants,
