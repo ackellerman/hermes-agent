@@ -41,6 +41,18 @@ from agent.compaction_verify import (  # noqa: E402
     run_review_gate,
 )
 
+# SPEC-0042 §3.7 model table (D7 default; never openrouter/auto unless a model-id
+# resolution failure is RECORDED as a finding first — the review card gates on
+# the honest number).
+MODEL_TABLE = {
+    "map": "llama-small",
+    "reason": "qwen3.8-v3",
+    "extract": "qwen3.8-v3",
+    "check": "qwen3.8-v3",
+    "gate": "qwen3.8-v3",
+    "escape_hatch": "deepseek-v4-flash",
+}
+
 
 def _make_ollama_llm(endpoint: str, model: str):
     """A callable-LLM over local ollama. Muse-glimmer is a reasoning model that
@@ -64,8 +76,8 @@ def _make_ollama_llm(endpoint: str, model: str):
 
 
 def _make_openrouter_llm(model: str = "openrouter/auto"):
-    """OPENROUTER route — the reliable lane for schema-constrained extraction.
-    Returns the model's assistant text; the stage/gate wrappers parse JSON."""
+    """OPENROUTER route — escape-hatch lane only (never the online default per
+    D7). Returns the model's assistant text."""
     import os  # noqa: PLC0415
     import urllib.request  # noqa: PLC0415
     key = os.environ.get("OPENROUTER_API_KEY", "")
@@ -82,10 +94,34 @@ def _make_openrouter_llm(model: str = "openrouter/auto"):
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {key}",
-                     "X-Title": "spec42-online-eval"})
+                     "X-Title": "spec43-online-eval"})
         with urllib.request.urlopen(req, timeout=600) as r:
             return json.loads(r.read().decode())["choices"][0]["message"]["content"]
 
+    return llm
+
+
+def _resolve_online_llm(model: str, provider: str, endpoint: str | None):
+    """Resolve an LLM callable for the model-table ids through the SAME aux
+    chain the production scheduler uses. Unresolvable ids are recorded as a
+    finding (D7), not silently replaced with openrouter/auto."""
+    from agent.auxiliary_client import _resolve_auto_route
+    client, resolved, label = _resolve_auto_route(
+        {"provider": provider, "model": model, "base_url": endpoint},
+        "compression")
+    if client is None or not resolved:
+        raise RuntimeError(
+            f"online eval: model id {model!r} does not resolve on this install "
+            f"(label={label!r}) — record as a finding, do NOT fall back silently")
+
+    def llm(messages):
+        resp = client.chat.completions.create(
+            model=resolved,
+            messages=[{"role": m.get("role", "user"), "content": m.get("content", "")}
+                      for m in messages],
+            temperature=0,
+        )
+        return resp.choices[0].message.content or ""
     return llm
 
 
@@ -114,13 +150,19 @@ def _approx_map_slice(fixture: dict) -> dict:
 
 
 def run(*, model: str, endpoint: str | None, provider: str, dump_root: Path,
-        tolerance: int = 1) -> dict:
-    if provider == "openrouter":
+        tolerance: int = 1, resolve_scheduler: bool = True) -> dict:
+    """Run the online fidelity eval under the SPEC-0042 §3.7 model table.
+
+    With ``resolve_scheduler`` (default), the stage/gate LLM is resolved through
+    the SAME aux chain (``_resolve_online_llm``) the production
+    ``IdlePipelinePass``/``CompactionBackstop`` use for each model-table id —
+    D7: openrouter/auto is never the default, and an unresolvable id raises so
+    the finding is recorded rather than silently falling back."""
+    if provider == "openrouter" and model in ("openrouter/auto", ""):
+        # D7: openrouter/auto is the ESCAPE-HATCH lane, never the default.
         llm = _make_openrouter_llm(model)
     else:
-        if not endpoint:
-            raise ValueError("--ollama is required when --provider=ollama")
-        llm = _make_ollama_llm(endpoint, model)
+        llm = _resolve_online_llm(model, provider, endpoint)
     fixture = fx_mod.build_correction_fixture()
     messages = fixture["messages"]
     did = FE.dump_id_for(fixture)
@@ -199,13 +241,16 @@ def run(*, model: str, endpoint: str | None, provider: str, dump_root: Path,
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--provider", choices=["openrouter", "ollama"], default="openrouter")
+    parser.add_argument("--provider", choices=["openrouter", "ollama", "custom"],
+                        default="custom")
     parser.add_argument("--ollama", help="endpoint required with --provider=ollama")
-    parser.add_argument("--ollama-model", default="muse-glimmer:latest")
-    parser.add_argument("--model", default="openrouter/auto")
+    parser.add_argument("--ollama-model", default=MODEL_TABLE["extract"])
+    parser.add_argument("--model", default=MODEL_TABLE["extract"],
+                        help="model-table id (SPEC-0042 §3.7); resolved via the "
+                             "real aux chain; openrouter/auto is escape-hatch only")
     parser.add_argument("--json", default="evals/compaction/results/online_fidelity_results.json")
     args = parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix="spec42-online-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="spec43-online-") as tmp:
         result = run(model=args.model, endpoint=args.ollama, provider=args.provider,
                      dump_root=Path(tmp) / "storage")
     text = json.dumps(result, indent=2)

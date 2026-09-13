@@ -299,6 +299,8 @@ class IdlePipelinePass:
         for queue-drain; when a row's dump is stale it falls back to a fresh
         dump (D3)."""
         from agent.compaction_extract import StageCheckError, run_extraction_cycle
+        if not self._models_reachable():
+            return None  # nobody can run A->B->C without a resolvable route
         if not self._extraction_cooldown_ok():
             return None
         if self._budget_exhausted():
