@@ -9,6 +9,7 @@ turn tail — no history mutation, no cache break beyond the normal append.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from tools.registry import registry
@@ -26,17 +27,51 @@ def check_requirements() -> bool:
     return _pipeline_enabled()
 
 
+def _storage_root() -> str:
+    """Resolve ``storage_root`` from the SAME config path ``enabled`` reads
+    (``compaction_pipeline.storage_root``); never a hardcoded path (D6b)."""
+    try:
+        from hermes_cli.config import load_config
+        return str((load_config() or {}).get("compaction_pipeline", {}).get(
+            "storage_root", "/tmp/hermes-compaction"))
+    except Exception:  # noqa: BLE001 — check_fn must never crash discovery
+        return "/tmp/hermes-compaction"
+
+
+def _session_transcript_reader():
+    """Bound reader for the real SessionDB transcript (D6c). Returns a callable
+    ``(session_id, start, end) -> List[dict]`` slicing by message index, or None
+    when the session DB surface is unavailable at call time. The writer seam is
+    ``divert_session_transcript_jsonl``; the primary read is
+    ``SessionDB.get_messages`` (hermes_state_messages.py:628)."""
+    def reader(session_id, start, end):
+        from hermes_state import SessionDB
+        db = SessionDB(session_id)
+        msgs = db.get_messages(session_id, include_inactive=False) or []
+        lo = int(start or 0)
+        hi = len(msgs) - 1 if end is None else int(end)
+        return [m for m in msgs[lo:hi + 1]
+                if isinstance(m, dict) and "role" in m]
+    return reader
+
+
 def read_dump(dump_id: str, start_msg: Optional[int] = None,
               end_msg: Optional[int] = None, task_id: Optional[str] = None) -> str:
     from agent.compaction_dump import DumpNotFoundError, DumpStore
-    from agent.compaction_rehydrate import Rehydrator
+    from agent.compaction_rehydrate import Rehydrator, StubRegistry
 
     if not dump_id or not isinstance(dump_id, str):
         return json.dumps({"error": "invalid_dump_id", "dump_id": dump_id})
     try:
-        store = DumpStore()
-        rh = Rehydrator(store)
-        result = rh.read_dump(dump_id, start_msg=start_msg, end_msg=end_msg)
+        root = _storage_root()
+        store = DumpStore(Path(root))
+        rh = Rehydrator(
+            store,
+            transcript_reader=_session_transcript_reader(),
+            stub_registry=StubRegistry.for_session(Path(root), task_id or "none"),
+        )
+        result = rh.read_dump(dump_id, session_id=task_id,
+                              start_msg=start_msg, end_msg=end_msg)
         return json.dumps({"success": True, **result}, ensure_ascii=False, default=str)
     except DumpNotFoundError as exc:
         return json.loads(str(exc))

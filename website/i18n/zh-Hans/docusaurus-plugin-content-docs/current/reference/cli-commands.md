@@ -440,7 +440,9 @@ hermes kanban boards rm atm10-server
 hermes kanban boards rm atm10-server --delete
 ```
 
-看板解析顺序（优先级从高到低）：`--board <slug>` 标志 → `HERMES_KANBAN_BOARD` 环境变量 → `~/.hermes/kanban/current` 文件 → `default`。
+看板解析顺序（优先级从高到低）：`--board <slug>` 标志 → 上下文覆盖 → 工作进程环境变量（当设置 `HERMES_KANBAN_DB` 时无条件采用 `HERMES_KANBAN_BOARD`）→ 交互式 `HERMES_KANBAN_BOARD` 环境变量（仅当 `kanban.env_board_pin` 为 `true`）→ 项目层（调用者的仓库根 → `projects.db` 行的 `board_slug`，或该根匹配的看板 `default_workdir`）→ `kanban.default_board` 配置文件默认值 → `~/.hermes/kanban/current` 文件 → `default`。
+
+行为变更（SPEC-0032）：当 `kanban.env_board_pin` 关闭（默认）时，继承的 `HERMES_KANBAN_BOARD` 不再绑定交互式会话的看板 — 请显式传递 `--board <slug>`（或启用该开关），而不要使用 `HERMES_KANBAN_BOARD=` 管道传递。
 
 所有操作也可作为 gateway 中的斜杠命令使用（`/kanban …`），参数界面相同——包括 `boards` 子命令和 `--board` 标志。
 

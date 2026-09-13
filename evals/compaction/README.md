@@ -2,7 +2,33 @@
 
 Measures what context compaction actually costs in *recall*, not just tokens.
 
-## What it does
+## SPEC-0042 structured-compaction harnesses (this spec)
+
+These are the harnesses for the SPEC-0042 checkpoint pipeline (not the OLD
+single-call compressor the legacy runner below measures):
+
+- `fidelity_eval.py` — AC-8 extraction fidelity. `--json` writes a receipt. In
+  OFFLINE mode it scores the rule-based reference checkpoint against the labeled
+  fixtures AND asserts that reference checkpoint passes the pipeline's own gate
+  (`checkpoint_gate_valid`) — the F2 guard that validator and fixtures agree.
+- `online_eval.py` — the ONLINE run spec §4 item 5 requires (real model
+  extraction through `RegionExtractor` Stage B + C, schema-checked by the
+  pipeline, then AC-8 scoring + loss probe + AC-10 gate + AC-11 stability).
+  `--provider openrouter` (default) drives OPENROUTER; `--provider ollama`
+  drives a local model.
+- `map_iou_falsifier.py` — AC-3 (episode-boundary IoU vs hand-labeled ground
+  truth, bar 0.90) and AC-5 (window tax: sum of update inputs <= 1.15 x region,
+  measured at ~100K-token scale). `--map-model real` runs a live map model;
+  default is a deterministic topic-transition segmenter. Committed fixtures:
+  `fixtures/map_iou_transcript.json` + `fixtures/map_iou_ground_truth.json`.
+- `soak.py` — spec §4 item 3 soak: replays transcripts through the real pipeline
+  modules (map/dump/extract/swap + SessionDB lock) and asserts the ordering,
+  lock-discipline, bounded-map, batched-swap and alternation invariants each
+  tick. Receipt: `results/soak_results.json`.
+
+All recepts live in `results/` (commit them so the review has the numbers).
+
+## Legacy recall harness (pre-spec, measures the OLD compressor)
 
 1. Takes a real long transcript (JSON: `{"messages": [...]}`, chat format).
 2. Generates a bank of factual recall questions from the region that

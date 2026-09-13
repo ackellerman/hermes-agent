@@ -1,0 +1,18 @@
+{
+  "mode": "drill",
+  "drill": "kill-mid",
+  "storage_root": "/tmp/spec43-drill-m5_l2036/storage",
+  "ts": 1789337228.955286,
+  "partial_region": "0001-cc79df81",
+  "record": {
+    "ran": true,
+    "updated": false,
+    "map_error": "map update did not return a map object: '{}'",
+    "extract_parked": "0001-cc79df81"
+  },
+  "stage_c_absent": true,
+  "assert": {
+    "partial_stage_never_swapped": true,
+    "no_crash": true
+  }
+}

@@ -222,6 +222,13 @@ class TestConnectionIsolation:
         assert [t.title for t in tasks] == ["implicit"]
 
     def test_connect_env_var_overrides_current(self, fresh_home, monkeypatch):
+        # SPEC-0032 env pins are switch-gated: this test asserts env-resolution,
+        # which is the switch-ON contract (AC2). Open the switch so the env var
+        # is honored, preserving the test's intent (env board wins over current).
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"kanban": {"env_board_pin": True}},
+        )
         kb.create_board("persist")
         kb.create_board("envwin")
         kb.set_current_board("persist")
