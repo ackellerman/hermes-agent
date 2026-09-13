@@ -1888,7 +1888,8 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     # The backstop (compaction_swap.backstop_gate) reads these FIRST — enabled
     # false means the legacy single-call path unconditionally, no pipeline
     # mechanism is touched (AC-19).
-    pp = dict(agent.config.get("compaction_pipeline", {}) or {})
+    from hermes_cli.config import load_config_readonly as _load_pp_cfg
+    pp = dict(_load_pp_cfg().get("compaction_pipeline", {}) or {})
     agent.compaction_pipeline_enabled = bool(pp.get("enabled", False))
     agent.compaction_pipeline_storage_root = str(pp.get("storage_root", "/tmp/hermes-compaction"))
     _map_cfg = pp.get("map", {}) or {}
