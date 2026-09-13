@@ -1504,24 +1504,6 @@ def run_kanban_goal_loop(
             except Exception:
                 pass
 
-    def _block(message: str, kind: Optional[str] = None) -> None:
-        # kind=None (the legacy shape) calls block_fn bare. A typed kind tries
-        # the kwarg first; a legacy block_fn without a kind parameter then gets
-        # the kind-LESS message rather than a crash (same pattern as the
-        # judge-transport-failure branch below).
-        try:
-            if kind is None:
-                block_fn(message)
-            else:
-                block_fn(message, kind=kind)
-        except TypeError:
-            try:
-                block_fn(message)
-            except Exception as exc:
-                _log(f"kanban goal loop: block_fn failed ({exc})")
-        except Exception as exc:
-            _log(f"kanban goal loop: block_fn failed ({exc})")
-
     def _result(outcome: str, reason: str) -> Dict[str, Any]:
         return {"outcome": outcome, "turns_used": turns_used, "reason": reason}
 
@@ -1604,18 +1586,37 @@ def run_kanban_goal_loop(
             # re-poking an impossible goal, and never let it land in done.
             # The judge ruled the goal cannot be satisfied at all — this is NOT done (#100954).
             _log(f"kanban goal loop: task {task_id} judged unachievable; blocking")
-            _block(f"Goal-mode judge ruled the goal unachievable: {reason}", kind="budget")
+            msg = f"Goal-mode judge ruled the goal unachievable: {reason}"
+            try:
+                block_fn(msg, kind="budget")
+            except TypeError:
+                # Legacy block_fn without a kind parameter: block kind-lessly.
+                try:
+                    block_fn(msg)
+                except Exception as exc:
+                    _log(f"kanban goal loop: block_fn failed ({exc})")
+            except Exception as exc:
+                _log(f"kanban goal loop: block_fn failed ({exc})")
             return _result("blocked_unachievable", f"judge verdict blocked: {reason}")
 
         if verdict == "done":
             if nudged_to_finalize:
                 # Already asked once to call kanban_complete — block for review rather than spin.
                 _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize; blocking")
-                _block(
+                msg = (
                     f"Goal-mode worker's output looked complete but it never "
-                    f"called kanban_complete after a finalize nudge ({reason}).",
-                    kind="budget",
+                    f"called kanban_complete after a finalize nudge ({reason})."
                 )
+                try:
+                    block_fn(msg, kind="budget")
+                except TypeError:
+                    # Legacy block_fn without a kind parameter: block kind-lessly.
+                    try:
+                        block_fn(msg)
+                    except Exception as exc:
+                        _log(f"kanban goal loop: block_fn failed ({exc})")
+                except Exception as exc:
+                    _log(f"kanban goal loop: block_fn failed ({exc})")
                 return _result("blocked_budget", "judged done, never finalized")
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
             nudged_to_finalize = True
@@ -1625,12 +1626,21 @@ def run_kanban_goal_loop(
         # Budget check BEFORE spending another turn.
         if turns_used >= max_turns:
             _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
-            _block(
+            msg = (
                 f"Goal-mode worker exhausted its turn budget "
                 f"({turns_used}/{max_turns}) without completing the task. "
-                f"Last judge verdict: {_truncate(reason, 300)}",
-                kind="budget",
+                f"Last judge verdict: {_truncate(reason, 300)}"
             )
+            try:
+                block_fn(msg, kind="budget")
+            except TypeError:
+                # Legacy block_fn without a kind parameter: block kind-lessly.
+                try:
+                    block_fn(msg)
+                except Exception as exc:
+                    _log(f"kanban goal loop: block_fn failed ({exc})")
+            except Exception as exc:
+                _log(f"kanban goal loop: block_fn failed ({exc})")
             return _result("blocked_budget", "turn budget exhausted")
 
         try:
