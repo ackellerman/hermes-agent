@@ -33,6 +33,8 @@ class SwapRefusedError(RuntimeError):
 
 def pipeline_pass_blocked(db, session_id: str) -> bool:
     """A pipeline pass must wait or degrade while the compression lease is live."""
+    if db is None:
+        return False  # no session DB -> no compression lease to contend with
     try:
         holder = db.compression_lock_holder(session_id)
     except AttributeError:
@@ -50,6 +52,8 @@ def pipeline_pass_blocked(db, session_id: str) -> bool:
 def compression_pass_blocked(db, session_id: str) -> bool:
     """A compression pass (manual /compress included) must wait or degrade while
     the pipeline lock is live (AC-14 direction b)."""
+    if db is None:
+        return False  # no session DB -> no pipeline lock to contend with
     import sqlite3
     import time
     with sqlite3.connect(db.db_path) as conn:
