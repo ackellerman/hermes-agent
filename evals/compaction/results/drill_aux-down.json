@@ -1,0 +1,19 @@
+{
+  "mode": "drill",
+  "drill": "aux-down",
+  "storage_root": "/tmp/spec43-drill-r5h1kc4c/storage",
+  "ts": 1789337228.4924686,
+  "action": "degrade",
+  "swapped": true,
+  "degraded": null,
+  "queue_rows": 1,
+  "queue_window": [
+    2,
+    20
+  ],
+  "assert": {
+    "legacy_or_degrade_completes": true,
+    "queue_row_written_dump_before_degrade": true,
+    "dump_exists": true
+  }
+}

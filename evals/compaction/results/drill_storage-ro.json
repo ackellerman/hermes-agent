@@ -1,0 +1,26 @@
+{
+  "mode": "drill",
+  "drill": "storage-ro",
+  "storage_root": "/tmp/spec43-drill-fpnnm7is/storage",
+  "ts": 1789337228.7232304,
+  "ran": true,
+  "record": {
+    "ran": true,
+    "queued": 0,
+    "updated": false,
+    "map_error": "map update did not return a map object: '{}'",
+    "dumped": "0001-d7e7e281",
+    "dump_window": [
+      2,
+      15
+    ],
+    "no_extraction": true
+  },
+  "live_unchanged": true,
+  "process_crashed": false,
+  "assert": {
+    "live_list_untouched": true,
+    "no_crash": true,
+    "fail_safe": true
+  }
+}

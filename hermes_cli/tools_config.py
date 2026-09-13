@@ -60,6 +60,7 @@ CONFIGURABLE_TOOLSETS = [
     ("image_gen",       "🎨 Image Generation",          "image_generate"),
     ("video_gen",       "🎬 Video Generation",          "video_generate (text/image/reference)"),
     ("x_search",        "🐦 X (Twitter) Search",        "x_search (requires xAI OAuth or XAI_API_KEY)"),
+    ("compaction",      "🗜️ Compaction Rehydration",    "read_dump (verbatim dump reads behind checkpoint stubs; requires compaction_pipeline.enabled)"),
     ("tts",             "🔊 Text-to-Speech",            "text_to_speech"),
     ("stt",             "🎙️ Speech-to-Text",           "voice transcription (gateway voice messages + voice mode)"),
     ("skills",          "📚 Skills",                    "list, view, manage"),
@@ -91,7 +92,7 @@ def gui_toolset_label(label: str) -> str:
 
 # OFF by default for new installs (still in _HERMES_CORE_TOOLS; the checklist won't pre-select them). x_search
 # auto-enables when xAI creds exist (mirrors HASS_TOKEN → homeassistant); its check_fn still gates the schema.
-_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a"}
+_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a", "compaction"}
 
 # Config-only capabilities: provider setup in `hermes tools` (TOOL_CATEGORIES) but not model toolsets — zero
 # schemas, own switch (``stt.enabled``), never in ``platform_toolsets`` or the per-platform checklist.
@@ -517,9 +518,20 @@ def _explicit_toolsets(
     return enabled
 
 
+def _compaction_pipeline_enabled() -> bool:
+    """Cheap offline check that the compaction pipeline is enabled (D6a). The
+    runtime ``check_fn`` still gates ``read_dump``'s schema registration."""
+    try:
+        from hermes_cli.config import load_config
+        return bool((load_config() or {}).get("compaction_pipeline", {}).get("enabled", False))
+    except Exception:  # noqa: BLE001 — resolve must never crash
+        return False
+
+
 def _composite_toolsets(toolset_names: List[str], platform: str, explicitly_configured: bool) -> Set[str]:
     """Enabled set inferred from composite names by reverse-mapping tool names (only while no explicit list is
-    saved). ``x_search`` is not in any composite, so inject it when xAI creds exist and exempt it from default-off."""
+    saved). ``x_search`` is not in any composite, so inject it when xAI creds exist and exempt it from default-off.
+    ``compaction`` is likewise injected when the pipeline is enabled (D6a), mirroring the x_search precedent."""
     from toolsets import resolve_toolset
 
     all_tool_names = {t for ts_name in toolset_names for t in resolve_toolset(ts_name)}
@@ -528,6 +540,9 @@ def _composite_toolsets(toolset_names: List[str], platform: str, explicitly_conf
     if _toolset_allowed_for_platform("x_search", platform) and _xai_credentials_present():
         enabled.add("x_search")
         default_off.discard("x_search")
+    if _toolset_allowed_for_platform("compaction", platform) and _compaction_pipeline_enabled():
+        enabled.add("compaction")
+        default_off.discard("compaction")
     return enabled - default_off
 
 

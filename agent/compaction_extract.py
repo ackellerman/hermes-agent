@@ -53,6 +53,30 @@ Every item must carry "cites": [[dump_id, start_msg, end_msg]] resolved to real
 dump ranges. Quote at most 50 tokens per item (orienting quotes only); bulk
 verbatim retention belongs to the dump, not the checkpoint. Output ONLY the
 checkpoint JSON.
+
+CORRECTION CITATION RULE (AC-8): for an instruction/correction, cite the
+IMMEDIATE message range right after the correction where the correction was
+applied — the very next restart/re-implementation/tool run that put the new
+direction into effect (typically within a few messages of the correction). Do
+NOT cite the original contradiction, and do NOT cite a much-later final state
+(e.g. a deploy days later).
+
+Emit EXACTLY this shape (sections in this order; cite triples [dump-id, start, end]).
+An unproduced section MUST be the string "null_reason: <why>" — never []:
+{
+  "instructions_and_corrections": [{"what": "...", "kind": "correction", "cites": [[0, 10, 12]]}],
+  "decisions": [{"what": "...", "cites": [[0, 20, 22]], "rejected_alternatives": ["..."]}],
+  "insights": "null_reason: none in this region",
+  "commitments": [{"what": "...", "cites": [[0, 30, 32]]}],
+  "open_threads": "null_reason: none in this region",
+  "artifacts": [{"what": "...", "cites": [[0, 40, 42]], "recoverable": true}],
+  "world_effects": [{"what": "...", "cites": [[0, 50, 52]]}],
+  "links": "null_reason: none in this region",
+  "narrative": "one-line orientation",
+  "confidence": 0.8,
+  "coverage": {"complete": true}
+}
+Every one of the eleven keys above must be present.
 """
 
 CHECK_PROMPT = """\
@@ -212,6 +236,47 @@ class RegionExtractor:
                 return obj
             last_reasons = reasons
         raise StageCheckError(stage, last_reasons)
+
+
+def run_extraction_cycle(
+    region_dir: Path,
+    *,
+    reason_llm: LLM,
+    extract_llm: LLM,
+    max_stage_retries: int = 2,
+) -> Dict[str, Any]:
+    """Scheduler entry (AC-22): one region's A -> B -> C cycle.
+
+    Wraps :class:`RegionExtractor` driving Stage A (mechanical slice from the
+    dumped region's map slice), Stage B (reason), Stage C (extract). ``reason_llm``
+    and ``extract_llm`` are the per-stage deterministic LLM callables. Returns the
+    Stage-C checkpoint on success. On a stage check failure that exhausts its
+    retries, :class:`StageCheckError` propagates: the caller parks the region
+    (stays live, never swapped) and records the park in telemetry.
+
+    ``region_dir`` is ``<storage_root>/<session_id>/<dump_id>`` — the directory
+    whose ``stage_a.json`` / ``stage_b.json`` / ``stage_c.json`` land.
+    """
+    from agent.compaction_map import CompactionMap
+
+    root = region_dir.parent.parent  # <root>/<session_id>/<dump_id> -> <root>/<session_id>
+    session_id = region_dir.parent.name
+    dump_id = region_dir.name
+    extractor = RegionExtractor(root, session_id, dump_id, max_stage_retries=max_stage_retries)
+
+    stage_a = extractor.load_artifact("a")
+    if stage_a is None:
+        map_slice = CompactionMap(root, session_id).slice(0, 2_000_000_000)
+        stage_a = extractor.stage_a(map_slice)
+
+    stage_b = extractor.load_artifact("b")
+    if stage_b is None:
+        stage_b = extractor.stage_b(reason_llm, stage_a.get("slice", stage_a))
+
+    stage_c = extractor.load_artifact("c")
+    if stage_c is None:
+        stage_c = extractor.stage_c(extract_llm, stage_b)
+    return stage_c
 
 
 def checkpoint_schema_check(checkpoint: Dict[str, Any]) -> List[str]:

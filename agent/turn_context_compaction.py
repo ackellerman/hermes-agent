@@ -35,6 +35,9 @@ class CompactionOutcome:
     compressed: bool = False
     # Preflight proved an immediate retry ineffective (no progress / insufficient).
     blocked: bool = False
+    # SPEC-0043 (AC-26/D5): the pipeline idle sweep already swapped the covered
+    # window, so the legacy idle summarizer must not also mutate this turn.
+    pipeline_swapped: bool = False
 
 
 # ── Helpers shared by every compression-attempt site ──
@@ -141,16 +144,30 @@ def run_turn_start_compaction(
 
 
 def _pipeline_idle_sweep(agent: Any, out: CompactionOutcome) -> None:
-    """SPEC-0042 idle seam: background pipeline duties (map updates). Default
-    OFF — with ``compaction_pipeline.enabled`` false this is a no-op that touches
-    nothing (AC-19). Never raises into the live path; never mutates messages."""
+    """SPEC-0042 idle seam: background pipeline duties (map updates, dump,
+    extraction, gate, degraded-queue drain, and the boundary batched swap
+    sweep). Default OFF — with ``compaction_pipeline.enabled`` false this is a
+    no-op that touches nothing (AC-19). Never raises into the live path.
+
+    AC-26 (D5): when the sweep swaps a region, the adopted message list is
+    installed on ``out.messages`` and ``out.pipeline_swapped`` marks the covered
+    window so the legacy idle summarizer for that same window is suppressed —
+    no region is double-mutated in one turn-start.
+    """
     if not getattr(agent, "compaction_pipeline_enabled", False):
         return
     try:
         from agent.compaction_pipeline import idle_pipeline_sweep
         idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
         record = idle_pipeline_sweep(agent, out.messages, idle_gap)
-        if record.get("ran"):
+        if record.get("swapped_messages") is not None:
+            # The sweep already mutated the covered window: adopt it and tell
+            # the legacy idle compaction to skip that same window (D5/AC-26).
+            out.messages = record["swapped_messages"]
+            out.pipeline_swapped = True
+            logger.debug("compaction pipeline idle sweep swapped %s; legacy summarizer suppressed",
+                         record.get("swapped_regions"))
+        elif record.get("ran"):
             logger.debug("compaction pipeline idle sweep: %s", record)
     except Exception as exc:  # noqa: BLE001 — background duty must never break a turn
         logger.warning("compaction pipeline idle sweep failed: %s", exc)
@@ -169,6 +186,11 @@ def _idle_compaction(
     from agent import turn_context as _tc
 
     _pipeline_idle_sweep(agent, out)
+
+    # AC-26 (D5): the pipeline swap sweep already mutated the covered window —
+    # the legacy idle summarizer must not double-mutate this same window.
+    if out.pipeline_swapped:
+        return
 
     messages = out.messages
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
