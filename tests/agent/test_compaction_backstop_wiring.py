@@ -20,10 +20,12 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from agent.compaction_dump import DumpStore
+import agent.compaction_backstop as compaction_backstop
 from agent.conversation_compression import _run_summary_dispatch
 from agent.compaction_backstop import (
     TELEMETRY_DEGRADATION_REASON,
@@ -45,7 +47,7 @@ class _FakeAgent:
         self.aux_runtime = {"provider": "ollama"}
         self.provider = "ollama"
         self.model = "muse-glimmer:latest"
-        self.context_compressor = None  # unused when commit_fence is None
+        self.context_compressor = SimpleNamespace(last_compress_window=(4, 7))
 
 
 def _alternating_messages(n: int = 8) -> list:
@@ -110,6 +112,31 @@ def test_ac19b_on_degrade_is_byte_identical_to_off(tmp_path):
     assert on_tel[TELEMETRY_DEGRADATION_REASON] == "extraction_incomplete"
 
 
+def test_dispatch_stamps_current_window_before_backstop(monkeypatch, tmp_path):
+    """The backstop must see this dispatch's window, not a prior one."""
+    messages = _alternating_messages()
+    agent = _FakeAgent(True, tmp_path)
+
+    agent.context_compressor = SimpleNamespace(
+        last_compress_window=(0, 3),  # stale value that must be replaced
+        _compress_window=lambda _messages: (4, 7),
+    )
+    observed = {}
+
+    def _fake_backstop(observed_agent, _messages):
+        observed["window"] = observed_agent.context_compressor.last_compress_window
+        return ("legacy_summary", None, {
+            TELEMETRY_DEGRADED: False, TELEMETRY_DEGRADATION_REASON: None,
+        })
+
+    monkeypatch.setattr(compaction_backstop, "maybe_backstop_swap", _fake_backstop)
+    _run_summary_dispatch(
+        agent, messages, _stamp_legacy_compress([]), {}, commit_fence=None,
+        attempt_generation=0, hard_cancel_event=None,
+    )
+    assert observed["window"] == (4, 7)
+
+
 # ── the swap path is reachable (a real swap_region production call) ────
 
 
@@ -147,6 +174,32 @@ def test_backstop_reaches_swap_when_a_ready_checkpoint_exists(tmp_path):
     assert any(str(m.get("content", "")).startswith("[compaction_checkpoint]")
                for m in swapped), "the swapped list must contain the checkpoint row"
     assert telemetry[TELEMETRY_DEGRADED] is False
+
+
+def test_backstop_rejects_ready_dump_for_stale_window(tmp_path):
+    """A ready artifact from another compression window must only degrade."""
+    messages = _alternating_messages(8)
+    agent = _FakeAgent(True, tmp_path)
+    # The current overflow will compress [4..7], but this otherwise valid dump
+    # was created for an earlier [0..3] window in the same session.
+    store = DumpStore(tmp_path)
+    ref = store.write_dump(agent.session_id, messages[:4], start_msg=0, end_msg=3, turn=0)
+    ddir = tmp_path / agent.session_id / ref.dump_id
+    ddir.mkdir(parents=True, exist_ok=True)
+    (ddir / "stage_c.json").write_text(json.dumps({
+        "decisions": [], "commitments": "null_reason: none", "artifacts": "null_reason: none",
+        "world_effects": "null_reason: none", "insights": "null_reason: none",
+        "open_threads": "null_reason: none", "links": "null_reason: none",
+        "instructions_and_corrections": "null_reason: none", "narrative": "stale",
+        "confidence": 0.9, "coverage": {"complete": True},
+    }))
+    (ddir / "gate.json").write_text(json.dumps({"swap_eligible": True, "findings": []}))
+
+    action, swapped, telemetry = CompactionBackstop(agent).decide_and_swap(messages)
+
+    assert action == "degrade"
+    assert swapped is None
+    assert telemetry[TELEMETRY_DEGRADATION_REASON] == "extraction_incomplete"
 
 
 def test_backstop_degrades_when_no_ready_region(tmp_path):
