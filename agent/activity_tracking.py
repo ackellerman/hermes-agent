@@ -76,7 +76,7 @@ class ActivityTrackingMixin:
                     heartbeat_current_worker_from_env, inject_new_comments_from_env
                 )
                 heartbeat_current_worker_from_env()
-                # Fold new operator notes into the running turn (OUT-OF-BAND steer).
+                # Fold new task notes into the running turn (OUT-OF-BAND steer); the injector gates on task status + run ownership.
                 inject_new_comments_from_env(self)
         if force_persist:
             reset_session_activity_persist_window(self)

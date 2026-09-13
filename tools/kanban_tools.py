@@ -451,8 +451,14 @@ _comment_watermark: dict[str, int] = {}
 
 
 def inject_new_comments_from_env(agent: Any) -> bool:
-    """Steer new operator comments on the worker's task into ``agent``; True iff a
-    steer was injected; never raises. Own comments (``HERMES_PROFILE``) are skipped."""
+    """Steer new task comments on the worker's task into ``agent``; True iff a
+    steer was injected; never raises. Own comments (``HERMES_PROFILE``) are skipped.
+
+    SPEC-0034: only steers while the task is ``running`` under THIS worker's
+    dispatcher run — a finished run (card left ``running``, or the dispatcher
+    re-claimed under a new run id) receives no comment steer, period. The
+    watermark still advances on refusal so nothing re-injects on a later poll
+    of the same process."""
     global _comment_poll_last_attempt
     tid = os.environ.get("HERMES_KANBAN_TASK")
     now = time.monotonic()
@@ -463,6 +469,16 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     seen = _comment_watermark.get(tid)
     try:
         with _board(None, quiet_close=True) as (kb, conn):
+            task = kb.get_task(conn, tid)
+            if (task is None or task.status != "running"
+                    or _worker_run_id(tid) != task.current_run_id):
+                # Not ours to steer anymore (card left running or was re-claimed).
+                # Advance the watermark as today so nothing re-injects on a later
+                # poll of this same process — but never steer.
+                if seen is not None:
+                    rows = kb.list_comments_after(conn, tid, after_id=seen)
+                    _comment_watermark[tid] = max((c.id for c in rows), default=seen)
+                return False
             rows = kb.list_comments_after(conn, tid, after_id=seen or 0)
     except Exception:
         logger.debug("comment-inject: bridge failed", exc_info=True)
@@ -477,10 +493,12 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()]
     if not fresh:
         return False
+    # Authorship is carried ONLY by the per-line prefix; the wrapper never claims
+    # operator origin for a peer (e.g. reviewer) comment (SPEC-0034 item 2).
     lines = [f"- {c.author or 'operator'}: {c.body.strip()}" for c in fresh]
     note = ("New note" + ("s" if len(fresh) > 1 else "")
-            + " on your kanban task from the operator (delivered mid-run). "
-            + "Take it into account for the work you're doing right now:\n" + "\n".join(lines))
+            + " on your kanban task (delivered mid-run). "
+            + "Read the author-prefixed lines and take them into account:\n" + "\n".join(lines))
     try:
         return bool(agent.steer(note))
     except Exception:
