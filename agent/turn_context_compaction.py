@@ -140,13 +140,35 @@ def run_turn_start_compaction(
     return out
 
 
+def _pipeline_idle_sweep(agent: Any, out: CompactionOutcome) -> None:
+    """SPEC-0042 idle seam: background pipeline duties (map updates). Default
+    OFF — with ``compaction_pipeline.enabled`` false this is a no-op that touches
+    nothing (AC-19). Never raises into the live path; never mutates messages."""
+    if not getattr(agent, "compaction_pipeline_enabled", False):
+        return
+    try:
+        from agent.compaction_pipeline import idle_pipeline_sweep
+        idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
+        record = idle_pipeline_sweep(agent, out.messages, idle_gap)
+        if record.get("ran"):
+            logger.debug("compaction pipeline idle sweep: %s", record)
+    except Exception as exc:  # noqa: BLE001 — background duty must never break a turn
+        logger.warning("compaction pipeline idle sweep failed: %s", exc)
+
+
 def _idle_compaction(
     agent: Any, out: CompactionOutcome, system_message: Optional[str], user_message: Any,
     effective_task_id: str,
 ) -> None:
     """Idle-triggered compaction (opt-in; ``idle_compact_after_seconds``): fires on the
-    wall-clock gap since ``_last_activity_ts``; a cheap gap check gates the estimate."""
+    wall-clock gap since ``_last_activity_ts``; a cheap gap check gates the estimate.
+
+    Also the idle seam for the SPEC-0042 pipeline background duties (map update
+    sweeps): gated on ``compaction_pipeline.enabled`` (default OFF, AC-19), runs
+    after the legacy path decision, never mutates the live message list."""
     from agent import turn_context as _tc
+
+    _pipeline_idle_sweep(agent, out)
 
     messages = out.messages
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
