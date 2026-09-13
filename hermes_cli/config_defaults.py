@@ -629,6 +629,43 @@ DEFAULT_CONFIG = {
         # guards. Example: 1800 = 30 min.
         "idle_compact_after_seconds": 0,
     },
+    # SPEC-0042 structured compaction pipeline. Default OFF until eval-proven;
+    # the feature proves itself before any profile enables it. All knobs here,
+    # never .env (non-secret settings rule).
+    "compaction_pipeline": {
+        "enabled": False,
+        "storage_root": "/tmp/hermes-compaction",
+        "map": {
+            # idle >= this many seconds triggers a map update pass (0 = off)
+            "idle_update_after_seconds": 20,
+            "cooldown_seconds": 120,
+        },
+        "extraction": {
+            "cooldown_seconds": 60,
+            # per-stage check failures re-run the stage at most this many times,
+            # then the region parks (stays live; never swaps)
+            "max_stage_retries": 2,
+            # background spend ceiling; hard stop, telemetry on hit
+            "budget_per_session_tokens": 200000,
+        },
+        "swap": {
+            # a single region may swap alone after this many seconds waiting
+            "max_wait_seconds": 900,
+        },
+        "review_gate": {
+            "always_on": True,
+            "loss_probe_samples": 8,
+        },
+        # per-stage model overrides; empty = resolve via existing aux resolution
+        "models": {
+            "map_update": "",
+            "reason": "",
+            "extract": "",
+            "check": "",
+            "gate": "",
+            "escape_hatch": "",
+        },
+    },
     # Anthropic prompt caching (Claude via OpenRouter or native API). cache_ttl: "5m" | "1h"; other
     # non-falsy values are ignored; falsy (false, null, "off", "disabled", "no", "none") disables
     # caching.

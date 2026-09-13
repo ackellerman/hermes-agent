@@ -433,6 +433,44 @@ class SessionCompressionMixin:
             "DELETE FROM compression_locks WHERE session_id = ? AND holder = ?",
             (session_id, holder))
 
+    # ── SPEC-0042 pipeline lock (AC-14) ─────────────────────────────────
+    # Siblings to the compression lock pair above, operating on the DISTINCT
+    # compaction_pipeline_locks table (hermes_state_common.py DDL). A pipeline
+    # pass and the compression lease must mutually exclude on the same session:
+    # distinct tables, mutually respected — never aliased, never interleaved.
+
+    def try_acquire_pipeline_lock(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
+        """Try to atomically acquire the compaction pipeline lock for ``session_id``.
+        ``False``: another holder owns a live lock and the caller must wait or
+        degrade (AC-14), never proceed."""
+        from hermes_state import _compression_lock_holder_process_is_dead
+        if not session_id:
+            return False
+        now = time.time()
+        expires_at = now + ttl_seconds
+        def _do(conn):
+            return _claim_lease_row(
+                conn, "compaction_pipeline_locks", "session_id", session_id, holder, now, expires_at,
+                lambda h, e: e < now or _compression_lock_holder_process_is_dead(h))
+        try:
+            acquired, reclaimed_holder = self._execute_write(_do)
+            if reclaimed_holder:
+                logger.warning("Reclaimed stale pipeline lock for session=%s (holder=%s)",
+                               session_id, reclaimed_holder)
+            return bool(acquired)
+        except sqlite3.Error as exc:
+            logger.warning("try_acquire_pipeline_lock(%s) failed: %s", session_id, exc)
+            return False
+
+    def release_pipeline_lock(self, session_id: str, holder: str) -> None:
+        """Release the compaction pipeline lock iff we own it; idempotent."""
+        if not session_id:
+            return
+        self._write_sql_logged(
+            "release_pipeline_lock", session_id,
+            "DELETE FROM compaction_pipeline_locks WHERE session_id = ? AND holder = ?",
+            (session_id, holder))
+
     def _session_turn_lease_key_on_conn(self, conn, session_id: str) -> str:
         """Walk compression parents on ``conn`` to the conversation lease key. Must share
         the connection of the lease INSERT/UPDATE/DELETE: a failed lookup must not yield a

@@ -79,6 +79,12 @@ TOOLSETS = {
         ["x_search"],
     ),
     "vision": _ts("Image analysis and vision tools", ["vision_analyze"]),
+    # SPEC-0042: rehydration reads; service-gated (check_fn: pipeline enabled),
+    # never core — footprint ladder rung 3.
+    "compaction": _ts(
+        "Compaction pipeline rehydration: verbatim dump reads behind checkpoint stubs",
+        ["read_dump"],
+    ),
     "video": _ts("Video analysis and understanding tools (opt-in, not in default toolset)", ["video_analyze"]),
     "image_gen": _ts("Creative generation tools (images)", ["image_generate"]),
     "video_gen": _ts(
