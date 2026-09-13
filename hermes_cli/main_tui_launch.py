@@ -805,16 +805,47 @@ def _launch_tui(
     sys.exit(code)
 
 
+def _kanban_env_board_pin_enabled() -> bool:
+    """Read ``kanban.env_board_pin`` (default False) fail-soft — the switch that
+    decides whether interactive sessions keep the env pin at all."""
+    try:
+        from hermes_cli.config import load_config
+        return bool(((load_config() or {}).get("kanban") or {}).get("env_board_pin"))
+    except Exception:
+        return False
+
+
 def _pin_kanban_board_env() -> None:
     """Pin the active kanban board into ``HERMES_KANBAN_BOARD`` so in-process tools and shelled-out
     ``hermes kanban`` calls agree even if a concurrent ``boards switch`` flips the file mid-turn.
 
-    Without this, in-process tools (``kanban_*``) and shelled-out CLI calls (``hermes kanban …``) resolve
-    the board on different paths: the env-pin if set, otherwise the global ``<root>/kanban/current`` file. A
-    concurrent ``hermes kanban boards switch`` from another session can flip the file mid-turn, so the same
-    chat sees its tool calls hit board A while its shell calls hit board B (#20074). Pinning at chat boot
-    mirrors what the dispatcher already does for spawned workers.
+    Two modes, gated by ``kanban.env_board_pin`` (default **off** — the deliberate behavior change
+    in SPEC-0032):
+    - ON: pin the resolved board as today. In-process tools and shelled-out CLI calls resolve the
+      board on different paths (the env-pin if set, otherwise the global ``<root>/kanban/current``
+      file), so a concurrent ``hermes kanban boards switch`` from another session could flip the
+      file mid-turn and the same chat would hit board A via tools and board B via shell (#20074).
+    - OFF (default): pop any inherited ``HERMES_KANBAN_BOARD`` and return with it unset. The pop is
+      the direct fix for a stale lineage carry-over — an interactive session no longer inherits a
+      board from a previous project's env. Env is NOT re-pinned: interactive resolution is now
+      config/project driven, not env driven.
+
+    Worker sessions (``HERMES_KANBAN_DB`` set) are exempt from the pop: the dispatcher sets
+    ``HERMES_KANBAN_BOARD`` as defense-in-depth for lifecycle-hook payloads, and deleting it at boot
+    would leave the Change-item-1 worker exemption nothing to honor. Workers keep their pin.
     """
+    # The pop is scoped to non-worker sessions (SPEC-0032 Change item 2).
+    if os.environ.get("HERMES_KANBAN_DB"):
+        _pin_resolved_board()
+        return
+    if not _kanban_env_board_pin_enabled():
+        os.environ.pop("HERMES_KANBAN_BOARD", None)
+        return
+    _pin_resolved_board()
+
+
+def _pin_resolved_board() -> None:
+    """Pin the resolved board if the env is not already set (idempotent)."""
     if os.environ.get("HERMES_KANBAN_BOARD"):
         return
     with contextlib.suppress(Exception):

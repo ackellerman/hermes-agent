@@ -693,7 +693,9 @@ hermes kanban boards rm atm10-server
 hermes kanban boards rm atm10-server --delete
 ```
 
-Board resolution order (highest precedence first): `--board <slug>` flag → `HERMES_KANBAN_BOARD` env var → `~/.hermes/kanban/current` file → `default`.
+Board resolution order (highest precedence first): `--board <slug>` flag → context override → worker env (`HERMES_KANBAN_BOARD` honored unconditionally when `HERMES_KANBAN_DB` is set) → interactive `HERMES_KANBAN_BOARD` env var (only when `kanban.env_board_pin` is `true`) → project layer (the caller's repo root → a `projects.db` row's `board_slug`, else a board whose `default_workdir` matches that root) → `kanban.default_board` profile default → `~/.hermes/kanban/current` file → `default`.
+
+Behavior change (SPEC-0032): with `kanban.env_board_pin` off (the default), an inherited `HERMES_KANBAN_BOARD` no longer binds an interactive session's board — pass `--board <slug>` explicitly (or enable the switch) instead of piping `HERMES_KANBAN_BOARD=`.
 
 All actions are also available as a slash command in the gateway (`/kanban …`), with the same argument surface — including `boards` subcommands and the `--board` flag.
 

@@ -2,8 +2,15 @@
 
 Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db`` (pre-boards
 back-compat), other boards at ``<root>/kanban/boards/<slug>/``; a worker on one board never sees
-another. Board resolution: ``board=`` arg > ``HERMES_KANBAN_BOARD`` > ``HERMES_KANBAN_DB`` (pins the
-file path) > ``<root>/kanban/current`` > ``default``; the dispatcher injects these into workers.
+another. Board resolution: ``board=`` arg > context override > worker/env (switch-gated) >
+project layer (repo root -> projects.db ``board_slug`` / board ``default_workdir``) > profile
+default (``kanban.default_board``) > ``<root>/kanban/current`` > ``default``.
+
+Deliberate behavior change (switch ``kanban.env_board_pin`` off, the default): an interactive
+session's inherited ``HERMES_KANBAN_BOARD`` no longer binds resolution — a script that used to do
+``HERMES_KANBAN_BOARD=x hermes kanban …`` must pass ``--board`` (or enable the switch). Workers
+and cron children (``HERMES_KANBAN_DB`` set) are exempt: their env board is honored
+unconditionally, defense-in-depth for the dispatcher's claimed-board pin.
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
 locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
@@ -402,10 +409,123 @@ def current_board_path() -> Path:
     return kanban_home() / "kanban" / "current"
 
 
+def _board_resolution_config() -> dict:
+    """The ``kanban`` config block, fail-soft (never raise from a hot path).
+
+    Read-through of :func:`hermes_cli.config.load_config`, which is already
+    memoized on the config file's signature — so this costs a dict lookup, not
+    a disk read, on steady-state calls. ``env_board_pin`` (default False) gates
+    the interactive env layer; ``default_board`` (default empty) is the profile
+    layer.
+    """
+    try:
+        from hermes_cli.config import load_config
+        kanban = (load_config() or {}).get("kanban") or {}
+    except Exception:
+        return {}
+    return kanban if isinstance(kanban, dict) else {}
+
+
+# Project-layer memo, keyed by cwd. ``kanban_db.py`` has zero ``lru_cache``
+# today (verified); the git rev-parse below is a subprocess call on every
+# task-transition hook, so it must be memoized per-cwd (A2). Two dicts: the
+# repo root and the resolved board slug are different value types stored under
+# the same cwd key (a path vs. a slug) — sharing one dict lets a root be read
+# back as a slug. Kept separate on purpose.
+_repo_toplevel_cache: dict[str, str] = {}
+_project_board_cache: dict[str, Optional[str]] = {}
+
+
+def _repo_toplevel_for_cwd(cwd: str) -> str:
+    """The caller's repo root: ``git -C <cwd> rev-parse --show-toplevel``,
+    falling back to ``cwd``. Memoized per-cwd (hot-path guard, A2)."""
+    key = os.path.normcase(cwd)
+    if key in _repo_toplevel_cache:
+        return _repo_toplevel_cache[key]
+    root = cwd
+    try:
+        out = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            root = out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    _repo_toplevel_cache[key] = root
+    return root
+
+
+def _resolved_path(p: str) -> str:
+    """Absolute, user-expanded, trailing-sep-stripped path (mirrors
+    ``projects_db._normalize_path`` for comparable matching)."""
+    return os.path.abspath(os.path.expanduser(str(p).strip())).rstrip("/\\") or os.sep
+
+
+def _project_board_via_projects_db(root: str) -> Optional[str]:
+    """(a) a ``projects.db`` row whose ``primary_path`` equals ``root``; its
+    ``board_slug`` wins when set and names an existing board (fail soft)."""
+    try:
+        from hermes_cli import projects_db as pdb
+        db_path = pdb.projects_db_path()
+        if not db_path.exists():
+            return None
+        with pdb.connect_closing(db_path=db_path) as conn:
+            proj = pdb.find_by_primary_path(conn, root)
+        if proj is None or not proj.board_slug:
+            return None
+        normed = _normalize_board_slug(proj.board_slug)
+        if normed and board_exists(normed):
+            return normed
+    except (ValueError, Exception):
+        pass
+    return None
+
+
+def _project_board_via_workdir(root: str) -> Optional[str]:
+    """(b) the lexicographically-first board whose board.json ``default_workdir``
+    equals ``root``. Never creates a board at resolution time."""
+    try:
+        matches = []
+        for meta in list_boards():
+            slug = meta.get("slug")
+            wd = meta.get("default_workdir")
+            if slug and wd and _resolved_path(wd) == root:
+                matches.append(slug)
+        return sorted(matches)[0] if matches else None
+    except Exception:
+        return None
+
+
+def _project_board_for_cwd() -> Optional[str]:
+    """Project layer: repo root -> projects.db ``board_slug``, else board.json
+    ``default_workdir`` match. Memoized per-cwd (the git call + db read both
+    run on the task-transition hot path)."""
+    key = os.path.normcase(os.getcwd())
+    if key in _project_board_cache:
+        return _project_board_cache[key]
+    root = _repo_toplevel_for_cwd(os.getcwd())
+    result = _project_board_via_projects_db(root)
+    if result is None:
+        result = _project_board_via_workdir(root)
+    _project_board_cache[key] = result
+    return result
+
+
+def clear_project_board_cache() -> None:
+    """Forget memoized project-layer resolutions (tests that move a repo on
+    disk, or a board default_workdir change, must re-resolve)."""
+    _project_board_cache.clear()
+    _repo_toplevel_cache.clear()
+
+
 def get_current_board() -> str:
-    """Active slug: context override -> ``HERMES_KANBAN_BOARD`` -> ``<root>/kanban/current``
-    (only while that board exists) -> ``DEFAULT_BOARD``. A malformed/stale slug
-    falls through — the dispatcher must never crash on a hand-edited file."""
+    """Active slug, layered (later beats earlier, all fail-soft):
+    context override -> worker env (``HERMES_KANBAN_DB`` set, unconditional) ->
+    interactive env (switch-gated) -> project layer -> profile default ->
+    ``<root>/kanban/current`` (only while that board exists) -> ``DEFAULT_BOARD``.
+    A malformed/stale slug falls through — the dispatcher must never crash on a
+    hand-edited file."""
     def _existing(candidate: str) -> Optional[str]:
         if not candidate:
             return None
@@ -415,13 +535,37 @@ def get_current_board() -> str:
             return None
         return normed if normed and board_exists(normed) else None
 
-    for candidate in (
-        (_CURRENT_BOARD_OVERRIDE.get() or "").strip(),
-        os.environ.get("HERMES_KANBAN_BOARD", "").strip(),
-    ):
-        found = _existing(candidate)
+    # 1. ContextVar override — unchanged, first.
+    ctx = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+    found = _existing(ctx)
+    if found:
+        return found
+
+    env_val = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    is_worker = bool(os.environ.get("HERMES_KANBAN_DB", "").strip())
+
+    # 2. Worker exemption: DB var present -> env board honored unconditionally
+    #    (the dispatcher's defense-in-depth pin must survive).
+    if is_worker:
+        found = _existing(env_val)
         if found:
             return found
+    # 3. Interactive env, switch-gated (default False -> skipped entirely).
+    elif _board_resolution_config().get("env_board_pin"):
+        found = _existing(env_val)
+        if found:
+            return found
+
+    # 4. Project layer (repo root binding).
+    found = _existing(_project_board_for_cwd() or "")
+    if found:
+        return found
+
+    # 5. Profile layer: kanban.default_board.
+    found = _existing(_board_resolution_config().get("default_board") or "")
+    if found:
+        return found
+
     try:
         f = current_board_path()
         if f.exists():

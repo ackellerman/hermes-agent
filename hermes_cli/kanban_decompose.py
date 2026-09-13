@@ -213,7 +213,7 @@ def _load_routing() -> _Routing:
     )
 
 
-def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
+def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str, board: Optional[str] = None) -> DecomposeOutcome:
     """``fanout=false``: single-task spec promotion (same effect as specify)."""
     title_val, body_val = _title_body(parsed)
     assignee_val = None
@@ -223,7 +223,7 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
         )
     if title_val is None and body_val is None:
         return DecomposeOutcome(task.id, False, "decomposer returned fanout=false with no title/body")
-    with kbc.connect_closing() as conn:
+    with kbc.connect_closing(board=board) as conn:
         ok = kb.specify_triage_task(
             conn, task.id, title=title_val, body=body_val, assignee=assignee_val, author=author,
         )
@@ -266,7 +266,7 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
     return children, ""
 
 
-def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
+def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str, board: Optional[str] = None) -> DecomposeOutcome:
     raw_tasks = parsed.get("tasks") or []
     if not isinstance(raw_tasks, list) or not raw_tasks:
         return DecomposeOutcome(task_id, False, "decomposer returned fanout=true with empty tasks list")
@@ -274,7 +274,7 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
     if reason:
         return DecomposeOutcome(task_id, False, reason)
     try:
-        with kbc.connect_closing() as conn:
+        with kbc.connect_closing(board=board) as conn:
             child_ids = kb.decompose_triage_task(
                 conn,
                 task_id,
@@ -300,11 +300,13 @@ def decompose_task(
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    board: Optional[str] = None,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks. Expected failures
     (not in triage, no aux client, API error, malformed/empty reply) surface
-    as ``ok=False``."""
-    task, reason = _load_triage_task(task_id)
+    as ``ok=False``. ``board`` (default None -> ambient resolution) pins every
+    connection this call makes, so the watcher can steer per-board."""
+    task, reason = _load_triage_task(task_id, board=board)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
 
@@ -327,13 +329,14 @@ def decompose_task(
 
     audit_author = author or _profile_author()
     if not parsed.get("fanout"):
-        return _apply_single(task, parsed, routing, audit_author)
-    return _apply_fanout(task_id, parsed, routing, audit_author)
+        return _apply_single(task, parsed, routing, audit_author, board=board)
+    return _apply_fanout(task_id, parsed, routing, audit_author, board=board)
 
 
-def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
-    with kbc.connect_closing() as conn:
+def list_triage_ids(*, tenant: Optional[str] = None, board: Optional[str] = None) -> list[str]:
+    """Return task ids currently in the triage column. ``board`` (default None
+    -> ambient resolution) pins the connection so the watcher can steer per-board."""
+    with kbc.connect_closing(board=board) as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
     return [row.id for row in rows]
 
