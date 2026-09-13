@@ -32,6 +32,7 @@ from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
 from agent.turn_retry_state import TurnRetryState
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
 # skewed phase mid-turn.
+from agent.kanban_stop import session_called_kanban_terminal
 from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call
 from agent.turn_api_error import handle_api_error
 from agent.turn_api_request import build_api_request
@@ -1387,6 +1388,18 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _loop_continues(api_call_count: int, max_iterations: int, budget_remaining: Any, messages: Any) -> bool:
+    """Loop-head predicate (SPEC-0034 AC6): iterate while call/budget headroom remains
+    AND this session has not already fired a terminal kanban tool — a turn that called
+    ``kanban_request_review`` / ``kanban_block`` / ``kanban_complete`` /
+    ``kanban_request_changes`` exits before the next API call. The grace call is
+    OR-ed by the caller: it is consumed within the iteration it fires, so it can never
+    outlive a terminal tool result appended in that same iteration."""
+    if session_called_kanban_terminal(messages):
+        return False
+    return api_call_count < max_iterations and budget_remaining > 0
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -1476,7 +1489,9 @@ def run_conversation(
             should_review_memory=s._should_review_memory,
         )
 
-    while (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    while (_loop_continues(s.api_call_count, agent.max_iterations,
+                           agent.iteration_budget.remaining, s.messages)
+           or agent._budget_grace_call):
         if _run_phase(begin_iteration, agent, s).action == "break":
             break
         _run_phase(prepare_iteration, agent, s)

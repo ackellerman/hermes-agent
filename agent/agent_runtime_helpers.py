@@ -3145,11 +3145,28 @@ def _requeue_pending_steer(agent, steer_text: str) -> None:
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
     """Append pending /steer text to the last ``role:"tool"`` message of this batch (bounded by
     ``num_tool_msgs``), marked as user-origin. Modifies existing content only, so role
-    alternation is preserved."""
+    alternation is preserved.
+
+    SPEC-0034: a session that already called a terminal kanban tool never receives the
+    splice — the turn is terminally over. The pending steer is drained (logged once at
+    info level, then discarded): the authoritative content lives on the board as the
+    card comment thread, and an in-session delivery would only re-arm a finished run."""
     if num_tool_msgs <= 0 or not messages:
         return
     steer_text = agent._drain_pending_steer()
     if not steer_text:
+        return
+    try:
+        from agent.kanban_stop import session_called_kanban_terminal
+        terminal = session_called_kanban_terminal(messages)
+    except Exception:
+        terminal = False
+    if terminal:
+        _ra().logger.info(
+            "Discarded pending /steer for terminally-ended session (%d chars): %s",
+            len(steer_text),
+            steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
+        )
         return
     # Skip non-tool messages in the tail in case something else is appended at the boundary.
     tail = range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1)

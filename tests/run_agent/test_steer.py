@@ -849,3 +849,65 @@ class TestLegacyHiddenPlaceholderWireSubstitution:
         wire = agent.client.chat.completions.create.call_args.kwargs["messages"]
         wire_assistants = [m for m in wire if m.get("role") == "assistant"]
         assert wire_assistants[0]["content"] == "visible text"
+
+
+class TestTerminalSessionSteerRefusal:
+    """SPEC-0034 AC5: a session that already called a terminal kanban tool
+    (e.g. kanban_request_review) must never have a pending steer spliced into
+    its tool results — the turn is terminally over, so the steer is drained,
+    logged at info level, and discarded. Without this, a peer reviewer's
+    mid-run comment re-armed a finished implementer turn (2026-09-12
+    incident, run 759)."""
+
+    def test_drains_pending_steer_without_splicing(self, caplog):
+        from agent.kanban_stop import session_called_kanban_terminal
+
+        agent = _bare_agent()
+        agent.steer("reviewer says: keep working on the land script")
+        messages = [
+            {"role": "user", "content": "do the work"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "rr1",
+                        "function": {"name": "kanban_request_review", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "name": "kanban_request_review", "content": "review requested", "tool_call_id": "rr1"},
+        ]
+        assert session_called_kanban_terminal(messages) is True
+        before = [dict(m) for m in messages]
+
+        with caplog.at_level("INFO"):  # logger resolves to run_agent via _ra()
+            agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+
+        # The steer never entered the session...
+        assert messages == before
+        # ...was drained (not requeued)...
+        assert not agent._pending_steer
+        # ...and exactly one info-level log records the discarded length.
+        discard_logs = [
+            r for r in caplog.records
+            if r.levelname == "INFO"
+            and "agent_runtime_helpers" in f"{r.name}:{r.pathname}"
+            and "discard" in r.getMessage().lower()
+        ]
+        assert len(discard_logs) == 1
+        assert str(len("reviewer says: keep working on the land script")) in discard_logs[0].getMessage()
+
+    def test_live_session_still_splices(self):
+        """Polarity guard (AC7-adjacent): a non-terminal session still receives
+        the steer via the marker, exactly as before."""
+        agent = _bare_agent()
+        agent.steer("operator note: use the v2 API")
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "tool_calls": [{"id": "a", "function": {"name": "terminal", "arguments": "{}"}}]},
+            {"role": "tool", "name": "terminal", "content": "ok", "tool_call_id": "a"},
+        ]
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+        assert STEER_MARKER_OPEN in messages[-1]["content"]
+        assert "v2 API" in messages[-1]["content"]
+        assert not agent._pending_steer
