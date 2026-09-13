@@ -4614,6 +4614,10 @@ Write only the summary body. Do not include any preamble or prefix."""
         n_messages = len(messages)
         # Phase 2: Determine boundaries
         compress_start, compress_end = self._compress_window(messages)
+        # SPEC-0042 backstop seam (F4): expose the affected region so the
+        # overflow backstop can swap exactly this window instead of re-deriving
+        # it. Read-only; never changes compression behavior.
+        self.last_compress_window = (compress_start, compress_end)
         if compress_start >= compress_end:
             self._record_compression_regions(
                 head_messages=messages[:compress_start], middle_messages=[], tail_messages=messages[compress_end:],
