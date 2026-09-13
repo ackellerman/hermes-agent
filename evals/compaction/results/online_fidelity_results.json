@@ -1,7 +1,7 @@
 {
   "mode": "online",
-  "model": "openrouter/auto",
-  "provider": "openrouter",
+  "model": "Qwen3.8-v3:27b",
+  "provider": "llama-server",
   "dump_id": "fx-40828e59",
   "stage_b_keys": [
     "coverage",
@@ -31,8 +31,8 @@
     },
     "commitments": {
       "labeled": 1,
-      "recalled": 1,
-      "recall": 1.0
+      "recalled": 0,
+      "recall": 0.0
     },
     "decisions": {
       "labeled": 1,
@@ -46,8 +46,8 @@
     },
     "world_effects": {
       "labeled": 1,
-      "recalled": 0,
-      "recall": 0.0
+      "recalled": 1,
+      "recall": 1.0
     }
   },
   "correction_recall_headline": 0.0,
@@ -62,7 +62,25 @@
     "gate_dropped_commitment": false,
     "dropped_findings": [
       {
-        "what": "The checkpoint has no commitment, but the dump records a commitment to ship the export module by Friday.",
+        "what": "Checkpoint marks audit-summary.txt as 'recoverable: true' but the dump explicitly states it was written to an ephemeral node and is unrecoverable. The live agent would be devastated to discover it believes it can retrieve a file that is permanently lost.",
+        "cites": [
+          [
+            13,
+            13
+          ]
+        ]
+      },
+      {
+        "what": "Checkpoint's insight and open thread both claim the reason streaming transport was abandoned is 'not recorded in this region,' but the dump explicitly records it: 'kept dropping connections under load; not worth the complexity now.' The agent would be devastated to learn it forgot a known reason and is carrying a false open thread.",
+        "cites": [
+          [
+            10,
+            11
+          ]
+        ]
+      },
+      {
+        "what": "The Friday ship commitment ('export module ships Friday') is entirely absent from the checkpoint (commitments field is null). The live agent would be devastated to learn it forgot a concrete date-bound delivery commitment.",
         "cites": [
           [
             6,
@@ -71,10 +89,28 @@
         ]
       },
       {
-        "what": "The checkpoint says the exporter was deployed to staging, but omits that staging-42 was provisioned.",
+        "what": "Checkpoint attributes the SQLite rejection to 'insufficient queryability for audit summaries,' but the dump states the actual reason was 'single-writer bottleneck at our volume.' The agent would be devastated to learn its architectural rationale is wrong, potentially leading to a bad re-decision if the topic resurfaces.",
         "cites": [
           [
-            14,
+            9,
+            9
+          ]
+        ]
+      },
+      {
+        "what": "The audit-summary.txt content ('totals per day, 3 anomalies flagged') is lost. The 3 flagged anomalies are a specific security/audit finding the agent would be devastated to have forgotten, especially given the file is unrecoverable.",
+        "cites": [
+          [
+            13,
+            13
+          ]
+        ]
+      },
+      {
+        "what": "The staging deployment detail 'staging-42 provisioned' is omitted. The agent would be devastated to learn it forgot the specific provisioned node identifier needed for follow-up operations.",
+        "cites": [
+          [
+            15,
             15
           ]
         ]
