@@ -384,6 +384,27 @@ def test_loop_judged_done_never_finalized_blocks_as_budget(kanban_home, monkeypa
     assert "exhausted its turn budget" not in message
 
 
+def test_loop_budget_sites_survive_legacy_block_fn(kanban_home, monkeypatch):
+    """A block_fn that predates the kind parameter (single-arg) must not crash
+    the loop at the three budget sites — the TypeError fallback blocks
+    kind-lessly. Drives the turn-exhaustion site, the cheapest of the three;
+    the other two share the identical fallback shape."""
+    blocks: list = []
+    _patch_judge(monkeypatch, ["continue", "continue"])
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: "still working",
+        task_status_fn=lambda: "running",
+        block_fn=lambda message: blocks.append(message),  # legacy single-arg shape
+        first_response="first",
+        max_turns=2,
+    )
+    assert res["outcome"] == "blocked_budget"
+    assert len(blocks) == 1
+    assert "exhausted its turn budget" in blocks[0]
+
+
 def _created_goal_max_turns(kanban_home, goal_max_turns):
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="t", assignee="w",
