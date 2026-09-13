@@ -238,6 +238,47 @@ class RegionExtractor:
         raise StageCheckError(stage, last_reasons)
 
 
+def run_extraction_cycle(
+    region_dir: Path,
+    *,
+    reason_llm: LLM,
+    extract_llm: LLM,
+    max_stage_retries: int = 2,
+) -> Dict[str, Any]:
+    """Scheduler entry (AC-22): one region's A -> B -> C cycle.
+
+    Wraps :class:`RegionExtractor` driving Stage A (mechanical slice from the
+    dumped region's map slice), Stage B (reason), Stage C (extract). ``reason_llm``
+    and ``extract_llm`` are the per-stage deterministic LLM callables. Returns the
+    Stage-C checkpoint on success. On a stage check failure that exhausts its
+    retries, :class:`StageCheckError` propagates: the caller parks the region
+    (stays live, never swapped) and records the park in telemetry.
+
+    ``region_dir`` is ``<storage_root>/<session_id>/<dump_id>`` — the directory
+    whose ``stage_a.json`` / ``stage_b.json`` / ``stage_c.json`` land.
+    """
+    from agent.compaction_map import CompactionMap
+
+    root = region_dir.parent.parent  # <root>/<session_id>/<dump_id> -> <root>/<session_id>
+    session_id = region_dir.parent.name
+    dump_id = region_dir.name
+    extractor = RegionExtractor(root, session_id, dump_id, max_stage_retries=max_stage_retries)
+
+    stage_a = extractor.load_artifact("a")
+    if stage_a is None:
+        map_slice = CompactionMap(root, session_id).slice(0, 2_000_000_000)
+        stage_a = extractor.stage_a(map_slice)
+
+    stage_b = extractor.load_artifact("b")
+    if stage_b is None:
+        stage_b = extractor.stage_b(reason_llm, stage_a.get("slice", stage_a))
+
+    stage_c = extractor.load_artifact("c")
+    if stage_c is None:
+        stage_c = extractor.stage_c(extract_llm, stage_b)
+    return stage_c
+
+
 def checkpoint_schema_check(checkpoint: Dict[str, Any]) -> List[str]:
     """AC-6 + AC-9 script validation: every section present; an empty section
     needs an explicit null_reason; quotes capped at 50 tokens/item; citations

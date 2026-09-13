@@ -17,13 +17,16 @@ Swap mechanics (spec §3.5):
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.compaction_dump import DumpStore
 from agent.compaction_verify import check_alternation_invariant
 
 CHECKPOINT_MARKER = "compaction_checkpoint"
+
+logger = logging.getLogger(__name__)
 
 
 class SwapRefusedError(RuntimeError):
@@ -169,3 +172,108 @@ def backstop_gate(cfg: Dict[str, Any], db, session_id: str,
         return {"action": "degrade", "degraded": True,
                 "degradation_reason": "model_unreachable", "max_wait_seconds": max_wait}
     return {"action": "run_pipeline", "degraded": False}
+
+
+# ── batched swap sweep (D4/D5, AC-25/26) ───────────────────────────────
+
+
+def swap_sweep(
+    messages: List[Dict[str, Any]],
+    *,
+    ready_regions: List[Dict[str, Any]],
+    dump_store: DumpStore,
+    session_id: str,
+    stub_registry=None,
+    current_window: Optional[Tuple[int, int]] = None,
+) -> List[Dict[str, Any]]:
+    """Swap ALL current-window-matching, complete, gate-passed regions in ONE
+    message-list mutation (AC-13 preserved: ≤1 prefix mutation per turn).
+
+    ``ready_regions``: list of dicts from :meth:`CompactionBackstop`-style
+    discovery, each with ``dump_id``, ``meta`` (start_msg/end_msg), ``checkpoint``,
+    ``gate``. Regions are processed from the HIGHEST ``start_idx`` to the LOWEST
+    so index math stays valid as earlier regions are removed. Each swapped-in
+    checkpoint registers its link-stubs into ``stub_registry`` (AC-28) and the
+    map entries are retired. Alternation is re-verified on the WHOLE output
+    before it is committed.
+
+    Region with a dump window that does not match its meta positions is skipped
+    (stale-window discipline); a stale-window region must never swap.
+    """
+    from agent.compaction_map import CompactionMap
+
+    # Verify + stage each region, highest start first so indices stay valid.
+    ordered = sorted(ready_regions, key=lambda r: -int(r["meta"].get("start_msg", 0)))
+    out = list(messages)
+    registry = stub_registry or _NullStubRegistry()
+    map_root = dump_store.root / session_id
+    for ready in ordered:
+        meta = ready["meta"]
+        start = int(meta.get("start_msg", 0))
+        end = int(meta.get("end_msg", start))
+        # Stale-window discipline: a dump whose window does not match the current
+        # compression window must NEVER swap (an earlier-pass artifact must not
+        # be applied to a different later window).
+        if current_window is not None:
+            dw = (start, end)
+            if dw != (int(current_window[0]), int(current_window[1])):
+                logger.warning("swap_sweep: dump %s window %s != current %s; stays live",
+                               ready["dump_id"], dw, current_window)
+                continue
+        if end >= len(out):
+            logger.warning("swap_sweep: dump range %d..%d exceeds message count %d; defer",
+                           start, end, len(out))
+            continue
+        if end < start:
+            logger.warning("swap_sweep: dump %s has inverted range %d..%d; defer",
+                           ready["dump_id"], start, end)
+            continue
+        gate = ready.get("gate")
+        if gate is not None and gate.get("swap_eligible") is not True:
+            continue
+        try:
+            out = swap_region(
+                out, start_idx=start, end_idx=end,
+                checkpoint=ready["checkpoint"], dump_store=dump_store,
+                session_id=session_id, dump_id=ready["dump_id"], gate_verdict=gate,
+            )
+        except SwapRefusedError as exc:
+            logger.warning("swap_sweep: refuse %s (%s); region stays live",
+                           ready["dump_id"], exc)
+            continue
+        except Exception as exc:  # noqa: BLE001 — one bad region must not wedge the sweep
+            logger.warning("swap_sweep: %s failed (%s); region stays live",
+                           ready["dump_id"], exc)
+            continue
+        _register_stubs(registry, ready, ready["checkpoint"])
+        # Retire the moved window from the moving map (map stays O(live)).
+        try:
+            CompactionMap(map_root, session_id).retire(start, end)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("swap_sweep: map retire deferred (%s)", exc)
+    return out
+
+
+class _NullStubRegistry:
+    """No-op registry so callers that don't persist stubs (unit tests) need not
+    build one."""
+
+    def register(self, *args, **kwargs):  # noqa: ANN002
+        return None
+
+
+def _register_stubs(registry, ready: Dict[str, Any], checkpoint: Dict[str, Any]) -> None:
+    """Register each cited link-stub of a swapped checkpoint into the registry."""
+    dump_id = ready["dump_id"]
+    meta = ready.get("meta") or {}
+    for section in ("instructions_and_corrections", "decisions", "commitments",
+                    "open_threads", "artifacts", "world_effects", "links", "insights"):
+        for item in checkpoint.get(section) or []:
+            if isinstance(item, dict) and item.get("cites"):
+                cite = item["cites"][0]
+                start = int(cite[1] if len(cite) == 3 else cite[0])
+                end = int(cite[2] if len(cite) == 3 else cite[1])
+                registry.register(
+                    dump_id, start, end,
+                    str(item.get("what", item.get("rationale", "item"))),
+                )

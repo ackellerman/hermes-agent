@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -148,6 +149,75 @@ class CompactionBackstop:
             return {"dump_id": dump_id, "meta": meta, "checkpoint": checkpoint, "gate": gate_verdict}
         return None
 
+    # ── degraded-region queue (D3, AC-24) ────────────────────────────
+
+    def _queue_path(self) -> Path:
+        return self._storage_root() / self._session_id() / "pipeline_queue.json"
+
+    def _read_queue(self) -> List[Dict[str, Any]]:
+        qp = self._queue_path()
+        if not qp.is_file():
+            return []
+        try:
+            data = json.loads(qp.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except (json.JSONDecodeError, OSError):
+            return []
+
+    def _write_queue(self, rows: List[Dict[str, Any]]) -> None:
+        qp = self._queue_path()
+        qp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = qp.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(rows, ensure_ascii=False, indent=2))
+            handle.flush()
+        import os
+        try:
+            os.fsync(handle.fileno())
+        except Exception:  # noqa: BLE001 — fsync best-effort on the queue
+            pass
+        os.replace(tmp, qp)
+
+    def _append_degraded(self, expected_window: Optional[Tuple[int, int]],
+                         reason: str, dump_id: Optional[str] = None) -> None:
+        """Persist a degraded-region row (D3): survives restart, drained by the
+        idle pass. A window mismatch on drain falls back to a fresh dump."""
+        if expected_window is None:
+            return
+        rows = self._read_queue()
+        window = [int(expected_window[0]), int(expected_window[1])]
+        # Idempotent: don't stack duplicate rows for the same (window, reason, dump).
+        if any(r.get("reason") == reason and r.get("window") == window
+               and r.get("dump_id") == dump_id for r in rows):
+            return
+        rows.append({
+            "dump_id": dump_id, "window": window, "reason": reason,
+            "queued_ts": time.time(),
+        })
+        self._write_queue(rows)
+
+    def _dump_window(self, messages: List[Dict[str, Any]],
+                     expected_window: Optional[Tuple[int, int]]) -> Optional[str]:
+        """Write a complete dump of ``messages[expected_window]`` (AC-20/21);
+        return the dump id or None on any failure. Idempotent per (window, hash):
+        a second call for the same window does not create a new dump file."""
+        if expected_window is None:
+            return None
+        start, end = int(expected_window[0]), int(expected_window[1])
+        if end >= len(messages) or start > end:
+            return None
+        try:
+            from agent.compaction_dump import DumpStore
+            store = DumpStore(self._storage_root())
+            region = messages[start:end + 1]
+            ref = store.write_dump(self._session_id(), region,
+                                   start_msg=start, end_msg=end, turn=1)
+            return ref.dump_id
+        except Exception as exc:  # noqa: BLE001 — never let a dump failure wedge the overflow turn
+            logger.warning("backstop dump-before-degrade failed (%s): %s",
+                           self._session_id(), exc)
+            return None
+
     # ── swap ──────────────────────────────────────────────────────────
 
     def _swap_ready_region(
@@ -210,12 +280,23 @@ class CompactionBackstop:
                 return ("swap", swapped,
                         {TELEMETRY_DEGRADED: False, TELEMETRY_DEGRADATION_REASON: None})
             # A ready checkpoint vanished between the gate and the swap -> degrade.
+            self._dump_window(messages, expected_window)
+            self._append_degraded(expected_window, "extraction_incomplete")
             return ("degrade", None,
                     {TELEMETRY_DEGRADED: True, TELEMETRY_DEGRADATION_REASON: "extraction_incomplete"})
         if action == "degrade":
+            # AC-21: dump-before-degrade — write the current window durably and
+            # enqueue it (AC-24) BEFORE running the legacy summary, so nothing is
+            # dropped without a durable copy even on the fallback path (D2). The
+            # message-list output stays byte-identical to the OFF case (AC-19b);
+            # the dump is a disk-side artifact, never part of the message list.
+            reason = decision.get("degradation_reason")
+            dump_id = self._dump_window(messages, expected_window)
+            self._append_degraded(expected_window, reason or "model_unreachable",
+                                  dump_id=dump_id)
             return ("degrade", None,
                     {TELEMETRY_DEGRADED: True,
-                     TELEMETRY_DEGRADATION_REASON: decision.get("degradation_reason")})
+                     TELEMETRY_DEGRADATION_REASON: reason})
         return ("legacy_summary", None,
                 {TELEMETRY_DEGRADED: False, TELEMETRY_DEGRADATION_REASON: None})
 
