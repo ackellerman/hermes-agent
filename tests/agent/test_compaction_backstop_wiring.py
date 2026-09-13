@@ -137,6 +137,33 @@ def test_dispatch_stamps_current_window_before_backstop(monkeypatch, tmp_path):
     assert observed["window"] == (4, 7)
 
 
+def test_dispatch_clears_stale_window_when_calculation_fails(monkeypatch, tmp_path):
+    """A failed current-window calculation must not reuse an old swap range."""
+    messages = _alternating_messages()
+    agent = _FakeAgent(True, tmp_path)
+
+    def _raise(_messages):
+        raise RuntimeError("window unavailable")
+
+    agent.context_compressor = SimpleNamespace(
+        last_compress_window=(0, 3), _compress_window=_raise,
+    )
+    observed = {}
+
+    def _fake_backstop(observed_agent, _messages):
+        observed["window"] = observed_agent.context_compressor.last_compress_window
+        return ("legacy_summary", None, {
+            TELEMETRY_DEGRADED: False, TELEMETRY_DEGRADATION_REASON: None,
+        })
+
+    monkeypatch.setattr(compaction_backstop, "maybe_backstop_swap", _fake_backstop)
+    _run_summary_dispatch(
+        agent, messages, _stamp_legacy_compress([]), {}, commit_fence=None,
+        attempt_generation=0, hard_cancel_event=None,
+    )
+    assert observed["window"] is None
+
+
 # ── the swap path is reachable (a real swap_region production call) ────
 
 

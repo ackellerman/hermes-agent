@@ -2701,13 +2701,21 @@ def _run_summary_dispatch(
             # is otherwise only populated inside the legacy compressor, which is
             # too late (and may describe a prior compression when the backstop
             # runs first). A range-mismatched ready dump must degrade, never swap.
-            try:
-                _compressor = agent.context_compressor
-                _current_window = _compressor._compress_window(messages)
-                if isinstance(_current_window, tuple) and len(_current_window) == 2:
-                    _compressor.last_compress_window = _current_window
-            except Exception:  # noqa: BLE001 - missing window is safely a degrade
-                logger.debug("Could not calculate current compaction backstop window", exc_info=True)
+            _compressor = getattr(agent, "context_compressor", None)
+            # Invalidate any value from a previous compression *before* calculating
+            # this dispatch's window. If the calculation fails or returns an
+            # unusable value, the backstop must see no eligible window and degrade;
+            # retaining an old interval could swap an unrelated ready dump.
+            if _compressor is not None:
+                setattr(_compressor, "last_compress_window", None)
+                try:
+                    _current_window = _compressor._compress_window(messages)
+                    if isinstance(_current_window, tuple) and len(_current_window) == 2:
+                        start, end = _current_window
+                        if isinstance(start, int) and isinstance(end, int) and 0 <= start < end:
+                            _compressor.last_compress_window = _current_window
+                except Exception:  # noqa: BLE001 - missing window is safely a degrade
+                    logger.debug("Could not calculate current compaction backstop window", exc_info=True)
             _bs_action, _bs_swapped, _bs_tel = maybe_backstop_swap(agent, messages)
             if _bs_swapped is not None:
                 compressed = _bs_swapped
