@@ -1,0 +1,90 @@
+{
+  "mode": "online",
+  "model": "openrouter/auto",
+  "endpoint": "http://localhost:11434",
+  "dump_id": "fx-40828e59",
+  "stage_b_keys": [
+    "coverage",
+    "items",
+    "open_questions"
+  ],
+  "stage_c_keys": [
+    "artifacts",
+    "commitments",
+    "confidence",
+    "coverage",
+    "decisions",
+    "insights",
+    "instructions_and_corrections",
+    "links",
+    "narrative",
+    "open_threads",
+    "world_effects"
+  ],
+  "checkpoint_gate_valid": true,
+  "checkpoint_gate_errors": [],
+  "scores": {
+    "corrections": {
+      "labeled": 1,
+      "recalled": 0,
+      "recall": 0.0
+    },
+    "commitments": {
+      "labeled": 1,
+      "recalled": 1,
+      "recall": 1.0
+    },
+    "decisions": {
+      "labeled": 1,
+      "recalled": 1,
+      "recall": 1.0
+    },
+    "artifacts": {
+      "labeled": 1,
+      "recalled": 1,
+      "recall": 1.0
+    },
+    "world_effects": {
+      "labeled": 1,
+      "recalled": 0,
+      "recall": 0.0
+    }
+  },
+  "correction_recall_headline": 0.0,
+  "ac8_pass": false,
+  "loss_probe": {
+    "questions": 8,
+    "gaps": 6,
+    "pass": false
+  },
+  "ac10": {
+    "gate_pass_checkpoint": false,
+    "gate_dropped_commitment": false,
+    "dropped_findings": [
+      {
+        "what": "The checkpoint has no commitment, but the dump records a commitment to ship the export module by Friday.",
+        "cites": [
+          [
+            6,
+            7
+          ]
+        ]
+      },
+      {
+        "what": "The checkpoint says the exporter was deployed to staging, but omits that staging-42 was provisioned.",
+        "cites": [
+          [
+            14,
+            15
+          ]
+        ]
+      }
+    ],
+    "flags_dropped_section": true
+  },
+  "ac11": {
+    "run_a_swap_eligible": false,
+    "run_b_swap_eligible": false,
+    "stable": true
+  }
+}

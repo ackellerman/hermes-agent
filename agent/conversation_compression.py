@@ -2687,14 +2687,32 @@ def _run_summary_dispatch(
             )
             compressed = messages
         else:
-            with (
-                aux_progress_hook(_progress_hook), aux_stream_deadline(_host_stream_deadline),
-                aux_interrupt_protection(cancel_check=_compression_cancel_requested),
-            ):
-                compressed = compress_fn(messages, **compress_kwargs)
-                # Freeze a hard stop that arrived after the last provider attempt but before session state rotates.
-                if hard_cancel_event is not None and hard_cancel_event.is_set():
-                    raise AuxiliaryExplicitCancellation()
+            # SPEC-0042 backstop seam (AC-19/19b/15; review finding F4). Before
+            # the legacy single-call summary runs, consult the pipeline backstop:
+            #  - enabled:false -> legacy_summary unconditionally, zero pipeline
+            #    mechanism touched (AC-19);
+            #  - enabled + ready dump/checkpoint/gate -> swap_region the region;
+            #  - otherwise degrade -> THIS legacy path byte-identically, with the
+            #    degradation recorded in compression telemetry (AC-19b).
+            # The telemetry fields are stamped in BOTH enabled states, so the
+            # ON-degrade run introduces no new telemetry attribute vs the OFF run.
+            from agent.compaction_backstop import TELEMETRY_DEGRADATION_REASON, TELEMETRY_DEGRADED, maybe_backstop_swap
+            _bs_action, _bs_swapped, _bs_tel = maybe_backstop_swap(agent, messages)
+            if _bs_swapped is not None:
+                compressed = _bs_swapped
+            else:
+                with (
+                    aux_progress_hook(_progress_hook), aux_stream_deadline(_host_stream_deadline),
+                    aux_interrupt_protection(cancel_check=_compression_cancel_requested),
+                ):
+                    compressed = compress_fn(messages, **compress_kwargs)
+                    # Freeze a hard stop that arrived after the last provider attempt but before session state rotates.
+                    if hard_cancel_event is not None and hard_cancel_event.is_set():
+                        raise AuxiliaryExplicitCancellation()
+            setattr(agent, "_compaction_backstop_telemetry", {
+                TELEMETRY_DEGRADED: bool(_bs_tel.get(TELEMETRY_DEGRADED, False)),
+                TELEMETRY_DEGRADATION_REASON: _bs_tel.get(TELEMETRY_DEGRADATION_REASON),
+            })
     finally:
         if commit_fence is not None:
             _clear_compression_cancelled_check_if_owner(agent.context_compressor, attempt_generation)

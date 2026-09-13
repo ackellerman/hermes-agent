@@ -73,6 +73,71 @@ def build_gate_fixture() -> dict:
     return {"messages": fx["messages"], "labels": fx["labels"]}
 
 
+_MAP_TOPICS = [
+    "provisioning cluster alpha",
+    "hardening authentication service",
+    "refactoring the billing parser",
+    "load-testing the gateway",
+    "migrating the audit store to Postgres",
+    "resolving the schema drift in analytics",
+    "onboarding the ETL workers",
+    "cutting the release branch",
+]
+
+_MAP_ROLE_TURNS = [
+    ("user", "Let's work on: {topic}."),
+    ("assistant", "Starting work on {topic}; outlining the plan.",
+     ["terminal"], "plan for {topic} written"),
+    ("tool", "{topic}: dry run complete"),
+    ("user", "Please push the {topic} changes through staging."),
+    ("assistant", "Staged the {topic} change set.",
+     ["terminal"], "{topic} change set staged"),
+    ("tool", "{topic}: staging deploy ok"),
+    ("assistant", "Verified {topic} end to end; noting the result.",
+     ["read_file"], "{topic} verification read"),
+    ("tool", "{topic}: verification passed"),
+]
+
+
+def build_map_iou_fixture(*, messages_per_episode: int = 25,
+                          n_episodes: int = 8,
+                          padding_tokens: int = 0) -> dict:
+    """Synthetic conversation with DISCRETE topic blocks — each episode is a
+    solid run of one ``_MAP_TOPICS`` keyword (a task), so a deterministic
+    topic-transition segmenter can recover the boundaries. Used by the AC-3 IoU
+    falsifier (episode boundaries vs hand-labeled ground truth >= 90% IoU) and
+    the AC-5 window-tax falsifier (sum of update inputs <= 1.15 x region).
+
+    ``padding_tokens`` adds neutral filler to every assistant content so the
+    region can be scaled toward the spec's 100K-token AC-5 target without
+    changing the topic structure.
+    """
+    messages = []
+    if padding_tokens:
+        target_chars = padding_tokens * 4
+        filler = ("Neutral progress note. " * ((target_chars // 23) + 1))[:target_chars]
+    else:
+        filler = ""
+    ground_truth = []
+    base = 0
+    for ep_idx, topic in enumerate(_MAP_TOPICS[:n_episodes]):
+        start = base
+        for k in range(messages_per_episode):
+            role, text, *rest = _MAP_ROLE_TURNS[k % len(_MAP_ROLE_TURNS)]
+            content = text.format(topic=topic) + (filler if role == "assistant" else "")
+            msg = {"role": role, "content": content}
+            if len(rest) >= 1 and isinstance(rest[0], list) and rest[0]:
+                msg["tool_calls"] = [{
+                    "id": f"tc-{ep_idx}-{k}",
+                    "function": {"name": rest[0][0], "arguments": '{"target":"%s"}' % topic}}]
+            if role == "tool":
+                msg["tool_call_id"] = f"tc-{ep_idx}-{k - 1}"
+            messages.append(msg)
+            base += 1
+        ground_truth.append([start, base - 1])
+    return {"messages": messages, "ground_truth_episodes": ground_truth}
+
+
 def write_fixtures() -> list:
     FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
     fixtures = {
@@ -84,6 +149,17 @@ def write_fixtures() -> list:
         p = FIXTURES_DIR / name
         p.write_text(json.dumps(fx, indent=2))
         paths.append(str(p))
+    # AC-3/AC-5 fixture: synthetic topic-blocked conversation + hand-labeled
+    # ground-truth episode boundaries (committed data, the IoU reference).
+    map_fixture = build_map_iou_fixture()
+    p = FIXTURES_DIR / "map_iou_transcript.json"
+    p.write_text(json.dumps({"messages": map_fixture["messages"]}, indent=2))
+    paths.append(str(p))
+    p = FIXTURES_DIR / "map_iou_ground_truth.json"
+    p.write_text(json.dumps({"ground_truth_episodes": map_fixture["ground_truth_episodes"],
+                             "schema": "list of [start_msg, end_msg] inclusive episode ranges"},
+                            indent=2))
+    paths.append(str(p))
     return paths
 
 

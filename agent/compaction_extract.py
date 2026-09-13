@@ -53,6 +53,30 @@ Every item must carry "cites": [[dump_id, start_msg, end_msg]] resolved to real
 dump ranges. Quote at most 50 tokens per item (orienting quotes only); bulk
 verbatim retention belongs to the dump, not the checkpoint. Output ONLY the
 checkpoint JSON.
+
+CORRECTION CITATION RULE (AC-8): for an instruction/correction, cite the
+IMMEDIATE message range right after the correction where the correction was
+applied — the very next restart/re-implementation/tool run that put the new
+direction into effect (typically within a few messages of the correction). Do
+NOT cite the original contradiction, and do NOT cite a much-later final state
+(e.g. a deploy days later).
+
+Emit EXACTLY this shape (sections in this order; cite triples [dump-id, start, end]).
+An unproduced section MUST be the string "null_reason: <why>" — never []:
+{
+  "instructions_and_corrections": [{"what": "...", "kind": "correction", "cites": [[0, 10, 12]]}],
+  "decisions": [{"what": "...", "cites": [[0, 20, 22]], "rejected_alternatives": ["..."]}],
+  "insights": "null_reason: none in this region",
+  "commitments": [{"what": "...", "cites": [[0, 30, 32]]}],
+  "open_threads": "null_reason: none in this region",
+  "artifacts": [{"what": "...", "cites": [[0, 40, 42]], "recoverable": true}],
+  "world_effects": [{"what": "...", "cites": [[0, 50, 52]]}],
+  "links": "null_reason: none in this region",
+  "narrative": "one-line orientation",
+  "confidence": 0.8,
+  "coverage": {"complete": true}
+}
+Every one of the eleven keys above must be present.
 """
 
 CHECK_PROMPT = """\

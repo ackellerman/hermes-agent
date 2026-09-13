@@ -1,0 +1,1524 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Let's work on: provisioning cluster alpha."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on provisioning cluster alpha; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-0-1",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"provisioning cluster alpha\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "provisioning cluster alpha: dry run complete",
+      "tool_call_id": "tc-0-1"
+    },
+    {
+      "role": "user",
+      "content": "Please push the provisioning cluster alpha changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the provisioning cluster alpha change set.",
+      "tool_calls": [
+        {
+          "id": "tc-0-4",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"provisioning cluster alpha\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "provisioning cluster alpha: staging deploy ok",
+      "tool_call_id": "tc-0-4"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified provisioning cluster alpha end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-0-6",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"provisioning cluster alpha\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "provisioning cluster alpha: verification passed",
+      "tool_call_id": "tc-0-6"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: provisioning cluster alpha."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on provisioning cluster alpha; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-0-9",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"provisioning cluster alpha\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "provisioning cluster alpha: dry run complete",
+      "tool_call_id": "tc-0-9"
+    },
+    {
+      "role": "user",
+      "content": "Please push the provisioning cluster alpha changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the provisioning cluster alpha change set.",
+      "tool_calls": [
+        {
+          "id": "tc-0-12",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"provisioning cluster alpha\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "provisioning cluster alpha: staging deploy ok",
+      "tool_call_id": "tc-0-12"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified provisioning cluster alpha end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-0-14",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"provisioning cluster alpha\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "provisioning cluster alpha: verification passed",
+      "tool_call_id": "tc-0-14"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: provisioning cluster alpha."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on provisioning cluster alpha; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-0-17",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"provisioning cluster alpha\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "provisioning cluster alpha: dry run complete",
+      "tool_call_id": "tc-0-17"
+    },
+    {
+      "role": "user",
+      "content": "Please push the provisioning cluster alpha changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the provisioning cluster alpha change set.",
+      "tool_calls": [
+        {
+          "id": "tc-0-20",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"provisioning cluster alpha\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "provisioning cluster alpha: staging deploy ok",
+      "tool_call_id": "tc-0-20"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified provisioning cluster alpha end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-0-22",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"provisioning cluster alpha\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "provisioning cluster alpha: verification passed",
+      "tool_call_id": "tc-0-22"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: provisioning cluster alpha."
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: hardening authentication service."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on hardening authentication service; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-1-1",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"hardening authentication service\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "hardening authentication service: dry run complete",
+      "tool_call_id": "tc-1-1"
+    },
+    {
+      "role": "user",
+      "content": "Please push the hardening authentication service changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the hardening authentication service change set.",
+      "tool_calls": [
+        {
+          "id": "tc-1-4",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"hardening authentication service\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "hardening authentication service: staging deploy ok",
+      "tool_call_id": "tc-1-4"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified hardening authentication service end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-1-6",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"hardening authentication service\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "hardening authentication service: verification passed",
+      "tool_call_id": "tc-1-6"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: hardening authentication service."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on hardening authentication service; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-1-9",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"hardening authentication service\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "hardening authentication service: dry run complete",
+      "tool_call_id": "tc-1-9"
+    },
+    {
+      "role": "user",
+      "content": "Please push the hardening authentication service changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the hardening authentication service change set.",
+      "tool_calls": [
+        {
+          "id": "tc-1-12",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"hardening authentication service\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "hardening authentication service: staging deploy ok",
+      "tool_call_id": "tc-1-12"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified hardening authentication service end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-1-14",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"hardening authentication service\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "hardening authentication service: verification passed",
+      "tool_call_id": "tc-1-14"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: hardening authentication service."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on hardening authentication service; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-1-17",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"hardening authentication service\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "hardening authentication service: dry run complete",
+      "tool_call_id": "tc-1-17"
+    },
+    {
+      "role": "user",
+      "content": "Please push the hardening authentication service changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the hardening authentication service change set.",
+      "tool_calls": [
+        {
+          "id": "tc-1-20",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"hardening authentication service\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "hardening authentication service: staging deploy ok",
+      "tool_call_id": "tc-1-20"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified hardening authentication service end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-1-22",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"hardening authentication service\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "hardening authentication service: verification passed",
+      "tool_call_id": "tc-1-22"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: hardening authentication service."
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: refactoring the billing parser."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on refactoring the billing parser; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-2-1",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"refactoring the billing parser\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "refactoring the billing parser: dry run complete",
+      "tool_call_id": "tc-2-1"
+    },
+    {
+      "role": "user",
+      "content": "Please push the refactoring the billing parser changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the refactoring the billing parser change set.",
+      "tool_calls": [
+        {
+          "id": "tc-2-4",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"refactoring the billing parser\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "refactoring the billing parser: staging deploy ok",
+      "tool_call_id": "tc-2-4"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified refactoring the billing parser end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-2-6",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"refactoring the billing parser\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "refactoring the billing parser: verification passed",
+      "tool_call_id": "tc-2-6"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: refactoring the billing parser."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on refactoring the billing parser; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-2-9",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"refactoring the billing parser\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "refactoring the billing parser: dry run complete",
+      "tool_call_id": "tc-2-9"
+    },
+    {
+      "role": "user",
+      "content": "Please push the refactoring the billing parser changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the refactoring the billing parser change set.",
+      "tool_calls": [
+        {
+          "id": "tc-2-12",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"refactoring the billing parser\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "refactoring the billing parser: staging deploy ok",
+      "tool_call_id": "tc-2-12"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified refactoring the billing parser end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-2-14",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"refactoring the billing parser\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "refactoring the billing parser: verification passed",
+      "tool_call_id": "tc-2-14"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: refactoring the billing parser."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on refactoring the billing parser; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-2-17",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"refactoring the billing parser\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "refactoring the billing parser: dry run complete",
+      "tool_call_id": "tc-2-17"
+    },
+    {
+      "role": "user",
+      "content": "Please push the refactoring the billing parser changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the refactoring the billing parser change set.",
+      "tool_calls": [
+        {
+          "id": "tc-2-20",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"refactoring the billing parser\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "refactoring the billing parser: staging deploy ok",
+      "tool_call_id": "tc-2-20"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified refactoring the billing parser end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-2-22",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"refactoring the billing parser\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "refactoring the billing parser: verification passed",
+      "tool_call_id": "tc-2-22"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: refactoring the billing parser."
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: load-testing the gateway."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on load-testing the gateway; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-3-1",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"load-testing the gateway\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "load-testing the gateway: dry run complete",
+      "tool_call_id": "tc-3-1"
+    },
+    {
+      "role": "user",
+      "content": "Please push the load-testing the gateway changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the load-testing the gateway change set.",
+      "tool_calls": [
+        {
+          "id": "tc-3-4",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"load-testing the gateway\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "load-testing the gateway: staging deploy ok",
+      "tool_call_id": "tc-3-4"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified load-testing the gateway end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-3-6",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"load-testing the gateway\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "load-testing the gateway: verification passed",
+      "tool_call_id": "tc-3-6"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: load-testing the gateway."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on load-testing the gateway; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-3-9",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"load-testing the gateway\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "load-testing the gateway: dry run complete",
+      "tool_call_id": "tc-3-9"
+    },
+    {
+      "role": "user",
+      "content": "Please push the load-testing the gateway changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the load-testing the gateway change set.",
+      "tool_calls": [
+        {
+          "id": "tc-3-12",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"load-testing the gateway\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "load-testing the gateway: staging deploy ok",
+      "tool_call_id": "tc-3-12"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified load-testing the gateway end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-3-14",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"load-testing the gateway\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "load-testing the gateway: verification passed",
+      "tool_call_id": "tc-3-14"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: load-testing the gateway."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on load-testing the gateway; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-3-17",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"load-testing the gateway\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "load-testing the gateway: dry run complete",
+      "tool_call_id": "tc-3-17"
+    },
+    {
+      "role": "user",
+      "content": "Please push the load-testing the gateway changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the load-testing the gateway change set.",
+      "tool_calls": [
+        {
+          "id": "tc-3-20",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"load-testing the gateway\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "load-testing the gateway: staging deploy ok",
+      "tool_call_id": "tc-3-20"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified load-testing the gateway end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-3-22",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"load-testing the gateway\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "load-testing the gateway: verification passed",
+      "tool_call_id": "tc-3-22"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: load-testing the gateway."
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: migrating the audit store to Postgres."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on migrating the audit store to Postgres; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-4-1",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"migrating the audit store to Postgres\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "migrating the audit store to Postgres: dry run complete",
+      "tool_call_id": "tc-4-1"
+    },
+    {
+      "role": "user",
+      "content": "Please push the migrating the audit store to Postgres changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the migrating the audit store to Postgres change set.",
+      "tool_calls": [
+        {
+          "id": "tc-4-4",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"migrating the audit store to Postgres\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "migrating the audit store to Postgres: staging deploy ok",
+      "tool_call_id": "tc-4-4"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified migrating the audit store to Postgres end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-4-6",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"migrating the audit store to Postgres\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "migrating the audit store to Postgres: verification passed",
+      "tool_call_id": "tc-4-6"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: migrating the audit store to Postgres."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on migrating the audit store to Postgres; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-4-9",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"migrating the audit store to Postgres\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "migrating the audit store to Postgres: dry run complete",
+      "tool_call_id": "tc-4-9"
+    },
+    {
+      "role": "user",
+      "content": "Please push the migrating the audit store to Postgres changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the migrating the audit store to Postgres change set.",
+      "tool_calls": [
+        {
+          "id": "tc-4-12",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"migrating the audit store to Postgres\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "migrating the audit store to Postgres: staging deploy ok",
+      "tool_call_id": "tc-4-12"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified migrating the audit store to Postgres end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-4-14",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"migrating the audit store to Postgres\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "migrating the audit store to Postgres: verification passed",
+      "tool_call_id": "tc-4-14"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: migrating the audit store to Postgres."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on migrating the audit store to Postgres; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-4-17",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"migrating the audit store to Postgres\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "migrating the audit store to Postgres: dry run complete",
+      "tool_call_id": "tc-4-17"
+    },
+    {
+      "role": "user",
+      "content": "Please push the migrating the audit store to Postgres changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the migrating the audit store to Postgres change set.",
+      "tool_calls": [
+        {
+          "id": "tc-4-20",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"migrating the audit store to Postgres\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "migrating the audit store to Postgres: staging deploy ok",
+      "tool_call_id": "tc-4-20"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified migrating the audit store to Postgres end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-4-22",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"migrating the audit store to Postgres\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "migrating the audit store to Postgres: verification passed",
+      "tool_call_id": "tc-4-22"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: migrating the audit store to Postgres."
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: resolving the schema drift in analytics."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on resolving the schema drift in analytics; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-5-1",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"resolving the schema drift in analytics\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "resolving the schema drift in analytics: dry run complete",
+      "tool_call_id": "tc-5-1"
+    },
+    {
+      "role": "user",
+      "content": "Please push the resolving the schema drift in analytics changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the resolving the schema drift in analytics change set.",
+      "tool_calls": [
+        {
+          "id": "tc-5-4",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"resolving the schema drift in analytics\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "resolving the schema drift in analytics: staging deploy ok",
+      "tool_call_id": "tc-5-4"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified resolving the schema drift in analytics end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-5-6",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"resolving the schema drift in analytics\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "resolving the schema drift in analytics: verification passed",
+      "tool_call_id": "tc-5-6"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: resolving the schema drift in analytics."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on resolving the schema drift in analytics; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-5-9",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"resolving the schema drift in analytics\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "resolving the schema drift in analytics: dry run complete",
+      "tool_call_id": "tc-5-9"
+    },
+    {
+      "role": "user",
+      "content": "Please push the resolving the schema drift in analytics changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the resolving the schema drift in analytics change set.",
+      "tool_calls": [
+        {
+          "id": "tc-5-12",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"resolving the schema drift in analytics\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "resolving the schema drift in analytics: staging deploy ok",
+      "tool_call_id": "tc-5-12"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified resolving the schema drift in analytics end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-5-14",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"resolving the schema drift in analytics\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "resolving the schema drift in analytics: verification passed",
+      "tool_call_id": "tc-5-14"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: resolving the schema drift in analytics."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on resolving the schema drift in analytics; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-5-17",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"resolving the schema drift in analytics\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "resolving the schema drift in analytics: dry run complete",
+      "tool_call_id": "tc-5-17"
+    },
+    {
+      "role": "user",
+      "content": "Please push the resolving the schema drift in analytics changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the resolving the schema drift in analytics change set.",
+      "tool_calls": [
+        {
+          "id": "tc-5-20",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"resolving the schema drift in analytics\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "resolving the schema drift in analytics: staging deploy ok",
+      "tool_call_id": "tc-5-20"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified resolving the schema drift in analytics end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-5-22",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"resolving the schema drift in analytics\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "resolving the schema drift in analytics: verification passed",
+      "tool_call_id": "tc-5-22"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: resolving the schema drift in analytics."
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: onboarding the ETL workers."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on onboarding the ETL workers; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-6-1",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"onboarding the ETL workers\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "onboarding the ETL workers: dry run complete",
+      "tool_call_id": "tc-6-1"
+    },
+    {
+      "role": "user",
+      "content": "Please push the onboarding the ETL workers changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the onboarding the ETL workers change set.",
+      "tool_calls": [
+        {
+          "id": "tc-6-4",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"onboarding the ETL workers\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "onboarding the ETL workers: staging deploy ok",
+      "tool_call_id": "tc-6-4"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified onboarding the ETL workers end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-6-6",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"onboarding the ETL workers\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "onboarding the ETL workers: verification passed",
+      "tool_call_id": "tc-6-6"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: onboarding the ETL workers."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on onboarding the ETL workers; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-6-9",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"onboarding the ETL workers\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "onboarding the ETL workers: dry run complete",
+      "tool_call_id": "tc-6-9"
+    },
+    {
+      "role": "user",
+      "content": "Please push the onboarding the ETL workers changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the onboarding the ETL workers change set.",
+      "tool_calls": [
+        {
+          "id": "tc-6-12",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"onboarding the ETL workers\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "onboarding the ETL workers: staging deploy ok",
+      "tool_call_id": "tc-6-12"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified onboarding the ETL workers end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-6-14",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"onboarding the ETL workers\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "onboarding the ETL workers: verification passed",
+      "tool_call_id": "tc-6-14"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: onboarding the ETL workers."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on onboarding the ETL workers; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-6-17",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"onboarding the ETL workers\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "onboarding the ETL workers: dry run complete",
+      "tool_call_id": "tc-6-17"
+    },
+    {
+      "role": "user",
+      "content": "Please push the onboarding the ETL workers changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the onboarding the ETL workers change set.",
+      "tool_calls": [
+        {
+          "id": "tc-6-20",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"onboarding the ETL workers\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "onboarding the ETL workers: staging deploy ok",
+      "tool_call_id": "tc-6-20"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified onboarding the ETL workers end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-6-22",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"onboarding the ETL workers\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "onboarding the ETL workers: verification passed",
+      "tool_call_id": "tc-6-22"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: onboarding the ETL workers."
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: cutting the release branch."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on cutting the release branch; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-7-1",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"cutting the release branch\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "cutting the release branch: dry run complete",
+      "tool_call_id": "tc-7-1"
+    },
+    {
+      "role": "user",
+      "content": "Please push the cutting the release branch changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the cutting the release branch change set.",
+      "tool_calls": [
+        {
+          "id": "tc-7-4",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"cutting the release branch\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "cutting the release branch: staging deploy ok",
+      "tool_call_id": "tc-7-4"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified cutting the release branch end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-7-6",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"cutting the release branch\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "cutting the release branch: verification passed",
+      "tool_call_id": "tc-7-6"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: cutting the release branch."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on cutting the release branch; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-7-9",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"cutting the release branch\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "cutting the release branch: dry run complete",
+      "tool_call_id": "tc-7-9"
+    },
+    {
+      "role": "user",
+      "content": "Please push the cutting the release branch changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the cutting the release branch change set.",
+      "tool_calls": [
+        {
+          "id": "tc-7-12",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"cutting the release branch\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "cutting the release branch: staging deploy ok",
+      "tool_call_id": "tc-7-12"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified cutting the release branch end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-7-14",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"cutting the release branch\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "cutting the release branch: verification passed",
+      "tool_call_id": "tc-7-14"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: cutting the release branch."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting work on cutting the release branch; outlining the plan.",
+      "tool_calls": [
+        {
+          "id": "tc-7-17",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"cutting the release branch\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "cutting the release branch: dry run complete",
+      "tool_call_id": "tc-7-17"
+    },
+    {
+      "role": "user",
+      "content": "Please push the cutting the release branch changes through staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Staged the cutting the release branch change set.",
+      "tool_calls": [
+        {
+          "id": "tc-7-20",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"target\":\"cutting the release branch\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "cutting the release branch: staging deploy ok",
+      "tool_call_id": "tc-7-20"
+    },
+    {
+      "role": "assistant",
+      "content": "Verified cutting the release branch end to end; noting the result.",
+      "tool_calls": [
+        {
+          "id": "tc-7-22",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"target\":\"cutting the release branch\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "cutting the release branch: verification passed",
+      "tool_call_id": "tc-7-22"
+    },
+    {
+      "role": "user",
+      "content": "Let's work on: cutting the release branch."
+    }
+  ]
+}
