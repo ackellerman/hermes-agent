@@ -428,16 +428,20 @@ def _board_resolution_config() -> dict:
 
 # Project-layer memo, keyed by cwd. ``kanban_db.py`` has zero ``lru_cache``
 # today (verified); the git rev-parse below is a subprocess call on every
-# task-transition hook, so it must be memoized per-cwd (A2).
+# task-transition hook, so it must be memoized per-cwd (A2). Two dicts: the
+# repo root and the resolved board slug are different value types stored under
+# the same cwd key (a path vs. a slug) — sharing one dict lets a root be read
+# back as a slug. Kept separate on purpose.
+_repo_toplevel_cache: dict[str, str] = {}
 _project_board_cache: dict[str, Optional[str]] = {}
 
 
 def _repo_toplevel_for_cwd(cwd: str) -> str:
     """The caller's repo root: ``git -C <cwd> rev-parse --show-toplevel``,
     falling back to ``cwd``. Memoized per-cwd (hot-path guard, A2)."""
-    cache = os.path.normcase(cwd)
-    if cache in _project_board_cache:
-        return str(_project_board_cache[cache])
+    key = os.path.normcase(cwd)
+    if key in _repo_toplevel_cache:
+        return _repo_toplevel_cache[key]
     root = cwd
     try:
         out = subprocess.run(
@@ -448,7 +452,7 @@ def _repo_toplevel_for_cwd(cwd: str) -> str:
             root = out.stdout.strip()
     except (OSError, subprocess.SubprocessError):
         pass
-    _project_board_cache[cache] = root
+    _repo_toplevel_cache[key] = root
     return root
 
 
@@ -497,14 +501,14 @@ def _project_board_for_cwd() -> Optional[str]:
     """Project layer: repo root -> projects.db ``board_slug``, else board.json
     ``default_workdir`` match. Memoized per-cwd (the git call + db read both
     run on the task-transition hot path)."""
-    cache = os.path.normcase(os.getcwd())
-    if cache in _project_board_cache:
-        return _project_board_cache[cache]
+    key = os.path.normcase(os.getcwd())
+    if key in _project_board_cache:
+        return _project_board_cache[key]
     root = _repo_toplevel_for_cwd(os.getcwd())
     result = _project_board_via_projects_db(root)
     if result is None:
         result = _project_board_via_workdir(root)
-    _project_board_cache[cache] = result
+    _project_board_cache[key] = result
     return result
 
 
@@ -512,6 +516,7 @@ def clear_project_board_cache() -> None:
     """Forget memoized project-layer resolutions (tests that move a repo on
     disk, or a board default_workdir change, must re-resolve)."""
     _project_board_cache.clear()
+    _repo_toplevel_cache.clear()
 
 
 def get_current_board() -> str:
