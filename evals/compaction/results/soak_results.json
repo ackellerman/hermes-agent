@@ -1,0 +1,51 @@
+{
+  "mode": "soak",
+  "turns_run": 400,
+  "transcripts": [
+    "<transcripts loaded>"
+  ],
+  "total_messages_processed": 4000,
+  "wall_seconds": 8.08,
+  "invariants": {
+    "ordering_swap_refuses_incomplete": true,
+    "lock_discipline_no_leak": true,
+    "map_monotonic": true,
+    "map_bounded_after_retire": true,
+    "batched_single_mutation": true,
+    "alternation_on_swap": true
+  },
+  "all_invariants_hold": true,
+  "violations": [],
+  "turn_log_tail": [
+    {
+      "tick": 397,
+      "dump_id": "0397-b4ff1b63",
+      "swapped_len": 11,
+      "map_covers_after": {
+        "start_msg": 10,
+        "end_msg": 9
+      },
+      "map_entries_after": 0
+    },
+    {
+      "tick": 398,
+      "dump_id": "0398-b4ff1b63",
+      "swapped_len": 11,
+      "map_covers_after": {
+        "start_msg": 10,
+        "end_msg": 9
+      },
+      "map_entries_after": 0
+    },
+    {
+      "tick": 399,
+      "dump_id": "0399-b4ff1b63",
+      "swapped_len": 11,
+      "map_covers_after": {
+        "start_msg": 10,
+        "end_msg": 9
+      },
+      "map_entries_after": 0
+    }
+  ]
+}

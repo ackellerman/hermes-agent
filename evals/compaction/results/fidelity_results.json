@@ -28,6 +28,8 @@
     }
   },
   "correction_recall_headline": 1.0,
+  "checkpoint_gate_valid": true,
+  "checkpoint_gate_errors": [],
   "ac8_pass": true,
   "note": "offline mode validates scoring machinery; spec \u00a74 item 5 requires the ONLINE run for merge numbers"
 }
