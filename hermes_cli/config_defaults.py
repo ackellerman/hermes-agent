@@ -1698,6 +1698,12 @@ DEFAULT_CONFIG = {
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
+        # Operator ceiling for a goal-mode card's turn budget: any goal_max_turns an agent or
+        # CLI caller supplies at task creation is capped to this value (create_task never
+        # refuses, it clamps). The worker itself cannot set a higher per-task value — this
+        # bound is not agent-overridable. An omitted goal_max_turns is untouched: the loop's
+        # own runtime default (20 turns) then applies, and the ceiling does not.
+        "goal_max_turns_ceiling": 100,
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,

@@ -98,11 +98,25 @@ VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", 
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "budget"}
+
+# A goal-mode worker's in-session terminal failures (judge-unachievable,
+# judged-done-never-finalized, turn-budget-exhausted) block as ``budget`` —
+# distinct from dispatcher spawn-failure ``capability``, so a card that ran
+# out of turns never masquerades as a spawn/infra failure (or a human
+# ``needs_input`` question). The goal loop is the only caller allowed to use
+# it; a worker's own kanban_block call is refused it (tools/kanban_tools.py).
+# The goal loop's three internal block sites are the sole legal source.
 
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
+
+# Ceiling an agent/CLI-supplied ``goal_max_turns`` may not exceed at create_task
+# (config ``kanban.goal_max_turns_ceiling`` overrides; None/omitted asks pass
+# through untouched — the loop's runtime DEFAULT_MAX_TURNS fallback is the
+# worker's default, not an ask, so the ceiling only bounds explicit values).
+DEFAULT_GOAL_MAX_TURNS_CEILING = 100
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
@@ -1451,6 +1465,25 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+
+    # An explicit goal_max_turns ask is not agent-overridable: cap it at the
+    # operator's ``kanban.goal_max_turns_ceiling`` (config wins over the shipped
+    # default) — mirror the failure_limit precedent: a value above the ceiling
+    # is silently capped, the create is never refused. An omitted ask (None)
+    # passes through: the loop's runtime DEFAULT_MAX_TURNS fallback is a
+    # default, not an ask, so the ceiling never touches it.
+    if goal_mode and goal_max_turns is not None:
+        from hermes_cli.config import cfg_get, load_config
+
+        ceiling = cfg_get(load_config(), "kanban", "goal_max_turns_ceiling",
+                          default=DEFAULT_GOAL_MAX_TURNS_CEILING)
+        try:
+            ceiling = int(ceiling)
+        except (TypeError, ValueError):
+            # A garbage operator value must not break task creation.
+            ceiling = DEFAULT_GOAL_MAX_TURNS_CEILING
+        if goal_max_turns > ceiling:
+            goal_max_turns = ceiling
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
