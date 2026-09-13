@@ -1884,6 +1884,27 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     agent.max_compression_attempts = cs.max_attempts
     agent.compression_idle_compact_after_seconds = cs.idle_compact_after_seconds
 
+    # SPEC-0042: compaction pipeline flags -> agent attributes (default OFF).
+    # The backstop (compaction_swap.backstop_gate) reads these FIRST — enabled
+    # false means the legacy single-call path unconditionally, no pipeline
+    # mechanism is touched (AC-19).
+    pp = dict(agent.config.get("compaction_pipeline", {}) or {})
+    agent.compaction_pipeline_enabled = bool(pp.get("enabled", False))
+    agent.compaction_pipeline_storage_root = str(pp.get("storage_root", "/tmp/hermes-compaction"))
+    _map_cfg = pp.get("map", {}) or {}
+    agent.compaction_pipeline_map_idle_after_seconds = float(_map_cfg.get("idle_update_after_seconds", 20))
+    agent.compaction_pipeline_map_cooldown_seconds = float(_map_cfg.get("cooldown_seconds", 120))
+    _ex_cfg = pp.get("extraction", {}) or {}
+    agent.compaction_pipeline_extraction_cooldown_seconds = float(_ex_cfg.get("cooldown_seconds", 60))
+    agent.compaction_pipeline_max_stage_retries = int(_ex_cfg.get("max_stage_retries", 2))
+    agent.compaction_pipeline_budget_per_session_tokens = int(_ex_cfg.get("budget_per_session_tokens", 200000))
+    _swap_cfg = pp.get("swap", {}) or {}
+    agent.compaction_pipeline_max_wait_seconds = float(_swap_cfg.get("max_wait_seconds", 900))
+    _gate_cfg = pp.get("review_gate", {}) or {}
+    agent.compaction_pipeline_gate_always_on = bool(_gate_cfg.get("always_on", True))
+    agent.compaction_pipeline_loss_probe_samples = int(_gate_cfg.get("loss_probe_samples", 8))
+    agent.compaction_pipeline_models = dict(pp.get("models", {}) or {})
+
 
 def _enforce_minimum_context(agent):
     # Reject windows below the 64K floor needed for reliable tool-calling; an explicit
