@@ -443,13 +443,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                     "or docs/hermes-kanban-v1-spec.pdf for the full design.",
     )
     # --board scopes every subcommand to one board's DB; when omitted the
-    # resolution is HERMES_KANBAN_BOARD, then the persisted current-board
+    # resolution is: worker env (HERMES_KANBAN_DB set -> unconditional),
+    # interactive env (only when kanban.env_board_pin is true), the project
+    # layer (repo root -> projects.db board_slug / board default_workdir), the
+    # kanban.default_board profile default, then the persisted current-board
     # file, then "default" (kanban_db.get_current_board()).
     kanban_parser.add_argument("--board", default=None, metavar="<slug>",
                                help="Board slug to operate on. Defaults to the current board (set "
-                                    "via `hermes kanban boards switch <slug>` or the "
-                                    "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards "
-                                    "list` to see all boards.")
+                                    "via `hermes kanban boards switch <slug>`, the "
+                                    "HERMES_KANBAN_BOARD env var when kanban.env_board_pin is "
+                                    "enabled, or the project/current-board resolution). Use "
+                                    "`hermes kanban boards list` to see all boards.")
     _add_commands(kanban_parser.add_subparsers(dest="kanban_action"), _SPECS)
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser

@@ -1678,6 +1678,15 @@ DEFAULT_CONFIG = {
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.
         "auto_subscribe_on_create": True,
+        # Interactive board resolution reads HERMES_KANBAN_BOARD only when this is
+        # true (default off — SPEC-0032). Off = env no longer binds an interactive
+        # session's board; resolution is config/project driven instead. Workers and
+        # cron children (HERMES_KANBAN_DB set) are exempt: their env board is always
+        # honored as defense-in-depth for the dispatcher's claimed-board pin.
+        "env_board_pin": False,
+        # Profile-level default board slug, consulted only when no project binding
+        # exists. Empty = no profile default (fall through to the current-file tail).
+        "default_board": "",
         # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,
