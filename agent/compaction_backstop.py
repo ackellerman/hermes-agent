@@ -63,12 +63,29 @@ class CompactionBackstop:
 
     # ── gate inputs ───────────────────────────────────────────────────
 
-    def _extraction_state(self) -> Optional[Dict[str, Any]]:
-        """Whether a ready (gate: passed) checkpoint exists for this session's
-        affected region. Returned dict carries ``gate`` for backstop_gate;
-        None means 'unknown/not ready' -> backstop degrades as
-        extraction_incomplete rather than blocking the overflow turn."""
-        ready = self._find_ready_region()
+    def _current_compression_window(self) -> Optional[Tuple[int, int]]:
+        """Return the window calculated for *this* overflow dispatch.
+
+        ``conversation_compression`` stamps this immediately before entering the
+        backstop. A previous compression's window is never safe to reuse: dump
+        ranges are message indices, so a stale ready dump could otherwise replace
+        an unrelated part of a later transcript.
+        """
+        compressor = getattr(self.agent, "context_compressor", None)
+        window = getattr(compressor, "last_compress_window", None)
+        if not isinstance(window, tuple) or len(window) != 2:
+            return None
+        try:
+            start, end = int(window[0]), int(window[1])
+        except (TypeError, ValueError):
+            return None
+        return (start, end) if 0 <= start < end else None
+
+    def _extraction_state(self, expected_window: Optional[Tuple[int, int]]) -> Optional[Dict[str, Any]]:
+        """Whether a ready, gate-passed checkpoint exists for this dispatch's
+        exact compression window. None means unknown/not ready and must degrade
+        rather than swapping a stale region."""
+        ready = self._find_ready_region(expected_window)
         if ready is None:
             return None
         return {"gate": "passed", "region": ready}
@@ -88,11 +105,15 @@ class CompactionBackstop:
 
     # ── data discovery: ready regions (dump complete + gate passed) ────
 
-    def _find_ready_region(self) -> Optional[Dict[str, Any]]:
-        """Scan the pipeline storage for a gate-passed checkpoint tied to a
-        complete dump. Returns ``{"dump_id", "meta", "checkpoint", "gate"}`` or
-        None. Only swap what the pipeline's own gate already cleared — the swap
-        re-checks ``require_complete`` and gate eligibility defensively."""
+    def _find_ready_region(self, expected_window: Optional[Tuple[int, int]]) -> Optional[Dict[str, Any]]:
+        """Find a gate-passed complete dump for ``expected_window`` only.
+
+        Dump ranges are transcript indices, not durable identities. Requiring an
+        exact current-window match prevents a ready artifact from an earlier
+        compression pass being applied to a different later window.
+        """
+        if expected_window is None:
+            return None
         session_dir = self._storage_root() / self._session_id()
         if not session_dir.is_dir():
             return None
@@ -115,16 +136,25 @@ class CompactionBackstop:
             store = DumpStore(self._storage_root())
             if not store.is_complete(self._session_id(), dump_id):
                 continue
-            return {"dump_id": dump_id, "checkpoint": checkpoint, "gate": gate_verdict}
+            meta = store.read_meta(self._session_id(), dump_id) or {}
+            try:
+                dump_window = (int(meta["start_msg"]), int(meta["end_msg"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if dump_window != expected_window:
+                logger.debug("backstop dump %s is for %s, current window is %s; defer",
+                             dump_id, dump_window, expected_window)
+                continue
+            return {"dump_id": dump_id, "meta": meta, "checkpoint": checkpoint, "gate": gate_verdict}
         return None
 
     # ── swap ──────────────────────────────────────────────────────────
 
-    def _swap_ready_region(self, messages: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
-        """If a ready dump+checkpoint+gate exists, swap its region into a new
-        message list via ``swap_region`` and return it; else None (caller falls
-        through to the legacy summary)."""
-        ready = self._find_ready_region()
+    def _swap_ready_region(
+        self, messages: List[Dict[str, Any]], expected_window: Optional[Tuple[int, int]],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Swap only a ready dump for the current dispatch window; else None."""
+        ready = self._find_ready_region(expected_window)
         if ready is None:
             return None
         try:
@@ -166,15 +196,16 @@ class CompactionBackstop:
             # AC-19: enabled:false short-circuits before ANY pipeline mechanism.
             return ("legacy_summary", None,
                     {TELEMETRY_DEGRADED: False, TELEMETRY_DEGRADATION_REASON: None})
+        expected_window = self._current_compression_window()
         from agent.compaction_swap import backstop_gate
         decision = backstop_gate(
             self._cfg(), getattr(self.agent, "db", None), self._session_id(),
-            extraction_state=self._extraction_state(),
+            extraction_state=self._extraction_state(expected_window),
             models_reachable=self._models_reachable(),
         )
         action = decision["action"]
         if action == "run_pipeline":
-            swapped = self._swap_ready_region(messages)
+            swapped = self._swap_ready_region(messages, expected_window)
             if swapped is not None:
                 return ("swap", swapped,
                         {TELEMETRY_DEGRADED: False, TELEMETRY_DEGRADATION_REASON: None})

@@ -2697,6 +2697,17 @@ def _run_summary_dispatch(
             # The telemetry fields are stamped in BOTH enabled states, so the
             # ON-degrade run introduces no new telemetry attribute vs the OFF run.
             from agent.compaction_backstop import TELEMETRY_DEGRADATION_REASON, TELEMETRY_DEGRADED, maybe_backstop_swap
+            # Bind the backstop to THIS overflow's window. ``last_compress_window``
+            # is otherwise only populated inside the legacy compressor, which is
+            # too late (and may describe a prior compression when the backstop
+            # runs first). A range-mismatched ready dump must degrade, never swap.
+            try:
+                _compressor = agent.context_compressor
+                _current_window = _compressor._compress_window(messages)
+                if isinstance(_current_window, tuple) and len(_current_window) == 2:
+                    _compressor.last_compress_window = _current_window
+            except Exception:  # noqa: BLE001 - missing window is safely a degrade
+                logger.debug("Could not calculate current compaction backstop window", exc_info=True)
             _bs_action, _bs_swapped, _bs_tel = maybe_backstop_swap(agent, messages)
             if _bs_swapped is not None:
                 compressed = _bs_swapped
