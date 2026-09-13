@@ -305,3 +305,113 @@ class TestCLIJudgeGate:
 # Overlay K5: kanban worker turn budget honours config (card > config > default)
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Typed "budget" block kind + goal_max_turns ceiling clamp (t_6a9c6b89)
+# ---------------------------------------------------------------------------
+#
+# The goal loop's three internal terminal failures (judge-unachievable,
+# judged-done-never-finalized, turn-budget-exhausted) used to block the card
+# untyped (kind=None), indistinguishable on the board from a genuine human
+# needs_input question. They now block as kind="budget" — a typed in-session
+# exhaustion class, deliberately distinct from dispatcher spawn-failure
+# "capability". Separately, an agent/CLI-supplied goal_max_turns is clamped
+# at create_task to kanban.goal_max_turns_ceiling (config, default 100): the
+# ceiling is not agent-overridable.
+
+
+def _drive_goal_loop(monkeypatch, verdicts, max_turns, blocks):
+    """Drive run_kanban_goal_loop with a scripted judge; record block calls."""
+    _patch_judge(monkeypatch, verdicts)
+    return goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: "still working",
+        task_status_fn=lambda: "running",
+        block_fn=lambda message, kind=None: blocks.append((message, kind)),
+        first_response="first",
+        max_turns=max_turns,
+    )
+
+
+def test_block_task_accepts_budget_kind(kanban_home):
+    """AC1: 'budget' is a valid block kind (typed in-session goal-loop
+    exhaustion); the blocked task stores it like any other typed kind."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="w")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        kb.claim_task(conn, tid, claimer="w")
+        assert kb.block_task(conn, tid, reason="x", kind="budget")
+        assert kb.get_task(conn, tid).block_kind == "budget"
+
+
+def test_loop_turn_budget_exhausted_blocks_as_budget(kanban_home, monkeypatch):
+    """AC2: the turn-budget-exhausted site blocks typed 'budget' with its own
+    reason text (discriminable from the finalize-nudge path's message)."""
+    blocks: list = []
+    res = _drive_goal_loop(monkeypatch, ["continue", "continue"], max_turns=2, blocks=blocks)
+    assert res["outcome"] == "blocked_budget"
+    assert len(blocks) == 1
+    message, kind = blocks[0]
+    assert kind == "budget"
+    assert "exhausted its turn budget" in message
+    assert "finalize" not in message
+
+
+def test_loop_judge_unachievable_blocks_as_budget(kanban_home, monkeypatch):
+    """AC3: the judge-ruled-unachievable site blocks typed 'budget'."""
+    blocks: list = []
+    res = _drive_goal_loop(monkeypatch, ["blocked"], max_turns=5, blocks=blocks)
+    assert res["outcome"] == "blocked_unachievable"
+    assert len(blocks) == 1
+    message, kind = blocks[0]
+    assert kind == "budget"
+    assert "unachievable" in message
+
+
+def test_loop_judged_done_never_finalized_blocks_as_budget(kanban_home, monkeypatch):
+    """AC7: the judged-done-never-finalized (finalize-nudge-exhausted) site is
+    ALSO typed 'budget' with its own reason text. A 'continue' first keeps the
+    nudge flag clear so the second 'done' is the one that trips the branch."""
+    blocks: list = []
+    res = _drive_goal_loop(monkeypatch, ["continue", "done", "done"], max_turns=5, blocks=blocks)
+    assert res["outcome"] == "blocked_budget"
+    assert len(blocks) == 1
+    message, kind = blocks[0]
+    assert kind == "budget"
+    assert "finalize" in message
+    assert "exhausted its turn budget" not in message
+
+
+def _created_goal_max_turns(kanban_home, goal_max_turns):
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="w",
+                             goal_mode=True, goal_max_turns=goal_max_turns)
+        return kb.get_task(conn, tid).goal_max_turns
+
+
+def test_goal_max_turns_clamped_to_shipped_default(kanban_home):
+    """AC5(a): with no config.yaml, an over-ceiling ask is capped to the
+    shipped default (100), never raised — mirroring failure_limit's
+    'config wins over an out-of-range ask' precedent."""
+    assert kb.DEFAULT_GOAL_MAX_TURNS_CEILING == 100
+    assert _created_goal_max_turns(kanban_home, 500) == kb.DEFAULT_GOAL_MAX_TURNS_CEILING
+    # An ask at or under the ceiling passes through untouched.
+    assert _created_goal_max_turns(kanban_home, 50) == 50
+
+
+def test_goal_max_turns_clamped_to_config_ceiling(kanban_home):
+    """AC5(b): the operator's kanban.goal_max_turns_ceiling in config.yaml
+    wins over both the ask and the shipped default."""
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  goal_max_turns_ceiling: 5\n", encoding="utf-8")
+    assert _created_goal_max_turns(kanban_home, 500) == 5
+
+
+def test_goal_max_turns_unset_default_untouched(kanban_home):
+    """AC5(c): goal_max_turns=None (the loop's runtime DEFAULT_MAX_TURNS
+    fallback) is left alone — the ceiling bounds an explicit ask only."""
+    assert _created_goal_max_turns(kanban_home, None) is None
+
+
