@@ -1,26 +1,46 @@
 {
   "mode": "online",
-  "model": "Qwen3.8-v3:27b",
-  "provider": "llama-server",
+  "harness": "production-scheduler (D7)",
+  "model_table": {
+    "map": "llama-small",
+    "reason": "qwen3.8-v3",
+    "extract": "qwen3.8-v3",
+    "check": "qwen3.8-v3",
+    "gate": "qwen3.8-v3",
+    "escape_hatch": "deepseek-v4-flash"
+  },
+  "models_used": {
+    "map": "Qwen3.8-v3:27b",
+    "reason": "Qwen3.8-v3:27b",
+    "extract": "Qwen3.8-v3:27b",
+    "check": "Qwen3.8-v3:27b",
+    "gate": "Qwen3.8-v3:27b",
+    "escape_hatch": "deepseek-v4-flash"
+  },
+  "resolved_model_ids": {
+    "map": "Qwen3.8-v3:27b",
+    "reason": "Qwen3.8-v3:27b",
+    "extract": "Qwen3.8-v3:27b",
+    "check": "Qwen3.8-v3:27b",
+    "gate": "Qwen3.8-v3:27b",
+    "escape_hatch": "deepseek-v4-flash"
+  },
+  "provider": "custom",
   "dump_id": "fx-40828e59",
-  "stage_b_keys": [
-    "coverage",
-    "items",
-    "open_questions"
-  ],
-  "stage_c_keys": [
-    "artifacts",
-    "commitments",
-    "confidence",
-    "coverage",
-    "decisions",
-    "insights",
-    "instructions_and_corrections",
-    "links",
-    "narrative",
-    "open_threads",
-    "world_effects"
-  ],
+  "pipeline_record": {
+    "ran": true,
+    "queued": 0,
+    "updated": false,
+    "dumped": "0001-665d8034",
+    "dump_window": [
+      0,
+      15
+    ],
+    "dumped_exists": true,
+    "extracted": "0001-665d8034",
+    "gated": "0001-665d8034",
+    "swap_eligible": false
+  },
   "checkpoint_gate_valid": true,
   "checkpoint_gate_errors": [],
   "scores": {
@@ -31,8 +51,8 @@
     },
     "commitments": {
       "labeled": 1,
-      "recalled": 0,
-      "recall": 0.0
+      "recalled": 1,
+      "recall": 1.0
     },
     "decisions": {
       "labeled": 1,
@@ -46,15 +66,15 @@
     },
     "world_effects": {
       "labeled": 1,
-      "recalled": 1,
-      "recall": 1.0
+      "recalled": 0,
+      "recall": 0.0
     }
   },
   "correction_recall_headline": 0.0,
   "ac8_pass": false,
   "loss_probe": {
-    "questions": 8,
-    "gaps": 6,
+    "questions": 2,
+    "gaps": 2,
     "pass": false
   },
   "ac10": {
@@ -62,7 +82,7 @@
     "gate_dropped_commitment": false,
     "dropped_findings": [
       {
-        "what": "Checkpoint marks audit-summary.txt as 'recoverable: true' but the dump explicitly states it was written to an ephemeral node and is unrecoverable. The live agent would be devastated to discover it believes it can retrieve a file that is permanently lost.",
+        "what": "audit-summary.txt is explicitly on an ephemeral node and UNRECOVERABLE (msg 13: 'ephemeral node, unrecoverable'), but the checkpoint marks it recoverable: true. The agent would be devastated to assume it can re-derive or re-fetch this artifact when it will be lost with the node.",
         "cites": [
           [
             13,
@@ -71,16 +91,7 @@
         ]
       },
       {
-        "what": "Checkpoint's insight and open thread both claim the reason streaming transport was abandoned is 'not recorded in this region,' but the dump explicitly records it: 'kept dropping connections under load; not worth the complexity now.' The agent would be devastated to learn it forgot a known reason and is carrying a false open thread.",
-        "cites": [
-          [
-            10,
-            11
-          ]
-        ]
-      },
-      {
-        "what": "The Friday ship commitment ('export module ships Friday') is entirely absent from the checkpoint (commitments field is null). The live agent would be devastated to learn it forgot a concrete date-bound delivery commitment.",
+        "what": "The Friday ship commitment (msgs 6-7: 'commit to shipping the export module by Friday' / 'Commitment noted: export module ships Friday') is absent from the commitments array, which is empty. It appears only in passing in the narrative, not as a tracked commitment with a deadline.",
         "cites": [
           [
             6,
@@ -89,29 +100,20 @@
         ]
       },
       {
-        "what": "Checkpoint attributes the SQLite rejection to 'insufficient queryability for audit summaries,' but the dump states the actual reason was 'single-writer bottleneck at our volume.' The agent would be devastated to learn its architectural rationale is wrong, potentially leading to a bad re-decision if the topic resurfaces.",
+        "what": "The rejected alternative for the Postgres decision is mischaracterized. The dump (msg 9) rejects SQLite specifically due to 'single-writer bottleneck at our volume.' The checkpoint instead lists 'in-memory or file-based audit store (insufficient for queryable audit trail)'\u2014a different technology and a different rationale.",
         "cites": [
           [
-            9,
+            8,
             9
           ]
         ]
       },
       {
-        "what": "The audit-summary.txt content ('totals per day, 3 anomalies flagged') is lost. The 3 flagged anomalies are a specific security/audit finding the agent would be devastated to have forgotten, especially given the file is unrecoverable.",
+        "what": "The open_thread claims the technical reason for abandoning streaming transport is 'not captured in the map,' but msg 11 states it plainly: 'kept dropping connections under load; not worth the complexity now.' The reason is present in the dump; the open thread is a false gap.",
         "cites": [
           [
-            13,
-            13
-          ]
-        ]
-      },
-      {
-        "what": "The staging deployment detail 'staging-42 provisioned' is omitted. The agent would be devastated to learn it forgot the specific provisioned node identifier needed for follow-up operations.",
-        "cites": [
-          [
-            15,
-            15
+            11,
+            11
           ]
         ]
       }
@@ -122,5 +124,79 @@
     "run_a_swap_eligible": false,
     "run_b_swap_eligible": false,
     "stable": true
+  },
+  "before_after": {
+    "before": {
+      "mode": "before-arm (current single-call summary)",
+      "summary_chars": 705,
+      "scores": {
+        "corrections": {
+          "labeled": 1,
+          "recalled": 0,
+          "recall": 0.0
+        },
+        "commitments": {
+          "labeled": 1,
+          "recalled": 1,
+          "recall": 1.0
+        },
+        "decisions": {
+          "labeled": 1,
+          "recalled": 1,
+          "recall": 1.0
+        },
+        "artifacts": {
+          "labeled": 1,
+          "recalled": 1,
+          "recall": 1.0
+        },
+        "world_effects": {
+          "labeled": 1,
+          "recalled": 1,
+          "recall": 1.0
+        }
+      },
+      "correction_recall_headline": 0.0
+    },
+    "after": {
+      "mode": "after-arm (production IdlePipelinePass checkpoint)",
+      "checkpoint_gate_valid": true,
+      "checkpoint_gate_errors": [],
+      "scores": {
+        "corrections": {
+          "labeled": 1,
+          "recalled": 0,
+          "recall": 0.0
+        },
+        "commitments": {
+          "labeled": 1,
+          "recalled": 1,
+          "recall": 1.0
+        },
+        "decisions": {
+          "labeled": 1,
+          "recalled": 1,
+          "recall": 1.0
+        },
+        "artifacts": {
+          "labeled": 1,
+          "recalled": 1,
+          "recall": 1.0
+        },
+        "world_effects": {
+          "labeled": 1,
+          "recalled": 0,
+          "recall": 0.0
+        }
+      },
+      "correction_recall_headline": 0.0,
+      "loss_probe": {
+        "questions": 2,
+        "gaps": 2,
+        "pass": false
+      },
+      "accepted_checkpoint": true,
+      "parked_region": null
+    }
   }
 }
