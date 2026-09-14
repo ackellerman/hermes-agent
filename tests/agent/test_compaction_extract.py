@@ -92,22 +92,36 @@ class TestAC9NoVerbatimRule:
 
 
 class TestStageFlow:
-    def test_stage_a_is_mechanical(self, tmp_path):
-        ex = RegionExtractor(tmp_path, "sess", "dump1")
+    @pytest.fixture
+    def region(self, tmp_path):
+        """D1: the region directory is the PRODUCER's. write_dump creates it; a
+        test that mkdir'd one would mask a producer/consumer layout regression
+        (D2), so these stage tests go through a real dump."""
+        from agent.compaction_dump import DumpStore
+        store = DumpStore(tmp_path)
+        ref = store.write_dump("sess", [{"role": "user", "content": "seed"}],
+                               start_msg=0, end_msg=0, turn=1)
+        return tmp_path, ref.dump_id
+
+    def test_stage_a_is_mechanical(self, region):
+        root, dump_id = region
+        ex = RegionExtractor(root, "sess", dump_id)
         art = ex.stage_a({"complete": True, "episodes": []})
         assert art["stage"] == "a"
         assert ex.load_artifact("a") == art
 
-    def test_stage_b_runs_checks_and_parks_after_retries(self, tmp_path):
+    def test_stage_b_runs_checks_and_parks_after_retries(self, region):
         """A stage that never validates parks the region (StageCheckError),
         never silently succeeds."""
-        ex = RegionExtractor(tmp_path, "sess", "dump2", max_stage_retries=1)
+        root, dump_id = region
+        ex = RegionExtractor(root, "sess", dump_id, max_stage_retries=1)
         bad = {"items": [{"verdict": "maybe"}]}  # schema-invalid, always
         with pytest.raises(Exception):
             ex.stage_b(lambda msgs: json.dumps(bad), {"episodes": []})
 
-    def test_stage_b_valid_output_persists_artifact(self, tmp_path):
-        ex = RegionExtractor(tmp_path, "sess", "dump3")
+    def test_stage_b_valid_output_persists_artifact(self, region):
+        root, dump_id = region
+        ex = RegionExtractor(root, "sess", dump_id)
         good = {"items": [{"map_ref": "e1", "verdict": "keep", "because": "dep",
                            "cites": [[0, 5]]}],
                 "open_questions": [],
@@ -115,3 +129,11 @@ class TestStageFlow:
         out = ex.stage_b(lambda msgs: json.dumps(good), {"episodes": []})
         assert out == good
         assert ex.load_artifact("b") == good
+
+    def test_region_extractor_asserts_absent_directory_instead_of_creating_it(self, tmp_path):
+        """D1: a region directory that the producer never created must raise, not
+        be fabricated by the extractor — that fabrication is exactly what hid the
+        dead producer/consumer chain (F1)."""
+        with pytest.raises(FileNotFoundError):
+            RegionExtractor(tmp_path, "sess", "never-produced")
+        assert not (tmp_path / "sess" / "never-produced").exists()

@@ -136,12 +136,27 @@ def parse_stage_json(raw: str) -> Dict[str, Any]:
 
 
 class RegionExtractor:
-    """Drives stages A/B/C (+ checks) for one dumped region."""
+    """Drives stages A/B/C (+ checks) for one dumped region.
+
+    The region directory is owned by the dump PRODUCER (D1,
+    :meth:`agent.compaction_dump.DumpStore.write_dump`): by the time any
+    extraction runs the directory must already exist. ``__init__`` therefore
+    ASSERTS rather than creating — a missing directory means the producer /
+    consumer layout has drifted, and fabricating it here would hide exactly that
+    regression.
+    """
 
     def __init__(self, root: Path, session_id: str, dump_id: str, *,
                  max_stage_retries: int = 2):
-        self.dir = Path(root) / session_id / dump_id
-        self.dir.mkdir(parents=True, exist_ok=True)
+        self.root = Path(root)
+        self.session_id = str(session_id)
+        self.dump_id = str(dump_id)
+        self.dir = self.root / self.session_id / self.dump_id
+        if not self.dir.is_dir():
+            raise FileNotFoundError(
+                f"region directory {self.dir} does not exist: the dump producer "
+                f"(DumpStore.write_dump) owns it, so a missing directory means the "
+                f"producer/consumer layout has drifted")
         self.max_stage_retries = max_stage_retries
 
     def _artifact(self, stage: str) -> Path:

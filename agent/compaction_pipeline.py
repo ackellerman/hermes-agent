@@ -124,7 +124,7 @@ class IdlePipelinePass:
             record: Dict[str, Any] = {"ran": True}
             now = time.time()
             # 0. drain one queued degraded region (AC-24), if models reachable.
-            self._drain_queued(record)
+            self._drain_queued(record, messages)
             # 1. map update over the un-covered tail, with real budget accounting.
             self._update_map(messages, llm_call, record)
             # 2. dump-onto-current-window at an over-threshold idle boundary (AC-20).
@@ -180,11 +180,13 @@ class IdlePipelinePass:
             or (getattr(self.agent, "provider", None) and getattr(self.agent, "model", None))
         )
 
-    def _drain_queued(self, record: Dict[str, Any]) -> None:
+    def _drain_queued(self, record: Dict[str, Any], messages=None) -> None:
         """Drain AT MOST one queued region per pass (within budget). A drain
         while models are unreachable must NOT shrink the queue (AC-24): the
-        row stays so a later pass retries it. A window-mismatched queued row
-        falls back to a fresh dump rather than extracting the wrong window."""
+        row stays so a later pass retries it. A queued row whose own region no
+        longer exists falls back to a fresh dump of the live window rather than
+        being refused (AC-24), and the row is only dropped once its work is
+        actually done."""
         if not self._models_reachable():
             return
         rows = self._read_queue()
@@ -197,7 +199,7 @@ class IdlePipelinePass:
         row = rows[0]
         try:
             window = tuple(int(x) for x in (row.get("window") or [0, 0])[:2])
-            result = self._run_extraction_for_window(window, row)
+            result = self._run_extraction_for_window(window, row, messages)
             if result is not None:
                 # Processed: re-dump fallback happened inside; drop the row.
                 remaining = rows[1:]
@@ -290,14 +292,38 @@ class IdlePipelinePass:
         cooldown = getattr(self.agent, "compaction_pipeline_extraction_cooldown_seconds", 60)
         return (time.time() - float(last)) >= max(0.0, float(cooldown))
 
+    def _complete_dump_for_window(self, store, window: Optional[tuple]):
+        """The complete dump directory whose meta window equals ``window``, or
+        None. ``None`` window means "any complete dump" (queue-drain lookup by
+        dump_id has no window to match)."""
+        sdir = store.session_dir(self.session_id)
+        if not sdir.is_dir():
+            return None
+        want = (int(window[0]), int(window[1])) if window else None
+        for d in sorted(p for p in sdir.iterdir() if p.is_dir()):
+            meta = store.read_meta(self.session_id, d.name) or {}
+            if not meta.get("complete"):
+                continue
+            got = (int(meta.get("start_msg", 0)), int(meta.get("end_msg", 0)))
+            if want is not None and got != want:
+                continue
+            return d
+        return None
+
     def _run_extraction_for_window(self, window: Optional[tuple],
                                    row: Optional[dict],
+                                   messages=None,
                                    ) -> Optional[Dict[str, Any]]:
         """Run A->B->C for the dumped region covering ``window``; return the
         Stage-C checkpoint on success (so the caller can drain the row), None
-        on a park/failure. Honors cooldown + budget. ``row`` is the queued row
-        for queue-drain; when a row's dump is stale it falls back to a fresh
-        dump (D3)."""
+        on a park/failure. Honors cooldown + budget.
+
+        ``row`` is the queued row for queue-drain. AC-24 fresh-dump fallback:
+        when the row's window has no complete dump (its dump was superseded by a
+        later window), the row is neither extracted against the wrong region nor
+        silently dropped — the LIVE window is dumped fresh and THAT region is
+        extracted, so the queued work actually gets done.
+        """
         from agent.compaction_extract import StageCheckError, run_extraction_cycle
         if not self._models_reachable():
             return None  # nobody can run A->B->C without a resolvable route
@@ -307,21 +333,12 @@ class IdlePipelinePass:
             return None
         from agent.compaction_dump import DumpStore
         store = DumpStore(Path(self.storage_root))
-        # Find the dump covering the window (or the row's dump_id).
-        dump_dirs = store.session_dir(self.session_id).glob("*/")
-        candidate = None
-        s, e = (int(window[0]), int(window[1])) if window else (None, None)
-        for d in dump_dirs:
-            if not d.is_dir():
-                continue
-            meta = store.read_meta(self.session_id, d.name) or {}
-            if not meta.get("complete"):
-                continue
-            ms, me = int(meta.get("start_msg", 0)), int(meta.get("end_msg", 0))
-            if window is not None and (ms, me) != (s, e):
-                continue
-            candidate = d
-            break
+        candidate = self._complete_dump_for_window(store, window)
+        if candidate is None and row is not None and messages is not None:
+            fresh = self._dump_fresh_window(messages)
+            if fresh is None:
+                return None
+            candidate = self._complete_dump_for_window(store, fresh)
         if candidate is None:
             return None
         try:
@@ -339,6 +356,27 @@ class IdlePipelinePass:
         except Exception as exc:  # noqa: BLE001
             logger.warning("extraction failed for %s: %s", candidate.name, exc)
             return None
+
+    def _dump_fresh_window(self, messages) -> Optional[tuple]:
+        """Dump the live compression window now, returning its (start, end) — the
+        AC-24 fallback target when a queued row's own region is gone."""
+        window = self._current_compression_window(messages)
+        if window is None:
+            return None
+        s, e = int(window[0]), int(window[1])
+        if e >= len(messages):
+            return None
+        from agent.compaction_dump import DumpStore, region_hash8
+        store = DumpStore(Path(self.storage_root))
+        region = list(messages)[s:e + 1]
+        try:
+            expected = f"{1:04d}-{region_hash8(region)}"
+            if not store.is_complete(self.session_id, expected):
+                store.write_dump(self.session_id, region, start_msg=s, end_msg=e, turn=1)
+        except Exception as exc:  # noqa: BLE001 — fallback failure keeps the row
+            logger.warning("fresh-dump fallback failed (%s): %s", self.session_id, exc)
+            return None
+        return (s, e)
 
     def _schedule_extraction(self, record: Dict[str, Any]) -> None:
         """Extract dumped-unextracted regions (≤ one region cycle per pass).
@@ -422,13 +460,20 @@ class IdlePipelinePass:
         """At the idle boundary, swap ALL current-window-matching, complete,
         gate-passed regions in one message-list mutation. Surface the swapped
         list via ``record["swapped_messages"]`` so the turn-context seam adopts
-        it and suppresses the legacy summarizer (D5/AC-26)."""
-        from agent.compaction_backstop import CompactionBackstop
+        it and suppresses the legacy summarizer (D5/AC-26).
+
+        D3: the sweep computes its OWN window from the live pass messages and
+        threads THAT into ``swap_sweep``. The backstop's
+        ``_current_compression_window()`` reads ``compressor.last_compress_window``,
+        which nothing stamps on an idle pass — it is None there, and a None window
+        makes the stale-window guard a no-op (any gate-passed region would swap
+        regardless of which window it covers).
+        """
         from agent.compaction_dump import DumpStore
         from agent.compaction_swap import swap_sweep
         store = DumpStore(Path(self.storage_root))
-        bs = CompactionBackstop(self.agent)
-        window = bs._current_compression_window()
+        window = self._current_compression_window(messages)
+        record["idle_window"] = list(window) if window is not None else None
         sdir = store.session_dir(self.session_id)
         ready = []
         if sdir.is_dir():

@@ -162,19 +162,21 @@ class TestAC20IdleDump:
         rec1 = sweep.run(messages, llm_call=lambda _p: "{}")
         assert rec1.get("dumped"), "an over-threshold idle pass must write a dump"
         store = DumpStore(tmp_path)
-        # Exactly one complete dump under the session dir (as .meta.json sidecars).
-        metas = sorted((store.session_dir("sess")).glob("*.meta.json"))
-        assert len(metas) == 1
-        dump_id = metas[0].name.removesuffix(".meta.json")
+        # Exactly one complete dump directory under the session dir (D1: the
+        # producer's own layout — discovered through the store, never by a glob
+        # that hardcodes where the journal sits).
+        dump_ids = store.dump_ids("sess")
+        assert len(dump_ids) == 1
+        dump_id = dump_ids[0]
         assert store.is_complete("sess", dump_id) is True
         content_path = store.dump_path("sess", dump_id)
         mtime1 = content_path.stat().st_mtime
 
         # Run again with no new messages -> no new dump, no fsync write (mtime stable).
         rec2 = sweep.run(messages, llm_call=lambda _p: "{}")
-        metas2 = sorted((store.session_dir("sess")).glob("*.meta.json"))
-        assert len(metas2) == 1, "second pass must not create a new dump file"
-        mtime2 = store.dump_path("sess", metas2[0].name.removesuffix(".meta.json")).stat().st_mtime
+        dump_ids2 = store.dump_ids("sess")
+        assert len(dump_ids2) == 1, "second pass must not create a new dump file"
+        mtime2 = store.dump_path("sess", dump_ids2[0]).stat().st_mtime
         assert mtime2 == mtime1, "idempotent dump must not rewrite the file (mtime stable)"
 
 
@@ -182,14 +184,35 @@ class TestAC20IdleDump:
 
 
 class TestAC21DumpBeforeDegrade:
-    def test_red_baseline_gap_provable(self):
-        """FALSIFIER AC-21 (RED): on the pre-fix contract the degrade branch had
-        zero write_dump calls; assert the wiring AND queue live in this module
-        by name so a revert is detectable."""
-        src = Path("agent/compaction_backstop.py").read_text()
-        assert "def decide_and_swap" in src
-        assert "_dump_window(" in src, "degrade branches must call the dump helper"
-        assert "_append_degraded(" in src, "degrade branches must enqueue the region"
+    def test_revert_tripwire_degrade_branch_writes_dump_and_enqueues(self, tmp_path):
+        """REVERT TRIPWIRE (AC-14 option b) — NOT a pre-fix baseline.
+
+        This test does not prove the pre-fix gap; it cannot, because it runs
+        against the already-fixed tree. What it does is fail loudly if the
+        dump-before-degrade wiring is reverted: the degrade branch must write a
+        complete dump AND enqueue the region, asserted from the ARTIFACTS.
+
+        The genuine RED baseline for this behaviour was re-run against the pre-fix
+        parent commit ``46822b15c`` and is committed as a dated record at
+        ``evals/compaction/results/SPEC-0044-AC-14-red-baseline-46822b15c.json``
+        (AC-14 option a). The dated record is the evidence; this test is the
+        tripwire that keeps the fix from silently disappearing.
+        """
+        messages = _alternating_messages(8)
+        a = _agent(root=tmp_path, n_models_reachable=False)
+        a.context_compressor = SimpleNamespace(last_compress_window=(2, 5),
+                                               _compress_window=lambda m: (2, 5))
+        action, swapped, tel = CompactionBackstop(a).decide_and_swap(messages)
+        # Behaviour, from the produced artifacts: the degrade path dumped first.
+        store = DumpStore(tmp_path)
+        dumped = store.dump_ids("sess")
+        assert dumped, "the degrade branch must write a dump (dump-before-degrade)"
+        assert all(store.is_complete("sess", d) for d in dumped)
+        qpath = store.session_dir("sess") / "pipeline_queue.json"
+        assert qpath.is_file(), "the degrade branch must enqueue the region"
+        assert json.loads(qpath.read_text())
+        assert action == "degrade" and swapped is None
+        assert tel[TELEMETRY_DEGRADED] is True
 
     def test_falsifier_models_down_dumps_before_degrade(self, tmp_path):
         messages = _alternating_messages(8)
@@ -203,9 +226,9 @@ class TestAC21DumpBeforeDegrade:
         assert tel[TELEMETRY_DEGRADATION_REASON] == "model_unreachable"
         # A complete dump must exist for window (2,5) AND a queue row appended.
         store = DumpStore(tmp_path)
-        metas = sorted((store.session_dir("sess")).glob("*.meta.json"))
-        assert metas, "degrade must write a dump"
-        dump_id = metas[0].name.removesuffix(".meta.json")
+        dump_ids = store.dump_ids("sess")
+        assert dump_ids, "degrade must write a dump"
+        dump_id = dump_ids[0]
         assert store.is_complete("sess", dump_id) is True
         meta = store.read_meta("sess", dump_id)
         window = [int(meta["start_msg"]), int(meta["end_msg"])]
@@ -225,8 +248,9 @@ class TestAC22Extraction:
         store = DumpStore(tmp_path)
         msgs = _alternating_messages(6)
         ref = store.write_dump("sess", msgs, start_msg=0, end_msg=5, turn=1)
-        sdir = store.session_dir("sess") / ref.dump_id
-        sdir.mkdir(parents=True, exist_ok=True)
+        # D2: the per-dump directory is the PRODUCER's (write_dump); no test-side
+        # mkdir stands in for it, so a layout regression cannot be masked here.
+        sdir = store.dump_dir("sess", ref.dump_id)
         # Map with an episode covering the dump, so stage A slices something.
         from agent.compaction_map import CompactionMap
         cm = CompactionMap(tmp_path, "sess")
@@ -293,8 +317,7 @@ class TestAC24QueueDrain:
         store = DumpStore(tmp_path)
         msgs = _alternating_messages(6)
         ref = store.write_dump("sess", msgs, start_msg=0, end_msg=5, turn=1)
-        d = store.session_dir("sess") / ref.dump_id
-        d.mkdir(parents=True, exist_ok=True)
+        d = store.dump_dir("sess", ref.dump_id)
         ckpt = {
             "instructions_and_corrections": [], "decisions": [], "insights": "null_reason: none",
             "commitments": [], "open_threads": "null_reason: none",
@@ -348,8 +371,7 @@ class TestAC25SwapSweep:
         for i, (s, e) in enumerate(windows):
             ref = store.write_dump("sess", messages[s:e + 1], start_msg=s, end_msg=e,
                                    turn=1 + i)
-            d = store.session_dir("sess") / ref.dump_id
-            d.mkdir(parents=True, exist_ok=True)
+            d = store.dump_dir("sess", ref.dump_id)
             ckpt = {
                 "instructions_and_corrections": [], "decisions": [], "insights": "null_reason: none",
                 "commitments": [{"what": f"c{i}", "cites": [[ref.dump_id, s + 1, s + 2]]}],

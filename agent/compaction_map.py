@@ -162,7 +162,15 @@ class CompactionMap:
         }
 
     def retire(self, start_msg: int, end_msg: int) -> Dict[str, Any]:
-        """Remove swapped-out entries, advance covers — map stays O(live)."""
+        """Remove swapped-out entries, advance covers — map stays O(live).
+
+        A cover with nothing left live collapses to the single-position range
+        ``[new_start, new_start]``. ``covers`` must ALWAYS be a non-negative range
+        (``start_msg <= end_msg``, AC-15): retiring a region that reaches the end
+        of the history must not leave ``start_msg > end_msg`` behind, because that
+        inverted range reads as corruption to every consumer and is exactly the
+        off-by-one the soak's bounded-map invariant exists to catch.
+        """
         map_obj = self.load()
         lo, hi = int(start_msg), int(end_msg)
         # episodes overlapping the retired window with a tail beyond it stay (clamped);
@@ -181,7 +189,16 @@ class CompactionMap:
                             if int(e.get("from", [0, 0])[-1]) > hi
                             or int(e.get("to", [0, 0])[-1]) > hi]
         covers = map_obj.get("covers", {})
-        covers["start_msg"] = max(int(covers.get("start_msg", 0)), hi + 1)
+        new_start = max(int(covers.get("start_msg", 0)), hi + 1)
+        covers["start_msg"] = new_start
+        # No live episode may start before the cover any more; keep the cover's own
+        # end coherent instead of leaving it below the start.
+        if kept:
+            covers["end_msg"] = max(int(covers.get("end_msg", 0)),
+                                    max(int(ep["end_msg"]) for ep in kept))
+        else:
+            # Nothing live: the cover collapses to the point range [new_start, new_start].
+            covers["end_msg"] = new_start
         map_obj["covers"] = covers
         self.save(map_obj)
         return map_obj

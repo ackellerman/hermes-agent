@@ -123,7 +123,7 @@ class Rehydrator:
             if self.store.root.is_dir() else []
         )
         for sdir in session_dirs:
-            if (sdir / f"{dump_id}.jsonl").is_file():
+            if (self.store.dump_dir(sdir.name, dump_id) / f"{dump_id}.jsonl").is_file():
                 return {
                     "source": "dump",
                     "dump_id": dump_id,

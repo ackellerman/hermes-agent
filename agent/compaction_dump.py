@@ -86,9 +86,13 @@ def _fsync_dir(path: Path) -> None:
 class DumpStore:
     """Append-only dump store under a config-definable root.
 
-    Layout: ``<root>/<session_id>/<dump_id>.jsonl`` with sidecar
-    ``<dump_id>.meta.json``. All writes are durability-ordered: content is fsynced
-    BEFORE the meta flips ``complete``, and the meta itself lands via atomic rename.
+    Canonical layout (D1): ``<root>/<session_id>/<dump_id>/`` is ONE directory
+    per dump, holding the message journal ``<dump_id>.jsonl`` and the sidecar
+    ``<dump_id>.meta.json``. The per-dump directory is created by the PRODUCER
+    (:meth:`write_dump`) — every consumer's directory scan then finds a real
+    region, and no test/eval-side ``mkdir`` is needed to invent one. All writes
+    are durability-ordered: content is fsynced BEFORE the meta flips
+    ``complete``, and the meta itself lands via atomic rename.
     """
 
     def __init__(self, root: Optional[Path] = None):
@@ -99,11 +103,25 @@ class DumpStore:
     def session_dir(self, session_id: str) -> Path:
         return self.root / session_id
 
+    def dump_dir(self, session_id: str, dump_id: str) -> Path:
+        """The per-dump directory: the region's artifact home (stages, gate)."""
+        return self.session_dir(session_id) / dump_id
+
     def dump_path(self, session_id: str, dump_id: str) -> Path:
-        return self.session_dir(session_id) / f"{dump_id}.jsonl"
+        return self.dump_dir(session_id, dump_id) / f"{dump_id}.jsonl"
 
     def meta_path(self, session_id: str, dump_id: str) -> Path:
-        return self.session_dir(session_id) / f"{dump_id}.meta.json"
+        return self.dump_dir(session_id, dump_id) / f"{dump_id}.meta.json"
+
+    # ── discovery ──────────────────────────────────────────────────────
+
+    def dump_ids(self, session_id: str) -> List[str]:
+        """Every dump directory under a session, sorted. The single discovery
+        primitive all consumers share, so a layout change lands once."""
+        sdir = self.session_dir(session_id)
+        if not sdir.is_dir():
+            return []
+        return sorted(p.name for p in sdir.iterdir() if p.is_dir())
 
     # ── write protocol ─────────────────────────────────────────────────
 
@@ -126,8 +144,11 @@ class DumpStore:
             raise ValueError(f"end_msg ({end_msg}) < start_msg ({start_msg})")
         sid = str(session_id)
         dump_id = f"{turn:04d}-{region_hash8(messages)}"
-        sdir = self.session_dir(sid)
-        sdir.mkdir(parents=True, exist_ok=True)
+        # D1: the PRODUCER owns the per-dump directory. Creating it here (and
+        # nothing else doing so) is what makes every consumer's directory scan
+        # find a real region.
+        ddir = self.dump_dir(sid, dump_id)
+        ddir.mkdir(parents=True, exist_ok=True)
         dpath = self.dump_path(sid, dump_id)
         mpath = self.meta_path(sid, dump_id)
 
@@ -154,7 +175,7 @@ class DumpStore:
             handle.flush()
             os.fsync(handle.fileno())
         # 3. fsync the directory so the content file entry itself is durable.
-        _fsync_dir(sdir)
+        _fsync_dir(ddir)
         # 4. only now flip complete:true via atomic rename.
         meta["complete"] = True
         self._atomic_write_json(mpath, meta)

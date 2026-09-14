@@ -33,6 +33,7 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -107,8 +108,19 @@ def _det_map_llm():
 
 def _load_transcripts(replay_dir) -> list:
     """Copy transcripts into a fresh temp dir (never read in place) and load their
-    message lists. Defaults to the committed synthetic fixtures."""
+    message lists. Defaults to the committed synthetic fixtures.
+
+    The COPY is mandatory and load-bearing: source files are read once as JSON,
+    re-serialized into a fresh temp directory, and only that copy is consumed —
+    the spec's "copied INTO the container, never read in place" rule holds even
+    when ``--replay-dir`` points at the repo's own fixtures.
+
+    NO CAP: every loaded file cycles across ticks (the previous ``[:3]`` cap made
+    a 5-file operator run report a count it never consumed). The consumed count is
+    what the receipt reports.
+    """
     src_dirs = [Path(replay_dir)] if replay_dir else [FIXTURES_DIR]
+    copied_root = Path(tempfile.mkdtemp(prefix="spec42-soak-transcripts-"))
     transcripts = []
     for src in src_dirs:
         for p in sorted(src.glob("*.json")):
@@ -119,8 +131,24 @@ def _load_transcripts(replay_dir) -> list:
             if msgs and "map_iou_transcript" in p.name:
                 continue  # map fixture is a driver, not a chat replay target
             if msgs:
+                (copied_root / p.name).write_text(
+                    json.dumps(obj, ensure_ascii=False), encoding="utf-8")
                 transcripts.append(msgs)
-    return transcripts[:3]
+    return transcripts
+
+
+def _tick_region(transcripts: list, tick: int, *, min_messages: int = 10) -> list:
+    """The message region a tick compacts, taken from the LOADED transcripts
+    (cycled so every file is consumed). A transcript shorter than
+    ``min_messages`` is cycled up so the existing invariant checks stay
+    meaningful. This is what makes ``--replay-dir`` genuinely drive the run."""
+    source = transcripts[tick % len(transcripts)]
+    if len(source) >= min_messages:
+        return copy.deepcopy(source)
+    out = []
+    while len(out) < min_messages:
+        out.extend(copy.deepcopy(source))
+    return out
 
 
 def _transcript_set_provenance(replay_dir) -> dict:
@@ -141,30 +169,63 @@ def _transcript_set_provenance(replay_dir) -> dict:
             "transcript_source": "operator" if files else "synthetic"}
 
 
-def run(*, turns: int, storage_root: Path, db, replay_dir=None) -> dict:
-    from hermes_state import SessionDB  # noqa: PLC0415
+def _container_provenance() -> dict | None:
+    """Container identity for the receipt, or None for a bare host run.
 
+    AC-9 requires every COMMITTED soak/drill receipt to identify the image or
+    commit it was produced from, and to fail if it was produced by a bare host
+    process. The container wrapper (``scripts/run_compaction_evals_in_container.sh``)
+    exports these; nothing is guessed when they are absent.
+    """
+    image = os.environ.get("HERMES_EVAL_CONTAINER_IMAGE")
+    if not image:
+        return None
+    return {
+        "container_image": image,
+        "container_image_id": os.environ.get("HERMES_EVAL_CONTAINER_IMAGE_ID", ""),
+        "container_image_digest": os.environ.get("HERMES_EVAL_CONTAINER_IMAGE_DIGEST", ""),
+        "container_commit": os.environ.get("HERMES_EVAL_CONTAINER_COMMIT", ""),
+        "container_runtime": os.environ.get("HERMES_EVAL_CONTAINER_RUNTIME", "docker"),
+        "container_command": os.environ.get("HERMES_EVAL_CONTAINER_COMMAND", ""),
+    }
+
+
+def run(*, turns: int, storage_root: Path, db, replay_dir=None) -> dict:
     store = DumpStore(storage_root)
     session_id = "soak-session"
     invariants = {}
     violations = []
     turn_log = []
     total_messages = 0
-    starter = _alternating_messages(20)
+
+    # The replay set is RESOLVED up front and drives every tick's region from the
+    # LOADED transcript content (never a hardcoded message generator). A
+    # resolved-but-empty set is reported, never papered over.
+    transcripts = _load_transcripts(replay_dir)
+    transcript_count = len(transcripts)
+    empty_replay_set = transcript_count == 0
+    if empty_replay_set:
+        transcripts = [_alternating_messages(20)]  # fallback, flagged in the receipt
 
     started = time.time()
-    expected = copy.deepcopy(_alternating_messages(20))
+    # The simulated long session GROWS: each tick appends the next transcript
+    # region after all previously-covered content, and the compaction window
+    # ADVANCES monotonically (covers.end_msg == the chunk's end offset, as the
+    # map update contract requires). Recompacting one fixed window every tick
+    # would leave covers pinned while the tick count climbed, and any honest
+    # cover-coherence check (AC-15) would then trip on the FIRST tick after a
+    # retire — a modelling error, not a pipeline one.
+    covered_end = -1
+    session_messages: list = []
     for tick in range(turns):
-        # Each pass is an independent compaction cycle over the same synthetic
-        # transcript (fresh copy — a long-session rotation between passes). The
-        # invariants under test are tick-local: a swap refuses an incomplete
-        # dump; the pipeline lock is held then released; the swap is a single
-        # batched mutation; the swapped list passes the alternation invariant;
-        # retiring advances covers.start; and a map update never regresses
-        # covers (MapRegressionError is a genuine failure, not expected).
-        workspace = copy.deepcopy(expected)
-        region_msgs = workspace[:10]
-        start_idx, end_idx = 0, 9
+        region_msgs = _tick_region(transcripts, tick)
+        session_messages = session_messages + copy.deepcopy(region_msgs)
+        start_idx = covered_end + 1
+        end_idx = len(session_messages) - 1
+        # The live window the pipeline sees is the whole session so far; the region
+        # under compaction is the newly-appended slice.
+        workspace = copy.deepcopy(session_messages)
+        region_msgs = workspace[start_idx:end_idx + 1]
 
         # LOCK_DISCIPLINE: acquire for the pass, release in finally.
         holder = f"pipeline:{session_id}"
@@ -221,11 +282,26 @@ def run(*, turns: int, storage_root: Path, db, replay_dir=None) -> dict:
             # MAP_BOUNDED: retire the swapped region -> covers advances, map drops it.
             cmap.retire(start_idx, end_idx)
             after = cmap.load()
-            if int(after["covers"]["start_msg"]) <= start_idx:
+            covers_after = after["covers"]
+            cs, ce = int(covers_after["start_msg"]), int(covers_after["end_msg"])
+            if cs <= start_idx:
                 violations.append(f"tick {tick}: retire did not advance covers.start_msg")
+            # AC-15: a bounded map's cover must be a NON-NEGATIVE range
+            # (start_msg <= end_msg). An inverted range means the retire
+            # off-by-one left a nonsensical window for every later consumer.
+            if cs > ce:
+                violations.append(
+                    f"tick {tick}: bounded-map cover incoherent after retire: "
+                    f"start_msg {cs} > end_msg {ce}")
+            if kept_episodes := after.get("episodes"):
+                for ep in kept_episodes:
+                    if int(ep["start_msg"]) < cs:
+                        violations.append(
+                            f"tick {tick}: retired episode {ep['start_msg']} remains "
+                            f"below covers.start_msg {cs}")
             total_messages += len(region_msgs)
             turn_log.append({
-                "tick": tick, "dump_id": dump_id,
+                "tick": tick, "dump_id": dump_id, "region_messages": len(region_msgs),
                 "swapped_len": len(swapped), "map_covers_after": after["covers"],
                 "map_entries_after": len(after["episodes"]),
             })
@@ -235,20 +311,31 @@ def run(*, turns: int, storage_root: Path, db, replay_dir=None) -> dict:
             db.release_pipeline_lock(session_id, holder)
     elapsed = time.time() - started
 
+    prov = _transcript_set_provenance(replay_dir)
     invariants = {
         "ordering_swap_refuses_incomplete": not any("refuse an incomplete" in v for v in violations),
         "lock_discipline_no_leak": not any("could not acquire" in v or "lock" in v.lower()
                                            and "acquire" in v for v in violations),
         "map_monotonic": not any("MapRegressionError" in v for v in violations),
         "map_bounded_after_retire": not any("retire did not advance" in v for v in violations),
+        "map_cover_coherent": not any("incoherent after retire" in v
+                                      or "remains below covers.start_msg" in v
+                                      for v in violations),
         "batched_single_mutation": not any("mutation count" in v for v in violations),
         "alternation_on_swap": not any("alternation violation" in v for v in violations),
+        # Non-vacuity guards: a soak that resolved no transcript, or whose region
+        # never came from the resolved set, proves nothing about replay traffic.
+        "transcripts_resolved": not empty_replay_set,
+        "replay_drove_the_pass": bool(turn_log) and all(
+            t["region_messages"] >= 10 for t in turn_log),
     }
-    prov = _transcript_set_provenance(replay_dir)
     return {
         "mode": "soak",
         "turns_run": turns,
-        "transcripts": _load_transcripts(replay_dir) and ["<transcripts loaded>"],
+        "container": _container_provenance(),
+        "transcripts_consumed": transcript_count,
+        "region_messages_per_pass": (turn_log[-1]["region_messages"] if turn_log else 0),
+        "turn_log_region_messages": sorted({t["region_messages"] for t in turn_log}),
         "transcript_count": prov["transcript_count"],
         "transcript_sha256": prov["transcript_sha256"],
         "transcript_source": prov["transcript_source"],
@@ -265,12 +352,22 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--turns", type=int, default=120)
     parser.add_argument("--replay-dir", default=None)
+    parser.add_argument("--storage", default=None,
+                        help="storage root to use (default: a fresh temp dir). "
+                             "Pointing this at a real path lets a falsifier read "
+                             "back the dump journals the run produced.")
     parser.add_argument("--json", default="evals/compaction/results/soak_results.json")
     args = parser.parse_args()
 
-    with tempfile.TemporaryDirectory(prefix="spec42-soak-") as tmp:
+    tmp_ctx = tempfile.TemporaryDirectory(prefix="spec42-soak-")
+    tmp = tmp_ctx.name
+    if args.storage:
+        root = Path(args.storage)
+        root.mkdir(parents=True, exist_ok=True)
+    else:
         root = Path(tmp) / "storage"
         root.mkdir(parents=True, exist_ok=True)
+    try:
         import os
         old_home = os.environ.get("HERMES_HOME")
         os.environ["HERMES_HOME"] = str(Path(tmp) / "home")
@@ -287,6 +384,8 @@ def main() -> int:
                 os.environ.pop("HERMES_HOME", None)
             else:
                 os.environ["HERMES_HOME"] = old_home
+    finally:
+        tmp_ctx.cleanup()
     text = json.dumps(result, indent=2)
     print(text)
     Path(args.json).parent.mkdir(parents=True, exist_ok=True)
