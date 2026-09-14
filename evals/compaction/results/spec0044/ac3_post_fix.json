@@ -1,0 +1,47 @@
+{
+  "ac": "AC-3",
+  "verdict": "PASS",
+  "note": "",
+  "tree": {
+    "commit": "b064d4fb537944c8d3d336e38612582e9022183c",
+    "branch": "wt/t_c323acdf",
+    "dirty": true
+  },
+  "evidence": {
+    "storage_root": "/tmp/spec44-ac3-argaa97f/storage",
+    "planted_regions": {
+      "0-3": "0001-cb3ffa5d",
+      "10-13": "0002-1f3bc5cb"
+    },
+    "idle_computed_window": [
+      0,
+      3
+    ],
+    "record": {
+      "ran": true,
+      "queued": 0,
+      "updated": false,
+      "map_error": "map update did not return a map object: '{}'",
+      "dumped": "0001-cb3ffa5d",
+      "dump_window": [
+        0,
+        3
+      ],
+      "dumped_exists": true,
+      "no_extraction": true,
+      "idle_window": [
+        0,
+        3
+      ],
+      "swapped_regions": [
+        "0001-cb3ffa5d"
+      ]
+    },
+    "swapped_regions": [
+      "0001-cb3ffa5d"
+    ],
+    "checkpoint_rows": 1,
+    "stale_region_still_live": true,
+    "matching_region_swapped": true
+  }
+}

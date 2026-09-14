@@ -99,8 +99,8 @@ class TestAC1DumpRoundTrip:
             sys.exit(0)  # a swap that proceeds on an incomplete dump must NOT get here
             """
         )
-        sdir = tmp_path / "sess-kill"
-        dump_ids = [p.name[: -len(".jsonl")] for p in sdir.glob("*.jsonl")]
+        # D1: discovery walks one level down through the store's own primitive.
+        dump_ids = DumpStore(tmp_path).dump_ids("sess-kill")
         assert dump_ids, "crash must leave the content + tombstone meta behind"
         r2 = subprocess.run(
             [sys.executable, "-c", recovery, str(tmp_path), dump_ids[0]],

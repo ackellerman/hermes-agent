@@ -57,18 +57,63 @@ def _alternating_messages(n: int = 8) -> list:
     return out
 
 
-# ── production-caller reachability ────────────────────────────────────
+# ── production-caller reachability (behavior, not source text) ────────
+#
+# F10/AC-13: these two checks previously read ``agent/*.py`` as text and asserted
+# a substring — the pattern root AGENTS.md bans, because it passes against a
+# mis-wired call site and fails on a correct refactor. They now invoke the real
+# production seam and assert on the produced artifacts.
 
 
-def test_backstop_module_calls_gate_and_swap_in_production():
-    src = Path("agent/compaction_backstop.py").read_text()
-    assert "backstop_gate(" in src, "backstop_gate must have a production caller"
-    assert "swap_region(" in src, "swap_region must have a production caller"
+def test_backstop_seam_routes_through_gate_and_swap_in_production(tmp_path):
+    """Drive the real overflow seam with a complete, gate-passed region: the
+    production path must reach ``swap_region`` (a swapped message list comes
+    back) and must consult the gate. A revert that drops either call is caught
+    here by the RESULT, not by grepping for a function name."""
+    messages = _alternating_messages(8)
+    agent = _FakeAgent(True, tmp_path)
+    # A complete dump of messages[4..7] plus a gate-passed checkpoint: the only
+    # way a swapped list can come back is if the seam called the gate and then
+    # swap_region. The gate is stubbed to a verdict, so what is under test is the
+    # production wiring, not the model.
+    store = DumpStore(tmp_path)
+    ref = store.write_dump(agent.session_id, messages[4:8], start_msg=4,
+                           end_msg=7, turn=0)
+    ddir = store.dump_dir(agent.session_id, ref.dump_id)
+    (ddir / "stage_c.json").write_text(json.dumps({
+        "decisions": [{"what": "Postgres", "cites": [[ref.dump_id, 5, 6]]}],
+        "commitments": "null_reason: none", "artifacts": "null_reason: none",
+        "world_effects": "null_reason: none", "insights": "null_reason: none",
+        "instructions_and_corrections": "null_reason: none",
+        "open_threads": "null_reason: none", "links": "null_reason: none",
+        "narrative": "db work", "confidence": 0.9,
+        "coverage": {"complete": True},
+    }))
+    (ddir / "gate.json").write_text(json.dumps({"swap_eligible": True, "findings": []}))
+
+    action, swapped, telemetry = CompactionBackstop(agent).decide_and_swap(messages)
+    assert action == "swap", f"the seam did not reach the swap path (action={action!r})"
+    assert swapped is not None and len(swapped) < len(messages), \
+        "a swap must replace the region with one checkpoint message"
+    assert telemetry.get(TELEMETRY_DEGRADED) is False
 
 
-def test_conversation_compression_wires_the_backstop_seam():
-    src = Path("agent/conversation_compression.py").read_text()
-    assert "maybe_backstop_swap" in src, "the overflow dispatch must consult the backstop"
+def test_overflow_dispatch_consults_the_backstop_end_to_end(tmp_path):
+    """The overflow dispatch must produce the backstop's result on the live path.
+    Asserting the OUTCOME (the degraded telemetry the backstop stamps onto the
+    agent) is behavior; reading the module's source for ``maybe_backstop_swap``
+    is not."""
+    messages = _alternating_messages()
+    agent = _FakeAgent(True, tmp_path / "on")
+    out = _run_summary_dispatch(
+        agent, messages, _stamp_legacy_compress([]), {}, commit_fence=None,
+        attempt_generation=0, hard_cancel_event=None)
+    # No ready region -> the dispatch still completes via the legacy path AND
+    # carries the backstop's verdict, which only the consulted backstop writes.
+    assert out is not None
+    tel = agent._compaction_backstop_telemetry
+    assert tel[TELEMETRY_DEGRADED] is True
+    assert tel[TELEMETRY_DEGRADATION_REASON] == "extraction_incomplete"
 
 
 # ── AC-19b byte-identity at the dispatch seam ─────────────────────────
@@ -179,8 +224,9 @@ def test_backstop_reaches_swap_when_a_ready_checkpoint_exists(tmp_path):
     dump_id = ref.dump_id
     sid = agent.session_id
     # Extraction + gate artifacts the seam scans for readiness.
-    ddir = root / sid / dump_id
-    ddir.mkdir(parents=True, exist_ok=True)
+    # D2: write_dump owns the per-dump directory; the harness plants only the
+    # artifacts the extraction/gate stages produce.
+    ddir = store.dump_dir(sid, dump_id)
     (ddir / "stage_c.json").write_text(json.dumps({
         "decisions": [{"what": "Postgres", "cites": [[dump_id, 5, 6]]}],
         "commitments": "null_reason: none",
@@ -211,8 +257,8 @@ def test_backstop_rejects_ready_dump_for_stale_window(tmp_path):
     # was created for an earlier [0..3] window in the same session.
     store = DumpStore(tmp_path)
     ref = store.write_dump(agent.session_id, messages[:4], start_msg=0, end_msg=3, turn=0)
-    ddir = tmp_path / agent.session_id / ref.dump_id
-    ddir.mkdir(parents=True, exist_ok=True)
+    # D2: the per-dump directory comes from write_dump, not a test-side mkdir.
+    ddir = store.dump_dir(agent.session_id, ref.dump_id)
     (ddir / "stage_c.json").write_text(json.dumps({
         "decisions": [], "commitments": "null_reason: none", "artifacts": "null_reason: none",
         "world_effects": "null_reason: none", "insights": "null_reason: none",
