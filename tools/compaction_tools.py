@@ -43,11 +43,21 @@ def _session_transcript_reader():
     ``(session_id, start, end) -> List[dict]`` slicing by message index, or None
     when the session DB surface is unavailable at call time. The writer seam is
     ``divert_session_transcript_jsonl``; the primary read is
-    ``SessionDB.get_messages`` (hermes_state_messages.py:628)."""
+    ``SessionDB.get_messages`` (hermes_state_messages.py:628).
+
+    The read binds the shared per-path SessionDB via
+    ``hermes_state_registry.acquire`` (the same pattern `tools/delegate_tool.py`
+    uses to open a child's transcript handle) and releases it in a finally —
+    never a bare ``SessionDB(session_id)`` (the first positional is ``db_path``,
+    not the session id). ``acquire()`` no-arg resolves the live state.db path at
+    call time, honoring a runtime HERMES_HOME redirect (test isolation)."""
     def reader(session_id, start, end):
-        from hermes_state import SessionDB
-        db = SessionDB(session_id)
-        msgs = db.get_messages(session_id, include_inactive=False) or []
+        from hermes_state_registry import acquire, release_or_close
+        db = acquire()
+        try:
+            msgs = db.get_messages(session_id, include_inactive=False) or []
+        finally:
+            release_or_close(db)
         lo = int(start or 0)
         hi = len(msgs) - 1 if end is None else int(end)
         return [m for m in msgs[lo:hi + 1]
