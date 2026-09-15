@@ -123,6 +123,10 @@ class IdlePipelinePass:
                 llm_call = self._default_llm_call()
             record: Dict[str, Any] = {"ran": True}
             now = time.time()
+            # Setup: adopt pre-D1 flat dumps into the canonical per-dump layout
+            # (SPEC-0045 R1b) — one cheap idempotent probe; a failure logs and
+            # leaves the flat pair in place, never wedging the pass.
+            self._adopt_flat_dumps(record)
             # 0. drain one queued degraded region (AC-24), if models reachable.
             self._drain_queued(record, messages)
             # 1. map update over the un-covered tail, with real budget accounting.
@@ -146,6 +150,22 @@ class IdlePipelinePass:
                     db.release_pipeline_lock(self.session_id, holder)
                 except Exception:  # noqa: BLE001
                     pass
+
+    # ── stage: setup — flat-dump adoption (SPEC-0045 R1b) ─────────────────
+
+    def _adopt_flat_dumps(self, record: Dict[str, Any]) -> None:
+        """One-time adoption of pre-D1 flat dumps into ``<sid>/<dump_id>/`` at
+        the first storage touch of the pass (SPEC-0045 R1b). A failure logs and
+        leaves the flat pair on disk; the pass never wedges on it."""
+        from agent.compaction_dump import DumpStore
+        try:
+            adopted = DumpStore(Path(self.storage_root)).ensure_layout(self.session_id)
+        except Exception as exc:  # noqa: BLE001 — adoption must never wedge a pass
+            logger.warning("flat-dump adoption failed (%s): %s", self.session_id, exc)
+            record["adopt_error"] = str(exc)
+            return
+        if adopted:
+            record["adopted_dumps"] = adopted
 
     # ── stage: queue drain (AC-24) ───────────────────────────────────────
 

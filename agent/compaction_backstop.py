@@ -262,6 +262,15 @@ class CompactionBackstop:
             return ("legacy_summary", None,
                     {TELEMETRY_DEGRADED: False, TELEMETRY_DEGRADATION_REASON: None})
         expected_window = self._current_compression_window()
+        # SPEC-0045 R1b: adopt pre-D1 flat dumps into the canonical per-dump
+        # layout before any directory scan looks for regions (both producers
+        # share the one-time adoption; idempotent, failure logs and leaves the
+        # flat pair in place).
+        from agent.compaction_dump import DumpStore
+        try:
+            DumpStore(self._storage_root()).ensure_layout(self._session_id())
+        except Exception as exc:  # noqa: BLE001 — adoption must never wedge the backstop
+            logger.warning("flat-dump adoption failed (%s): %s", self._session_id(), exc)
         from agent.compaction_swap import backstop_gate
         decision = backstop_gate(
             self._cfg(), getattr(self.agent, "db", None), self._session_id(),
