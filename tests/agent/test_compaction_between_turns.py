@@ -230,6 +230,7 @@ class TestACA2PacketIdentity:
         a = _agent(tmp_path)
         a._session_messages = messages
         a._compaction_stage_llms = _stage_llms()
+        _plant_map(tmp_path)  # SPEC-0047 D3: extraction refuses a mapless (0..0) slice
         rec = between_turns_pass(a, llm_call=lambda _p: "{}")
         assert rec.get("ran") is True
         staged_hash = rec.get("packet_hash")
@@ -407,6 +408,7 @@ class TestACA4NoMidTurnMutation:
         a._session_messages = messages
         snapshot = [dict(m) for m in messages]
         a._compaction_stage_llms = _stage_llms()
+        _plant_map(tmp_path)  # SPEC-0047 D3: extraction refuses a mapless (0..0) slice
         rec = between_turns_pass(a, llm_call=lambda _p: "{}")
         assert rec.get("ran") is True
         assert messages == snapshot, \
@@ -529,6 +531,7 @@ class TestPendingSwapStore:
     def test_schema_versioned(self, tmp_path):
         a = _agent(tmp_path)
         a._compaction_stage_llms = _stage_llms()
+        _plant_map(tmp_path)  # SPEC-0047 D3: extraction refuses a mapless (0..0) slice
         rec = between_turns_pass(a, llm_call=lambda _p: "{}")
         record = read_pending_swap(tmp_path, "sess")
         assert record["schema_version"] == 1
@@ -542,6 +545,7 @@ class TestPendingSwapStore:
     def test_staged_record_carries_region_refs_and_gate_digest(self, tmp_path):
         a = _agent(tmp_path)
         a._compaction_stage_llms = _stage_llms()
+        _plant_map(tmp_path)  # SPEC-0047 D3: extraction refuses a mapless (0..0) slice
         between_turns_pass(a, llm_call=lambda _p: "{}")
         record = read_pending_swap(tmp_path, "sess")
         assert record["region_refs"] and record["region_refs"][0]["dump_id"]
