@@ -136,13 +136,32 @@ class IdlePipelinePass:
 
     # ── execution ────────────────────────────────────────────────────────
 
-    def run(self, messages, llm_call=None) -> Dict[str, Any]:
+    def run(self, messages, llm_call=None, bypass: bool = False) -> Dict[str, Any]:
         """One pass: acquire lock (AC-14), then in order per D1:
         queue-drain -> map update -> dump-at-boundary -> extraction cycle ->
         gate + loss probe -> batched swap sweep. Returns a telemetry record;
         raises nothing — a failed stage logs and parks, the live context is
         untouched (except the boundary sweep, whose result is surfaced in
-        ``record["swapped_messages"]``)."""
+        ``record["swapped_messages"]``).
+
+        SPEC-0045 R5 (``bypass=True`` — the idle gate was waived at the live
+        compression threshold): the pass completes the FULL cycle for the
+        current window — dump -> extract -> gate -> swap sweep — in this same
+        pass. Rationale: the same turn's preflight compression still sees
+        over-threshold context; if the bypass pass only dumped, the backstop
+        prose-compacted the same turn, the live list was replaced by the
+        summary, and the queued window indices no longer mapped to live
+        messages (the dump could never swap). Mechanism: extraction for the
+        freshly dumped bypass region runs IN THIS PASS, waiving the
+        once-per-pass extraction budget of one region ONLY for that region;
+        ``extraction.cooldown_seconds`` keeps its semantics — it applies to
+        QUEUED drains, not the bypass region (the boundary is now, not idle
+        background). The session budget is NOT waived. If extraction parks
+        (StageCheckError / models unreachable), the pass returns normally —
+        the same turn's backstop then degrades to prose (the existing
+        ``decide_and_swap`` path): the bounded fallback; nothing raises into
+        the live path. Telemetry: ``bypass_swapped`` / ``bypass_parked``.
+        """
         if not self.enabled:
             return {"ran": False, "reason": "disabled"}
         db = getattr(self.agent, "db", None)
@@ -160,6 +179,8 @@ class IdlePipelinePass:
             if llm_call is None:
                 llm_call = self._default_llm_call()
             record: Dict[str, Any] = {"ran": True}
+            if bypass:
+                record["bypass"] = True
             now = time.time()
             # Setup: adopt pre-D1 flat dumps into the canonical per-dump layout
             # (SPEC-0045 R1b) — one cheap idempotent probe; a failure logs and
@@ -171,12 +192,28 @@ class IdlePipelinePass:
             self._update_map(messages, llm_call, record)
             # 2. dump-onto-current-window at an over-threshold idle boundary (AC-20).
             self._dump_current_window(messages, record)
+            # 2b. R5 bypass full-cycle: the freshly dumped bypass region is
+            #     extracted IN THIS PASS (cooldown waived for it; budget and
+            #     every other gate unchanged), then the gate targets it and the
+            #     swap sweep runs as usual — so the same turn's backstop finds
+            #     a ready region instead of prose-compacting the live window.
+            bypass_dump_id = record.get("dumped") if bypass else None
+            if bypass_dump_id:
+                self._extract_bypass_region(bypass_dump_id, record)
             # 3. scheduled + persisted extraction for dumped-unextracted regions (AC-22).
             self._schedule_extraction(record)
             # 4. always-on gate + loss probe, persisted gate artifact (AC-23).
-            self._run_gate(record)
+            self._run_gate(record, target_dump_id=bypass_dump_id)
             # 5. batched swap sweep at the idle boundary (D4, AC-25).
             self._run_swap_sweep(messages, record)
+            if bypass_dump_id:
+                swapped = record.get("swapped_regions") or []
+                if bypass_dump_id in swapped:
+                    record["bypass_swapped"] = [bypass_dump_id]
+                elif "bypass_parked" not in record:
+                    # Extracted + gated but not swapped (gate flagged / sweep
+                    # refused): the region stays live; the backstop degrades.
+                    record["bypass_parked"] = [bypass_dump_id]
             self.agent._compaction_pipeline_last_pass_ts = now
             return record
         except Exception as exc:  # noqa: BLE001 — a failed pass parks; live path unaffected
@@ -343,6 +380,39 @@ class IdlePipelinePass:
             logger.warning("idle dump failed (%s): %s", self.session_id, exc)
             record["dump_error"] = str(exc)
 
+    def _extract_bypass_region(self, dump_id: str, record: Dict[str, Any]) -> None:
+        """R5 full-cycle: run the A->B->C cycle for the freshly dumped bypass
+        region IN THIS PASS.
+
+        Waived for THIS region only: the once-per-pass extraction budget of one
+        region and ``extraction.cooldown_seconds`` (cooldown applies to QUEUED
+        drains — the bypass boundary is now, not idle background). The session
+        budget is NOT waived, nor are models-reachable / dump-complete gates.
+        A park (StageCheckError / models unreachable / budget / no complete
+        dump) is recorded as ``bypass_parked`` telemetry; nothing raises into
+        the live path — the same turn's backstop degrades to prose instead."""
+        from agent.compaction_dump import DumpStore
+        store = DumpStore(Path(self.storage_root))
+        if self._budget_exhausted():
+            record["bypass_parked"] = [dump_id]
+            record["budget_blocked"] = "bypass_extract"
+            return
+        if not self._models_reachable():
+            record["bypass_parked"] = [dump_id]
+            record["models_unreachable"] = True
+            return
+        if not store.is_complete(self.session_id, dump_id):
+            record["bypass_parked"] = [dump_id]
+            return
+        meta = store.read_meta(self.session_id, dump_id) or {}
+        window = (int(meta.get("start_msg", 0)), int(meta.get("end_msg", 0)))
+        stage_c = self._run_extraction_for_window(window, None,
+                                                  bypass_dump_id=dump_id)
+        if stage_c is not None:
+            record["bypass_extracted"] = dump_id
+        else:
+            record.setdefault("bypass_parked", [dump_id])
+
     # ── stage: scheduled + persisted extraction (AC-22) ─────────────────
 
     def _extraction_cooldown_ok(self) -> bool:
@@ -368,10 +438,15 @@ class IdlePipelinePass:
     def _run_extraction_for_window(self, window: Optional[tuple],
                                    row: Optional[dict],
                                    messages=None,
+                                   bypass_dump_id: Optional[str] = None,
                                    ) -> Optional[Dict[str, Any]]:
         """Run A->B->C for the dumped region covering ``window``; return the
         Stage-C checkpoint on success (so the caller can drain the row), None
-        on a park/failure. Honors cooldown + budget.
+        on a park/failure. Honors cooldown + budget — EXCEPT for the R5 bypass
+        region (``bypass_dump_id``): the bypass region's extraction runs in the
+        same pass as its dump (cooldown applies to QUEUED drains, not the
+        bypass region; SPEC-0045 R5), so the once-per-pass and cooldown gates
+        are waived for exactly that dump id. Budget still binds.
 
         ``row`` is the queued row for queue-drain. AC-24 fresh-dump fallback:
         when the row's window has no complete dump (its dump was superseded by a
@@ -382,18 +457,24 @@ class IdlePipelinePass:
         from agent.compaction_extract import StageCheckError, run_extraction_cycle
         if not self._models_reachable():
             return None  # nobody can run A->B->C without a resolvable route
-        if not self._extraction_cooldown_ok():
+        is_bypass = bypass_dump_id is not None
+        if not is_bypass and not self._extraction_cooldown_ok():
             return None
         if self._budget_exhausted():
             return None
         from agent.compaction_dump import DumpStore
         store = DumpStore(Path(self.storage_root))
-        candidate = self._complete_dump_for_window(store, window)
-        if candidate is None and row is not None and messages is not None:
-            fresh = self._dump_fresh_window(messages)
-            if fresh is None:
+        if is_bypass:
+            candidate = store.dump_dir(self.session_id, bypass_dump_id)
+            if not candidate.is_dir():
                 return None
-            candidate = self._complete_dump_for_window(store, fresh)
+        else:
+            candidate = self._complete_dump_for_window(store, window)
+            if candidate is None and row is not None and messages is not None:
+                fresh = self._dump_fresh_window(messages)
+                if fresh is None:
+                    return None
+                candidate = self._complete_dump_for_window(store, fresh)
         if candidate is None:
             return None
         try:
@@ -455,16 +536,27 @@ class IdlePipelinePass:
 
     # ── stage: gate + loss probe (AC-23) ────────────────────────────────
 
-    def _run_gate(self, record: Dict[str, Any]) -> None:
+    def _run_gate(self, record: Dict[str, Any], target_dump_id: Optional[str] = None) -> None:
         """Run the always-on gate over {checkpoint + dump} and persist the gate
         artifact next to the checkpoint. A loss-probe gap flips the region back
-        to Stage B (its stage_c is removed so a later pass re-extracts)."""
+        to Stage B (its stage_c is removed so a later pass re-extracts).
+
+        ``target_dump_id`` (SPEC-0045 R5 bypass full-cycle): when set, the gate
+        examines that dump FIRST so the freshly extracted bypass region can be
+        gated and swapped in the same pass; if it has no stage_c yet (extraction
+        parked) the scan continues with the ordinary ordering."""
         from agent.compaction_dump import DumpStore
         from agent.compaction_verify import (
             generate_loss_probe_questions, run_loss_probe, run_review_gate)
         store = DumpStore(Path(self.storage_root))
         sdir = store.session_dir(self.session_id)
-        for d in store.dump_dirs(self.session_id):
+        dirs = store.dump_dirs(self.session_id)
+        if target_dump_id is not None:
+            target_dir = store.dump_dir(self.session_id, target_dump_id)
+            if target_dir in dirs:
+                dirs.remove(target_dir)
+                dirs.insert(0, target_dir)
+        for d in dirs:
             if (d / "gate.json").is_file():
                 continue
             stage_c = _read_json(d / "stage_c.json")
@@ -632,7 +724,4 @@ def idle_pipeline_sweep(agent: Any, messages, idle_gap_seconds: float) -> Dict[s
     bypass = sweep._bypass_fires(idle_gap_seconds, messages)
     if not sweep.gates_pass(idle_gap_seconds, messages=messages):
         return {"ran": False, "reason": "gates"}
-    record = sweep.run(messages)
-    if bypass:
-        record["bypass"] = True
-    return record
+    return sweep.run(messages, bypass=bypass)
