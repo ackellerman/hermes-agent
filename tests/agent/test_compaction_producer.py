@@ -453,3 +453,108 @@ class TestAC26Composition:
         # reintroduced the pre-swap content.
         assert len(out.messages) == 1
         assert "[compaction_checkpoint]" in out.messages[0]["content"]
+
+
+# ── S1 (SPEC-0044 review finding): the swap's map retire must hit the REAL map ──
+
+
+class TestMapRetireHitsRealMap:
+    """PINNING TEST for review finding S1 (t_b939d649).
+
+    ``swap_sweep`` built its map root as ``dump_store.root / session_id`` and
+    passed the session id to ``CompactionMap`` AGAIN, which joins the session id
+    itself (``compaction_map.py``: ``root / session_id / "map.json"``). Two
+    production consequences, both asserted here:
+
+    (i)  ``CompactionMap.save()`` mkdirs a phantom ``<root>/<sid>/<sid>/``
+         directory carrying no ``<dump_id>.meta.json`` — every consumer's
+         dump-directory scan then sees it as a region candidate (the F1 defect
+         class re-entering through a side door);
+    (ii) the real map never retires: its ``covers`` never advance, so the map
+         grows unbounded in production.
+
+    Deterministic: stage LLMs injected, zero test-side ``mkdir``, and the map is
+    planted through the producer's own ``CompactionMap.save``. The swap itself is
+    asserted non-vacuous (checkpoint row present) so the test cannot pass by
+    never reaching the retire.
+    """
+
+    WINDOW = (56, 59)
+    N = 60
+
+    def _map_llm(self):
+        """Deterministic ``map_update`` callable: echoes the chunk's own cover."""
+        def map_llm(payload):
+            data = json.loads(payload[1]["content"])
+            chunk = data["chunk"]
+            return json.dumps({
+                "schema_version": 1,
+                "covers": {"start_msg": int(chunk["start_msg"]),
+                           "end_msg": int(chunk["end_msg"])},
+                "episodes": [{"name": "ep", "start_msg": int(chunk["start_msg"]),
+                              "end_msg": int(chunk["end_msg"]), "topic": "work"}],
+                "entities": [], "edges": [],
+            })
+        return map_llm
+
+    def test_swap_retire_advances_real_map_and_leaves_no_meta_less_dir(self, tmp_path):
+        from agent.compaction_map import CompactionMap
+
+        messages = _alternating_messages(self.N)
+        a = _agent(root=tmp_path)
+        a.context_compressor = SimpleNamespace(
+            last_compress_window=self.WINDOW,
+            _compress_window=lambda _m, _w=self.WINDOW: _w)
+        a.compaction_pipeline_gate_always_on = False  # keep the gate-passed artifact
+        a._compaction_stage_llms = _stage_llms(tmp_path, "sess", "placeholder", commit=True)
+
+        # Plant the map the way production does (producer-owned path — not a mkdir).
+        real_map = CompactionMap(tmp_path, "sess")
+        real_map.save({
+            "schema_version": 1,
+            "covers": {"start_msg": 0, "end_msg": self.N - 1},
+            "episodes": [{"start_msg": 0, "end_msg": self.N - 1, "name": "ep0"}],
+            "entities": [], "edges": [],
+        })
+        before = real_map.load()["covers"]
+        assert int(before["end_msg"]) == self.N - 1, "fixture precondition: real map planted"
+
+        rec = IdlePipelinePass(a).run(messages, llm_call=self._map_llm())
+
+        # Non-vacuity: the sweep actually reached the retire (it swapped the region).
+        swapped = rec.get("swapped_messages") or []
+        assert rec.get("swapped_regions"), f"sweep must swap the current window: {rec}"
+        assert any("[compaction_checkpoint]" in str(m.get("content", "")) for m in swapped), \
+            f"swapped list must carry the checkpoint row: {rec}"
+
+        store = DumpStore(tmp_path)
+        sdir = store.session_dir("sess")
+
+        # (i) every directory under the session dir is a REAL dump directory.
+        offenders = []
+        for p in sorted(sdir.iterdir()):
+            if not p.is_dir():
+                continue
+            if not (p / f"{p.name}.meta.json").is_file():
+                offenders.append(p.name)
+        assert offenders == [], (
+            "directory discovered as a region candidate but carrying no "
+            f"<dump_id>.meta.json (phantom map dir — finding S1): {offenders}"
+        )
+        assert all(store.is_complete("sess", d) for d in store.dump_ids("sess")), \
+            "dump_ids must expose only real dumps"
+
+        # (ii) the retire hit the REAL map: covers ADVANCED past the swapped window.
+        after = real_map.load()["covers"]
+        assert int(after["start_msg"]) > int(before["start_msg"]) or \
+            int(after["end_msg"]) > int(before["end_msg"]), (
+            "swap retire did not reach the real map at <root>/<sid>/map.json — "
+            f"covers stayed {before} (now {after}); finding S1"
+        )
+        assert int(after["start_msg"]) == self.WINDOW[1] + 1, (
+            f"retire must advance covers.start_msg to just past the swapped window "
+            f"{self.WINDOW}, got {after}"
+        )
+        # The phantom path must not exist at all.
+        assert not (sdir / "sess" / "map.json").is_file(), \
+            "map retired at <root>/<sid>/<sid>/map.json — double session-id prefix"

@@ -115,12 +115,9 @@ class CompactionBackstop:
         """
         if expected_window is None:
             return None
-        session_dir = self._storage_root() / self._session_id()
-        if not session_dir.is_dir():
-            return None
-        for child in sorted(session_dir.iterdir()):
-            if not child.is_dir():
-                continue
+        from agent.compaction_dump import DumpStore
+        store = DumpStore(self._storage_root())
+        for child in store.dump_dirs(self._session_id()):
             dump_id = child.name
             stage_c = child / "stage_c.json"
             gate = child / "gate.json"
@@ -133,8 +130,6 @@ class CompactionBackstop:
                 continue
             if gate_verdict.get("swap_eligible") is not True:
                 continue
-            from agent.compaction_dump import DumpStore
-            store = DumpStore(self._storage_root())
             if not store.is_complete(self._session_id(), dump_id):
                 continue
             meta = store.read_meta(self._session_id(), dump_id) or {}

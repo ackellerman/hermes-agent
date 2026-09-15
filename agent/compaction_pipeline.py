@@ -296,11 +296,8 @@ class IdlePipelinePass:
         """The complete dump directory whose meta window equals ``window``, or
         None. ``None`` window means "any complete dump" (queue-drain lookup by
         dump_id has no window to match)."""
-        sdir = store.session_dir(self.session_id)
-        if not sdir.is_dir():
-            return None
         want = (int(window[0]), int(window[1])) if window else None
-        for d in sorted(p for p in sdir.iterdir() if p.is_dir()):
+        for d in store.dump_dirs(self.session_id):
             meta = store.read_meta(self.session_id, d.name) or {}
             if not meta.get("complete"):
                 continue
@@ -383,10 +380,7 @@ class IdlePipelinePass:
         A region whose stage_c exists is already extracted; skip it."""
         from agent.compaction_dump import DumpStore
         store = DumpStore(Path(self.storage_root))
-        sdir = store.session_dir(self.session_id)
-        if not sdir.is_dir():
-            return
-        for d in sorted(p for p in sdir.iterdir() if p.is_dir()):
+        for d in store.dump_dirs(self.session_id):
             if (d / "stage_c.json").is_file():
                 continue
             meta = store.read_meta(self.session_id, d.name) or {}
@@ -412,9 +406,7 @@ class IdlePipelinePass:
             generate_loss_probe_questions, run_loss_probe, run_review_gate)
         store = DumpStore(Path(self.storage_root))
         sdir = store.session_dir(self.session_id)
-        if not sdir.is_dir():
-            return
-        for d in sorted(p for p in sdir.iterdir() if p.is_dir()):
+        for d in store.dump_dirs(self.session_id):
             if (d / "gate.json").is_file():
                 continue
             stage_c = _read_json(d / "stage_c.json")
@@ -474,27 +466,25 @@ class IdlePipelinePass:
         store = DumpStore(Path(self.storage_root))
         window = self._current_compression_window(messages)
         record["idle_window"] = list(window) if window is not None else None
-        sdir = store.session_dir(self.session_id)
         ready = []
-        if sdir.is_dir():
-            for d in sorted(p for p in sdir.iterdir() if p.is_dir()):
-                stage_c = _read_json(d / "stage_c.json")
-                gate = _read_json(d / "gate.json")
-                if stage_c is None or gate is None:
-                    continue
-                if gate.get("swap_eligible") is not True:
-                    continue
-                meta = store.read_meta(self.session_id, d.name) or {}
-                if not meta.get("complete"):
-                    continue
-                try:
-                    dw = (int(meta.get("start_msg", 0)), int(meta.get("end_msg", 0)))
-                except (TypeError, ValueError):
-                    continue
-                if window is not None and dw != window:
-                    continue  # stale-window discipline: never swap the wrong window
-                ready.append({"dump_id": d.name, "meta": meta,
-                              "checkpoint": stage_c, "gate": gate})
+        for d in store.dump_dirs(self.session_id):
+            stage_c = _read_json(d / "stage_c.json")
+            gate = _read_json(d / "gate.json")
+            if stage_c is None or gate is None:
+                continue
+            if gate.get("swap_eligible") is not True:
+                continue
+            meta = store.read_meta(self.session_id, d.name) or {}
+            if not meta.get("complete"):
+                continue
+            try:
+                dw = (int(meta.get("start_msg", 0)), int(meta.get("end_msg", 0)))
+            except (TypeError, ValueError):
+                continue
+            if window is not None and dw != window:
+                continue  # stale-window discipline: never swap the wrong window
+            ready.append({"dump_id": d.name, "meta": meta,
+                          "checkpoint": stage_c, "gate": gate})
         if not ready:
             return
         from agent.compaction_rehydrate import StubRegistry
