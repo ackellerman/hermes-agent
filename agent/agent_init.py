@@ -1892,6 +1892,9 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     pp = dict(_load_pp_cfg().get("compaction_pipeline", {}) or {})
     agent.compaction_pipeline_enabled = bool(pp.get("enabled", False))
     agent.compaction_pipeline_storage_root = str(pp.get("storage_root", "/tmp/hermes-compaction"))
+    # SPEC-0046: between-turns sweep flag (default True per operator ruling).
+    agent.compaction_pipeline_between_turns_sweep = bool(
+        pp.get("between_turns_sweep", True))
     _map_cfg = pp.get("map", {}) or {}
     agent.compaction_pipeline_map_idle_after_seconds = float(_map_cfg.get("idle_update_after_seconds", 20))
     agent.compaction_pipeline_map_cooldown_seconds = float(_map_cfg.get("cooldown_seconds", 120))

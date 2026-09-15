@@ -149,14 +149,16 @@ def _pipeline_idle_sweep(agent: Any, out: CompactionOutcome) -> None:
     sweep). Default OFF — with ``compaction_pipeline.enabled`` false this is a
     no-op that touches nothing (AC-19). Never raises into the live path.
 
-    AC-26 (D5): when the sweep swaps a region, the adopted message list is
-    installed on ``out.messages`` and ``out.pipeline_swapped`` marks the covered
-    window so the legacy idle summarizer for that same window is suppressed —
-    no region is double-mutated in one turn-start.
+    SPEC-0046: BEFORE the normal pass, a staged pending swap whose packet hash
+    matches the live packet is applied as this turn's single prefix mutation
+    (AC-A3) and the record is cleared. A mismatching or corrupt record is
+    discarded (the region re-runs against the fresh packet); the R5 threshold
+    bypass and the idle-gate behavior below are unchanged.
     """
     if not getattr(agent, "compaction_pipeline_enabled", False):
         return
     try:
+        _apply_pending_swap(agent, out)
         from agent.compaction_pipeline import idle_pipeline_sweep
         idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
         record = idle_pipeline_sweep(agent, out.messages, idle_gap)
@@ -171,6 +173,73 @@ def _pipeline_idle_sweep(agent: Any, out: CompactionOutcome) -> None:
             logger.debug("compaction pipeline idle sweep: %s", record)
     except Exception as exc:  # noqa: BLE001 — background duty must never break a turn
         logger.warning("compaction pipeline idle sweep failed: %s", exc)
+
+
+def _apply_pending_swap(agent: Any, out: "CompactionOutcome") -> bool:
+    """SPEC-0046 (AC-A3): apply a staged between-turns swap at turn start.
+
+    The pending record is consumed FIRST — it is the staged boundary mutation
+    (the R5 bypass and the idle sweep proceed after, on the updated list).
+    Applies only when the staged packet hash still matches the live packet's
+    row identity (nothing changed the context between turns — no manual
+    /compress, branch, or rewind). A mismatch (context changed) or a corrupt
+    record is discarded, never applied and never raised; the dump stays valid
+    for rehydration either way. Telemetry: ``trigger="reinjected"``."""
+    if not getattr(agent, "compaction_pipeline_between_turns_sweep", True):
+        return False
+    from agent.compaction_pending_swap import (
+        clear_pending_swap,
+        compute_packet_hash,
+        read_pending_swap,
+    )
+
+    storage_root = getattr(agent, "compaction_pipeline_storage_root", "/tmp/hermes-compaction")
+    session_id = getattr(agent, "session_id", "") or ""
+    record = read_pending_swap(storage_root, session_id)
+    if record is None:
+        return False
+    staged_hash = str(record.get("packet_hash", ""))
+    if not staged_hash or compute_packet_hash(out.messages) != staged_hash:
+        # Packet identity changed since the stage (another mutation path won):
+        # the pending swap is stale — discard it; the region re-runs normally.
+        clear_pending_swap(storage_root, session_id)
+        logger.info("pending swap discarded (packet hash mismatch) for session %s",
+                    session_id)
+        return False
+    swapped = record.get("swapped_messages")
+    if not isinstance(swapped, list) or not swapped:
+        clear_pending_swap(storage_root, session_id)
+        return False
+    # Re-verify alternation on the staged list before it becomes the turn's
+    # prefix (the swap verified itself at stage time; a corrupt record must
+    # not smuggle a broken sequence into a turn).
+    try:
+        from agent.compaction_verify import check_alternation_invariant
+
+        is_valid, violations = check_alternation_invariant(list(swapped))
+        if not is_valid:
+            clear_pending_swap(storage_root, session_id)
+            logger.warning("pending swap discarded (alternation %s) for session %s",
+                           violations, session_id)
+            return False
+    except Exception:  # noqa: BLE001 — verifier unavailable: keep original semantics
+        pass
+    out.messages = [dict(m) if isinstance(m, dict) else m for m in swapped]
+    out.pipeline_swapped = True  # the boundary mutation happened; suppress the
+    # legacy idle summarizer for the covered window (same contract as D5/AC-26).
+    clear_pending_swap(storage_root, session_id)
+    try:
+        agent._compaction_pipeline_reinjected_regions = [
+            r.get("dump_id") for r in (record.get("region_refs") or [])
+        ]
+    except Exception:  # noqa: BLE001 — telemetry stamp must never break a turn
+        pass
+    logger.info(
+        "pending swap reinjected at turn start (packet hash matched, regions=%s, "
+        "trigger=reinjected) for session %s",
+        [r.get("dump_id") for r in (record.get("region_refs") or [])], session_id,
+    )
+    return True
 
 
 def _idle_compaction(
