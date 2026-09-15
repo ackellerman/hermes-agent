@@ -28,11 +28,37 @@ sweeps). Locks: `compaction_pipeline_locks` — a DISTINCT sqlite table from
 `compression_locks`; the two subsystems mutually exclude per session.
 
 Config knobs (`compaction_pipeline:` in config.yaml): `enabled`,
-`storage_root`, `map.idle_update_after_seconds`, `map.cooldown_seconds`,
-`extraction.cooldown_seconds`, `extraction.max_stage_retries`,
-`extraction.budget_per_session_tokens`, `swap.max_wait_seconds`,
-`review_gate.always_on`, `review_gate.loss_probe_samples`, and per-stage
-`models.*` overrides (empty string = existing aux resolution).
+`storage_root`, `between_turns_sweep`, `map.idle_update_after_seconds`,
+`map.cooldown_seconds`, `extraction.cooldown_seconds`,
+`extraction.max_stage_retries`, `extraction.budget_per_session_tokens`,
+`swap.max_wait_seconds`, `review_gate.always_on`,
+`review_gate.loss_probe_samples`, and per-stage `models.*` overrides (empty
+string = existing aux resolution).
+
+### Between-turns sweep (SPEC-0046, default ON)
+
+When the pipeline is enabled, one autonomous pass runs between turns — no
+idle-timeout condition exists on this path. When a turn ends, a single
+one-shot tick fires ~5s later on the shared scheduler thread
+(`agent/turn_facade_lease.py`), reads the FROZEN context packet (the message
+list does not change between turns), and runs the full chain (dump,
+extraction, gate + loss probe). The ready, gate-passed swap is never applied
+between turns — there is no live list to mutate — it is STAGED as
+`<storage_root>/<session_id>/pending_swap.json`, keyed by the packet's
+row-identity hash (`agent/compaction_pending_swap.py`).
+
+The tick is one-shot per turn boundary: after it fires (or is cancelled by a
+new turn starting before the delay), nothing re-arms until a NEW turn
+completes — an idle session is stale and gets no further passes.
+
+At the next turn start, `agent/turn_context_compaction.py` applies the staged
+swap as that turn's single prefix mutation when the packet hash still
+matches; a mismatch (manual `/compress`, branch, rewind changed the packet)
+discards the record and the region re-runs against the fresh packet.
+Telemetry: `trigger="between_turns"` / `"reinjected"`,
+`deferred_swap=true` + `packet_hash` on staged swaps. Off-switch:
+`between_turns_sweep: false` restores turn-start-only behavior with zero
+scheduler handles armed and no pending-swap records written.
 
 Backstop contract: the trigger condition is unchanged (`should_compress_info`);
 with the pipeline enabled the backstop waits up to `swap.max_wait_seconds` for
