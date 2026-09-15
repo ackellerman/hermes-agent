@@ -635,6 +635,13 @@ DEFAULT_CONFIG = {
     "compaction_pipeline": {
         "enabled": False,
         "storage_root": "/tmp/hermes-compaction",
+        # SPEC-0046: one autonomous pipeline pass between turns (default TRUE
+        # per operator ruling). When a turn ends, a single one-shot tick fires
+        # ~5s later against the frozen context packet and stages a pending
+        # swap; the next turn start reinjects it if the packet hash still
+        # matches. One-shot per turn boundary: never re-armed while the
+        # session stays idle (no periodic passes for a stale session).
+        "between_turns_sweep": True,
         "map": {
             # idle >= this many seconds triggers a map update pass (0 = off)
             "idle_update_after_seconds": 20,
