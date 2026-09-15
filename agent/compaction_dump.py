@@ -115,13 +115,31 @@ class DumpStore:
 
     # ── discovery ──────────────────────────────────────────────────────
 
-    def dump_ids(self, session_id: str) -> List[str]:
-        """Every dump directory under a session, sorted. The single discovery
-        primitive all consumers share, so a layout change lands once."""
+    def dump_dirs(self, session_id: str) -> List[Path]:
+        """Every REAL dump directory under a session, sorted by name — the single
+        discovery choke point all consumers share.
+
+        A directory is a dump directory only if it carries its own
+        ``<dump_id>.meta.json``. The producer writes that tombstone FIRST
+        (``write_dump`` step 1), so a crash mid-write still yields a discoverable
+        region; but a directory created by anything else — notably a map artifact
+        saved under a mis-prefixed root — carries no meta and is NOT a region.
+        Without this guard such a phantom directory is handed to the swap /
+        extraction / gating scans as a region candidate (SPEC-0044 review finding
+        S1: the F1 defect class re-entering through a side door).
+        """
         sdir = self.session_dir(session_id)
         if not sdir.is_dir():
             return []
-        return sorted(p.name for p in sdir.iterdir() if p.is_dir())
+        return sorted(
+            (p for p in sdir.iterdir()
+             if p.is_dir() and (p / f"{p.name}.meta.json").is_file()),
+            key=lambda p: p.name,
+        )
+
+    def dump_ids(self, session_id: str) -> List[str]:
+        """Every real dump id under a session, sorted (see :meth:`dump_dirs`)."""
+        return [p.name for p in self.dump_dirs(session_id)]
 
     # ── write protocol ─────────────────────────────────────────────────
 

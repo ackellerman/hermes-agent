@@ -206,7 +206,12 @@ def swap_sweep(
     ordered = sorted(ready_regions, key=lambda r: -int(r["meta"].get("start_msg", 0)))
     out = list(messages)
     registry = stub_registry or _NullStubRegistry()
-    map_root = dump_store.root / session_id
+    # ``CompactionMap`` joins the session id itself (``root/<sid>/map.json``), so
+    # the root handed to it must be the STORE root, never the session dir — a
+    # pre-joined session id here would retire the map at ``<root>/<sid>/<sid>/``
+    # (real map never retires) and mkdir a meta-less phantom directory that every
+    # consumer's dump discovery then treats as a region (S1).
+    map_root = dump_store.root
     for ready in ordered:
         meta = ready["meta"]
         start = int(meta.get("start_msg", 0))
