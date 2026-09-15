@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 DUMP_SCHEMA_VERSION = 1
 DEFAULT_STORAGE_ROOT = Path("/tmp/hermes-compaction")
@@ -140,6 +143,93 @@ class DumpStore:
     def dump_ids(self, session_id: str) -> List[str]:
         """Every real dump id under a session, sorted (see :meth:`dump_dirs`)."""
         return [p.name for p in self.dump_dirs(session_id)]
+
+    # ── flat-dump adoption (SPEC-0045 R1b) ──────────────────────────────
+
+    def ensure_layout(self, session_id: str) -> List[str]:
+        """One-time adoption of pre-D1 FLAT dumps into the canonical per-dump
+        layout (SPEC-0045 R1b): move ``<sid>/<dump_id>.jsonl`` +
+        ``<sid>/<dump_id>.meta.json`` siblings into ``<sid>/<dump_id>/``.
+
+        Sessions written before the producer gained the directory-per-dump
+        protocol keep their artifacts FLAT next to ``pipeline_queue.json``; the
+        consumers' directory scans (:meth:`dump_dirs`) never see them. This is
+        the single choke point both producers call when a session's storage is
+        first touched per process.
+
+        Idempotent by construction: after adoption nothing flat remains, and a
+        second call finds no flat pair and performs zero moves. NEVER deletes
+        data: a move that fails is logged and left in place (the flat pair
+        stays visible on disk rather than being silently skipped or removed),
+        and the per-dump dir is never created for a dump whose adoption failed.
+
+        Cheap by construction: a single ``iterdir`` probe per call when the
+        session dir has no flat artifacts; zero cost when it does not exist.
+
+        Returns the adopted dump ids (sorted); empty when nothing was adopted.
+        """
+        sdir = self.session_dir(session_id)
+        if not sdir.is_dir():
+            return []
+        adopted: List[str] = []
+        for entry in sorted(sdir.iterdir(), key=lambda p: p.name):
+            if not entry.is_file():
+                continue
+            name = entry.name
+            if not name.endswith(".jsonl"):
+                continue
+            dump_id = name[: -len(".jsonl")]
+            if not dump_id:
+                continue
+            meta = sdir / f"{dump_id}.meta.json"
+            if not meta.is_file():
+                continue  # journal without its sidecar is not a flat dump pair
+            ddir = self.dump_dir(session_id, dump_id)
+            moved: list = []
+            try:
+                ddir.mkdir(parents=True, exist_ok=True)
+                for src in (entry, meta):
+                    dst = ddir / src.name
+                    self._move_preserving_mtime(src, dst)
+                    moved.append((src, dst))
+                _fsync_dir(ddir)
+                _fsync_dir(sdir)
+            except OSError as exc:
+                # Failure logs and leaves the flat pair in place — the next
+                # open retries; nothing is dropped and nothing is half-adopted
+                # without being visible (both artifacts or neither). Roll back
+                # ONLY the moves this call completed, so a concurrent adopter's
+                # finished move is never undone.
+                logger.warning(
+                    "compaction dump adoption failed for %s/%s: %s (flat pair left in place)",
+                    session_id, dump_id, exc)
+                for src, dst in reversed(moved):
+                    try:
+                        if dst.is_file() and not src.is_file():
+                            self._move_preserving_mtime(dst, src)
+                    except OSError:
+                        pass
+                continue
+            logger.info(
+                "compaction dump adoption: %s/%s flat artifacts moved into %s/",
+                session_id, dump_id, ddir.name)
+            adopted.append(dump_id)
+        return adopted
+
+    @staticmethod
+    def _move_preserving_mtime(src: Path, dst: Path) -> None:
+        """os.replace across paths, restoring the source's mtime on the copy
+        when a real rename is not possible (cross-device fallback)."""
+        try:
+            os.replace(src, dst)
+            return
+        except OSError:
+            pass  # e.g. EXDEV — fall through to copy + mtime restore
+        import shutil
+        stat = src.stat()
+        shutil.copy2(str(src), str(dst))
+        os.utime(dst, (stat.st_atime, stat.st_mtime))
+        os.remove(src)
 
     # ── write protocol ─────────────────────────────────────────────────
 
