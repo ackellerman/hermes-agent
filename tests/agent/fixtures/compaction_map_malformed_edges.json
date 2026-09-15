@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "covers": {"start_msg": 0, "end_msg": 700},
+  "episodes": [
+    {"id": "ep-01-work-db", "title": "Work-database design", "start_msg": 3, "end_msg": 16, "status": "complete"},
+    {"id": "ep-02-pipeline", "title": "Planning pipeline design", "start_msg": 17, "end_msg": 30, "status": "complete"},
+    {"id": "ep-03-compaction", "title": "Structured compaction design", "start_msg": 31, "end_msg": 45, "status": "complete"},
+    {"id": "ep-04-build-plan", "title": "Build plan authored", "start_msg": 46, "end_msg": 58, "status": "complete"},
+    {"id": "ep-05-reviews", "title": "Reviews A-I applied", "start_msg": 59, "end_msg": 70, "status": "complete"},
+    {"id": "ep-06-schema", "title": "Session-record schema landed", "start_msg": 71, "end_msg": 85, "status": "complete"},
+    {"id": "ep-07-validator", "title": "Record validator landed", "start_msg": 86, "end_msg": 99, "status": "complete"},
+    {"id": "ep-08-incident", "title": "git gc incident", "start_msg": 100, "end_msg": 120, "status": "complete"},
+    {"id": "ep-09-boards", "title": "Board retirement ruling", "start_msg": 121, "end_msg": 150, "status": "complete"},
+    {"id": "ep-10-cutover", "title": "CLI cutover planning", "start_msg": 151, "end_msg": 700, "status": "active"}
+  ],
+  "entities": [
+    {"id": "doc-work-db", "kind": "design-doc"},
+    {"id": "doc-pipeline", "kind": "design-doc"},
+    {"id": "doc-compaction-design", "kind": "design-doc"},
+    {"id": "doc-build-plan", "kind": "plan"},
+    {"id": "review-d", "kind": "review"},
+    {"id": "review-h", "kind": "review"},
+    {"id": "cli-hg", "kind": "external-tool"},
+    {"id": "cli-new", "kind": "planned-tool"}
+  ],
+  "edges": [
+    {"from": "doc-pipeline", "to": "doc-work-db", "kind": "depends-on"},
+    {"from": "doc-compaction-design", "to": "fork-compaction-pipeline", "kind": "depends-on"},
+    {"from": "doc-build-plan", "to": "review-h", "kind": "depends-on"},
+    {"from": "review-i", "to": "doc-build-plan", "kind": "refines"},
+    {"from": "review-g", "to": "doc-work-db", "kind": "refines"},
+    {"from": "review-d", "to": "doc-work-db", "kind": "refines"},
+    {"from": "review-h", "to": "doc-loose-joints", "kind": "refines"},
+    {"from": "legacy-board-proxy-docs", "to": "doc-work-db", "kind": "superseded-by"},
+    {"from": "schema-session-record-v1", "to": "review-h", "kind": "depends-on"},
+    {"from": "record-validator", "to": "schema-session-record-v1", "kind": "depends-on"},
+    {"from": "newsystem-workspace", "to": "doc-build-plan", "kind": "depends-on"},
+    {"from": "cli-hg", "to": "cli-new", "kind": "superseded-by"},
+    {"from": "kanban-boards", "to": "cli-new", "kind": "superseded-by"},
+    {"from": "doc-restart", "to": "doc-build-plan", "kind": "depends-on"}
+  ]
+}
