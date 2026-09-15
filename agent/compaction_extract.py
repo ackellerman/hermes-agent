@@ -135,6 +135,38 @@ def parse_stage_json(raw: str) -> Dict[str, Any]:
     return parsed
 
 
+def dump_window_degenerate(slice_covers: Any, dump_window: Any) -> Optional[str]:
+    """SPEC-0047 D3: is the slice degenerate vs the dump window being extracted?
+
+    Returns the reason string when degenerate, None when usable. Degenerate
+    means the slice's bounds do not overlap the dump window at all:
+    ``covers.end_msg < dump.start_msg`` (the map has not caught up to the dump)
+    or a 0..0 (collapsed/empty) slice against a larger dump window.
+
+    ``dump_window`` is a ``(start_msg, end_msg)`` pair — either a 2-sequence
+    or a meta dict carrying ``start_msg``/``end_msg`` keys.
+    """
+    try:
+        s = int(slice_covers.get("start_msg", 0))
+        e = int(slice_covers.get("end_msg", 0))
+    except (TypeError, ValueError, AttributeError):
+        return f"slice covers is not an int range object: {slice_covers!r}"
+    if isinstance(dump_window, dict):
+        dump_window = (dump_window.get("start_msg"), dump_window.get("end_msg"))
+    try:
+        ds = int(dump_window[0])
+        de = int(dump_window[1])
+    except (TypeError, ValueError, IndexError):
+        return None  # no usable dump window: other checks govern
+    if e < ds:
+        return (f"degenerate slice vs dump window: slice covers {s}..{e} ends "
+                f"before the dump window starts ({ds}..{de})")
+    if s == 0 and e == 0 and de > ds:
+        return (f"degenerate slice vs dump window: 0..0 slice against dump "
+                f"window {ds}..{de}")
+    return None
+
+
 class RegionExtractor:
     """Drives stages A/B/C (+ checks) for one dumped region.
 
@@ -220,7 +252,9 @@ class RegionExtractor:
 
     # ── Stage C (extract checkpoint) ─────────────────────────────────────
 
-    def stage_c(self, llm: LLM, stage_b_output: Dict[str, Any]) -> Dict[str, Any]:
+    def stage_c(self, llm: LLM, stage_b_output: Dict[str, Any], *,
+                slice_covers: Any = None,
+                dump_window: Any = None) -> Dict[str, Any]:
         return self._run_with_check(
             "c",
             lambda: parse_stage_json(llm([
@@ -228,7 +262,8 @@ class RegionExtractor:
                 {"role": "user", "content": json.dumps(
                     {"stage_b": stage_b_output}, ensure_ascii=False, default=str)},
             ])),
-            lambda obj: checkpoint_schema_check(obj),
+            lambda obj: checkpoint_schema_check(obj, slice_covers=slice_covers,
+                                                dump_window=dump_window),
             check_llm=None,
         )
 
@@ -251,6 +286,18 @@ class RegionExtractor:
                 return obj
             last_reasons = reasons
         raise StageCheckError(stage, last_reasons)
+
+
+def _read_region_meta(region_dir: Path) -> Optional[Dict[str, Any]]:
+    """(start_msg, end_msg) for the region's dump, or None when absent/unreadable."""
+    meta_path = Path(region_dir) / f"{Path(region_dir).name}.meta.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if isinstance(meta, dict) and "start_msg" in meta and "end_msg" in meta:
+        return meta
+    return None
 
 
 def run_extraction_cycle(
@@ -284,21 +331,49 @@ def run_extraction_cycle(
         map_slice = CompactionMap(root, session_id).slice(0, 2_000_000_000)
         stage_a = extractor.stage_a(map_slice)
 
+    # SPEC-0047 D3: degenerate-slice refusal. A slice whose bounds do not
+    # overlap the dump window (map not caught up, or a collapsed 0..0 slice)
+    # must NEVER flow into Stage B/C — the pre-map pass produced a
+    # confidence-0.2 "Degenerate empty region" checkpoint exactly that way.
+    # Raise StageCheckError so the caller parks the region; a later pass
+    # retries after the map has caught up (the catch-up path).
+    slice_obj = stage_a.get("slice", stage_a) if isinstance(stage_a, dict) else stage_a
+    covers = slice_obj.get("covers", {}) if isinstance(slice_obj, dict) else {}
+    dump_meta = _read_region_meta(region_dir)
+    if dump_meta is not None:
+        degenerate = dump_window_degenerate(covers, dump_meta)
+        if degenerate:
+            raise StageCheckError("a", [degenerate])
+
     stage_b = extractor.load_artifact("b")
     if stage_b is None:
         stage_b = extractor.stage_b(reason_llm, stage_a.get("slice", stage_a))
 
     stage_c = extractor.load_artifact("c")
     if stage_c is None:
-        stage_c = extractor.stage_c(extract_llm, stage_b)
+        stage_c = extractor.stage_c(extract_llm, stage_b,
+                                    slice_covers=covers,
+                                    dump_window=dump_meta)
     return stage_c
 
 
-def checkpoint_schema_check(checkpoint: Dict[str, Any]) -> List[str]:
+def checkpoint_schema_check(checkpoint: Dict[str, Any],
+                            slice_covers: Any = None,
+                            dump_window: Any = None) -> List[str]:
     """AC-6 + AC-9 script validation: every section present; an empty section
     needs an explicit null_reason; quotes capped at 50 tokens/item; citations
-    resolve to (dump_id, start, end) triples."""
+    resolve to (dump_id, start, end) triples.
+
+    SPEC-0047 D3: when the slice's covers and the dump window are supplied,
+    a checkpoint built from a slice that does not overlap the dump window is
+    rejected (degenerate slice vs dump window) — the "Degenerate empty region,
+    confidence 0.2" artifact class must never pass.
+    """
     errors: List[str] = []
+    if slice_covers is not None and dump_window is not None:
+        degenerate = dump_window_degenerate(slice_covers, dump_window)
+        if degenerate:
+            errors.append(degenerate)
     for section in CHECKPOINT_SECTIONS:
         if section not in checkpoint:
             errors.append(f"missing section '{section}'")
