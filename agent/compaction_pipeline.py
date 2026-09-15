@@ -101,6 +101,27 @@ class IdlePipelinePass:
             return False  # an ordinary idle pass, not a bypass
         return self._over_threshold(messages)
 
+    def gates_pass_between_turns(self, messages: Optional[List[Any]] = None) -> bool:
+        """SPEC-0046 between-turns gates: enabled + cooldown + budget ONLY.
+
+        There is NO idle-gap gate on this path (the operator ruling: the pass
+        runs automatically between turns because the context packet is frozen —
+        a wall-clock gap buys nothing). Lock acquisition happens in ``run``.
+        The R5 threshold predicate is irrelevant here: with no idle gate there
+        is nothing to waive; cooldown, budget, and enabled still bind so a
+        stale session cannot burn spend."""
+        if not self.enabled:
+            return False
+        now = time.time()
+        if now - self._last_pass_ts() < getattr(
+                self.agent, "compaction_pipeline_map_cooldown_seconds", 120):
+            return False
+        if self._spent_tokens() > self._budget():
+            logger.info("compaction pipeline budget exceeded for session %s; "
+                        "between-turns pass skipped", self.session_id)
+            return False
+        return True
+
     def _last_pass_ts(self) -> float:
         return float(getattr(self.agent, "_compaction_pipeline_last_pass_ts", 0.0))
 
@@ -610,6 +631,10 @@ class IdlePipelinePass:
         which nothing stamps on an idle pass — it is None there, and a None window
         makes the stale-window guard a no-op (any gate-passed region would swap
         regardless of which window it covers).
+
+        SPEC-0046: the ready regions also land on ``record["pending_ready_regions"]``
+        so the between-turns entry can stage them (packet hash + region refs +
+        gate digest) without recomputing discovery.
         """
         from agent.compaction_dump import DumpStore
         from agent.compaction_swap import swap_sweep
@@ -635,6 +660,7 @@ class IdlePipelinePass:
                 continue  # stale-window discipline: never swap the wrong window
             ready.append({"dump_id": d.name, "meta": meta,
                           "checkpoint": stage_c, "gate": gate})
+        record["pending_ready_regions"] = ready
         if not ready:
             return
         from agent.compaction_rehydrate import StubRegistry
@@ -725,3 +751,126 @@ def idle_pipeline_sweep(agent: Any, messages, idle_gap_seconds: float) -> Dict[s
     if not sweep.gates_pass(idle_gap_seconds, messages=messages):
         return {"ran": False, "reason": "gates"}
     return sweep.run(messages, bypass=bypass)
+
+
+# ── SPEC-0046: the between-turns pass (frozen packet, stage-not-apply) ────
+
+
+def _frozen_packet_messages(agent: Any):
+    """Read the frozen between-turns packet without mutating anything.
+
+    Source order: the aliased ``agent._session_messages`` when it is a list
+    (it aliases the session history and is not mutated between turns), else
+    the session DB's active rows. A fresh gateway session may have neither —
+    that is a no-op with a reason, never a raise."""
+    aliased = getattr(agent, "_session_messages", None)
+    if isinstance(aliased, list) and aliased:
+        return list(aliased)
+    db = getattr(agent, "db", None) or getattr(agent, "_session_db", None)
+    reader = getattr(db, "get_messages_as_conversation", None)
+    session_id = getattr(agent, "session_id", "") or ""
+    if reader is not None and session_id:
+        try:
+            rows = reader(session_id, repair_alternation=True, include_row_ids=True)
+            if isinstance(rows, list) and rows:
+                return list(rows)
+        except Exception as exc:  # noqa: BLE001 — a bad read degrades to a no-op
+            logger.warning("between-turns packet DB read failed (%s): %s",
+                           session_id, exc)
+    return None
+
+
+def _swap_regions_digest(record: Dict[str, Any]) -> str:
+    from agent.compaction_pending_swap import digest_gate_verdicts
+    return digest_gate_verdicts(
+        [r.get("gate") for r in (record.get("pending_ready_regions") or [])])
+
+
+def between_turns_pass(agent: Any, llm_call=None) -> Dict[str, Any]:
+    """SPEC-0046 one-shot entry: run ONE pipeline pass against the frozen
+    between-turns packet and STAGE (never apply) the ready swap.
+
+    Between turns the message list is not consumed or mutated by anyone — the
+    same bytes the next ``build_turn_context`` will load — so the pass runs the
+    full chain (flat-dump adoption, queue drain, map update, dump, extraction,
+    gate + loss probe) exactly as :meth:`IdlePipelinePass.run` does, then
+    computes the swap sweep's replacement list LOCALLY and persists it as a
+    pending-swap record keyed by the packet's row-identity hash. No live list
+    exists to mutate and none is touched (AC-A4). The next turn start
+    reinjects the staged swap when the packet hash still matches (AC-A3).
+
+    Gates: lock, cooldown, budget — via :meth:`gates_pass` with the frozen
+    packet (the R5 threshold waiver rides along unchanged). Telemetry:
+    ``trigger="between_turns"``; a staged swap carries ``deferred_swap=True``
+    and ``packet_hash``; ``applied`` is always False here (nothing live is
+    mutated). One-shot per turn boundary: the tick is armed once at turn end
+    and never re-armed while the session stays idle (operator ruling).
+    """
+    from agent.compaction_pending_swap import (
+        build_pending_swap_record,
+        clear_pending_swap,
+        compute_packet_hash,
+        packet_identity,
+        write_pending_swap,
+    )
+
+    def _noop(reason: str) -> Dict[str, Any]:
+        return {"ran": False, "trigger": "between_turns", "reason": reason,
+                "applied": False}
+
+    sweep = IdlePipelinePass(agent)
+    if not getattr(agent, "compaction_pipeline_between_turns_sweep", True):
+        return _noop("between_turns_disabled")
+    # The frozen packet: aliased list, else session DB active rows. Absent
+    # packet -> no-op with a reason (fresh gateway session before first turn).
+    messages = _frozen_packet_messages(agent)
+    if not messages:
+        return _noop("no_packet")
+    # Gates WITHOUT any idle-gap condition (SPEC-0046): enabled + cooldown +
+    # budget only. Lock acquisition happens inside ``sweep.run``.
+    if not sweep.gates_pass_between_turns(messages=messages):
+        return _noop("gates")
+    packet_hash = compute_packet_hash(messages)
+    record = sweep.run(messages, llm_call=llm_call, bypass=False)
+    record["trigger"] = "between_turns"
+    record.setdefault("applied", False)
+    if not record.get("ran"):
+        return record
+    swapped = record.get("swapped_messages")
+    if swapped is None:
+        # Nothing gate-passed to stage; the artifacts (map/dump/gate) still
+        # advanced storage — that is the pass's progress for this boundary.
+        return record
+    # STAGE, never apply: persist the ready swap keyed by the frozen packet's
+    # identity, and drop the computed list from the record — nothing live is
+    # mutated by this pass (AC-A4).
+    ready = record.pop("pending_ready_regions", None) or []
+    regions = [
+        {"dump_id": r.get("dump_id"),
+         "start_msg": int((r.get("meta") or {}).get("start_msg", 0)),
+         "end_msg": int((r.get("meta") or {}).get("end_msg", 0))}
+        for r in (ready or [])
+    ]
+    staged = build_pending_swap_record(
+        packet_hash=packet_hash,
+        packet_identity=packet_identity(messages),
+        swapped_messages=swapped,
+        region_refs=regions,
+        gate_verdict_digest=_swap_regions_digest(record),
+    )
+    try:
+        write_pending_swap(sweep.storage_root, sweep.session_id, staged)
+    except Exception as exc:  # noqa: BLE001 — staging failure parks the swap
+        logger.warning("pending-swap persist failed (%s): %s", sweep.session_id, exc)
+        record["stage_error"] = str(exc)
+        record["deferred_swap"] = False
+        clear_pending_swap(sweep.storage_root, sweep.session_id)
+        return record
+    record["deferred_swap"] = True
+    record["packet_hash"] = packet_hash
+    record["staged_regions"] = [r["dump_id"] for r in regions]
+    # Stage-not-apply: the computed list must never ride on the record as an
+    # adopted swap (there is no live list; adoption happens at next turn start).
+    record.pop("swapped_messages", None)
+    record.pop("swapped_regions", None)
+    return record
