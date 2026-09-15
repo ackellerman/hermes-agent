@@ -19,6 +19,12 @@ logger = logging.getLogger("run_agent")
 LEASE_TTL_SECONDS = 300.0
 LEASE_WAIT_SECONDS = 1800.0
 
+# SPEC-0046: the between-turns tick fires ONCE this long after a turn ends
+# (the turn-loop teardown time). One-shot per turn boundary: after it fires
+# (or is cancelled by a new turn) it is NOT re-armed until a NEW turn
+# completes — an idle session is stale and gets no further passes.
+BETWEEN_TURNS_SWEEP_DELAY_SECONDS = 5.0
+
 
 class DurableTurnLease:
     """An admitted session turn lease plus the periodic timers that keep it alive and watch the turn.
@@ -40,6 +46,11 @@ class DurableTurnLease:
         self.interrupt_message: Optional[str] = None
         self.watchdog = None  # TurnLivenessWatchdog when configured
         self.timer_handles: list = []  # periodic_scheduler handles, cancelled in join_threads
+        # SPEC-0046 between-turns one-shot tick: the pending handle (None when
+        # not armed) and the cancelled flag the tick checks before running — a
+        # turn starting between arm and fire must win the race.
+        self.between_turns_handle = None
+        self._between_turns_cancelled = threading.Event()
 
     def _current_session_id(self) -> str:
         return getattr(self.agent, "session_id", None) or self.session_id
@@ -210,6 +221,119 @@ class TurnLeaseAdmission:
     lease: Optional[DurableTurnLease] = None
     early_result: Optional[Dict[str, Any]] = None
     conversation_history: Optional[List[Dict[str, Any]]] = None
+
+
+# ── SPEC-0046: the between-turns one-shot tick (agent-scoped state) ───────
+#
+# Each turn builds a NEW DurableTurnLease, so the armed tick cannot live on a
+# lease instance — a tick armed when turn 1 ends must still be cancellable by
+# turn 2's start. The state lives on the AGENT (``_between_turns_sweep_handle``
+# + ``_between_turns_sweep_cancelled``), guarded by a module-level lock:
+#
+# - ``arm_between_turns_sweep(agent)`` at turn end: arms exactly ONE tick on
+#   the shared scheduler thread (never a thread), ~5s out. OFF-switch false or
+#   pipeline disabled arms NOTHING (AC-A5).
+# - ``cancel_between_turns_sweep(agent)`` at turn start: a turn starting
+#   before the delay elapses cancels the pending tick AND flags the cancelled
+#   event the tick body checks — cancel wins the race even if the tick has
+#   already been popped by the scheduler but has not run its body yet.
+# - After the tick fires (or is cancelled) NOTHING is re-armed until a NEW
+#   turn completes: one-shot per turn boundary, no periodic re-arming while
+#   the session sits idle (operator ruling: an idle session is stale).
+# - Every path is guarded: a tick failure logs and returns; it can never
+#   affect a turn.
+
+
+class _BetweenTurnsState:
+    """Agent-scoped handle + one-shot latch + cancelled flag, per agent."""
+
+    __slots__ = ("handle", "cancelled", "armed_this_boundary")
+
+    def __init__(self) -> None:
+        self.handle: Any = None  # ScheduledHandle while armed, else None
+        self.cancelled = threading.Event()
+        # One-shot latch: set when the armed tick FIRES (not when merely
+        # cancelled); arm() is a no-op while it holds, so an idle session can
+        # never accumulate ticks — only a NEW turn end re-arms.
+        self.armed_this_boundary = False
+
+
+_BETWEEN_TURNS_LOCK = threading.Lock()
+
+
+def _between_turns_state(agent) -> _BetweenTurnsState:
+    state = getattr(agent, "_between_turns_sweep_state", None)
+    if not isinstance(state, _BetweenTurnsState):
+        state = _BetweenTurnsState()
+        agent._between_turns_sweep_state = state
+    return state
+
+
+def arm_between_turns_sweep(agent) -> None:
+    """Arm the ONE between-turns pipeline tick at turn end (SPEC-0046 W3).
+
+    ONE-SHOT PER TURN BOUNDARY (operator ruling): the tick fires once ~5s
+    after a turn ends and NOTHING re-arms while the session stays idle —
+    ``arm`` refuses while the boundary's tick has already fired (the one-shot
+    latch); the façade calls this again only when a NEW turn completes.
+    Idempotent per boundary: an already-pending tick is never doubled."""
+    try:
+        if getattr(agent, "compaction_pipeline_between_turns_sweep", True) is False:
+            return
+        if not getattr(agent, "compaction_pipeline_enabled", False):
+            return  # AC-19/AC-A5: pipeline off -> zero handles armed
+        with _BETWEEN_TURNS_LOCK:
+            state = _between_turns_state(agent)
+            if state.armed_this_boundary:
+                return  # the boundary already fired its one tick: stay quiet
+            if state.handle is not None and not state.handle.cancelled:
+                return  # already armed this boundary — never two pending ticks
+            state.cancelled.clear()
+            from agent.periodic_scheduler import schedule
+
+            state.handle = schedule(
+                lambda: _between_turns_tick(agent), BETWEEN_TURNS_SWEEP_DELAY_SECONDS)
+    except Exception:  # noqa: BLE001 — arming must never break turn teardown
+        logger.warning("failed to arm between-turns sweep", exc_info=True)
+
+
+def cancel_between_turns_sweep(agent) -> None:
+    """Cancel the pending between-turns tick: a turn started before the delay
+    elapsed — the tick must never run while a turn is in flight (AC-A4). Safe
+    when nothing is armed. Clears the one-shot latch: the NEXT turn end re-arms
+    a fresh boundary (this call IS the new turn beginning)."""
+    with _BETWEEN_TURNS_LOCK:
+        state = _between_turns_state(agent)
+        state.cancelled.set()
+        state.armed_this_boundary = False
+        handle = state.handle
+        state.handle = None
+    if handle is not None:
+        try:
+            handle.cancel(wait=None)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _between_turns_tick(agent):
+    """The one-shot tick body. Returns False so the scheduler never
+    reschedules it: exactly one pass per turn boundary, nothing more until a
+    new turn ends (no periodic re-arming for a stale session)."""
+    with _BETWEEN_TURNS_LOCK:
+        state = _between_turns_state(agent)
+        state.handle = None
+        if state.cancelled.is_set():
+            return False  # a turn started between arm and fire: stay quiet
+        state.cancelled.set()  # one-shot: this tick will never fire again
+        state.armed_this_boundary = True  # latch: arm() is a no-op until a NEW turn end
+    try:
+        from agent.compaction_pipeline import between_turns_pass
+
+        record = between_turns_pass(agent)
+        logger.debug("between-turns pipeline pass: %s", record)
+    except Exception:  # noqa: BLE001 — a tick failure logs only, never raises
+        logger.warning("between-turns pipeline pass failed", exc_info=True)
+    return False
 
 
 def _durable_session_exists(db, session_id: str) -> bool:
