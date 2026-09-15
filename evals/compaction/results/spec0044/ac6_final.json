@@ -3,7 +3,7 @@
   "verdict": "PASS",
   "note": "",
   "tree": {
-    "commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "commit": "07da5e399700e199ae9213d23ebc7c6986649b4d",
     "branch": "wt/t_c323acdf",
     "dirty": true
   },
@@ -12,8 +12,8 @@
     "receipt": {
       "mode": "drill",
       "drill": "aux-down",
-      "storage_root": "/tmp/spec43-drill-ku4w0kbn/storage",
-      "ts": 1789430706.8732166,
+      "storage_root": "/tmp/spec43-drill-wep6rnnq/storage",
+      "ts": 1789431683.3973794,
       "container": null,
       "action": "degrade",
       "swapped": true,
