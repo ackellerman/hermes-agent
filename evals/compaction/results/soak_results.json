@@ -1,0 +1,73 @@
+{
+  "mode": "soak",
+  "turns_run": 400,
+  "container": {
+    "container_image": "nousresearch/hermes-agent:latest",
+    "container_image_id": "sha256:1d4a19fcfc5452716bfde16970be6e9dbe3c1487a31d5fbb8b0a3e65c556f5d9",
+    "container_image_digest": "nousresearch/hermes-agent@sha256:877195433e2fe26d1082c9065b3f4ac98efe48b38f7c5525ab7c9188c05a3a05",
+    "container_commit": "07da5e399700e199ae9213d23ebc7c6986649b4d",
+    "container_tree_dirty": false,
+    "container_runtime": "docker",
+    "container_command": "python3 evals/compaction/soak.py --turns 400 --json /out/soak_results.json --replay-dir /replay"
+  },
+  "transcripts_consumed": 5,
+  "region_messages_per_pass": 120,
+  "turn_log_region_messages": [
+    120
+  ],
+  "max_live_window": 400,
+  "transcript_count": 5,
+  "transcript_sha256": "aab34b8026e3b6b598c84d07d91c4fa65eae9224ce733849296feb011fc2a162",
+  "transcript_source": "operator",
+  "total_messages_processed": 48000,
+  "wall_seconds": 7.87,
+  "invariants": {
+    "ordering_swap_refuses_incomplete": true,
+    "lock_discipline_no_leak": true,
+    "map_monotonic": true,
+    "map_bounded_after_retire": true,
+    "map_cover_coherent": true,
+    "batched_single_mutation": true,
+    "alternation_on_swap": true,
+    "transcripts_resolved": true,
+    "replay_drove_the_pass": true,
+    "receipt_self_consistent": true
+  },
+  "all_invariants_hold": true,
+  "violations": [],
+  "turn_log_tail": [
+    {
+      "tick": 397,
+      "dump_id": "0397-6833a038",
+      "region_messages": 120,
+      "swapped_len": 401,
+      "map_covers_after": {
+        "start_msg": 47760,
+        "end_msg": 47760
+      },
+      "map_entries_after": 0
+    },
+    {
+      "tick": 398,
+      "dump_id": "0398-b44fbb35",
+      "region_messages": 120,
+      "swapped_len": 401,
+      "map_covers_after": {
+        "start_msg": 47880,
+        "end_msg": 47880
+      },
+      "map_entries_after": 0
+    },
+    {
+      "tick": 399,
+      "dump_id": "0399-2a8ff86e",
+      "region_messages": 120,
+      "swapped_len": 401,
+      "map_covers_after": {
+        "start_msg": 48000,
+        "end_msg": 48000
+      },
+      "map_entries_after": 0
+    }
+  ]
+}

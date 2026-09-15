@@ -3,7 +3,7 @@
   "verdict": "PASS",
   "note": "",
   "tree": {
-    "commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "commit": "07da5e399700e199ae9213d23ebc7c6986649b4d",
     "branch": "wt/t_c323acdf",
     "dirty": true
   },
@@ -12,8 +12,8 @@
     "receipt": {
       "mode": "drill",
       "drill": "storage-ro",
-      "storage_root": "/tmp/spec43-drill-bi7v0ilm/storage",
-      "ts": 1789430707.2158213,
+      "storage_root": "/tmp/spec43-drill-wbqkv3yn/storage",
+      "ts": 1789431683.7577686,
       "container": null,
       "unwritable_mechanism": "chmod",
       "preflight_root_writable": false,
@@ -22,8 +22,8 @@
         "ran": true,
         "queued": 0,
         "updated": false,
-        "map_error": "[Errno 13] Permission denied: '/tmp/spec43-drill-bi7v0ilm/storage/drill-session/map.json.tmp'",
-        "dump_error": "[Errno 13] Permission denied: '/tmp/spec43-drill-bi7v0ilm/storage/drill-session/0001-d7e7e281'",
+        "map_error": "[Errno 13] Permission denied: '/tmp/spec43-drill-wbqkv3yn/storage/drill-session/map.json.tmp'",
+        "dump_error": "[Errno 13] Permission denied: '/tmp/spec43-drill-wbqkv3yn/storage/drill-session/0001-d7e7e281'",
         "no_extraction": true,
         "idle_window": [
           2,

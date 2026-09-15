@@ -124,7 +124,7 @@
   "before_after": {
     "before": {
       "mode": "before-arm (real ContextCompressor single-call summary)",
-      "summary_chars": 8057,
+      "summary_chars": 5856,
       "scores": {
         "corrections": {
           "labeled": 1,

@@ -3,7 +3,7 @@
   "verdict": "PASS",
   "note": "",
   "tree": {
-    "commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "commit": "07da5e399700e199ae9213d23ebc7c6986649b4d",
     "branch": "wt/t_c323acdf",
     "dirty": true
   },
@@ -19,6 +19,7 @@
       "turn_log_region_messages": [
         24
       ],
+      "max_live_window": 400,
       "transcript_count": 1,
       "transcript_sha256": "7ce31b6bc40e54b7cd2ec10e1278c05ffb7ebaa1353949dd1fde640346d1e98e",
       "transcript_source": "operator",
@@ -33,14 +34,15 @@
         "batched_single_mutation": true,
         "alternation_on_swap": true,
         "transcripts_resolved": true,
-        "replay_drove_the_pass": true
+        "replay_drove_the_pass": true,
+        "receipt_self_consistent": true
       },
       "all_invariants_hold": true,
       "violations": [],
       "turn_log_tail": [
         {
           "tick": 1,
-          "dump_id": "0001-66e1f1f0",
+          "dump_id": "0001-32bd39a3",
           "region_messages": 24,
           "swapped_len": 25,
           "map_covers_after": {
@@ -51,7 +53,7 @@
         },
         {
           "tick": 2,
-          "dump_id": "0002-66e1f1f0",
+          "dump_id": "0002-32bd39a3",
           "region_messages": 24,
           "swapped_len": 49,
           "map_covers_after": {
@@ -62,7 +64,7 @@
         },
         {
           "tick": 3,
-          "dump_id": "0003-66e1f1f0",
+          "dump_id": "0003-32bd39a3",
           "region_messages": 24,
           "swapped_len": 73,
           "map_covers_after": {
@@ -79,10 +81,10 @@
       24
     ],
     "dumped_regions": [
-      "0000-66e1f1f0",
-      "0001-66e1f1f0",
-      "0002-66e1f1f0",
-      "0003-66e1f1f0"
+      "0000-32bd39a3",
+      "0001-32bd39a3",
+      "0002-32bd39a3",
+      "0003-32bd39a3"
     ],
     "sentinel_in_processed_region": true,
     "control_rc": 0,

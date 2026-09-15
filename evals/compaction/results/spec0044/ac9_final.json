@@ -3,7 +3,7 @@
   "verdict": "PASS",
   "note": "",
   "tree": {
-    "commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "commit": "07da5e399700e199ae9213d23ebc7c6986649b4d",
     "branch": "wt/t_c323acdf",
     "dirty": true
   },
@@ -16,28 +16,28 @@
         "has_container": true,
         "container_image": "nousresearch/hermes-agent:latest",
         "container_image_id": "sha256:1d4a19fcfc5452716bfde16970be6e9dbe3c1487a31d5fbb8b0a3e65c556f5d9",
-        "container_commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6"
+        "container_commit": "07da5e399700e199ae9213d23ebc7c6986649b4d"
       },
       "drill_aux-down.json": {
         "present": true,
         "has_container": true,
         "container_image": "nousresearch/hermes-agent:latest",
         "container_image_id": "sha256:1d4a19fcfc5452716bfde16970be6e9dbe3c1487a31d5fbb8b0a3e65c556f5d9",
-        "container_commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6"
+        "container_commit": "07da5e399700e199ae9213d23ebc7c6986649b4d"
       },
       "drill_storage-ro.json": {
         "present": true,
         "has_container": true,
         "container_image": "nousresearch/hermes-agent:latest",
         "container_image_id": "sha256:1d4a19fcfc5452716bfde16970be6e9dbe3c1487a31d5fbb8b0a3e65c556f5d9",
-        "container_commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6"
+        "container_commit": "07da5e399700e199ae9213d23ebc7c6986649b4d"
       },
       "drill_kill-mid.json": {
         "present": true,
         "has_container": true,
         "container_image": "nousresearch/hermes-agent:latest",
         "container_image_id": "sha256:1d4a19fcfc5452716bfde16970be6e9dbe3c1487a31d5fbb8b0a3e65c556f5d9",
-        "container_commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6"
+        "container_commit": "07da5e399700e199ae9213d23ebc7c6986649b4d"
       }
     }
   }

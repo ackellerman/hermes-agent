@@ -3,7 +3,7 @@
   "verdict": "PASS",
   "note": "",
   "tree": {
-    "commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "commit": "07da5e399700e199ae9213d23ebc7c6986649b4d",
     "branch": "wt/t_c323acdf",
     "dirty": true
   },
@@ -13,8 +13,16 @@
     "invariant_holds": true,
     "turn_log_covers": [
       {
-        "start_msg": 933,
-        "end_msg": 933
+        "start_msg": 47760,
+        "end_msg": 47760
+      },
+      {
+        "start_msg": 47880,
+        "end_msg": 47880
+      },
+      {
+        "start_msg": 48000,
+        "end_msg": 48000
       }
     ],
     "all_covers_coherent": true,

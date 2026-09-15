@@ -3,12 +3,12 @@
   "verdict": "PASS",
   "note": "",
   "tree": {
-    "commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "commit": "07da5e399700e199ae9213d23ebc7c6986649b4d",
     "branch": "wt/t_c323acdf",
     "dirty": true
   },
   "evidence": {
-    "storage_root": "/tmp/spec44-ac1-dd5vg59x/storage",
+    "storage_root": "/tmp/spec44-ac1-nqcutenm/storage",
     "pass1_record": {
       "ran": true,
       "queued": 0,
@@ -34,7 +34,7 @@
       "0001-cb3ffa5d",
       "sess"
     ],
-    "region_dir": "/tmp/spec44-ac1-dd5vg59x/storage/sess/0001-cb3ffa5d",
+    "region_dir": "/tmp/spec44-ac1-nqcutenm/storage/sess/0001-cb3ffa5d",
     "artifacts": [
       "0001-cb3ffa5d.jsonl",
       "0001-cb3ffa5d.meta.json",
