@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -44,13 +44,22 @@ class IdlePipelinePass:
 
     # ── gates ────────────────────────────────────────────────────────────
 
-    def gates_pass(self, idle_gap_seconds: float, now: Optional[float] = None) -> bool:
+    def gates_pass(self, idle_gap_seconds: float, now: Optional[float] = None,
+                   messages: Optional[List[Any]] = None) -> bool:
         """enabled + idle gap + cooldown + budget; lock acquisition happens in
-        ``run`` and is released before returning."""
+        ``run`` and is released before returning.
+
+        SPEC-0045 R5: when the rough estimate of ``messages`` is at/over the
+        LIVE compression trigger (``compressor.threshold_tokens``), the idle-gap
+        check is WAIVED — a continuously-prompted session must still reach the
+        pipeline at the same boundary the backstop uses. Only the idle gap is
+        waived: cooldown, budget, lock, and the enabled check are NOT. A stub
+        compressor without ``threshold_tokens`` (tests/evals) gets no bypass.
+        """
         if not self.enabled:
             return False
         idle_after = getattr(self.agent, "compaction_pipeline_map_idle_after_seconds", 20)
-        if idle_gap_seconds < max(0.0, float(idle_after)):
+        if idle_gap_seconds < max(0.0, float(idle_after)) and not self._over_threshold(messages):
             return False
         now = now or time.time()
         if now - self._last_pass_ts() < getattr(
@@ -62,6 +71,35 @@ class IdlePipelinePass:
                         self.session_id)
             return False
         return True
+
+    def _over_threshold(self, messages: Optional[List[Any]]) -> bool:
+        """True when ``estimate_messages_tokens_rough(messages)`` is at/over the
+        live compression threshold — the same estimator and the same value the
+        preflight cheap gate and the backstop consult (SPEC-0045 R5). Defensive
+        ``getattr``: stub compressors (SimpleNamespace) carry no
+        ``threshold_tokens``; None means "no bypass", never a raise."""
+        if messages is None:
+            return False
+        compressor = getattr(self.agent, "context_compressor", None)
+        threshold = getattr(compressor, "threshold_tokens", None)
+        if threshold is None:
+            return False
+        try:
+            from agent.model_metadata import estimate_messages_tokens_rough
+            estimate = int(estimate_messages_tokens_rough(list(messages)))
+            return estimate >= int(threshold)
+        except Exception:  # noqa: BLE001 — the gate must never raise on a bad estimate
+            return False
+
+    def _bypass_fires(self, idle_gap_seconds: float, messages: Optional[List[Any]]) -> bool:
+        """The R5 waiver actually fired: the idle gate would have refused this
+        pass AND the rough estimate is at/over the live compression trigger.
+        Pure predicate for telemetry (``record["bypass"]``) and for the W3
+        full-cycle branch; cooldown/budget outcomes are not part of it."""
+        if idle_gap_seconds >= max(0.0, float(getattr(
+                self.agent, "compaction_pipeline_map_idle_after_seconds", 20))):
+            return False  # an ordinary idle pass, not a bypass
+        return self._over_threshold(messages)
 
     def _last_pass_ts(self) -> float:
         return float(getattr(self.agent, "_compaction_pipeline_last_pass_ts", 0.0))
@@ -584,8 +622,17 @@ def _atomic_write_json(path, obj: Dict[str, Any]) -> None:
 
 
 def idle_pipeline_sweep(agent: Any, messages, idle_gap_seconds: float) -> Dict[str, Any]:
-    """Entry point hooked into the idle seam. OFF by default (AC-19)."""
+    """Entry point hooked into the idle seam. OFF by default (AC-19).
+
+    SPEC-0045 R5: ``messages`` ride into ``gates_pass`` so the idle-gap check
+    can be waived at the live compression threshold; ``record["bypass"] = True``
+    marks a pass that ran on that waiver (the §4 monitoring signature for
+    repeated degrades at the threshold bypass)."""
     sweep = IdlePipelinePass(agent)
-    if not sweep.gates_pass(idle_gap_seconds):
+    bypass = sweep._bypass_fires(idle_gap_seconds, messages)
+    if not sweep.gates_pass(idle_gap_seconds, messages=messages):
         return {"ran": False, "reason": "gates"}
-    return sweep.run(messages)
+    record = sweep.run(messages)
+    if bypass:
+        record["bypass"] = True
+    return record
