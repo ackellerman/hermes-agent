@@ -21,12 +21,18 @@ window (D5, AC-26). Budget accounting is a monotonic per-call summed counter
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# SPEC-0047 D4: a region whose extraction fails with the SAME exception
+# type+message this many times parks durably until the map's covers advance
+# past the dump window end (something changed that might fix the parse).
+DETERMINISTIC_FAILURE_THRESHOLD = 2
 
 
 class PipelineBudgetExceeded(RuntimeError):
@@ -41,6 +47,11 @@ class IdlePipelinePass:
         self.session_id = getattr(agent, "session_id", "") or "none"
         self.storage_root = getattr(agent, "compaction_pipeline_storage_root", "/tmp/hermes-compaction")
         self.enabled = bool(getattr(agent, "compaction_pipeline_enabled", False))
+        # Dump ids whose extraction was already attempted in THIS pass object's
+        # run (the R5 bypass region, the queue-drain row) — so the scheduled
+        # scan never re-attempts them (one attempt per region per pass; the D4
+        # breaker ladders once per pass, not twice).
+        self._extraction_attempted: set = set()
 
     # ── gates ────────────────────────────────────────────────────────────
 
@@ -315,7 +326,8 @@ class IdlePipelinePass:
         row = rows[0]
         try:
             window = tuple(int(x) for x in (row.get("window") or [0, 0])[:2])
-            result = self._run_extraction_for_window(window, row, messages)
+            result = self._run_extraction_for_window(window, row, messages,
+                                                     record=record)
             if result is not None:
                 # Processed: re-dump fallback happened inside; drop the row.
                 remaining = rows[1:]
@@ -428,7 +440,8 @@ class IdlePipelinePass:
         meta = store.read_meta(self.session_id, dump_id) or {}
         window = (int(meta.get("start_msg", 0)), int(meta.get("end_msg", 0)))
         stage_c = self._run_extraction_for_window(window, None,
-                                                  bypass_dump_id=dump_id)
+                                                  bypass_dump_id=dump_id,
+                                                  record=record)
         if stage_c is not None:
             record["bypass_extracted"] = dump_id
         else:
@@ -460,6 +473,7 @@ class IdlePipelinePass:
                                    row: Optional[dict],
                                    messages=None,
                                    bypass_dump_id: Optional[str] = None,
+                                   record: Optional[Dict[str, Any]] = None,
                                    ) -> Optional[Dict[str, Any]]:
         """Run A->B->C for the dumped region covering ``window``; return the
         Stage-C checkpoint on success (so the caller can drain the row), None
@@ -468,6 +482,10 @@ class IdlePipelinePass:
         same pass as its dump (cooldown applies to QUEUED drains, not the
         bypass region; SPEC-0045 R5), so the once-per-pass and cooldown gates
         are waived for exactly that dump id. Budget still binds.
+
+        ``record`` (optional) is the pass telemetry record; when supplied,
+        breaker skips and park events are recorded on it
+        (``parked_regions`` / ``extract_park`` / ``extract_failed``).
 
         ``row`` is the queued row for queue-drain. AC-24 fresh-dump fallback:
         when the row's window has no complete dump (its dump was superseded by a
@@ -498,6 +516,32 @@ class IdlePipelinePass:
                 candidate = self._complete_dump_for_window(store, fresh)
         if candidate is None:
             return None
+        # SPEC-0047 D4 circuit breaker: a region parked durably after repeated
+        # IDENTICAL extraction failures is skipped until the map's covers end
+        # advances past the dump window end (new map content might fix the
+        # parse). Telemetry records every skip.
+        telemetry = record if record is not None else {}
+        from agent.compaction_map import CompactionMap
+        covers_end_now = int(CompactionMap(Path(self.storage_root), self.session_id)
+                             .load().get("covers", {}).get("end_msg", 0) or 0)
+        if _park_blocks(candidate, covers_end_now):
+            park = _read_park(candidate) or {}
+            logger.info(
+                "extraction skipped for %s: parked (%d identical failures, "
+                "covers end %s vs dump end %s)",
+                candidate.name, park.get("failures", 0), covers_end_now,
+                park.get("dump_end"))
+            telemetry.setdefault("parked_regions", []).append(
+                {"dump_id": candidate.name, "reason": park.get("reason"),
+                 "failures": park.get("failures", 0)})
+            return None
+        # A park whose unblock condition is already met clears now: the next
+        # attempt ladders from a clean slate instead of inheriting a stale
+        # failure count (D4: retry only when something changed).
+        _clear_expired_park(candidate, covers_end_now)
+        meta = store.read_meta(self.session_id, candidate.name) or {}
+        dump_end = int(meta.get("end_msg", 0)) if meta else None
+        self._extraction_attempted.add(candidate.name)
         try:
             stage_c = run_extraction_cycle(
                 candidate,
@@ -506,12 +550,25 @@ class IdlePipelinePass:
                 max_stage_retries=getattr(self.agent, "compaction_pipeline_max_stage_retries", 2),
             )
             self.agent._compaction_pipeline_last_extract_ts = time.time()
+            # Success clears any lingering park marker (e.g. a transient
+            # failure streak that never hit the breaker threshold).
+            _clear_park(candidate)
             return stage_c
         except StageCheckError as exc:
             logger.warning("extraction parked for %s: %s", candidate.name, exc)
+            marker = _park_region(candidate, reason=str(exc), exc=exc,
+                                  covers_end=covers_end_now, dump_end=dump_end)
+            if marker["failures"] < DETERMINISTIC_FAILURE_THRESHOLD:
+                telemetry["extract_park"] = {"dump_id": candidate.name,
+                                             "failures": marker["failures"]}
             return None
         except Exception as exc:  # noqa: BLE001
             logger.warning("extraction failed for %s: %s", candidate.name, exc)
+            marker = _park_region(candidate, reason=str(exc), exc=exc,
+                                  covers_end=covers_end_now, dump_end=dump_end)
+            if marker["failures"] < DETERMINISTIC_FAILURE_THRESHOLD:
+                telemetry["extract_failed"] = {"dump_id": candidate.name,
+                                               "error": str(exc)}
             return None
 
     def _dump_fresh_window(self, messages) -> Optional[tuple]:
@@ -537,20 +594,27 @@ class IdlePipelinePass:
 
     def _schedule_extraction(self, record: Dict[str, Any]) -> None:
         """Extract dumped-unextracted regions (≤ one region cycle per pass).
-        A region whose stage_c exists is already extracted; skip it."""
+        A region whose stage_c exists is already extracted; skip it. A region
+        already extraction-attempted THIS pass (the R5 bypass region) is not
+        attempted again — one extraction attempt per region per pass, so a
+        deterministic failure ladders once per pass, not twice."""
         from agent.compaction_dump import DumpStore
         store = DumpStore(Path(self.storage_root))
         for d in store.dump_dirs(self.session_id):
             if (d / "stage_c.json").is_file():
                 continue
+            if d.name in self._extraction_attempted:
+                continue
             meta = store.read_meta(self.session_id, d.name) or {}
             if not meta.get("complete"):
                 continue
             window = (int(meta["start_msg"]), int(meta["end_msg"]))
-            stage_c = self._run_extraction_for_window(window, None)
+            stage_c = self._run_extraction_for_window(window, None, record=record)
             if stage_c is not None:
                 record["extracted"] = d.name
             else:
+                # Parked (D4 breaker skip, StageCheckError, or any failure) —
+                # the region stays live and is retried on a later pass.
                 record["extract_parked"] = d.name
             return  # ≤ one region cycle per pass
         record["no_extraction"] = True
@@ -737,6 +801,103 @@ def _atomic_write_json(path, obj: Dict[str, Any]) -> None:
         except Exception:  # noqa: BLE001
             pass
     os.replace(tmp, path)
+
+
+# ── SPEC-0047 D4: deterministic-failure circuit breaker ──────────────────
+
+
+def _park_path(dump_dir: Path) -> Path:
+    """The durable park marker next to the dump: ``<dump_id>.parked.json``."""
+    return Path(dump_dir) / "extraction.parked.json"
+
+
+def _read_park(dump_dir: Path) -> Optional[Dict[str, Any]]:
+    return _read_json(_park_path(dump_dir))
+
+
+def _park_region(dump_dir: Path, *, reason: str, exc: Optional[BaseException] = None,
+                 covers_end: Optional[int] = None,
+                 dump_end: Optional[int] = None) -> Dict[str, Any]:
+    """Durably park a region after a failed extraction attempt.
+
+    Increments the failure count when the exception type+message repeats,
+    resets it when the failure signature CHANGES (a new failure mode restarts
+    the ladder), and stamps the map covers end observed at failure time. The
+    marker clears itself once ``covers.end_msg`` advances past the dump
+    window end (D4: new map content might fix the parse — retry then).
+    """
+    marker = {
+        "parked": True,
+        "reason": reason,
+        "failures": 1,
+        "last_error_type": type(exc).__name__ if exc is not None else None,
+        "last_error": str(exc) if exc is not None else None,
+        "covers_end_at_failure": covers_end,
+        "dump_end": dump_end,
+        "parked_at": time.time(),
+        "park_version": 1,
+    }
+    prior = _read_park(dump_dir) or {}
+    if (prior.get("last_error_type") == marker["last_error_type"]
+            and prior.get("last_error") == marker["last_error"]):
+        marker["failures"] = int(prior.get("failures", 0)) + 1
+        marker["parked_at"] = prior.get("parked_at", marker["parked_at"])
+    _atomic_write_json(_park_path(dump_dir), marker)
+    logger.warning(
+        "extraction parked durably for %s (%d identical failures): %s",
+        Path(dump_dir).name, marker["failures"], reason)
+    return marker
+
+
+def _clear_park(dump_dir: Path) -> None:
+    try:
+        _park_path(dump_dir).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _park_blocks(dump_dir: Path, covers_end: Optional[int]) -> bool:
+    """True when a parked region must be skipped: the failure ladder has
+    reached the breaker threshold AND the map covers have not yet advanced
+    past the dump window end. Below the threshold the region keeps retrying
+    (transient failures); ``covers_end=None`` (no map / empty map) never
+    unblocks an at-threshold park — nothing changed that could fix the parse.
+    A corrupt marker does not block (fail-open to a normal retry)."""
+    park = _read_park(dump_dir)
+    if not park:
+        return False
+    try:
+        failures = int(park.get("failures", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if failures < DETERMINISTIC_FAILURE_THRESHOLD:
+        return False
+    dump_end = park.get("dump_end")
+    if not isinstance(dump_end, int):
+        return False
+    if covers_end is None:
+        return True
+    try:
+        return int(covers_end) < int(dump_end)
+    except (TypeError, ValueError):
+        return True
+
+
+def _clear_expired_park(dump_dir: Path, covers_end: Optional[int]) -> None:
+    """Drop a park marker whose unblock condition is already satisfied (the
+    map advanced past the dump end): the next attempt ladders from a clean
+    slate instead of inheriting the stale failure count."""
+    park = _read_park(dump_dir)
+    if not park:
+        return
+    dump_end = park.get("dump_end")
+    if not isinstance(dump_end, int) or covers_end is None:
+        return
+    try:
+        if int(covers_end) >= int(dump_end):
+            _clear_park(dump_dir)
+    except (TypeError, ValueError):
+        pass
 
 
 def idle_pipeline_sweep(agent: Any, messages, idle_gap_seconds: float) -> Dict[str, Any]:
