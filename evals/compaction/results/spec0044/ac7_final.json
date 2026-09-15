@@ -1,0 +1,46 @@
+{
+  "ac": "AC-7",
+  "verdict": "PASS",
+  "note": "",
+  "tree": {
+    "commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "branch": "wt/t_c323acdf",
+    "dirty": true
+  },
+  "evidence": {
+    "rc": 0,
+    "receipt": {
+      "mode": "drill",
+      "drill": "storage-ro",
+      "storage_root": "/tmp/spec43-drill-bi7v0ilm/storage",
+      "ts": 1789430707.2158213,
+      "container": null,
+      "unwritable_mechanism": "chmod",
+      "preflight_root_writable": false,
+      "ran": true,
+      "record": {
+        "ran": true,
+        "queued": 0,
+        "updated": false,
+        "map_error": "[Errno 13] Permission denied: '/tmp/spec43-drill-bi7v0ilm/storage/drill-session/map.json.tmp'",
+        "dump_error": "[Errno 13] Permission denied: '/tmp/spec43-drill-bi7v0ilm/storage/drill-session/0001-d7e7e281'",
+        "no_extraction": true,
+        "idle_window": [
+          2,
+          15
+        ]
+      },
+      "live_unchanged": true,
+      "process_crashed": false,
+      "assert": {
+        "preflight_proved_root_read_only": true,
+        "live_list_untouched": true,
+        "no_crash": true,
+        "storage_failure_recorded": true,
+        "nothing_written_to_readonly_root": true
+      }
+    },
+    "preflight_proved_root_read_only": true,
+    "mechanism": "chmod"
+  }
+}

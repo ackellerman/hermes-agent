@@ -137,18 +137,50 @@ def _load_transcripts(replay_dir) -> list:
     return transcripts
 
 
-def _tick_region(transcripts: list, tick: int, *, min_messages: int = 10) -> list:
+def _tick_region(transcripts: list, tick: int, *, min_messages: int = 10,
+                 max_messages: int = 120) -> list:
     """The message region a tick compacts, taken from the LOADED transcripts
     (cycled so every file is consumed). A transcript shorter than
     ``min_messages`` is cycled up so the existing invariant checks stay
-    meaningful. This is what makes ``--replay-dir`` genuinely drive the run."""
+    meaningful; one longer than ``max_messages`` is TRUNCATED so the live-window
+    rotation can always keep the simulated session bounded (a region larger than
+    the whole window would otherwise make rotation impossible and grow the
+    receipt without limit).
+
+    CONTENT is replayed verbatim (that is the token-scale driver AC-5 needs);
+    ROLES are projected onto a valid alternation. Real transcripts contain runs
+    of same-role messages (and tool turns whose tool_calls/tool_call_id pairings
+    this harness does not replay), while a live agent context is always
+    alternation-valid. Feeding raw roles would make the swap refuse on a broken
+    INPUT and stop exercising the swap at all — measuring the fixture, not the
+    pipeline.
+    """
     source = transcripts[tick % len(transcripts)]
-    if len(source) >= min_messages:
-        return copy.deepcopy(source)
-    out = []
+    normalized: list = []
+    prev_role = None
+    for msg in source:
+        content = msg.get("content")
+        if content is None:
+            continue
+        role = "assistant" if prev_role != "assistant" else "user"
+        normalized.append({"role": role, "content": content})
+        prev_role = role
+    if len(normalized) > max_messages:
+        normalized = normalized[:max_messages]
+    if len(normalized) >= min_messages:
+        return normalized
+    out: list = []
     while len(out) < min_messages:
-        out.extend(copy.deepcopy(source))
+        out.extend(copy.deepcopy(normalized))
     return out
+
+
+def _brief(text, limit: int = 400) -> str:
+    """A bounded string for a receipt. A violation message can embed an entire
+    message list; an unbounded receipt once reached 4.5 GB. Bounding here keeps
+    the receipt readable and committable while preserving the leading detail."""
+    out = str(text)
+    return out if len(out) <= limit else out[:limit] + f"... [+{len(out) - limit} chars]"
 
 
 def _transcript_set_provenance(replay_dir) -> dict:
@@ -185,6 +217,7 @@ def _container_provenance() -> dict | None:
         "container_image_id": os.environ.get("HERMES_EVAL_CONTAINER_IMAGE_ID", ""),
         "container_image_digest": os.environ.get("HERMES_EVAL_CONTAINER_IMAGE_DIGEST", ""),
         "container_commit": os.environ.get("HERMES_EVAL_CONTAINER_COMMIT", ""),
+        "container_tree_dirty": os.environ.get("HERMES_EVAL_CONTAINER_TREE_DIRTY", "") == "true",
         "container_runtime": os.environ.get("HERMES_EVAL_CONTAINER_RUNTIME", "docker"),
         "container_command": os.environ.get("HERMES_EVAL_CONTAINER_COMMAND", ""),
     }
@@ -208,24 +241,23 @@ def run(*, turns: int, storage_root: Path, db, replay_dir=None) -> dict:
         transcripts = [_alternating_messages(20)]  # fallback, flagged in the receipt
 
     started = time.time()
-    # The simulated long session GROWS: each tick appends the next transcript
-    # region after all previously-covered content, and the compaction window
-    # ADVANCES monotonically (covers.end_msg == the chunk's end offset, as the
-    # map update contract requires). Recompacting one fixed window every tick
-    # would leave covers pinned while the tick count climbed, and any honest
-    # cover-coherence check (AC-15) would then trip on the FIRST tick after a
-    # retire — a modelling error, not a pipeline one.
-    covered_end = -1
-    session_messages: list = []
+    # The simulated long session GROWS and then ROTATES: each tick appends the
+    # next transcript region, and once the live window passes ``max_live`` messages
+    # the already-compacted prefix is dropped (exactly what a real long session
+    # does at a compression boundary). Compaction WINDOW INDICES stay absolute and
+    # monotonic, so ``covers.end_msg`` still advances every tick and the AC-15
+    # cover-coherence check stays meaningful — while the per-tick cost stays linear
+    # instead of growing with the tick count.
+    max_live = 400
+    base_offset = 0            # absolute index of live_window[0]
+    live_window: list = []     # the messages currently visible to the pipeline
     for tick in range(turns):
         region_msgs = _tick_region(transcripts, tick)
-        session_messages = session_messages + copy.deepcopy(region_msgs)
-        start_idx = covered_end + 1
-        end_idx = len(session_messages) - 1
-        # The live window the pipeline sees is the whole session so far; the region
-        # under compaction is the newly-appended slice.
-        workspace = copy.deepcopy(session_messages)
-        region_msgs = workspace[start_idx:end_idx + 1]
+        live_window = live_window + copy.deepcopy(region_msgs)
+        start_idx = base_offset + len(live_window) - len(region_msgs)
+        end_idx = base_offset + len(live_window) - 1
+        workspace = copy.deepcopy(live_window)
+        region_msgs = workspace[start_idx - base_offset:end_idx - base_offset + 1]
 
         # LOCK_DISCIPLINE: acquire for the pass, release in finally.
         holder = f"pipeline:{session_id}"
@@ -248,7 +280,8 @@ def run(*, turns: int, storage_root: Path, db, replay_dir=None) -> dict:
             bad_checkpoint = {"commitments": "null_reason: none", "narrative": "x",
                               "confidence": 0.5, "coverage": {"complete": True}}
             try:
-                swap_region(workspace, start_idx=start_idx, end_idx=end_idx,
+                swap_region(workspace, start_idx=start_idx - base_offset,
+                            end_idx=end_idx - base_offset,
                             checkpoint=bad_checkpoint, dump_store=store,
                             session_id=session_id, dump_id="definitely-missing",
                             gate_verdict={"swap_eligible": True})
@@ -267,9 +300,12 @@ def run(*, turns: int, storage_root: Path, db, replay_dir=None) -> dict:
             checkpoint = extractor.stage_c(_det_stage_c_llm(dump_id, start_idx, end_idx), stage_b)
 
             # SWAP_ORDERING: gate eligible -> swap; single batched mutation.
+            # ``workspace`` is the LIVE window, so the swap uses LOCAL indices while
+            # the dump and the map use absolute ones.
             before_len = len(workspace)
             swapped = swap_region(
-                workspace, start_idx=start_idx, end_idx=end_idx, checkpoint=checkpoint,
+                workspace, start_idx=start_idx - base_offset,
+                end_idx=end_idx - base_offset, checkpoint=checkpoint,
                 dump_store=store, session_id=session_id, dump_id=dump_id,
                 gate_verdict={"swap_eligible": True})
             if len(swapped) != before_len - (end_idx - start_idx):
@@ -299,6 +335,16 @@ def run(*, turns: int, storage_root: Path, db, replay_dir=None) -> dict:
                         violations.append(
                             f"tick {tick}: retired episode {ep['start_msg']} remains "
                             f"below covers.start_msg {cs}")
+
+            # ROTATE: drop the already-compacted prefix once the live window is
+            # oversized. Only messages strictly below covers.start_msg may go, so
+            # nothing un-covered is discarded and the absolute indices stay
+            # monotonic across the rotation.
+            droppable = min(cs - base_offset, len(live_window) - max_live)
+            if droppable > 0:
+                live_window = live_window[droppable:]
+                base_offset += droppable
+
             total_messages += len(region_msgs)
             turn_log.append({
                 "tick": tick, "dump_id": dump_id, "region_messages": len(region_msgs),
@@ -306,13 +352,18 @@ def run(*, turns: int, storage_root: Path, db, replay_dir=None) -> dict:
                 "map_entries_after": len(after["episodes"]),
             })
         except Exception as exc:  # noqa: BLE001
-            violations.append(f"tick {tick}: unexpected exception: {exc!r}")
+            raw = f"tick {tick}: unexpected exception: {exc!r}"
+            violations.append(_brief(raw))
+            # An unmapped exception is a FAILURE, not merely an unobserved
+            # condition: record it so ``all_invariants_hold`` cannot report true
+            # while ``violations`` is non-empty (they once disagreed).
+            invariants["unmapped_exception"] = False
         finally:
             db.release_pipeline_lock(session_id, holder)
     elapsed = time.time() - started
 
     prov = _transcript_set_provenance(replay_dir)
-    invariants = {
+    invariants.update({
         "ordering_swap_refuses_incomplete": not any("refuse an incomplete" in v for v in violations),
         "lock_discipline_no_leak": not any("could not acquire" in v or "lock" in v.lower()
                                            and "acquire" in v for v in violations),
@@ -328,7 +379,10 @@ def run(*, turns: int, storage_root: Path, db, replay_dir=None) -> dict:
         "transcripts_resolved": not empty_replay_set,
         "replay_drove_the_pass": bool(turn_log) and all(
             t["region_messages"] >= 10 for t in turn_log),
-    }
+        # The receipt's own consistency: a non-empty violation list MUST mean the
+        # invariants did not all hold.
+        "receipt_self_consistent": not violations,
+    })
     return {
         "mode": "soak",
         "turns_run": turns,
@@ -336,6 +390,7 @@ def run(*, turns: int, storage_root: Path, db, replay_dir=None) -> dict:
         "transcripts_consumed": transcript_count,
         "region_messages_per_pass": (turn_log[-1]["region_messages"] if turn_log else 0),
         "turn_log_region_messages": sorted({t["region_messages"] for t in turn_log}),
+        "max_live_window": max_live,
         "transcript_count": prov["transcript_count"],
         "transcript_sha256": prov["transcript_sha256"],
         "transcript_source": prov["transcript_source"],

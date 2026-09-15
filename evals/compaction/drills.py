@@ -59,6 +59,7 @@ def _container_provenance() -> dict | None:
         "container_image_id": os.environ.get("HERMES_EVAL_CONTAINER_IMAGE_ID", ""),
         "container_image_digest": os.environ.get("HERMES_EVAL_CONTAINER_IMAGE_DIGEST", ""),
         "container_commit": os.environ.get("HERMES_EVAL_CONTAINER_COMMIT", ""),
+        "container_tree_dirty": os.environ.get("HERMES_EVAL_CONTAINER_TREE_DIRTY", "") == "true",
         "container_runtime": os.environ.get("HERMES_EVAL_CONTAINER_RUNTIME", "docker"),
         "container_command": os.environ.get("HERMES_EVAL_CONTAINER_COMMAND", ""),
     }

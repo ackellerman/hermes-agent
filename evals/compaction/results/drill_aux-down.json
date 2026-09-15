@@ -1,8 +1,17 @@
 {
   "mode": "drill",
   "drill": "aux-down",
-  "storage_root": "/tmp/spec43-drill-r5h1kc4c/storage",
-  "ts": 1789337228.4924686,
+  "storage_root": "/tmp/spec43-drill-r5xy9b6y/storage",
+  "ts": 1789430524.6438246,
+  "container": {
+    "container_image": "nousresearch/hermes-agent:latest",
+    "container_image_id": "sha256:1d4a19fcfc5452716bfde16970be6e9dbe3c1487a31d5fbb8b0a3e65c556f5d9",
+    "container_image_digest": "nousresearch/hermes-agent@sha256:877195433e2fe26d1082c9065b3f4ac98efe48b38f7c5525ab7c9188c05a3a05",
+    "container_commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "container_tree_dirty": false,
+    "container_runtime": "docker",
+    "container_command": "python3 evals/compaction/drills.py aux-down --json /out/drill_aux-down.json"
+  },
   "action": "degrade",
   "swapped": true,
   "degraded": null,
@@ -11,9 +20,16 @@
     2,
     20
   ],
+  "dumps_on_disk": [
+    "0001-f4dc77b0"
+  ],
+  "complete_dumps": [
+    "0001-f4dc77b0"
+  ],
   "assert": {
     "legacy_or_degrade_completes": true,
     "queue_row_written_dump_before_degrade": true,
-    "dump_exists": true
+    "dumped_region_exists_on_disk": true,
+    "queue_row_window_has_a_complete_dump": true
   }
 }

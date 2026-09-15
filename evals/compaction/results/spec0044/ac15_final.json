@@ -1,0 +1,28 @@
+{
+  "ac": "AC-15",
+  "verdict": "PASS",
+  "note": "",
+  "tree": {
+    "commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "branch": "wt/t_c323acdf",
+    "dirty": true
+  },
+  "evidence": {
+    "soak_receipt_present": true,
+    "invariant_present": true,
+    "invariant_holds": true,
+    "turn_log_covers": [
+      {
+        "start_msg": 933,
+        "end_msg": 933
+      }
+    ],
+    "all_covers_coherent": true,
+    "all_invariants_hold": true,
+    "discriminator_committed": true,
+    "discriminator_rc": 0,
+    "discriminator_output": [
+      "AC-15 DISCRIMINATES: True"
+    ]
+  }
+}

@@ -64,6 +64,10 @@ mkdir -p "$RESULTS"
 
 COMMIT="$(git -C "$REPO" rev-parse HEAD)"
 BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
+# A receipt must never claim a clean commit for a tree that had uncommitted
+# changes when the run happened (AC-9 provenance): the flag rides into the
+# receipt alongside the commit.
+if [ -n "$(git -C "$REPO" status --porcelain)" ]; then TREE_DIRTY="true"; else TREE_DIRTY="false"; fi
 DIRTY="$(git -C "$REPO" status --porcelain | head -c 200)"
 if [ -n "$DIRTY" ] && [ "$ALLOW_DIRTY" -ne 1 ]; then
   echo "refusing to receipt a dirty tree (pass --allow-dirty for local iteration):" >&2
@@ -91,6 +95,20 @@ tar -C "$REPO" -cf - \
   --exclude='.worktrees' --exclude='*.egg-info' \
   . | tar -C "$WORK/src" -xf -
 
+# The soak also runs against the OPERATOR transcript set when one is supplied:
+# SPEC-0043's AC-30 pins the operator replay (count + sha256) and the SPEC-0044
+# AC-5 falsifier requires provenance and traffic to agree, so the committed soak
+# receipt carries both the container identity AND the operator pin.
+REPLAY_ARGS=()
+if [ -n "${HERMES_COMPACTION_REPLAY_DIR:-}" ]; then
+  [ -d "$HERMES_COMPACTION_REPLAY_DIR" ] || {
+    echo "replay dir does not exist: $HERMES_COMPACTION_REPLAY_DIR" >&2; exit 2; }
+  mkdir -p "$WORK/replay"
+  cp "$HERMES_COMPACTION_REPLAY_DIR"/*.json "$WORK/replay/"
+  REPLAY_ARGS=(--replay-dir /replay)
+  echo "operator replay: $HERMES_COMPACTION_REPLAY_DIR ($(ls "$WORK/replay" | wc -l) files)"
+fi
+
 CONTAINER_ENV=(
   -e HERMES_HOME=/tmp/hermes-home
   # /src must precede the image's own /opt/hermes install (which sits on
@@ -100,6 +118,7 @@ CONTAINER_ENV=(
   -e "HERMES_EVAL_CONTAINER_IMAGE_ID=$IMAGE_ID"
   -e "HERMES_EVAL_CONTAINER_IMAGE_DIGEST=$IMAGE_DIGEST"
   -e "HERMES_EVAL_CONTAINER_COMMIT=$COMMIT"
+  -e "HERMES_EVAL_CONTAINER_TREE_DIRTY=$TREE_DIRTY"
   -e "HERMES_EVAL_CONTAINER_RUNTIME=$RUNTIME"
   -e "PYTHONDONTWRITEBYTECODE=1"
 )
@@ -107,9 +126,10 @@ CONTAINER_ENV=(
 run_in_container() {
   # $1 = receipt path inside the container; remaining = the python command
   local receipt="$1"; shift
+  local mounts=(-v "$WORK/src:/src:ro" -v "$WORK/out:/out")
+  if [ -d "$WORK/replay" ]; then mounts+=(-v "$WORK/replay:/replay:ro"); fi
   "$RUNTIME" run --rm \
-    -v "$WORK/src:/src:ro" \
-    -v "$WORK/out:/out" \
+    "${mounts[@]}" \
     -w /src \
     --entrypoint sh \
     "${CONTAINER_ENV[@]}" \
@@ -119,9 +139,9 @@ run_in_container() {
 
 mkdir -p "$WORK/out"
 
-echo "=== soak (turns=$TURNS) ==="
+echo "=== soak (turns=$TURNS${REPLAY_ARGS:+ , operator replay}) ==="
 run_in_container /out/soak_results.json python3 evals/compaction/soak.py \
-  --turns "$TURNS" --json /out/soak_results.json
+  --turns "$TURNS" --json /out/soak_results.json "${REPLAY_ARGS[@]}"
 
 for drill in aux-down storage-ro kill-mid; do
   echo "=== drill $drill ==="

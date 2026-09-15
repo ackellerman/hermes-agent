@@ -1,18 +1,42 @@
 {
   "mode": "drill",
   "drill": "kill-mid",
-  "storage_root": "/tmp/spec43-drill-m5_l2036/storage",
-  "ts": 1789337228.955286,
-  "partial_region": "0001-cc79df81",
+  "storage_root": "/tmp/spec43-drill-fy23ev27/storage",
+  "ts": 1789430525.905594,
+  "container": {
+    "container_image": "nousresearch/hermes-agent:latest",
+    "container_image_id": "sha256:1d4a19fcfc5452716bfde16970be6e9dbe3c1487a31d5fbb8b0a3e65c556f5d9",
+    "container_image_digest": "nousresearch/hermes-agent@sha256:877195433e2fe26d1082c9065b3f4ac98efe48b38f7c5525ab7c9188c05a3a05",
+    "container_commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "container_tree_dirty": false,
+    "container_runtime": "docker",
+    "container_command": "python3 evals/compaction/drills.py kill-mid --json /out/drill_kill-mid.json"
+  },
+  "child_killed_by_signal": true,
+  "child_returncode": -9,
+  "partial_region": "0001-a5b29f27",
   "record": {
     "ran": true,
-    "updated": false,
-    "map_error": "map update did not return a map object: '{}'",
-    "extract_parked": "0001-cc79df81"
+    "queued": 0,
+    "updated": true,
+    "dumped": "0001-a5b29f27",
+    "dump_window": [
+      0,
+      9
+    ],
+    "dumped_exists": true,
+    "extract_parked": "0001-a5b29f27",
+    "idle_window": [
+      0,
+      9
+    ]
   },
-  "stage_c_absent": true,
   "assert": {
-    "partial_stage_never_swapped": true,
+    "real_process_killed_mid_stage": true,
+    "partial_region_present": true,
+    "partial_region_has_no_stage_c": true,
+    "partial_region_never_swapped": true,
+    "live_list_untouched": true,
     "no_crash": true
   }
 }

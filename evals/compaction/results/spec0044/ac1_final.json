@@ -1,0 +1,79 @@
+{
+  "ac": "AC-1",
+  "verdict": "PASS",
+  "note": "",
+  "tree": {
+    "commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "branch": "wt/t_c323acdf",
+    "dirty": true
+  },
+  "evidence": {
+    "storage_root": "/tmp/spec44-ac1-dd5vg59x/storage",
+    "pass1_record": {
+      "ran": true,
+      "queued": 0,
+      "updated": false,
+      "map_error": "map update did not return a map object: '{}'",
+      "dumped": "0001-cb3ffa5d",
+      "dump_window": [
+        0,
+        3
+      ],
+      "extracted": "0001-cb3ffa5d",
+      "gated": "0001-cb3ffa5d",
+      "swap_eligible": true,
+      "idle_window": [
+        0,
+        3
+      ],
+      "swapped_regions": [
+        "0001-cb3ffa5d"
+      ]
+    },
+    "dump_dirs_after_pass1": [
+      "0001-cb3ffa5d",
+      "sess"
+    ],
+    "region_dir": "/tmp/spec44-ac1-dd5vg59x/storage/sess/0001-cb3ffa5d",
+    "artifacts": [
+      "0001-cb3ffa5d.jsonl",
+      "0001-cb3ffa5d.meta.json",
+      "gate.json",
+      "stage_a.json",
+      "stage_b.json",
+      "stage_c.json"
+    ],
+    "stage_c_present": true,
+    "gate_present": true,
+    "dump_complete": true,
+    "flat_siblings": [
+      "stubs.json"
+    ],
+    "backstop_action": "swap",
+    "backstop_degraded": false,
+    "backstop_reason": null,
+    "swapped_has_checkpoint": true,
+    "pass2_record": {
+      "ran": true,
+      "queued": 0,
+      "updated": false,
+      "map_error": "map update did not return a map object: '{}'",
+      "dumped": "0001-cb3ffa5d",
+      "dump_window": [
+        0,
+        3
+      ],
+      "dumped_exists": true,
+      "no_extraction": true,
+      "idle_window": [
+        0,
+        3
+      ],
+      "swapped_regions": [
+        "0001-cb3ffa5d"
+      ]
+    },
+    "dump_dir_count_stable": true,
+    "dump_mtime_stable": true
+  }
+}
