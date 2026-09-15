@@ -1,0 +1,49 @@
+{
+  "ac": "AC-4",
+  "verdict": "PASS",
+  "note": "",
+  "tree": {
+    "commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "branch": "wt/t_c323acdf",
+    "dirty": true
+  },
+  "evidence": {
+    "storage_root": "/tmp/spec44-ac4-g4wxwufn/storage",
+    "queued_window": [
+      20,
+      29
+    ],
+    "live_window": [
+      0,
+      3
+    ],
+    "expected_fresh_dump": "0001-cb3ffa5d",
+    "record": {
+      "ran": true,
+      "queued_drained": 1,
+      "updated": false,
+      "map_error": "map update did not return a map object: '{}'",
+      "dumped": "0001-cb3ffa5d",
+      "dump_window": [
+        0,
+        3
+      ],
+      "dumped_exists": true,
+      "no_extraction": true,
+      "gated": "0001-cb3ffa5d",
+      "swap_eligible": true,
+      "idle_window": [
+        0,
+        3
+      ],
+      "swapped_regions": [
+        "0001-cb3ffa5d"
+      ]
+    },
+    "queue_rows_after": [],
+    "fresh_dump_dir_exists": true,
+    "fresh_stage_c": true,
+    "stale_dump_created": false,
+    "control_queue_rows": 1
+  }
+}

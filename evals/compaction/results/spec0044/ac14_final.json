@@ -1,0 +1,24 @@
+{
+  "ac": "AC-14",
+  "verdict": "PASS",
+  "note": "",
+  "tree": {
+    "commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "branch": "wt/t_c323acdf",
+    "dirty": true
+  },
+  "evidence": {
+    "dated_red_record": true,
+    "record_commit": "46822b15cc4b8aa57faea94f794b0ba7b38934cf",
+    "record_mode": "pre-fix-red-baseline",
+    "record_red_conditions": {
+      "no_per_dump_directory": true,
+      "journal_not_inside_dir": true,
+      "extractor_fabricated_the_dir": true,
+      "degrade_did_not_dump": true
+    },
+    "record_all_red": true,
+    "docstring_labels_tripwire": true,
+    "docstring_disclaims_baseline": true
+  }
+}

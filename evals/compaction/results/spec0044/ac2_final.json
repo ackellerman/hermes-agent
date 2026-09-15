@@ -1,0 +1,20 @@
+{
+  "ac": "AC-2",
+  "verdict": "PASS",
+  "note": "",
+  "tree": {
+    "commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "branch": "wt/t_c323acdf",
+    "dirty": true
+  },
+  "evidence": {
+    "fabrication_lines": [],
+    "scanned": [
+      "tests/agent/test_compaction_producer.py",
+      "tests/agent/test_compaction_backstop_wiring.py",
+      "evals/compaction/online_eval.py"
+    ],
+    "producer_suite_rc": 0,
+    "producer_suite_tail": "er-file parallel test suite via run_tests_parallel.py\n  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)\n\u25b6 pre-compiling bytecode cache\n\u25b6 launching test runner\nDiscovered 1 test files (~11 tests) under ['tests/agent/test_compaction_producer.py']; running with -j 96\n[100.0% |    11/~11 | \u271311 | \u2717 0] \u2713 tests/agent/test_compaction_producer.py (11\u2713, 2.8s)\n\n=== Summary: 1 files, 11 tests passed, 0 failed (100% complete) in 2.8s (96 workers) ===\n  Durations cached to test_durations.json (1 files)\n\n=== Per-file subprocess time distribution ===\n  Files:   1\n  Total subprocess CPU-wall: 2.8s  (runner wall: 2.8s, parallelism: 96x)\n  P50: 2.79s  P90: 2.79s  P95: 2.79s  P99: 2.79s  Max: 2.79s\n  <1s: 0 files (0%)  <2s: 0 files (0%)\n  Top 10 slowest:\n      2.79s  tests/agent/test_compaction_producer.py\n"
+  }
+}

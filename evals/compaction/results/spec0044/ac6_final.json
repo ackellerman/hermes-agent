@@ -1,0 +1,51 @@
+{
+  "ac": "AC-6",
+  "verdict": "PASS",
+  "note": "",
+  "tree": {
+    "commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "branch": "wt/t_c323acdf",
+    "dirty": true
+  },
+  "evidence": {
+    "rc": 0,
+    "receipt": {
+      "mode": "drill",
+      "drill": "aux-down",
+      "storage_root": "/tmp/spec43-drill-ku4w0kbn/storage",
+      "ts": 1789430706.8732166,
+      "container": null,
+      "action": "degrade",
+      "swapped": true,
+      "degraded": null,
+      "queue_rows": 1,
+      "queue_window": [
+        2,
+        20
+      ],
+      "dumps_on_disk": [
+        "0001-f4dc77b0"
+      ],
+      "complete_dumps": [
+        "0001-f4dc77b0"
+      ],
+      "assert": {
+        "legacy_or_degrade_completes": true,
+        "queue_row_written_dump_before_degrade": true,
+        "dumped_region_exists_on_disk": true,
+        "queue_row_window_has_a_complete_dump": true
+      }
+    },
+    "dumps_on_disk": [
+      "0001-f4dc77b0"
+    ],
+    "complete_dumps": [
+      "0001-f4dc77b0"
+    ],
+    "queue_window": [
+      2,
+      20
+    ],
+    "evidence_matches_filesystem": true
+  }
+}

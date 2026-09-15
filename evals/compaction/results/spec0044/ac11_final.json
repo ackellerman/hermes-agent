@@ -1,0 +1,17 @@
+{
+  "ac": "AC-11",
+  "verdict": "PASS",
+  "note": "",
+  "tree": {
+    "commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "branch": "wt/t_c323acdf",
+    "dirty": true
+  },
+  "evidence": {
+    "real_receipt_present": false,
+    "deterministic_reproduces_fields": true,
+    "deterministic_field_diff": [],
+    "deterministic_rc": 1,
+    "real_receipt_removed_or_renamed": true
+  }
+}

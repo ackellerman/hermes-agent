@@ -1,0 +1,41 @@
+{
+  "ac": "AC-10",
+  "verdict": "PASS",
+  "note": "",
+  "tree": {
+    "commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "branch": "wt/t_c323acdf",
+    "dirty": true
+  },
+  "evidence": {
+    "receipt_present": true,
+    "mode": "online",
+    "before_mode": "before-arm (real ContextCompressor single-call summary)",
+    "method_invoked": true,
+    "compressor_class": "agent.context_compressor.ContextCompressor",
+    "models_called": [
+      {
+        "model": "",
+        "task": "compression",
+        "resolved_provider": "ollama-cloud",
+        "resolved_model": "deepseek-v4.1-flash:cloud"
+      }
+    ],
+    "runtime_model_resolution": {
+      "asked_model": "Qwen3.8-v3:27b",
+      "actually_called_model": "deepseek-v4.1-flash:cloud",
+      "actually_called_provider": "ollama-cloud",
+      "substitution_reason": "the install's auxiliary.compression route governs the aux call and resolved a different model id than the one requested; the id that actually served the request is recorded above"
+    },
+    "map_model_is_spec_id": true,
+    "map_model_substitution": null,
+    "gate_always_on_default": true,
+    "gate_setting_touched_by_harness": false,
+    "substitutions_all_reasoned": true,
+    "checks": {
+      "a_real_compressor_method": true,
+      "b_runtime_model_id": true,
+      "c_gate_at_default": true
+    }
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "ac": "AC-8",
+  "verdict": "PASS",
+  "note": "",
+  "tree": {
+    "commit": "890bdd8d01b7ad04bc7baa02760d4f01bc1294c6",
+    "branch": "wt/t_c323acdf",
+    "dirty": true
+  },
+  "evidence": {
+    "rc": 0,
+    "receipt": {
+      "mode": "drill",
+      "drill": "kill-mid",
+      "storage_root": "/tmp/spec43-drill-hxz7ncda/storage",
+      "ts": 1789430707.7040973,
+      "container": null,
+      "child_killed_by_signal": true,
+      "child_returncode": -9,
+      "partial_region": "0001-a5b29f27",
+      "record": {
+        "ran": true,
+        "queued": 0,
+        "updated": true,
+        "dumped": "0001-a5b29f27",
+        "dump_window": [
+          0,
+          9
+        ],
+        "dumped_exists": true,
+        "extract_parked": "0001-a5b29f27",
+        "idle_window": [
+          0,
+          9
+        ]
+      },
+      "assert": {
+        "real_process_killed_mid_stage": true,
+        "partial_region_present": true,
+        "partial_region_has_no_stage_c": true,
+        "partial_region_never_swapped": true,
+        "live_list_untouched": true,
+        "no_crash": true
+      }
+    },
+    "child_returncode": -9
+  }
+}

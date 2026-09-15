@@ -10,21 +10,80 @@
     "escape_hatch": "deepseek-v4-flash"
   },
   "models_used": {
-    "map": "Qwen3.8-v3:27b",
+    "map": "llama-small",
     "reason": "Qwen3.8-v3:27b",
     "extract": "Qwen3.8-v3:27b",
     "check": "Qwen3.8-v3:27b",
     "gate": "Qwen3.8-v3:27b",
     "escape_hatch": "deepseek-v4-flash"
+  },
+  "model_substitutions": [
+    {
+      "stage": "reason/extract/check/gate",
+      "spec_id": "qwen3.8-v3",
+      "used_id": "Qwen3.8-v3:27b",
+      "reason": "the SPEC 3.7 id is a logical id; this install serves the concrete alias given on the command line"
+    }
+  ],
+  "map_model_is_spec_id": true,
+  "map_model_substitution": null,
+  "runtime_model_resolution": {
+    "asked_model": "Qwen3.8-v3:27b",
+    "actually_called_model": "deepseek-v4.1-flash:cloud",
+    "actually_called_provider": "ollama-cloud",
+    "substitution_reason": "the install's auxiliary.compression route governs the aux call and resolved a different model id than the one requested; the id that actually served the request is recorded above"
   },
   "resolved_model_ids": {
-    "map": "Qwen3.8-v3:27b",
+    "map": "llama-small",
     "reason": "Qwen3.8-v3:27b",
     "extract": "Qwen3.8-v3:27b",
     "check": "Qwen3.8-v3:27b",
     "gate": "Qwen3.8-v3:27b",
     "escape_hatch": "deepseek-v4-flash"
   },
+  "gate_always_on_default": true,
+  "gate_setting_touched_by_harness": false,
+  "production_pass_gate_always_on": true,
+  "production_pass_parked": true,
+  "gate_stability_harness_pass": {
+    "ran": false,
+    "gate_always_on": false,
+    "purpose": "AC-10/AC-11 measurement pass: the gate's loss-probe flip-back is disabled so a produced checkpoint survives to be graded. This setting differs from production and is disclosed here.",
+    "pipeline_record": {
+      "ran": true,
+      "queued": 0,
+      "updated": false,
+      "dumped": "0001-665d8034",
+      "dump_window": [
+        0,
+        15
+      ],
+      "dumped_exists": true,
+      "extract_parked": "0001-665d8034",
+      "idle_window": [
+        0,
+        15
+      ]
+    }
+  },
+  "findings": [
+    {
+      "finding": "gate-on production pass produced no swappable checkpoint",
+      "detail": "with ``compaction_pipeline_gate_always_on`` at its production default (True) the region parked, so AC-8 correction recall has no headline number for this fixture; none is reported rather than substituting a gate-off number",
+      "pipeline_record": {
+        "ran": true,
+        "queued": 0,
+        "updated": false,
+        "dumped": "0001-665d8034",
+        "dumped_exists": true,
+        "extract_parked": "0001-665d8034"
+      }
+    },
+    {
+      "finding": "map stage id",
+      "detail": "map model id == the SPEC-0042 3.7 id 'llama-small' on this run"
+    }
+  ],
   "provider": "custom",
   "dump_id": "fx-40828e59",
   "pipeline_record": {
@@ -37,98 +96,35 @@
       15
     ],
     "dumped_exists": true,
-    "extracted": "0001-665d8034",
-    "gated": "0001-665d8034",
-    "swap_eligible": false
+    "extract_parked": "0001-665d8034",
+    "idle_window": [
+      0,
+      15
+    ]
   },
   "checkpoint_gate_valid": true,
   "checkpoint_gate_errors": [],
-  "scores": {
-    "corrections": {
-      "labeled": 1,
-      "recalled": 0,
-      "recall": 0.0
-    },
-    "commitments": {
-      "labeled": 1,
-      "recalled": 1,
-      "recall": 1.0
-    },
-    "decisions": {
-      "labeled": 1,
-      "recalled": 1,
-      "recall": 1.0
-    },
-    "artifacts": {
-      "labeled": 1,
-      "recalled": 1,
-      "recall": 1.0
-    },
-    "world_effects": {
-      "labeled": 1,
-      "recalled": 0,
-      "recall": 0.0
-    }
-  },
-  "correction_recall_headline": 0.0,
+  "scores": {},
+  "correction_recall_headline": null,
   "ac8_pass": false,
-  "loss_probe": {
-    "questions": 2,
-    "gaps": 2,
-    "pass": false
-  },
+  "loss_probe": null,
   "ac10": {
-    "gate_pass_checkpoint": false,
-    "gate_dropped_commitment": false,
-    "dropped_findings": [
-      {
-        "what": "audit-summary.txt is explicitly on an ephemeral node and UNRECOVERABLE (msg 13: 'ephemeral node, unrecoverable'), but the checkpoint marks it recoverable: true. The agent would be devastated to assume it can re-derive or re-fetch this artifact when it will be lost with the node.",
-        "cites": [
-          [
-            13,
-            13
-          ]
-        ]
-      },
-      {
-        "what": "The Friday ship commitment (msgs 6-7: 'commit to shipping the export module by Friday' / 'Commitment noted: export module ships Friday') is absent from the commitments array, which is empty. It appears only in passing in the narrative, not as a tracked commitment with a deadline.",
-        "cites": [
-          [
-            6,
-            7
-          ]
-        ]
-      },
-      {
-        "what": "The rejected alternative for the Postgres decision is mischaracterized. The dump (msg 9) rejects SQLite specifically due to 'single-writer bottleneck at our volume.' The checkpoint instead lists 'in-memory or file-based audit store (insufficient for queryable audit trail)'\u2014a different technology and a different rationale.",
-        "cites": [
-          [
-            8,
-            9
-          ]
-        ]
-      },
-      {
-        "what": "The open_thread claims the technical reason for abandoning streaming transport is 'not captured in the map,' but msg 11 states it plainly: 'kept dropping connections under load; not worth the complexity now.' The reason is present in the dump; the open thread is a false gap.",
-        "cites": [
-          [
-            11,
-            11
-          ]
-        ]
-      }
-    ],
-    "flags_dropped_section": true
+    "gate_pass_checkpoint": null,
+    "gate_dropped_commitment": null,
+    "dropped_findings": [],
+    "flags_dropped_section": false,
+    "note": "skipped: no stage_c produced"
   },
   "ac11": {
-    "run_a_swap_eligible": false,
-    "run_b_swap_eligible": false,
-    "stable": true
+    "run_a_swap_eligible": null,
+    "run_b_swap_eligible": null,
+    "stable": null,
+    "note": "skipped: no stage_c produced"
   },
   "before_after": {
     "before": {
-      "mode": "before-arm (current single-call summary)",
-      "summary_chars": 705,
+      "mode": "before-arm (real ContextCompressor single-call summary)",
+      "summary_chars": 8057,
       "scores": {
         "corrections": {
           "labeled": 1,
@@ -154,49 +150,34 @@
           "labeled": 1,
           "recalled": 1,
           "recall": 1.0
-        }
-      },
-      "correction_recall_headline": 0.0
-    },
-    "after": {
-      "mode": "after-arm (production IdlePipelinePass checkpoint)",
-      "checkpoint_gate_valid": true,
-      "checkpoint_gate_errors": [],
-      "scores": {
-        "corrections": {
-          "labeled": 1,
-          "recalled": 0,
-          "recall": 0.0
-        },
-        "commitments": {
-          "labeled": 1,
-          "recalled": 1,
-          "recall": 1.0
-        },
-        "decisions": {
-          "labeled": 1,
-          "recalled": 1,
-          "recall": 1.0
-        },
-        "artifacts": {
-          "labeled": 1,
-          "recalled": 1,
-          "recall": 1.0
-        },
-        "world_effects": {
-          "labeled": 1,
-          "recalled": 0,
-          "recall": 0.0
         }
       },
       "correction_recall_headline": 0.0,
-      "loss_probe": {
-        "questions": 2,
-        "gaps": 2,
-        "pass": false
-      },
-      "accepted_checkpoint": true,
-      "parked_region": null
+      "evidence": {
+        "compressor_class": "agent.context_compressor.ContextCompressor",
+        "method": "_generate_summary",
+        "summary_model_asked": "Qwen3.8-v3:27b",
+        "method_invoked": true,
+        "models_called": [
+          {
+            "model": "",
+            "task": "compression",
+            "resolved_provider": "ollama-cloud",
+            "resolved_model": "deepseek-v4.1-flash:cloud"
+          }
+        ]
+      }
+    },
+    "after": {
+      "mode": "after-arm (production IdlePipelinePass checkpoint)",
+      "measured_from": "production_pass",
+      "checkpoint_gate_valid": true,
+      "checkpoint_gate_errors": [],
+      "scores": {},
+      "correction_recall_headline": null,
+      "loss_probe": null,
+      "accepted_checkpoint": false,
+      "parked_region": "extract_parked"
     }
   }
 }
