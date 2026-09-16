@@ -69,17 +69,35 @@ def compression_pass_blocked(db, session_id: str) -> bool:
 
 
 def build_checkpoint_row(checkpoint: Dict[str, Any], dump_ref, stubs: List[str]) -> Dict[str, Any]:
-    """The one swapped-in row: narrative + section index + dump refs + per-item
-    link-stubs, all as DATA on this single assistant message."""
+    """The one swapped-in row: narrative + section index + dump ref, all as
+    DATA on this single assistant message.
+
+    SPEC-0049 D5: the row carries NO per-item coordinate table — the agent
+    enumerates compacted regions via the ``list_regions`` tool (backed by the
+    persisted stub registry) and pulls verbatim content via ``read_dump``.
+    The stubs argument is accepted for back-compat with existing callers but
+    only a bounded count is emitted; coordinates live in the store, not the
+    context (a coordinate table in-context forces the agent to re-read its
+    whole context to find them — the operator's ruling).
+    """
     parts: List[str] = [f"[{CHECKPOINT_MARKER}] {checkpoint.get('narrative', '')}"]
     sections = {k: checkpoint.get(k) for k in (
         "instructions_and_corrections", "decisions", "insights", "commitments",
         "open_threads", "artifacts", "world_effects", "links")}
     parts.append("Sections: " + json.dumps(sections, ensure_ascii=False, default=str))
-    parts.append(f"Dump ref: dump:{dump_ref.dump_id}#{dump_ref.start_msg}-{dump_ref.end_msg}")
+    # D5 (operator ruling): the row carries NO storage coordinates and NO
+    # dump refs — the agent must not even know where regions live, so it
+    # cannot go looking; discovery is list_regions, retrieval is read_dump.
     parts.append(
-        "Stubs are references; call read_dump if and only if the work returns to that region.")
-    parts.extend(stubs)
+        "Earlier parts of this conversation were compacted. Compacted "
+        "regions are catalogued behind the compaction tools: call "
+        "list_regions to enumerate them (one-liners + refs), then read_dump "
+        "with the chosen ref for a region's verbatim messages when the work "
+        "returns to it. Do not read regions speculatively.")
+    if stubs:
+        # D5 back-compat bound: a caller-built stub list is summarized by
+        # count, never inlined — the context stays coordinate-free.
+        parts.append(f"({len(stubs)} cited items are in the catalogue)")
     return {"role": "assistant", "content": "\n\n".join(parts)}
 
 
@@ -268,17 +286,30 @@ class _NullStubRegistry:
 
 
 def _register_stubs(registry, ready: Dict[str, Any], checkpoint: Dict[str, Any]) -> None:
-    """Register each cited link-stub of a swapped checkpoint into the registry."""
+    """Register each swapped checkpoint's REGION into the registry.
+
+    SPEC-0049 D5: the registry is keyed by dump_id, so a region gets ONE
+    entry (the pre-D5 per-item loop overwrote itself — later items clobbered
+    earlier ones). The one-liner merges the region's identity: the
+    kept_substance refs (the substance catalogue) plus the first cited
+    section item, bounded to keep the catalogue row short.
+    """
     dump_id = ready["dump_id"]
     meta = ready.get("meta") or {}
+    start = int(meta.get("start_msg", 0))
+    end = int(meta.get("end_msg", 0))
+    liners: List[str] = []
+    for entry in checkpoint.get("kept_substance") or []:
+        if isinstance(entry, dict) and entry.get("ref"):
+            liners.append(f"{entry['ref']}: {str(entry.get('substance', ''))[:120]}")
     for section in ("instructions_and_corrections", "decisions", "commitments",
                     "open_threads", "artifacts", "world_effects", "links", "insights"):
         for item in checkpoint.get(section) or []:
             if isinstance(item, dict) and item.get("cites"):
-                cite = item["cites"][0]
-                start = int(cite[1] if len(cite) == 3 else cite[0])
-                end = int(cite[2] if len(cite) == 3 else cite[1])
-                registry.register(
-                    dump_id, start, end,
-                    str(item.get("what", item.get("rationale", "item"))),
-                )
+                what = str(item.get("what", item.get("rationale", "item")))[:120]
+                liners.append(f"{section}: {what}")
+                break  # one representative per section keeps the row bounded
+        if len(liners) >= 8:
+            break
+    one_liner = " | ".join(liners) if liners else "compacted region"
+    registry.register(dump_id, start, end, one_liner)
