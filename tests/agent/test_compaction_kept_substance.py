@@ -56,10 +56,10 @@ class TestACD2KeptSubstanceSchema:
     def test_falsifier_oversize_entry_rejected(self):
         broken = _ckpt()
         broken["kept_substance"] = [
-            {"ref": "ep-1", "cites": [[0, 1, 2]],
+            {"ref": "ep-1", "cites": [[0, 0, 1]],
              "substance": "word " * (MAX_SUBSTANCE_TOKENS_PER_ENTRY + 10)}]
         errors = checkpoint_schema_check(broken)
-        assert any("> 200 tokens" in e for e in errors), errors
+        assert any(f"> {MAX_SUBSTANCE_TOKENS_PER_ENTRY} tokens" in e for e in errors), errors
 
     def test_null_reason_kept_substance_passes(self):
         ckpt = _ckpt()
