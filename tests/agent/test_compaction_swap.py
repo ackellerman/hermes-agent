@@ -52,7 +52,13 @@ class TestSwap:
         row = out[0]
         assert row["role"] == "assistant"
         assert "compaction_checkpoint" in row["content"]
-        assert "[dump: " in row["content"], "link-stubs must ride the checkpoint row"
+        # SPEC-0049 D5: the row is COORDINATE-FREE — no per-item stub table
+        # in context; the agent enumerates regions via list_regions instead.
+        assert "[dump: " not in row["content"], \
+            "per-item coordinate stubs must not ride the checkpoint row (D5)"
+        assert "list_regions" in row["content"], \
+            "the row must point at the catalogue tool (D5)"
+        assert "cited items are in the catalogue" in row["content"]
         assert out[1]["role"] == "user"
 
     def test_swap_refuses_incomplete_dump(self, dump):
@@ -177,3 +183,51 @@ class _TouchSpyDB(_FakeDB):
 
     def compression_lock_holder(self, session_id):
         raise AssertionError("AC-19 violation: OFF-case backstop probed the lock")
+
+class TestD5Catalogue:
+    """SPEC-0049 D5: coordinates live in the store (stub registry), surfaced
+    by list_regions — never as a per-item table in the context row."""
+
+    def test_falsifier_registry_one_entry_per_region(self, tmp_path):
+        """The registry is keyed by dump_id: per-item registration used to
+        clobber itself — a region must land as ONE catalogue row carrying a
+        merged one-liner."""
+        from agent.compaction_rehydrate import StubRegistry
+        reg = StubRegistry(tmp_path / "stubs.json")
+        ready = {"dump_id": "0001-abc",
+                 "meta": {"start_msg": 0, "end_msg": 9}}
+        ckpt = {"kept_substance": [
+                    {"ref": "ep-1", "substance": "chose jsonl", "cites": [[0, 0, 1]]},
+                    {"ref": "ep-2", "substance": "retry ladder", "cites": [[0, 4, 5]]}],
+                "decisions": [{"what": "d1", "cites": [[0, 2, 3]]}],
+                "commitments": "null_reason: none"}
+        from agent.compaction_swap import _register_stubs
+        _register_stubs(reg, ready, ckpt)
+        assert list(reg._stubs.keys()) == ["0001-abc"], reg._stubs
+        entry = reg._stubs["0001-abc"]
+        assert entry["start_msg"] == 0 and entry["end_msg"] == 9
+        assert "ep-1" in entry["summary"] and "ep-2" in entry["summary"], \
+            "the merged one-liner must carry the substance catalogue refs"
+
+    def test_list_regions_returns_catalogue_rows(self, tmp_path, monkeypatch):
+        """list_regions enumerates the registry as structured rows."""
+        import json as _json
+        from agent.compaction_rehydrate import StubRegistry
+        reg = StubRegistry.for_session(tmp_path, "sess")
+        reg.register("0001-abc", 0, 9, "ep-1: chose jsonl")
+        reg.save()
+        monkeypatch.setattr(
+            "tools.compaction_tools._storage_root", lambda: str(tmp_path))
+        import tools.compaction_tools as ct
+        out = _json.loads(ct.list_regions(task_id="sess"))
+        assert out.get("success") is True
+        assert out["regions"] and out["regions"][0]["ref"] == "0001-abc"
+        assert "chose jsonl" in out["regions"][0]["one_liner"]
+
+    def test_list_regions_empty_is_structured(self, tmp_path, monkeypatch):
+        import json as _json
+        monkeypatch.setattr(
+            "tools.compaction_tools._storage_root", lambda: str(tmp_path))
+        import tools.compaction_tools as ct
+        out = _json.loads(ct.list_regions(task_id="no-such"))
+        assert out.get("success") is True and out.get("regions") == []

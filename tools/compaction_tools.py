@@ -89,6 +89,54 @@ def read_dump(dump_id: str, start_msg: Optional[int] = None,
         return json.dumps({"error": "read_dump_failed", "detail": str(exc)})
 
 
+def list_regions(task_id: Optional[str] = None) -> str:
+    """SPEC-0049 D5: enumerate this session's compacted regions from the
+    persisted stub registry — the coordinate table lives in the store, never
+    in the context. One row per swapped region: ref, message range,
+    one-liner, dump id."""
+    from agent.compaction_rehydrate import StubRegistry
+
+    sid = task_id or "none"
+    try:
+        root = _storage_root()
+        registry = StubRegistry.for_session(Path(root), sid)
+        items = registry._stubs or {}
+        if not items:
+            return json.dumps({"success": True, "regions": [],
+                               "note": "no compacted regions for this session"})
+        regions = [
+            {"ref": dump_id,
+             "one_liner": v.get("summary"),
+             "dump_id": dump_id}
+            for dump_id, v in sorted(items.items())
+        ]
+        return json.dumps({"success": True, "regions": regions},
+                           ensure_ascii=False, default=str)
+    except Exception as exc:  # noqa: BLE001 — structured error, never silent
+        return json.dumps({"error": "list_regions_failed", "detail": str(exc)})
+
+
+registry.register(
+    name="list_regions",
+    toolset="compaction",
+    schema={
+        "name": "list_regions",
+        "description": (
+            "List this session's compacted conversation regions (from the "
+            "stub registry): the ref, message range, and a one-liner for "
+            "each. Use FIRST when work may return to a compacted region; "
+            "then read_dump with the chosen ref to get the verbatim messages."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    handler=lambda args, **kw: list_regions(task_id=kw.get("task_id")),
+    check_fn=check_requirements,
+)
+
+
 registry.register(
     name="read_dump",
     toolset="compaction",
