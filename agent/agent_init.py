@@ -1908,6 +1908,8 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     agent.compaction_pipeline_gate_always_on = bool(_gate_cfg.get("always_on", True))
     agent.compaction_pipeline_loss_probe_samples = int(_gate_cfg.get("loss_probe_samples", 8))
     agent.compaction_pipeline_models = dict(pp.get("models", {}) or {})
+    # SPEC-0048 D-C/D-D: slow-pass + lock-stall warning threshold.
+    agent.compaction_pipeline_slow_pass_warn_s = float(pp.get("slow_pass_warn_s", 300))
 
 
 def _enforce_minimum_context(agent):
