@@ -36,7 +36,9 @@ import fixtures as fx_mod  # noqa: E402
 from agent.compaction_extract import checkpoint_schema_check  # type: ignore  # noqa: E402
 from agent.compaction_extract import CHECKPOINT_SECTIONS  # noqa: E402
 
-_EMPTY_NULL_REASON_SECTIONS = ("insights", "open_threads", "links")
+# SPEC-0049 D2: kept_substance is a checkpoint section now — the offline
+# reference carries an explicit null_reason (it has no stage-b verdicts).
+_EMPTY_NULL_REASON_SECTIONS = ("insights", "open_threads", "links", "kept_substance")
 
 
 def dump_id_for(fixture: dict) -> str:
