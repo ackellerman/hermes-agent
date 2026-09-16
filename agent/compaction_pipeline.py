@@ -39,6 +39,23 @@ class PipelineBudgetExceeded(RuntimeError):
     """Background spend ceiling hit: hard stop; telemetry records it."""
 
 
+class StageTransportError(RuntimeError):
+    """SPEC-0048 D-A: the stage lane returned EMPTY content — a transport-level
+    failure, retried ONCE in-process. Distinct from a parse error so the pass
+    surfaces "empty stage output (transport)" instead of burning a breaker
+    rung on a misleading "not JSON" (F-C: content=None on a trivial request,
+    16/16 successes on the identical request minutes later)."""
+
+
+# SPEC-0048 D-A: per-call LLM timeouts. The read timeout bounds a GENUINE
+# stall (zero bytes while the tick thread blocks with the lock held — F-A);
+# it must NOT kill slow-but-alive calls: the ollama-cloud lane took 688.2s on
+# the real 1.09 MB stage_b payload and completed validly, hence the 900s
+# default. Configurable via ``compaction_pipeline.models.call_timeout_s``.
+DEFAULT_STAGE_CALL_TIMEOUT_S = 900
+DEFAULT_STAGE_CONNECT_TIMEOUT_S = 30
+
+
 class IdlePipelinePass:
     """One idle-window pass over the pipeline's background duties."""
 
@@ -52,6 +69,13 @@ class IdlePipelinePass:
         # scan never re-attempts them (one attempt per region per pass; the D4
         # breaker ladders once per pass, not twice).
         self._extraction_attempted: set = set()
+        # SPEC-0048 D-C/D-D telemetry: the stage currently in flight (named at
+        # each call site) and the pass start, for duration_s + slow-pass and
+        # lock-stall warnings.
+        self._current_stage: Optional[str] = None
+        self._pass_started_at: float = 0.0
+        self._lock_acquired_at: float = 0.0
+        self._slow_warned: bool = False
 
     # ── gates ────────────────────────────────────────────────────────────
 
@@ -199,6 +223,7 @@ class IdlePipelinePass:
         db = getattr(self.agent, "db", None)
         holder = f"pipeline:{self.session_id}"
         acquired = False
+        self._pass_started_at = time.time()
         if db is not None:
             try:
                 acquired = db.try_acquire_pipeline_lock(self.session_id, holder)
@@ -207,6 +232,9 @@ class IdlePipelinePass:
                 return {"ran": False, "reason": "lock_error"}
             if not acquired:
                 return {"ran": False, "reason": "lock_held"}
+            # SPEC-0048 D-D: stamp when THIS pass took the lock (the lease row
+            # already carries acquired_at; this mirrors it for the watchdog).
+            self._lock_acquired_at = time.time()
         try:
             if llm_call is None:
                 llm_call = self._default_llm_call()
@@ -247,11 +275,13 @@ class IdlePipelinePass:
                     # refused): the region stays live; the backstop degrades.
                     record["bypass_parked"] = [bypass_dump_id]
             self.agent._compaction_pipeline_last_pass_ts = now
+            _finish_pass_telemetry(self, record)
             return record
         except Exception as exc:  # noqa: BLE001 — a failed pass parks; live path unaffected
             logger.warning("compaction pipeline pass failed (%s): %s", self.session_id, exc)
             return {"ran": False, "reason": f"error: {exc}"}
         finally:
+            self._current_stage = None
             if db is not None and acquired:
                 try:
                     db.release_pipeline_lock(self.session_id, holder)
@@ -746,15 +776,27 @@ class IdlePipelinePass:
         """Resolve a per-stage LLM callable. Defaults to the map-update aux
         resolution; config ``compaction_pipeline.models.<name>`` overrides the
         model id (resolved through the same aux chain). Deterministic tests
-        inject stage llms via ``agent._compaction_stage_llms``."""
+        inject stage llms via ``agent._compaction_stage_llms``.
+
+        SPEC-0048 D-A: every stage call carries ``timeout=(connect, read)`` —
+        read default 900s (``compaction_pipeline.models.call_timeout_s``) — and
+        treats EMPTY content as a transport-level failure (StageTransportError)
+        retried exactly ONCE in-process. SPEC-0048 D-C: the wrapper stamps the
+        in-flight stage name for the duration/slow-pass telemetry."""
         overrides = getattr(self.agent, "_compaction_stage_llms", None)
         if isinstance(overrides, dict) and callable(overrides.get(name)):
-            return overrides[name]
+            base = overrides[name]
+        else:
+            base = self._aux_stage_llm(name)
+        return self._tracked_stage_llm(name, base)
+
+    def _aux_stage_llm(self, name: str):
+        models = getattr(self.agent, "compaction_pipeline_models", {}) or {}
+        read_timeout = float(models.get("call_timeout_s", DEFAULT_STAGE_CALL_TIMEOUT_S))
 
         def llm_call(payload):
             from agent.auxiliary_client import _resolve_auto_route
-            models = getattr(self.agent, "compaction_pipeline_models", {}) or {}
-            model_id = (models or {}).get(name, "") or getattr(self.agent, "model", None)
+            model_id = models.get(name, "") or getattr(self.agent, "model", None)
             runtime = getattr(self.agent, "aux_runtime", None) or {
                 "provider": getattr(self.agent, "provider", None),
                 "model": model_id,
@@ -764,15 +806,43 @@ class IdlePipelinePass:
             client, resolved_model, _label = _resolve_auto_route(runtime, "compression")
             if client is None or not resolved_model:
                 raise RuntimeError(f"compaction pipeline: no aux route for stage {name}")
-            resp = client.chat.completions.create(
-                model=resolved_model,
-                messages=[{"role": "user", "content": "\n\n".join(
-                    m.get("content", "") if isinstance(m, dict) else str(m)
-                    for m in payload)}],
-                temperature=0,
-            )
-            return resp.choices[0].message.content or ""
+            return _call_stage_llm(name, client, resolved_model, payload, read_timeout)
         return llm_call
+
+    def _tracked_stage_llm(self, name: str, base):
+        """Wrap a stage callable so the pass knows the stage in flight (D-C)
+        and the D-A transport discipline applies to INJECTED lanes too (the
+        deterministic-falsifier lane that returns "" is exactly the F-C shape):
+        stamped before each call, transport-wrapped, slow-pass checked after."""
+
+        def tracked(payload):
+            self._mark_stage(name)
+            try:
+                return _stage_output_or_transport(name, base, payload)
+            finally:
+                self._check_slow_pass()
+        return tracked
+
+    def _mark_stage(self, name: str) -> None:
+        """Stamp the in-flight stage name; cheap slow-pass check at each stage
+        boundary (D-C: a pass past slow_pass_warn_s warns ONCE, naming the
+        stage, instead of a silent 12-minute gap reading as a hang). Also the
+        D-D lock-stall watchdog checkpoint."""
+        self._current_stage = name
+        self._check_slow_pass()
+        _check_lock_stall(self)
+
+    def _check_slow_pass(self) -> None:
+        if self._slow_warned or not self._pass_started_at:
+            return
+        elapsed = time.time() - self._pass_started_at
+        warn_s = _slow_pass_warn_s(self.agent)
+        if elapsed > warn_s:
+            self._slow_warned = True
+            logger.warning(
+                "slow compaction pass (%s): %.1fs elapsed exceeds "
+                "slow_pass_warn_s=%.0fs; stage in flight: %s",
+                self.session_id, elapsed, warn_s, self._current_stage)
 
     def _default_llm_call(self):
         """Resolve the map-update model via the existing aux resolution chain
@@ -801,6 +871,110 @@ def _atomic_write_json(path, obj: Dict[str, Any]) -> None:
         except Exception:  # noqa: BLE001
             pass
     os.replace(tmp, path)
+
+
+# ── SPEC-0048 D-C/D-D: pass-duration telemetry + lock-stall watchdog ──────
+
+
+def _stage_output_or_transport(name: str, call, payload):
+    """Shared stage-output discipline (D-A): invoke ``call(payload)``, treat
+    EMPTY content as a transport failure (F-C: transient content=None on the
+    lane — 16/16 successes on the identical request minutes later), retry
+    exactly ONCE in-process, then surface StageTransportError. The pass's
+    park/retry ladder sees its own error string ("empty stage output
+    (transport)"), never a misleading "not JSON". Timeout/connection errors
+    from the lane map to StageTransportError too, so a stalled call unwinds
+    through the normal pass path instead of hanging the tick thread."""
+    import openai
+
+    try:
+        content = call(payload)
+        if not content:
+            logger.warning("stage %s: empty content from lane; retrying once "
+                           "(transport)", name)
+            content = call(payload)
+        if not content:
+            raise StageTransportError("empty stage output (transport)")
+        return content
+    except openai.APITimeoutError as exc:
+        raise StageTransportError(
+            f"stage {name} call timed out (transport): {exc}") from exc
+    except openai.APIConnectionError as exc:
+        raise StageTransportError(f"stage {name} transport error: {exc}") from exc
+
+
+def _call_stage_llm(name: str, client, resolved_model: str, payload,
+                    read_timeout: float):
+    """One aux-lane stage LLM call with a hard client-side timeout (D-A).
+    The read timeout bounds a GENUINE stall (F-A: zero bytes while the tick
+    thread blocks with the lock held) without killing slow-but-alive calls —
+    the ollama-cloud lane legitimately took 688.2s on the real 1.09 MB stage_b
+    payload, hence the 900s default. Empty/transport handling is shared with
+    the injected-lane path via :func:`_stage_output_or_transport`."""
+    import openai
+
+    def once(p):
+        resp = client.chat.completions.create(
+            model=resolved_model,
+            messages=[{"role": "user", "content": "\n\n".join(
+                m.get("content", "") if isinstance(m, dict) else str(m)
+                for m in p)}],
+            temperature=0,
+            timeout=(DEFAULT_STAGE_CONNECT_TIMEOUT_S, read_timeout),
+        )
+        return resp.choices[0].message.content or ""
+
+    try:
+        return _stage_output_or_transport(name, once, payload)
+    except StageTransportError:
+        raise
+    except openai.APIStatusError as exc:
+        raise StageTransportError(f"stage {name} transport error: {exc}") from exc
+
+
+def _slow_pass_warn_s(agent: Any) -> float:
+    """``compaction_pipeline.slow_pass_warn_s`` (default 300): a pass running
+    longer than this logs a WARNING naming the stage in flight (D-C); a pass
+    HOLDING THE LOCK longer than 4x this logs a lock-stall WARNING (D-D)."""
+    return float(getattr(agent, "compaction_pipeline_slow_pass_warn_s", 300))
+
+
+def _finish_pass_telemetry(sweep: "IdlePipelinePass",
+                           record: Dict[str, Any]) -> None:
+    """Stamp ``duration_s`` on the record; warn when the pass exceeded
+    ``slow_pass_warn_s`` (D-C) or held the lock beyond ``slow_pass_warn_s * 4``
+    (D-D). Diagnostic only: the D-A timeout already bounds a real stall."""
+    elapsed = time.time() - sweep._pass_started_at
+    record["duration_s"] = round(max(0.0, elapsed), 3)
+    warn_s = _slow_pass_warn_s(sweep.agent)
+    if elapsed > warn_s:
+        record["slow_pass"] = True
+    if not sweep._slow_warned and elapsed > warn_s:
+        # D-C: warn once per pass, naming the stage in flight (the D-C
+        # stage-boundary check may already have warned — never double-log).
+        sweep._slow_warned = True
+        logger.warning(
+            "slow compaction pass (%s): %.1fs exceeds slow_pass_warn_s=%.0fs "
+            "(stage in flight at pass end: %s)",
+            sweep.session_id, elapsed, warn_s, sweep._current_stage)
+    _check_lock_stall(sweep)
+
+
+def _check_lock_stall(sweep: "IdlePipelinePass") -> None:
+    """D-D watchdog, checked cheaply at stage boundaries: a WARNING naming the
+    holder when this pass has held the lock beyond ``slow_pass_warn_s * 4``.
+    No new thread; no behavior change beyond the log."""
+    acquired_at = sweep._lock_acquired_at
+    if not acquired_at:
+        return
+    held = time.time() - acquired_at
+    warn_s = _slow_pass_warn_s(sweep.agent)
+    if held > warn_s * 4:
+        logger.warning(
+            "pipeline lock stall (%s): holder pipeline:%s has held the lock "
+            "for %.1fs (slow_pass_warn_s*4=%.0fs); stage in flight: %s",
+            sweep.session_id, sweep.session_id, held, warn_s * 4,
+            sweep._current_stage)
 
 
 # ── SPEC-0047 D4: deterministic-failure circuit breaker ──────────────────

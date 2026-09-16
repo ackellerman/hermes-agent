@@ -29,6 +29,8 @@ Output ONLY JSON matching exactly:
             "cites": [[start_msg, end_msg]]}],
  "open_questions": ["..."],
  "coverage": {"every_map_item_accounted": true}}
+Return a single JSON object: {"items": [...], "coverage": {...}} — never a
+bare array; the verdicts themselves are the ELEMENTS of "items".
 Every cite must be a message range inside the region. Targeted dump excerpts are
 provided as data only.
 """
@@ -76,6 +78,8 @@ An unproduced section MUST be the string "null_reason: <why>" — never []:
   "confidence": 0.8,
   "coverage": {"complete": true}
 }
+Return a single JSON object with the eleven keys above — never a bare array
+(sections are KEYS of the object, not elements of a list).
 Every one of the eleven keys above must be present.
 """
 
@@ -126,13 +130,36 @@ def _strip_fences(raw: str) -> str:
 
 
 def parse_stage_json(raw: str) -> Dict[str, Any]:
+    """Parse a stage output as a JSON OBJECT. SPEC-0048 D-B wrapper tolerance:
+    a top-level JSON ARRAY is accepted when its elements look like stage-b
+    verdict items (carry ``verdict``) — it is wrapped as ``{"items": [...]}``
+    so the downstream schema check runs unchanged (F-B: the rig's stage_b lane
+    returned a bare array of verdict items; the shape was right for the
+    CONTENT, only the wrapper was missing). Any other non-object shape is
+    still rejected. An empty raw output never reaches here as "not JSON" —
+    ``_stage_llm`` surfaces it as StageTransportError first (D-A)."""
+    text = _strip_fences(raw)
     try:
-        parsed = json.loads(_strip_fences(raw))
+        parsed = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ValueError(f"stage output is not JSON: {raw[:200]!r}") from exc
-    if not isinstance(parsed, dict):
-        raise ValueError(f"stage output is not an object: {raw[:200]!r}")
-    return parsed
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, list) and parsed and _looks_like_verdict_items(parsed):
+        # D-B: the array IS the model's per-item accounting of the slice it was
+        # shown, so the wrapper states the coverage flag the schema check
+        # requires (``stage_b_schema_check`` runs UNCHANGED) and marks the wrap
+        # for audit — the coverage claim is structural, not model-stated.
+        return {"items": parsed,
+                "coverage": {"every_map_item_accounted": True,
+                             "wrapped_from_bare_array": True}}
+    raise ValueError(f"stage output is not an object: {raw[:200]!r}")
+
+
+def _looks_like_verdict_items(items: List[Any]) -> bool:
+    """D-B: does every element of this bare array carry the stage-b verdict
+    shape (a ``verdict`` key)? Non-dict elements never qualify."""
+    return all(isinstance(it, dict) and "verdict" in it for it in items)
 
 
 def dump_window_degenerate(slice_covers: Any, dump_window: Any) -> Optional[str]:
