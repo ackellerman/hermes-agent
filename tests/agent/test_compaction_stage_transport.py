@@ -101,6 +101,8 @@ def _stage_llms(reason=None, extract=None, gate=None):
         if extract is not None:
             return extract(payload)
         ckpt = {
+            "kept_substance": [{"ref": "ep0", "substance": "ep0 kept",
+                                "cites": [[0, 0, 1]]}],
             "instructions_and_corrections": "null_reason: none in region",
             "decisions": [{"what": "chose jsonl", "cites": [["dump", 1, 2]],
                            "rejected_alternatives": []}],
