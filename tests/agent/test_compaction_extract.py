@@ -16,6 +16,8 @@ from agent.compaction_extract import (
 def _valid_checkpoint(dump_id="d-abc"):
     item = {"what": "use jsonl format", "cites": [[dump_id, 3, 5]]}
     return {
+        "kept_substance": [{"ref": "ep-1", "substance": "user chose jsonl format",
+                            "cites": [[dump_id, 3, 5]]}],
         "instructions_and_corrections": [dict(item, kind="correction")],
         "decisions": [dict(item, rationale="reason", rejected=["alt"])],
         "insights": [item],

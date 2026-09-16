@@ -30,6 +30,10 @@ def _conformant_checkpoint() -> dict:
     """A checkpoint in the exact Stage C form the validator accepts."""
     did = "fx-abcd1234"
     return {
+        "kept_substance": [
+            {"ref": "ep0", "substance": "export service: JSONL format, Postgres audit log",
+             "cites": [[did, 3, 10]]},
+        ],
         "instructions_and_corrections": [
             {"what": "use JSONL not CSV", "kind": "correction",
              "cites": [[did, 3, 3]]},

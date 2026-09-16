@@ -86,6 +86,7 @@ def _stage_llms(dump_id: str, fail_extract: bool = False):
         if fail_extract:
             return "not json at all {{{"
         ckpt = {
+            "kept_substance": "null_reason: no keep verdicts in region",
             "instructions_and_corrections": "null_reason: none in region",
             "decisions": [{"what": "chose jsonl", "cites": [[dump_id, 1, 2]],
                            "rejected_alternatives": []}],
@@ -195,6 +196,7 @@ class TestACB3DegenerateSliceRefusal:
         """checkpoint_schema_check (with slice + dump window) refuses a
         checkpoint whose slice bounds are degenerate vs the dump window."""
         ckpt = {
+            "kept_substance": "null_reason: no keep verdicts in region",
             "instructions_and_corrections": "null_reason: none in region",
             "decisions": "null_reason: none in region",
             "insights": "null_reason: none in region",

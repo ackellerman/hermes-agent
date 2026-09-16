@@ -90,6 +90,7 @@ def _stage_llms():
 
     def extract(payload):
         ckpt = {
+            "kept_substance": "null_reason: no keep verdicts in region",
             "instructions_and_corrections": "null_reason: none in region",
             "decisions": [{"what": "chose jsonl", "cites": [["dump", 1, 2]],
                            "rejected_alternatives": []}],

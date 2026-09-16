@@ -107,6 +107,7 @@ def _stage_llms(root: Path, session_id: str, dump_id: str, bad_stage=None, commi
 
     def extract(payload):
         ckpt = {
+            "kept_substance": "null_reason: no keep verdicts in region",
             "instructions_and_corrections": "null_reason: none in region",
             "decisions": [{"what": "chose jsonl", "cites": [[dump_id, 1, 2]],
                            "rejected_alternatives": []}],
