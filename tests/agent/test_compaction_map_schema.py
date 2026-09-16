@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.compaction_extract import STAGE_B_PROMPT, STAGE_C_PROMPT
 from agent.compaction_map import CompactionMap, MapRegressionError
 
 FIXTURE = Path(__file__).parent / "fixtures" / "compaction_map_malformed_edges.json"
@@ -287,4 +288,76 @@ class TestPromptCounterExample:
         """The D1 counter-example: the prompt shows the WRONG shape."""
         from agent.compaction_map import MAP_UPDATE_PROMPT
         assert "entity ids are NEVER valid endpoints" in MAP_UPDATE_PROMPT
-        assert '"doc-pipeline"' in MAP_UPDATE_PROMPT
+
+
+# ── SPEC-0048 AC-C3: bare-array stage_b accepted (wrapper tolerance) ──────
+
+STAGE_B_FIXTURE = Path(__file__).parent / "fixtures" / "compaction_stageb_bare_array.json"
+
+
+class TestACC3BareArrayStageB:
+    def test_falsifier_rig_bare_array_parses_wraps_and_passes_schema_check(self):
+        """AC-C3 verbatim: the EXACT bare-array stage_b response observed in
+        the offline rig (2026-09-15 23:50:25, region 0001-5c51cb94 — parked
+        with 'stage output is not an object') now parses, wraps as
+        {\"items\": [...]}, and passes stage_b_schema_check UNCHANGED.
+        Pre-fix: ValueError, region parked, breaker rung burned."""
+        from agent.compaction_extract import RegionExtractor, parse_stage_json
+
+        raw = STAGE_B_FIXTURE.read_text(encoding="utf-8")
+        obj = parse_stage_json(raw)  # must not raise
+        assert obj["items"], "the array becomes the items list"
+        assert len(obj["items"]) == 5
+        assert obj["items"][0]["verdict"] == "keep"
+        assert obj["items"][0]["cites"] == [[3, 16]]
+        # The wrap marks itself for audit: the coverage claim is structural.
+        assert obj["coverage"]["every_map_item_accounted"] is True
+        assert obj["coverage"]["wrapped_from_bare_array"] is True
+        # stage_b_schema_check runs UNCHANGED and accepts the wrapped form.
+        errors = RegionExtractor.stage_b_schema_check(obj)
+        assert errors == [], f"the wrapped array must pass the schema check: {errors}"
+
+    def test_non_verdict_array_still_rejected(self):
+        """A bare array that is NOT verdict items keeps the old rejection —
+        the tolerance is shape-specific, not a blanket list pass-through."""
+        from agent.compaction_extract import parse_stage_json
+        with pytest.raises(ValueError) as excinfo:
+            parse_stage_json('[1, 2, 3]')
+        assert "not an object" in str(excinfo.value)
+
+    def test_empty_array_rejected(self):
+        """An empty array carries no verdict evidence: still rejected."""
+        from agent.compaction_extract import parse_stage_json
+        with pytest.raises(ValueError):
+            parse_stage_json('[]')
+
+    def test_stage_c_checkpoint_array_rejected(self):
+        """Stage C's sections are KEYS of an object; a bare array of
+        section-shaped dicts must NOT be wrapped into a checkpoint —
+        checkpoint_schema_check is not weakened (D-B)."""
+        from agent.compaction_extract import parse_stage_json
+        raw = json.dumps([
+            {"insights": "x", "narrative": "y", "confidence": 0.5}])
+        with pytest.raises(ValueError):
+            parse_stage_json(raw)
+
+    def test_prompt_pins_the_object_wrapper(self):
+        """D-B prompt pinning: STAGE_B_PROMPT explicitly forbids the bare
+        array that the rig's lane produced."""
+        assert 'Return a single JSON object' in STAGE_B_PROMPT
+        assert '{"items": [...], "coverage": {...}}' in STAGE_B_PROMPT
+        assert "never a\nbare array" in STAGE_B_PROMPT or "never a bare array" in STAGE_B_PROMPT
+
+    def test_stage_c_prompt_pins_the_object_wrapper(self):
+        """Stage C has the same ambiguity (eleven sections that an LLM might
+        emit as a list): the prompt pins the object wrapper there too."""
+        assert 'Return a single JSON object' in STAGE_C_PROMPT
+        assert "never a bare array" in STAGE_C_PROMPT
+
+    def test_fixture_shape_matches_the_rig_evidence(self):
+        """The fixture is the observed response shape: verdict items keyed by
+        episode id with cites ranges — nothing redacted (no secrets)."""
+        data = json.loads(STAGE_B_FIXTURE.read_text(encoding="utf-8"))
+        assert isinstance(data, list) and len(data) >= 3
+        assert all("verdict" in it and "cites" in it for it in data)
+        assert data[0]["id"] == "ep-01-db-design-v1"
