@@ -90,10 +90,10 @@ def build_checkpoint_row(checkpoint: Dict[str, Any], dump_ref, stubs: List[str])
     # cannot go looking; discovery is list_regions, retrieval is read_dump.
     parts.append(
         "Earlier parts of this conversation were compacted. Compacted "
-        "regions are catalogued behind the compaction tools: call "
-        "list_regions to enumerate them (one-liners + refs), then read_dump "
-        "with the chosen ref for a region's verbatim messages when the work "
-        "returns to it. Do not read regions speculatively.")
+        "regions are catalogued behind the compaction tools: when the work "
+        "touches a topic from before this point, call list_regions to "
+        "enumerate the regions (one-liners + refs), pick the matching ref, "
+        "and call read_dump with it to get the region's verbatim messages.")
     if stubs:
         # D5 back-compat bound: a caller-built stub list is summarized by
         # count, never inlined — the context stays coordinate-free.

@@ -122,10 +122,10 @@ registry.register(
     schema={
         "name": "list_regions",
         "description": (
-            "List this session's compacted conversation regions (from the "
-            "stub registry): the ref, message range, and a one-liner for "
-            "each. Use FIRST when work may return to a compacted region; "
-            "then read_dump with the chosen ref to get the verbatim messages."
+            "List this session's compacted conversation regions: a ref and "
+            "a one-liner for each. Call this first when the work touches a "
+            "topic from earlier in the conversation, then read_dump with "
+            "the matching ref to get that region's verbatim messages."
         ),
         "parameters": {
             "type": "object",
@@ -143,16 +143,16 @@ registry.register(
     schema={
         "name": "read_dump",
         "description": (
-            "Read a verbatim message range from a compaction dump artifact. "
-            "Use when a checkpoint link-stub references work the conversation "
-            "has returned to. Returns the original messages plus a `source` "
-            "field (dump | transcript-fallback)."
+            "Read a compacted conversation region's verbatim messages. "
+            "Call list_regions first to pick the matching ref, then pass it "
+            "here. Returns the original messages plus a `source` field "
+            "(dump | transcript-fallback)."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "dump_id": {"type": "string",
-                            "description": "The dump id cited by the stub, e.g. the `<turn>-<hash8>` in `[dump: ...]`."},
+                            "description": "The region ref returned by list_regions."},
                 "start_msg": {"type": "integer",
                               "description": "Optional first message index to read."},
                 "end_msg": {"type": "integer",
