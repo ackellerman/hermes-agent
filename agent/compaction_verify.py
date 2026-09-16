@@ -101,17 +101,59 @@ def generate_loss_probe_questions(
     *,
     samples: int = 8,
     seed: int = 0,
+    stage_b_verdicts: Optional[List[Dict[str, Any]]] = None,
 ) -> List[str]:
-    """N sampled questions generated FROM dump content."""
+    """N sampled questions generated FROM dump content.
+
+    SPEC-0049 D3 kept-scoping: when ``stage_b_verdicts`` are supplied, the
+    question generator is pointed ONLY at the cite ranges of KEEP verdicts —
+    Stage B's drops are out of scope by design (grading a deliberate drop as a
+    checkpoint gap inverts the verdict; a 100% flip rate was observed exactly
+    that way on the rig's 0001-68bcdd95 region). Superseded items are also
+    out of scope: the checkpoint distills the superseding direction.
+    """
+    prompt = (
+        f"Generate exactly {samples} distinct questions whose answers are "
+        "present in the conversation below. Output ONLY JSON: "
+        '{"questions": ["..."]}')
+    payload: Dict[str, Any] = {"dump": dump_msgs, "sampling_seed": seed}
+    if stage_b_verdicts:
+        kept_msgs = _kept_scope_rows(stage_b_verdicts, dump_msgs)
+        if kept_msgs is not None:
+            payload = {"dump": kept_msgs, "sampling_seed": seed,
+                       "kept_scope": True}
     verdict = json.loads(question_llm([
-        {"role": "user", "content": (
-            f"Generate exactly {samples} distinct questions whose answers are "
-            "present in the conversation below. Output ONLY JSON: "
-            '{"questions": ["..."]}')},
+        {"role": "user", "content": prompt},
         {"role": "user", "content": json.dumps(
-            {"dump": dump_msgs, "sampling_seed": seed}, ensure_ascii=False, default=str)},
+            payload, ensure_ascii=False, default=str)},
     ]))
     return list(verdict.get("questions", []))
+
+
+def _kept_scope_rows(stage_b_verdicts: List[Dict[str, Any]],
+                     dump_msgs: List[Dict[str, Any]],
+                     ) -> Optional[List[Dict[str, Any]]]:
+    """The dump rows inside KEEP-verdict cite ranges (each cite is
+    [dump_id, start, end] over the region's own dump, indexed 0..len-1), or
+    None when no usable keep cites exist (caller falls back to the full dump
+    rather than generating questions about nothing)."""
+    keep_rows: List[int] = []
+    for item in stage_b_verdicts or []:
+        if not isinstance(item, dict) or item.get("verdict") != "keep":
+            continue
+        for cite in item.get("cites") or []:
+            if not (isinstance(cite, (list, tuple)) and len(cite) == 3):
+                continue
+            _dump_id, start, end = cite
+            try:
+                start, end = int(start), int(end)
+            except (TypeError, ValueError):
+                continue
+            keep_rows.extend(range(max(0, start), min(end, len(dump_msgs) - 1) + 1))
+    if not keep_rows:
+        return None
+    seen = sorted(set(keep_rows))
+    return [dump_msgs[i] for i in seen]
 
 
 def run_loss_probe(

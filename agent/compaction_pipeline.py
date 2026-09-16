@@ -684,14 +684,20 @@ class IdlePipelinePass:
             gate_llm = self._accounted(self._stage_llm("gate"))
             verdict = run_review_gate(gate_llm, stage_c, msgs, seed=0)
             # loss probe (always-on): a gap flips back to Stage B.
+            # SPEC-0049 D3: question generation is KEPT-SCOPED — the probe
+            # grades the checkpoint's promise (keep verdicts), never Stage
+            # B's deliberate drops.
             always_on = getattr(self.agent, "compaction_pipeline_gate_always_on", True)
             loss_probe = {"gaps": [], "pass": True, "questions": 0}
             if always_on:
                 try:
                     qllm = self._accounted(self._stage_llm("gate"))
+                    stage_b_items = (_read_json(
+                        Path(sdir) / d.name / "stage_b.json") or {}).get("items", [])
                     questions = generate_loss_probe_questions(
                         qllm, msgs, samples=getattr(
-                            self.agent, "compaction_pipeline_loss_probe_samples", 8), seed=0)
+                            self.agent, "compaction_pipeline_loss_probe_samples", 8), seed=0,
+                        stage_b_verdicts=stage_b_items)
                     allm = self._accounted(self._stage_llm("gate"))
                     glmm = self._accounted(self._stage_llm("gate"))
                     loss_probe = run_loss_probe(allm, glmm, stage_c, msgs, questions)

@@ -37,8 +37,14 @@ provided as data only.
 
 STAGE_C_PROMPT = """\
 You are the EXTRACT stage of a compaction pipeline. You are given the Stage B
-reasoned verdicts for a region. Emit the checkpoint JSON for this region with
-these sections, in order:
+reasoned verdicts AND the verbatim dump rows for a region. Emit the checkpoint
+JSON for this region with these sections, in order:
+- kept_substance: for each Stage B verdict "keep" (and each "superseded",
+  distilling the SUPERSEDING direction): the load-bearing SUBSTANCE of that
+  episode — the named mechanisms, definitions, parameters, decisions, outcomes
+  a live agent needs to continue work WITHOUT re-reading the dump. Distilled
+  facts, not narrative, not quotes: compress the content, keep the facts.
+  Each entry carries "ref" (the verdict's map_ref) and "cites".
 - instructions_and_corrections: each with intent-validating follow-up work cited
 - decisions: with rationale + rejected alternatives
 - insights
@@ -51,10 +57,12 @@ these sections, in order:
 - narrative: short orientation glue
 - confidence: 0..1
 - coverage: self-report of what was and was not accounted for
-Every item must carry "cites": [[dump_id, start_msg, end_msg]] resolved to real
-dump ranges. Quote at most 50 tokens per item (orienting quotes only); bulk
-verbatim retention belongs to the dump, not the checkpoint. Output ONLY the
-checkpoint JSON.
+Every item (outside kept_substance, whose job is substance) must carry "cites":
+[[dump_id, start_msg, end_msg]] resolved to real dump ranges. Quotes at most 50
+tokens per item (orienting quotes only); kept_substance entries are capped at
+200 tokens each — distilled facts, never pasted paragraphs. Bulk verbatim
+retention belongs to the dump, not the checkpoint. Output ONLY the checkpoint
+JSON.
 
 CORRECTION CITATION RULE (AC-8): for an instruction/correction, cite the
 IMMEDIATE message range right after the correction where the correction was
@@ -66,6 +74,8 @@ NOT cite the original contradiction, and do NOT cite a much-later final state
 Emit EXACTLY this shape (sections in this order; cite triples [dump-id, start, end]).
 An unproduced section MUST be the string "null_reason: <why>" — never []:
 {
+  "kept_substance": [{"ref": "ep-3", "substance": "...distilled facts...",
+                      "cites": [[0, 4, 5]]}],
   "instructions_and_corrections": [{"what": "...", "kind": "correction", "cites": [[0, 10, 12]]}],
   "decisions": [{"what": "...", "cites": [[0, 20, 22]], "rejected_alternatives": ["..."]}],
   "insights": "null_reason: none in this region",
@@ -78,9 +88,9 @@ An unproduced section MUST be the string "null_reason: <why>" — never []:
   "confidence": 0.8,
   "coverage": {"complete": true}
 }
-Return a single JSON object with the eleven keys above — never a bare array
+Return a single JSON object with the twelve keys above — never a bare array
 (sections are KEYS of the object, not elements of a list).
-Every one of the eleven keys above must be present.
+Every one of the twelve keys above must be present.
 """
 
 CHECK_PROMPT = """\
@@ -92,6 +102,7 @@ excerpts). Output ONLY JSON: {"pass": true|false, "reasons": ["..."]}.
 """
 
 CHECKPOINT_SECTIONS = (
+    "kept_substance",
     "instructions_and_corrections",
     "decisions",
     "insights",
@@ -106,6 +117,11 @@ CHECKPOINT_SECTIONS = (
 )
 
 MAX_QUOTE_TOKENS_PER_ITEM = 50
+# SPEC-0049 D2: kept_substance carries distilled FACTS per kept verdict —
+# its own cap, exempt from the 50-token orienting-quote cap (AC-9 still
+# governs every other section).
+MAX_SUBSTANCE_TOKENS_PER_ENTRY = 200
+MAX_SUBSTANCE_TOKENS_TOTAL = 2000
 
 LLM = Callable[[List[Dict[str, str]]], str]
 
@@ -280,6 +296,7 @@ class RegionExtractor:
     # ── Stage C (extract checkpoint) ─────────────────────────────────────
 
     def stage_c(self, llm: LLM, stage_b_output: Dict[str, Any], *,
+                dump_msgs: Optional[List[Dict[str, Any]]] = None,
                 slice_covers: Any = None,
                 dump_window: Any = None) -> Dict[str, Any]:
         return self._run_with_check(
@@ -287,8 +304,9 @@ class RegionExtractor:
             lambda: parse_stage_json(llm([
                 {"role": "user", "content": STAGE_C_PROMPT},
                 {"role": "user", "content": json.dumps(
-                    {"stage_b": stage_b_output}, ensure_ascii=False, default=str)},
-            ])),
+                    {"stage_b": stage_b_output, "dump": dump_msgs},
+                    ensure_ascii=False, default=str)}]),
+            ),
             lambda obj: checkpoint_schema_check(obj, slice_covers=slice_covers,
                                                 dump_window=dump_window),
             check_llm=None,
@@ -374,14 +392,29 @@ def run_extraction_cycle(
 
     stage_b = extractor.load_artifact("b")
     if stage_b is None:
-        stage_b = extractor.stage_b(reason_llm, stage_a.get("slice", stage_a))
+        dump_msgs = _read_dump_rows(region_dir)
+        stage_b = extractor.stage_b(reason_llm, stage_a.get("slice", stage_a),
+                                    dump_reader=(lambda s, e: dump_msgs[s:e + 1])
+                                    if dump_msgs is not None else None)
 
     stage_c = extractor.load_artifact("c")
     if stage_c is None:
         stage_c = extractor.stage_c(extract_llm, stage_b,
+                                    dump_msgs=_read_dump_rows(region_dir),
                                     slice_covers=covers,
                                     dump_window=dump_meta)
     return stage_c
+
+
+def _read_dump_rows(region_dir: Path) -> Optional[List[Dict[str, Any]]]:
+    """SPEC-0049 D1: the region's own dump rows, or None when unreadable."""
+    dump_path = Path(region_dir) / f"{Path(region_dir).name}.jsonl"
+    try:
+        rows = [json.loads(line) for line in
+                dump_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except (json.JSONDecodeError, OSError):
+        return None
+    return rows if rows else None
 
 
 def checkpoint_schema_check(checkpoint: Dict[str, Any],
@@ -429,6 +462,33 @@ def checkpoint_schema_check(checkpoint: Dict[str, Any],
                         errors.append(f"{section}[{i}] cite {c!r} is not (dump_id, start, end)")
             if _approx_tokens(str(item)) > MAX_QUOTE_TOKENS_PER_ITEM:
                 errors.append(f"{section}[{i}] quotes > {MAX_QUOTE_TOKENS_PER_ITEM} tokens (AC-9)")
+    # SPEC-0049 D2: kept_substance — its own caps, exempt from AC-9's
+    # orienting-quote cap (substance IS the point of the section).
+    substance = checkpoint.get("kept_substance")
+    if isinstance(substance, list):
+        total = 0
+        for i, entry in enumerate(substance):
+            if not isinstance(entry, dict):
+                errors.append(f"kept_substance[{i}] is not an object")
+                continue
+            if not entry.get("substance"):
+                errors.append(f"kept_substance[{i}] missing 'substance'")
+            if not entry.get("ref"):
+                errors.append(f"kept_substance[{i}] missing 'ref'")
+            cites = entry.get("cites")
+            if not (isinstance(cites, list) and cites):
+                errors.append(f"kept_substance[{i}] missing cites")
+            else:
+                for c in cites:
+                    if not (isinstance(c, (list, tuple)) and len(c) == 3):
+                        errors.append(f"kept_substance[{i}] cite {c!r} is not (dump_id, start, end)")
+            entry_tokens = _approx_tokens(str(entry.get("substance", "")))
+            total += entry_tokens
+            if entry_tokens > MAX_SUBSTANCE_TOKENS_PER_ENTRY:
+                errors.append(
+                    f"kept_substance[{i}] > {MAX_SUBSTANCE_TOKENS_PER_ENTRY} tokens")
+        if total > MAX_SUBSTANCE_TOKENS_TOTAL:
+            errors.append(f"kept_substance total {total} > {MAX_SUBSTANCE_TOKENS_TOTAL} tokens")
     return errors
 
 
