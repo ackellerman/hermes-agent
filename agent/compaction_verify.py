@@ -111,10 +111,21 @@ def generate_loss_probe_questions(
     checkpoint gap inverts the verdict; a 100% flip rate was observed exactly
     that way on the rig's 0001-68bcdd95 region). Superseded items are also
     out of scope: the checkpoint distills the superseding direction.
+
+    D3b (AC-D1 iteration): questions must target LOAD-BEARING facts — named
+    mechanisms, definitions, formulas, decisions, explicit lists — the things
+    a compact checkpoint MUST retain. Incidental trivia (an env-var value
+    echoed in a tool log) is not a compaction obligation; asking it created
+    un-satisfiable gaps on the real lane.
     """
     prompt = (
-        f"Generate exactly {samples} distinct questions whose answers are "
-        "present in the conversation below. Output ONLY JSON: "
+        f"Generate exactly {samples} distinct questions about LOAD-BEARING "
+        "facts present in the conversation below: named mechanisms, "
+        "definitions, formulas, parameter values, explicit lists, decisions "
+        "and their reasons — facts a continuation agent would need. Do NOT "
+        "ask about incidental details (session ids, environment variable "
+        "values, boilerplate). Each question must have a specific, checkable "
+        'answer stated in the conversation. Output ONLY JSON: '
         '{"questions": ["..."]}')
     payload: Dict[str, Any] = {"dump": dump_msgs, "sampling_seed": seed}
     if stage_b_verdicts:
@@ -175,8 +186,13 @@ def run_loss_probe(
         ]))
         grade = json.loads(grader_llm([
             {"role": "user", "content": (
-                "Does the checkpoint answer match the dump's ground truth for "
-                'this question? Output ONLY JSON: {"match": true|false, "why": "..."}')},
+                "Does the checkpoint answer convey the ESSENTIAL ground-truth "
+                "fact for this question? Match on MEANING, not wording: the "
+                "answer may paraphrase or omit incidental specifics, but the "
+                "core fact (mechanism name, definition, formula, decision, "
+                "list membership) must be present and correct. An answer "
+                "that says the checkpoint lacks the answer is NOT a match. "
+                'Output ONLY JSON: {"match": true|false, "why": "..."}')},
             {"role": "user", "content": json.dumps(
                 {"question": q, "answer": ans, "dump": dump_msgs},
                 ensure_ascii=False, default=str)},

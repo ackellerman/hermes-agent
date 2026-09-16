@@ -44,6 +44,9 @@ JSON for this region with these sections, in order:
   episode — the named mechanisms, definitions, parameters, decisions, outcomes
   a live agent needs to continue work WITHOUT re-reading the dump. Distilled
   facts, not narrative, not quotes: compress the content, keep the facts.
+  COMPLETENESS RULE: every named mechanism, definition, formula, default
+  value, and explicit list in a kept episode's load-bearing content must
+  survive into the distilled facts — the probe grades recall of these.
   Each entry carries "ref" (the verdict's map_ref) and "cites".
 - instructions_and_corrections: each with intent-validating follow-up work cited
 - decisions: with rationale + rejected alternatives
@@ -60,9 +63,9 @@ JSON for this region with these sections, in order:
 Every item (outside kept_substance, whose job is substance) must carry "cites":
 [[dump_id, start_msg, end_msg]] resolved to real dump ranges. Quotes at most 50
 tokens per item (orienting quotes only); kept_substance entries are capped at
-200 tokens each — distilled facts, never pasted paragraphs. Bulk verbatim
-retention belongs to the dump, not the checkpoint. Output ONLY the checkpoint
-JSON.
+400 tokens each and the section has a stated budget — stay under it; density
+matters more than prose. Bulk verbatim retention belongs to the dump, not the
+checkpoint. Output ONLY the checkpoint JSON.
 
 CORRECTION CITATION RULE (AC-8): for an instruction/correction, cite the
 IMMEDIATE message range right after the correction where the correction was
@@ -119,9 +122,23 @@ CHECKPOINT_SECTIONS = (
 MAX_QUOTE_TOKENS_PER_ITEM = 50
 # SPEC-0049 D2: kept_substance carries distilled FACTS per kept verdict —
 # its own cap, exempt from the 50-token orienting-quote cap (AC-9 still
-# governs every other section).
-MAX_SUBSTANCE_TOKENS_PER_ENTRY = 200
-MAX_SUBSTANCE_TOKENS_TOTAL = 2000
+# governs every other section). D2b (AC-D1 iteration): the section budget
+# SCALES with the region so a dense region is not force-crushed into a fixed
+# 2KB (the real-lane probe showed 2000 total starving a 448KB region); the
+# per-entry cap doubles so multi-fact episodes distill fully.
+MAX_SUBSTANCE_TOKENS_PER_ENTRY = 400
+MIN_SUBSTANCE_TOKENS_TOTAL = 2000
+MAX_SUBSTANCE_TOKENS_TOTAL = 8000
+
+
+def substance_budget_for(dump_chars: int) -> int:
+    """D2b: kept_substance total cap for a region of this size — roughly
+    2 tokens per 100 chars of dump, clamped to [2000, 8000]. A 25K-char
+    region gets the floor; a 450K-char region gets the ceiling (~56x
+    compression against the dump it replaces)."""
+    scaled = int(dump_chars // 50)
+    return max(MIN_SUBSTANCE_TOKENS_TOTAL,
+               min(MAX_SUBSTANCE_TOKENS_TOTAL, scaled))
 
 LLM = Callable[[List[Dict[str, str]]], str]
 
@@ -299,16 +316,24 @@ class RegionExtractor:
                 dump_msgs: Optional[List[Dict[str, Any]]] = None,
                 slice_covers: Any = None,
                 dump_window: Any = None) -> Dict[str, Any]:
+        # D2b: the substance budget scales with the dump size — a dense
+        # region gets proportionally more kept_substance room.
+        substance_budget = None
+        if dump_msgs is not None:
+            substance_budget = substance_budget_for(
+                sum(len(str(m.get("content", ""))) for m in dump_msgs))
         return self._run_with_check(
             "c",
             lambda: parse_stage_json(llm([
                 {"role": "user", "content": STAGE_C_PROMPT},
                 {"role": "user", "content": json.dumps(
-                    {"stage_b": stage_b_output, "dump": dump_msgs},
+                    {"stage_b": stage_b_output, "dump": dump_msgs,
+                     "kept_substance_budget_tokens": substance_budget},
                     ensure_ascii=False, default=str)}]),
             ),
             lambda obj: checkpoint_schema_check(obj, slice_covers=slice_covers,
-                                                dump_window=dump_window),
+                                                dump_window=dump_window,
+                                                substance_budget=substance_budget),
             check_llm=None,
         )
 
@@ -419,7 +444,9 @@ def _read_dump_rows(region_dir: Path) -> Optional[List[Dict[str, Any]]]:
 
 def checkpoint_schema_check(checkpoint: Dict[str, Any],
                             slice_covers: Any = None,
-                            dump_window: Any = None) -> List[str]:
+                            dump_window: Any = None,
+                            substance_budget: Optional[int] = None,
+                            ) -> List[str]:
     """AC-6 + AC-9 script validation: every section present; an empty section
     needs an explicit null_reason; quotes capped at 50 tokens/item; citations
     resolve to (dump_id, start, end) triples.
@@ -464,6 +491,7 @@ def checkpoint_schema_check(checkpoint: Dict[str, Any],
                 errors.append(f"{section}[{i}] quotes > {MAX_QUOTE_TOKENS_PER_ITEM} tokens (AC-9)")
     # SPEC-0049 D2: kept_substance — its own caps, exempt from AC-9's
     # orienting-quote cap (substance IS the point of the section).
+    budget_total = _substance_budget_total(substance_budget)
     substance = checkpoint.get("kept_substance")
     if isinstance(substance, list):
         total = 0
@@ -487,9 +515,17 @@ def checkpoint_schema_check(checkpoint: Dict[str, Any],
             if entry_tokens > MAX_SUBSTANCE_TOKENS_PER_ENTRY:
                 errors.append(
                     f"kept_substance[{i}] > {MAX_SUBSTANCE_TOKENS_PER_ENTRY} tokens")
-        if total > MAX_SUBSTANCE_TOKENS_TOTAL:
-            errors.append(f"kept_substance total {total} > {MAX_SUBSTANCE_TOKENS_TOTAL} tokens")
+        if total > budget_total:
+            errors.append(
+                f"kept_substance total {total} > {budget_total} tokens")
     return errors
+
+
+def _substance_budget_total(substance_budget: Optional[int]) -> int:
+    """D2b: the effective kept_substance cap — explicit budget when supplied
+    (the caller sized it off the region), else the floor (a small region
+    never needs more)."""
+    return int(substance_budget) if substance_budget else MIN_SUBSTANCE_TOKENS_TOTAL
 
 
 def _approx_tokens(text: str) -> int:
