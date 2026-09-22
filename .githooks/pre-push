@@ -139,8 +139,21 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       r=$(timeout "$GIT_TIMEOUT" git rev-list "$local_sha" --not --all 2>/dev/null) || r=""
     fi
   else
-    r=$(timeout "$GIT_TIMEOUT" git rev-list "$local_sha" --not "$remote_sha" 2>/dev/null) \
+    # Update of an existing ref. The raw range is EVERYTHING the destination
+    # lacks — a merge that pulls upstream/main into development drags in the
+    # whole upstream side (measured: 8,039 commits). Those commits are already
+    # published (upstream's own public history), their blobs are absent in a
+    # blob:none clone, and scanning them is both useless and a guaranteed
+    # fail-closed refusal. Scan what no remote already has — the same contract
+    # as the new-ref branch above.
+    r=$(timeout "$GIT_TIMEOUT" git rev-list "$local_sha" \
+          --not "$remote_sha" --remotes="$remote_name" --remotes=origin --remotes=upstream 2>/dev/null) \
       || { unevaluable="$unevaluable $local_sha"; continue; }
+    if [ -z "$r" ]; then
+      # Everything this push would transfer is already on a remote we track;
+      # there is no unpublished content to gate.
+      r=$(timeout "$GIT_TIMEOUT" git rev-list "$local_sha" --not --all 2>/dev/null) || r=""
+    fi
   fi
   printf '%s\n' $r >> "$shas"
 done <<EOF
@@ -180,11 +193,14 @@ fi
 # `-c core.quotePath=false` is required: with git's default, a non-ASCII filename is emitted as
 # `+++ "b/\303\274n..."`, which does not match the file-header rule, and the parser then
 # attributes the leak to the PREVIOUS file — a wrong-path diagnosis with no line number.
-if ! timeout "$GIT_TIMEOUT" git -c core.pager=cat -c core.quotePath=false log \
+timeout "$GIT_TIMEOUT" git -c core.pager=cat -c core.quotePath=false log \
       --no-walk -c -p -U0 --no-color --no-notes --no-textconv \
-      --format='commit %H' --stdin < "$shas" > "$out" 2> "$err"; then
-  rc=$?
-  # rc of git itself (never a pipeline's). Refuse: a killed or failing scan must NOT pass.
+      --format='commit %H' --stdin < "$shas" > "$out" 2> "$err"
+rc=$?
+# rc of git itself, captured BEFORE any test inverts it (`if ! cmd` would make
+# $? the negated status — always 0 — and the report would say "git rc=0" on
+# every real failure). Refuse: a killed or failing scan must NOT pass.
+if [ "$rc" -ne 0 ]; then
   printf 'pre-push: the diff scan failed (git rc=%s); refusing (fail closed)\n' "$rc" >&2
   sed -n '1,5p' "$err" >&2 2>/dev/null || true
   exit 1
