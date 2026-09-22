@@ -22,9 +22,22 @@ def all_assignees_spawnable(monkeypatch):
     gate ACTIVE by default. Tools tests create cards with synthetic assignees,
     so this autouse fixture re-allows them (overrides the refusing stub).
     Tests that genuinely need refusal patch ``profile_exists`` themselves.
+
+    Returns the pre-patch ``profile_exists`` (the root conftest's hermetic
+    wrapper — real resolution against the sandboxed home) so
+    assignee-sensitive tests can restore real semantics for the handler under
+    test: the reviewer-guard pair does
+    ``monkeypatch.setattr(profiles, "profile_exists", all_assignees_spawnable)``.
+    A blanket ``lambda name: True`` here also neuters upstream's reviewer
+    guard in ``_handle_request_review`` (lazy import at call time sees the
+    patched symbol) — that is exactly how
+    ``test_request_review_rejects_unknown_reviewer_without_mutation`` came to
+    fail on this fork while passing on upstream.
     """
     from hermes_cli import profiles
+    real_profile_exists = profiles.profile_exists
     monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    return real_profile_exists
 
 
 @pytest.fixture(autouse=True)

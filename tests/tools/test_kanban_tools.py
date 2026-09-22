@@ -199,16 +199,21 @@ def test_complete_reports_registered_attachments(worker_env):
     assert readback["attachments"] == d["attachments"]
 
 
-def test_request_review_rejects_unknown_reviewer_without_mutation(monkeypatch, worker_env, tmp_path):
+def test_request_review_rejects_unknown_reviewer_without_mutation(monkeypatch, worker_env, tmp_path, all_assignees_spawnable):
     """#106163: a non-profile ``reviewer`` (e.g. the literal "reviewer") must be
     refused with an error the model sees, leaving the task running under the
     implementer — never parked in ``review`` on an assignee nobody can spawn."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import profiles
     from tools import kanban_tools as kt
 
     (tmp_path / ".hermes" / "profiles" / "verifier").mkdir(parents=True)
     (tmp_path / ".hermes" / "profiles" / "verifier" / "config.yaml").write_text("{}\n")  # identity marker
+    # This test is assignee-sensitive: restore REAL profile_exists semantics for
+    # the reviewer guard (the autouse all_assignees_spawnable blanket would make
+    # any name a "profile" and the refusal would never fire — see the conftest).
+    monkeypatch.setattr(profiles, "profile_exists", all_assignees_spawnable)
     with kbc.connect() as conn:
         before = kb.get_task(conn, worker_env)
         before_events = kb.list_events(conn, worker_env)
@@ -223,13 +228,17 @@ def test_request_review_rejects_unknown_reviewer_without_mutation(monkeypatch, w
         assert kb.list_events(conn, worker_env) == before_events
 
 
-def test_request_review_accepts_installed_profile(monkeypatch, worker_env, tmp_path):
+def test_request_review_accepts_installed_profile(monkeypatch, worker_env, tmp_path, all_assignees_spawnable):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import profiles
     from tools import kanban_tools as kt
 
     (tmp_path / ".hermes" / "profiles" / "verifier").mkdir(parents=True)
     (tmp_path / ".hermes" / "profiles" / "verifier" / "config.yaml").write_text("{}\n")  # identity marker
+    # Same as above: the accept case must pass the REAL profile_exists, not the
+    # blanket-True fixture — otherwise the handler's guard is not exercised at all.
+    monkeypatch.setattr(profiles, "profile_exists", all_assignees_spawnable)
     with kbc.connect() as conn:
         monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb.get_task(conn, worker_env).current_run_id))
 
