@@ -221,23 +221,39 @@ fi
 # and the content.
 #
 # The path comes from the `diff --git|combined|cc` header and is rewritten by `---`/`+++` ONLY
-# when they are the immediately-adjacent pair: in a combined diff, ordinary ADDED CONTENT can
-# be rendered as a literal file header (`+ /dev/null`, `+ b/decoy.txt`), which would otherwise
-# hijack the path and destroy the diagnosis.
+# when they are the immediately-adjacent pair BEFORE the first hunk: in a combined diff,
+# ordinary ADDED CONTENT can be rendered as a literal file header — markers `--` + content
+# `- a/victim.txt` prints as `--- a/victim.txt` and sets the pair flag; markers `++` + content
+# `+ b/decoy.txt` prints as `+++ b/decoy.txt` and hijacks the path. The same `+++ `-form line
+# is also ADDED CONTENT the generic rule excludes (`!/^\+\+\+ /`), so without the hunk state a
+# leak line whose text begins `+ ` is silently unscanned in merge commits.
 parse() { # $1=pattern file  $2=1 to collect hits as file:content
   awk -v patfile="$1" '
     BEGIN { pat=""; while ((getline l < patfile) > 0) pat = pat l }
     function flush() { }
-    /^commit /            { commit=$2; file=""; pend=0; next }
+    /^commit /            { commit=$2; file=""; pend=0; inhunk=0; next }
     /^diff --(git|combined|cc) / {
                             f=$0
                             sub(/^diff --(git|combined|cc) /,"",f)
                             sub(/^"/,"",f); sub(/^[ab]\//,"",f)
                             sub(/ .*/,"",f); sub(/"$/,"",f)
-                            file=f; pend=0; next
+                            file=f; pend=0; inhunk=0; next
                           }
-    /^--- /               { pend=1; next }
+    /^@@/                 { inhunk=1; pend=0; next }
+    /^--- /               {
+                            if (inhunk) { pend=0; next }   # mid-hunk: removed content, not a header
+                            pend=1; next
+                          }
     /^\+\+\+ /            {
+                            if (inhunk) {
+                              # mid-hunk: ADDED CONTENT rendered in header form. Strip ONE
+                              # marker char and scan: patterns are unanchored, so residual
+                              # marker pluses cannot mask a hit, and this covers every
+                              # parent count (1p: `+`+`++ x`; 2p: `++`+`+ x`).
+                              s=$0; sub(/^\+/,"",s)
+                              if (s ~ pat) print commit "\t" file "\t" s
+                              pend=0; next
+                            }
                             if (pend) {
                               p=$0; sub(/^\+\+\+ /,"",p)
                               if (p == "/dev/null") file=""
