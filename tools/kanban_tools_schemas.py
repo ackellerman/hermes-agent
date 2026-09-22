@@ -146,8 +146,8 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "Optional list of absolute paths to deliverable "
                 "files you produced during this run — generated "
                 "charts, PDFs, spreadsheets, images, archives. "
-                "Examples: [\"/tmp/q3-revenue.png\", "
-                "\"/tmp/report.pdf\"]. The gateway notifier "
+                "Examples: [\"~/.hermes/cache/scratch/q3-revenue.png\", "
+                "\"~/.hermes/cache/scratch/report.pdf\"]. The gateway notifier "
                 "uploads each path as a native attachment to the "
                 "subscribed chat (images embed inline, everything "
                 "else uploads as a file) so the deliverable "
@@ -190,21 +190,25 @@ KANBAN_BLOCK_SCHEMA = _schema(
             "enum": ["dependency", "needs_input", "capability", "transient"],
             "description": (
                 "Why you're blocked. 'dependency' waits in todo and "
-                "resumes automatically when every task in depends_on is "
-                "done (depends_on is REQUIRED for this kind); the others "
-                "surface to a human. Omit only if none apply."
+                "resumes automatically when an incomplete parent finishes; "
+                "if no parent is open it is recorded as needs_input instead. "
+                "The others surface to a human. Omit only if none apply. "
+                "With kind='dependency' you MAY name the parent task id(s) "
+                "via depends_on so the scheduler records the edge explicitly."
             ),
         },
         "depends_on": {
             "type": "array",
             "items": {"type": "string"},
             "description": (
-                "REQUIRED with kind='dependency': the task id(s) this "
-                "task is waiting on, e.g. ['t_1a2b3c4d']. The scheduler "
-                "links them as parents and will not re-dispatch this task "
-                "until they are all done. A dependency mentioned only in "
-                "`reason` is invisible to the scheduler and the task would "
-                "be re-dispatched every tick."
+                "OPTIONAL with kind='dependency': the task id(s) this "
+                "task is waiting on, e.g. ['t_1a2b3c4d']. When supplied the "
+                "scheduler links them as parents and this task is not "
+                "re-dispatched until they are all done. When absent, a "
+                "dependency block still waits on any already-linked "
+                "incomplete parent, or is recorded as needs_input if none "
+                "is open. A dependency mentioned only in `reason` is "
+                "invisible to the scheduler."
             ),
         },
     },
@@ -241,6 +245,24 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
                 "as changed_files, tests_run, commit, or decisions."
             ),
             "additionalProperties": True,
+        },
+        "artifacts": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Optional list of absolute paths to deliverable "
+                "files this handoff names — generated charts, "
+                "PDFs, spreadsheets, images, archives. Examples: "
+                "['~/.hermes/cache/scratch/q3-revenue.png', '~/.hermes/cache/scratch/report.pdf']. "
+                "A review handoff is the last implementer "
+                "transition, so the kernel copies these into the "
+                "task's durable attachments before the reviewer's "
+                "completion cleans the scratch workspace up, and "
+                "the gateway notifier uploads them as native "
+                "attachments to the subscribed chat. A missing "
+                "declared scratch artifact keeps the task in place "
+                "so you can fix the path and retry."
+            ),
         },
     },
     ["summary"],
@@ -471,6 +493,10 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "open-ended cards where one shot rarely finishes the "
                 "work. Defaults to false (classic single-shot worker)."
         )),
+        "completion_contract": _prop("string", (
+            "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
+            "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
+        )),
         "goal_max_turns": _prop("integer", (
                 "Turn budget for goal_mode workers. Caps how many "
                 "continuation turns the worker may take before the task "
@@ -519,7 +545,9 @@ KANBAN_LINK_SCHEMA = _schema(
     (
         "Add a parent→child dependency edge after both tasks already "
         "exist. The child won't promote to 'ready' until all parents "
-        "are 'done'. Cycles and self-links are rejected."
+        "are 'done'. Cycles and self-links are rejected. A running child "
+        "is rejected unless the active owning worker is linking its own "
+        "card for a dependency handoff."
     ),
     {
         "parent_id": {"type": "string", "description": "Parent task id."},
