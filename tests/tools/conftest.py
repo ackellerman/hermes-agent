@@ -33,6 +33,14 @@ def all_assignees_spawnable(monkeypatch):
     patched symbol) — that is exactly how
     ``test_request_review_rejects_unknown_reviewer_without_mutation`` came to
     fail on this fork while passing on upstream.
+
+    ORDERING-DEPENDENT: the captured symbol is the root conftest's hermetic
+    wrapper only because pytest instantiates the root autouse
+    ``_hermetic_profile_exists`` (tests/conftest.py) BEFORE this tools-subdir
+    autouse fixture. Both wrappers resolve through HERMES_HOME, so the
+    behaviour is hermetic-correct either way — but a future autouse patch
+    inserted between them would capture the wrong symbol, in which case the
+    reject test fails loudly rather than silently passing.
     """
     from hermes_cli import profiles
     real_profile_exists = profiles.profile_exists
