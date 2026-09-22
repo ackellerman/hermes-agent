@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+#
+# pre-push — fork-dev host-path / personal-info gate (AGENTS.md rule 4 mechanism).
+#
+# WHY: the SPEC-0044 branch introduced absolute host-path literals into this PUBLIC fork
+# (`/home/<operator>/...` twice, and this host's mount root) and nothing noticed until a
+# manual audit. A scrub commit on top does not help — the literals stay in the history that
+# gets pushed. This gate refuses the push that would introduce them.
+#
+# THREAT MODEL — the gate targets ACCIDENTS on ORDINARY operations, not adversaries.
+# A determined bypass exists and no hook design closes it: `git push --no-verify` and
+# `git -c core.hooksPath=/dev/null push` both skip this script entirely. The design goals are
+# therefore (a) never a false pass on an ordinary operation and (b) never a false block on
+# one. Ordinary = a feature branch, a 2-parent merge, an octopus merge, a binary artifact,
+# an LFS pointer, a deletion, a multi-ref push, and a worktree that is NOT checked out at the
+# pushed tip (this fleet's normal state).
+#
+# Escape hatch: HERMES_ALLOW_HOST_PATHS=1 git push ...
+#
+# Pattern policy: block ONLY what identifies the operator or this host; warn (never block) on
+# generic path spellings, which are this repo's own public vocabulary — upstream's docs are
+# full of `~/.hermes/profiles/<name>`, its tests full of `/Users/...`, and its SSRF deny-lists
+# full of RFC1918 literals. Blocking those refuses ordinary pushes, which is how a gate ends
+# up permanently bypassed. See .githooks/patterns/ and the SPEC for the measurements.
+
+set -u
+
+# ── constants ────────────────────────────────────────────────────────────────────────────
+GIT_TIMEOUT=60                 # seconds, per git invocation
+ATTR_TIMEOUT=60                # seconds, for the whole attribute sweep (its own budget)
+MAX_COMMITS=10000              # on the DEDUPED sha list
+MAX_BYTES=67108864             # 64 MiB of `git log -p` output
+MAX_ATTR_PATHS=6000            # (commit,path) units checked with check-attr
+MAX_REDERIVE_BYTES=8388608     # 8 MiB read back per hit when re-deriving the line number
+
+# Published md5s of the shipped pattern files (SPEC §1). A mismatch or an absent file is
+# FATAL: on the `grep -aE -f` route a missing file exits 2 and an empty one exits 1, both with
+# zero matches — i.e. an unguarded implementation PASSES a real leak. The patterns are tracked,
+# so a commit inside the pushed range could otherwise weaken them unnoticed.
+BLOCK_MD5=ea4d230cadaf6e4a3d46b0d1a41219bb
+WARN_MD5=144222245d71a493d62303158528d40a
+
+# ── never touch the network ──────────────────────────────────────────────────────────────
+# This checkout is a blob:none PARTIAL CLONE (remote.origin.promisor=true). Without this, any
+# git command touching an object that is absent locally triggers a lazy fetch: measured, a
+# pre-push hook then HANGS (rc=124/128 after ~84s) instead of gating. Worst possible failure
+# mode for a hook that runs on every push, so it is set before anything else runs.
+export GIT_NO_LAZY_FETCH=1
+export GIT_TERMINAL_PROMPT=0
+export GIT_PAGER=cat
+
+die() { printf 'pre-push: %s\n' "$1" >&2; exit 1; }
+
+# Safety net for the cleanup trap: only ever remove a *private* scratch dir, never a shared one.
+rm_scratch() {
+  case "${tmpdir:-}" in
+    /tmp|/|""|/tmp/|/var/tmp|/var/tmp/) return 0 ;;   # never touch a shared directory
+  esac
+  [ -n "${tmpdir:-}" ] && rm -rf -- "$tmpdir"
+}
+
+# ── escape hatch ─────────────────────────────────────────────────────────────────────────
+if [ "${HERMES_ALLOW_HOST_PATHS:-}" = "1" ]; then
+  printf '*** BYPASSED *** host-path gate skipped (HERMES_ALLOW_HOST_PATHS=1)\n' >&2
+  exit 0
+fi
+
+# ── locate the patterns next to this hook, and verify their integrity ────────────────────
+hook_dir=$(cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || die "cannot resolve the hook directory; refusing (fail closed)"
+repo_root=$(timeout "$GIT_TIMEOUT" git rev-parse --show-toplevel 2>/dev/null || true)
+[ -n "$repo_root" ] || die "cannot determine the repo root; refusing (fail closed)"
+
+BLOCK_FILE=
+WARN_FILE=
+for cand in "$hook_dir/patterns" "$repo_root/.githooks/patterns"; do
+  if [ -r "$cand/block.ere" ]; then BLOCK_FILE="$cand/block.ere"; WARN_FILE="$cand/warn.ere"; break; fi
+done
+if [ -z "$BLOCK_FILE" ]; then
+  die "pattern file not found; refusing (fail closed).
+  Looked for:
+    $hook_dir/patterns/block.ere
+    $repo_root/.githooks/patterns/block.ere
+  Both pattern files (block.ere, warn.ere) must ship beside this hook."
+fi
+
+check_md5() { # $1=file $2=expected $3=label
+  [ -r "$1" ] || die "$3 pattern file is missing ($1); refusing (fail closed)"
+  got=$(md5sum -- "$1" 2>/dev/null | cut -d' ' -f1 || true)
+  [ "$got" = "$2" ] || die "$3 pattern file does not match its published md5 (expected $2, got ${got:-none}); refusing (fail closed)"
+}
+check_md5 "$BLOCK_FILE" "$BLOCK_MD5" block
+check_md5 "$WARN_FILE"  "$WARN_MD5"  warn
+
+# A pattern must also be non-degenerate. An empty file matches EVERY line (awk `$0 ~ p` with
+# p="" → 2/2), and an invalid ERE makes awk exit 2 with empty stdout — either way the gate
+# would refuse everything or pass everything. Validate behaviourally, not just non-emptily.
+nonempty() { [ -s "$1" ] || die "$2 pattern file is empty; refusing (fail closed)"; }
+nonempty "$BLOCK_FILE" block
+nonempty "$WARN_FILE"  warn
+
+# ── read the refs git hands us on stdin ──────────────────────────────────────────────────
+# <local_ref> <local_sha> <remote_ref> <remote_sha>
+remote_name="${1:-origin}"                           # $1 is the remote being pushed to
+stdin_data=$(cat)
+[ -n "$stdin_data" ] || exit 0                      # no refs → nothing to gate
+
+# ONE private directory. Do NOT use bare `mktemp` + `dirname`: that yields `/tmp`, and the
+# cleanup trap below then `rm -rf /tmp`. (That is not hypothetical — it is exactly the bug this
+# gate shipped with in its first draft, and it destroyed the author's whole scratch tree.)
+tmpdir=$(mktemp -d) || die "cannot create a temporary directory; refusing (fail closed)"
+shas="$tmpdir/shas"
+out="$tmpdir/out"
+err="$tmpdir/err"
+trap rm_scratch EXIT TERM INT HUP                   # NB: SIGKILL leaks this dir by design
+
+unevaluable=""
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -n "${local_ref:-}" ] || continue
+  case "$local_ref" in refs/tags/*) ;; esac
+  # deletion (local sha all zeros): nothing is added by this ref
+  case "$local_sha" in 0000000000000000000000000000000000000000) continue ;; esac
+  if ! timeout "$GIT_TIMEOUT" git cat-file -e "${local_sha}^{commit}" 2>/dev/null; then
+    unevaluable="$unevaluable $local_sha"
+    continue
+  fi
+  if [ "$remote_sha" = "0000000000000000000000000000000000000000" ] \
+     || ! timeout "$GIT_TIMEOUT" git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+    # A new ref, or a force-push whose old tip we do not have. The whole ancestry is
+    # reachable, but nearly all of it is ALREADY PUBLISHED, so scanning it is both useless
+    # (31,996 commits on development) and slow — and it would refuse every new branch.
+    # Evaluate instead what the remote's own tracking refs do not already contain.
+    r=$(timeout "$GIT_TIMEOUT" git rev-list "$local_sha" \
+          --not --remotes="$remote_name" --remotes=origin --remotes=upstream 2>/dev/null) \
+      || { unevaluable="$unevaluable $local_sha"; continue; }
+    if [ -z "$r" ]; then
+      # Nothing new for the remote we can see: git would transfer no new commits, so there is
+      # nothing to gate. (If the remote genuinely has no refs we track, every commit below is
+      # new and the MAX_COMMITS guard below refuses loudly rather than scanning silently.)
+      r=$(timeout "$GIT_TIMEOUT" git rev-list "$local_sha" --not --all 2>/dev/null) || r=""
+    fi
+  else
+    r=$(timeout "$GIT_TIMEOUT" git rev-list "$local_sha" --not "$remote_sha" 2>/dev/null) \
+      || { unevaluable="$unevaluable $local_sha"; continue; }
+  fi
+  printf '%s\n' $r >> "$shas"
+done <<EOF
+$stdin_data
+EOF
+
+if [ -n "$unevaluable" ]; then
+  printf 'pre-push: cannot evaluate %s locally; refusing (fail closed)\n' "$unevaluable" >&2
+  printf '  The object is absent because this is a blob:none partial clone and lazy fetching is\n' >&2
+  printf '  disabled. A plain `git fetch` will NOT fix it. Either:\n' >&2
+  printf '    git fetch --no-filter <remote>          # or unset remote.<r>.partialclonefilter\n' >&2
+  printf '    git fetch --refetch <remote>            # and remote.<r>.promisor, then re-fetch\n' >&2
+  printf '  or bypass:  HERMES_ALLOW_HOST_PATHS=1 git push ...\n' >&2
+  exit 1
+fi
+
+# Dedupe. `git log` dedupes internally too, but the cap must be applied to a stable count, and
+# the number REPORTED to the operator is the deduped one (raw and deduped differ by the number
+# of refs sharing a tip).
+sort -u -o "$shas" "$shas"
+commit_count=$(wc -l < "$shas" | tr -d ' ')
+[ "$commit_count" -gt 0 ] || exit 0
+
+if [ "$commit_count" -gt "$MAX_COMMITS" ]; then
+  die "$commit_count commits to evaluate exceeds MAX_COMMITS=$MAX_COMMITS; refusing (fail closed).
+  This normally means the remote's refs are not fetched locally, so every commit looks new.
+  Run:  git fetch <remote>            (then push again)
+  or bypass:  HERMES_ALLOW_HOST_PATHS=1 git push ..."
+fi
+
+# ── scan the added lines of exactly those commits ────────────────────────────────────────
+# One pass. `-c` (combined) is MANDATORY: plain `git log -p` emits NOTHING for a merge, so a
+# host path introduced in a merge (including one present in neither parent) is invisible;
+# `-m` shows it but duplicates hunks per parent and produced 68 MB on this repo's range.
+# Config `-c` goes BEFORE the subcommand; the combined-diff `-c` goes AFTER `log`. Misplacing
+# the latter is `fatal: ambiguous argument`.
+# `-c core.quotePath=false` is required: with git's default, a non-ASCII filename is emitted as
+# `+++ "b/\303\274n..."`, which does not match the file-header rule, and the parser then
+# attributes the leak to the PREVIOUS file — a wrong-path diagnosis with no line number.
+if ! timeout "$GIT_TIMEOUT" git -c core.pager=cat -c core.quotePath=false log \
+      --no-walk -c -p -U0 --no-color --no-notes --no-textconv \
+      --format='commit %H' --stdin < "$shas" > "$out" 2> "$err"; then
+  rc=$?
+  # rc of git itself (never a pipeline's). Refuse: a killed or failing scan must NOT pass.
+  printf 'pre-push: the diff scan failed (git rc=%s); refusing (fail closed)\n' "$rc" >&2
+  sed -n '1,5p' "$err" >&2 2>/dev/null || true
+  exit 1
+fi
+# NOTE: a non-empty stderr is NOT by itself a failure — git legitimately writes
+# `warning: lazy fetching disabled; some objects may not be available` there, and refusing on
+# that would reject a clean push.
+
+bytes=$(wc -c < "$out" | tr -d ' ')
+if [ "$bytes" -gt "$MAX_BYTES" ]; then
+  die "diff output is ${bytes}B, over MAX_BYTES=$MAX_BYTES; refusing (fail closed)"
+fi
+
+# ── parse ────────────────────────────────────────────────────────────────────────────────
+# Line numbers are RE-DERIVED from the commit's own tree (below), never computed from the hunk
+# header: combined diffs use `@@@`/`@@@@`/`@@@@@` and prefix added lines with (parents-1) '+',
+# so arithmetic there is a bug factory. The parser therefore only needs to identify the file
+# and the content.
+#
+# The path comes from the `diff --git|combined|cc` header and is rewritten by `---`/`+++` ONLY
+# when they are the immediately-adjacent pair: in a combined diff, ordinary ADDED CONTENT can
+# be rendered as a literal file header (`+ /dev/null`, `+ b/decoy.txt`), which would otherwise
+# hijack the path and destroy the diagnosis.
+parse() { # $1=pattern file  $2=1 to collect hits as file:content
+  awk -v patfile="$1" '
+    BEGIN { pat=""; while ((getline l < patfile) > 0) pat = pat l }
+    function flush() { }
+    /^commit /            { commit=$2; file=""; pend=0; next }
+    /^diff --(git|combined|cc) / {
+                            f=$0
+                            sub(/^diff --(git|combined|cc) /,"",f)
+                            sub(/^"/,"",f); sub(/^[ab]\//,"",f)
+                            sub(/ .*/,"",f); sub(/"$/,"",f)
+                            file=f; pend=0; next
+                          }
+    /^--- /               { pend=1; next }
+    /^\+\+\+ /            {
+                            if (pend) {
+                              p=$0; sub(/^\+\+\+ /,"",p)
+                              if (p == "/dev/null") file=""
+                              else { sub(/^"/,"",p); sub(/^b\//,"",p); sub(/"$/,"",p); sub(/\t.*/,"",p); file=p }
+                            }
+                            pend=0; next
+                          }
+    { if ($0 !~ /^(index|new file|deleted file|similarity|rename|copy|old mode|new mode|mode|Binary files|GIT binary patch) /) pend=0 }
+    /^Binary files /      { next }
+    /^\++/ && !/^\+\+\+ / { s=$0; sub(/^\++/,"",s); if (s ~ pat) print commit "\t" file "\t" s }
+  ' "$out"
+}
+
+hits=$(parse "$BLOCK_FILE" 1)
+warns=$(parse "$WARN_FILE" 1)
+
+# ── blinding / suppression detection ─────────────────────────────────────────────────────
+# A path the diff could not read is a path the gate did not check. Three routes, all measured:
+#   1. an attribute that suppresses the diff (`-diff`, `binary`, a textconv/filter driver) —
+#      it can be committed EARLIER than the leak, so it must be evaluated per scanned commit
+#      and NOT from the range's own lines.
+#   2. a NUL byte or UTF-16: the diff emits `Binary files ... differ` with no content.
+#   3. a local `$GIT_DIR/info/attributes`.
+# `git check-attr` MUST carry `--source=<commit>`: without it it reads the CALLER's worktree,
+# which is a silent no-op whenever the worktree is not checked out at the pushed tip — i.e.
+# this fleet's normal state (measured: bare form `[]` vs `--source` `diff: unset`).
+suppress=""
+attr_paths=0
+attr_calls=0
+
+# (3) local attributes file.
+# `git rev-parse --git-path` returns an ABSOLUTE path when run inside a linked worktree and a
+# RELATIVE one from the main checkout, so it must be resolved against the right base in each
+# case — measuring this is how the guard was found to be silently dead in the worktree case,
+# which is this fleet's normal state.
+info_attr=$(timeout "$GIT_TIMEOUT" git rev-parse --git-path info/attributes 2>/dev/null || true)
+if [ -n "$info_attr" ]; then
+  case "$info_attr" in
+    /*) info_attr_abs="$info_attr" ;;
+    *)  info_attr_abs="$repo_root/$info_attr" ;;
+  esac
+  if [ -s "$info_attr_abs" ]; then
+    die "a local attributes file exists and can hide content from this gate:
+  $info_attr_abs
+Remove it (or empty it) and push again, or bypass: HERMES_ALLOW_HOST_PATHS=1 git push ..."
+  fi
+fi
+
+# (1) per-commit attribute sweep, over the changed paths of each scanned commit
+changed=$(timeout "$GIT_TIMEOUT" git -c core.quotePath=false log --no-walk --name-only \
+            --format='commit %H' --stdin < "$shas" 2>/dev/null || true)
+attr_rc=0
+if [ -n "$changed" ]; then
+  timeout "$ATTR_TIMEOUT" bash -c '
+    repo_root="$1"; changed="$2"; maxp="$3"; block="$4"
+    c=""; paths=""; n=0
+    sweep() {
+      [ -n "$c" ] || return 0
+      [ -n "$paths" ] || return 0
+      # shellcheck disable=SC2086
+      o=$(git check-attr -a --source="$c" -- $paths 2>/dev/null)
+      printf "%s\n" "$o" | grep -E "diff: unset|binary: set|diff: ([^u]|u[^n])|filter: " \
+        | sed "s|^|$c |"
+    }
+    while IFS= read -r line; do
+      case "$line" in
+        "commit "*) sweep; c=${line#commit }; paths="" ;;
+        "") ;;
+        *) paths="$paths \"$line\""; n=$((n+1))
+           if [ "$n" -gt "$maxp" ]; then echo "CAPEXCEEDED $n"; return 7; fi ;;
+      esac
+    done <<EOF2
+$changed
+EOF2
+    sweep
+  ' _ "$repo_root" "$changed" "$MAX_ATTR_PATHS" "$BLOCK_FILE" > "$tmpdir/attr.out" 2>/dev/null
+  attr_rc=$?
+  if [ "$attr_rc" = "7" ]; then
+    die "the attribute sweep exceeded MAX_ATTR_PATHS=$MAX_ATTR_PATHS (commit,path) units; refusing (fail closed)"
+  elif [ "$attr_rc" != "0" ]; then
+    die "the attribute sweep failed or timed out (rc=$attr_rc); refusing (fail closed)"
+  fi
+  suppress=$(cat "$tmpdir/attr.out" 2>/dev/null || true)
+fi
+
+# (2) a `Binary files ... differ` line means the gate could not read that path's content.
+# Refuse only when the path's BYTES carry a hit — otherwise every ordinary binary artifact
+# (a screenshot, an .xlsx, a repo that declares `*.png binary`) becomes a false block.
+binary_hits=""
+if grep -aq '^Binary files ' "$out" 2>/dev/null; then
+  # collect the changed paths of the scanned commits that are binary/unreadable
+  bpaths=$(timeout "$GIT_TIMEOUT" git -c core.quotePath=false log --no-walk --name-only \
+             --format='commit %H' --stdin < "$shas" 2>/dev/null | grep -v '^commit ' | grep -v '^$' | sort -u || true)
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    # is it binary in any scanned commit?
+    while IFS= read -r c; do
+      [ -n "$c" ] || continue
+      if timeout "$GIT_TIMEOUT" git cat-file blob "$c:$p" 2>/dev/null \
+           | head -c "$MAX_REDERIVE_BYTES" | grep -aqE -f "$BLOCK_FILE"; then
+        binary_hits="$binary_hits
+$c:$p (content hidden from the diff, but the bytes match the host-path pattern)"
+        break
+      fi
+    done < "$shas"
+  done <<EOF2
+$bpaths
+EOF2
+fi
+
+# ── report ───────────────────────────────────────────────────────────────────────────────
+if [ -n "$suppress" ]; then
+  die "content is hidden from this gate by a diff-suppressing attribute:
+$suppress
+  Refusing because the gate cannot read those paths. Remove the attribute (or the attribute
+  file) and push again, or bypass: HERMES_ALLOW_HOST_PATHS=1 git push ..."
+fi
+
+if [ -n "$binary_hits" ]; then
+  die "a host-path literal is present in file content the diff did not show:$binary_hits
+  Bypass with HERMES_ALLOW_HOST_PATHS=1 git push ... if this is deliberate."
+fi
+
+if [ -z "$hits" ]; then
+  if [ -n "$warns" ]; then
+    printf 'pre-push: host-path gate passed (%s commits).\n' "$commit_count" >&2
+    printf '  Not blocking, but these generic path/IP spellings identify nobody — they may be\n' >&2
+    printf '  placeholders or fixtures. Confirm none is a real one:\n' >&2
+    printf '%s\n' "$warns" | awk -F'\t' '{ printf "    %s:%s  %s\n", $2, "?", $3 }' | sed 's/:?/: (see diff)/' >&2
+  fi
+  exit 0
+fi
+
+# A hit: re-derive the exact line from the commit's own tree. `git show <c>:<p>` is a blob read
+# and is immune to the attributes that blinded the diff. Locate the line by the MATCHED CONTENT
+# (`grep -nF`), not by arithmetic — a content search cannot be off by one, and if it fails we
+# report the content and a `approx?` marker instead of a confident wrong file:line.
+report=""
+printf '%s\n' "$hits" | while IFS="$(printf '\t')" read -r commit file content; do
+  [ -n "$content" ] || continue
+  line=""
+  if [ -n "$file" ]; then
+    line=$(timeout "$GIT_TIMEOUT" git show "$commit:$file" 2>/dev/null \
+             | head -c "$MAX_REDERIVE_BYTES" | grep -nF -m1 -- "$content" 2>/dev/null | cut -d: -f1 || true)
+  fi
+  if [ -n "$line" ]; then
+    printf '  %s:%s\n      %s\n' "$file" "$line" "$content"
+  else
+    printf '  %s:line approx?  (could not re-derive; matched content follows)\n      %s\n' "${file:-<unknown path>}" "$content"
+  fi
+done > "$tmpdir/report" 2>/dev/null
+
+printf '\n' >&2
+printf 'pre-push: REFUSED — the push adds host-path / personal-info literals.\n\n' >&2
+cat "$tmpdir/report" >&2
+printf '\n' >&2
+printf '  These belong in the history you are about to publish, so a later "fix" commit does not\n' >&2
+printf '  help: the literal stays in the pushed range.\n\n' >&2
+printf '  Repair it at the source, then commit and push again:\n' >&2
+printf '    - replace an absolute checkout path with  git rev-parse --show-toplevel\n' >&2
+printf '      or  Path(__file__).resolve().parents[N]\n' >&2
+printf '    - replace an interpreter path with  sys.executable  /  "$(command -v python3)"\n' >&2
+printf '    - replace a home or profile path with  get_hermes_home()  /  \$HERMES_HOME  /  ~\n' >&2
+printf '    - replace an operator name in prose with a role ("the operator", "the maintainer")\n\n' >&2
+printf '  Deliberate?  HERMES_ALLOW_HOST_PATHS=1 git push ...\n\n' >&2
+exit 1
