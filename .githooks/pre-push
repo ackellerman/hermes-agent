@@ -297,16 +297,22 @@ if [ -n "$changed" ]; then
     sweep() {
       [ -n "$c" ] || return 0
       [ -n "$paths" ] || return 0
-      # shellcheck disable=SC2086
-      o=$(git check-attr -a --source="$c" -- $paths 2>/dev/null)
-      printf "%s\n" "$o" | grep -E "diff: unset|binary: set|diff: ([^u]|u[^n])|filter: " \
+      # Paths go to check-attr via --stdin, NEVER via word-split `-- $paths`:
+      # pre-quoting path words inside a variable embeds the quote characters
+      # as literal path bytes (quote removal does not apply to expansion
+      # results), so check-attr looks up names like `".gitattributes"` and
+      # matches nothing — the sweep goes permanently blind.
+      printf "%s\n" "$paths" \
+        | git check-attr -a --source="$c" --stdin 2>/dev/null \
+        | grep -E "diff: unset|binary: set|diff: ([^u]|u[^n])|filter: " \
         | sed "s|^|$c |"
     }
     while IFS= read -r line; do
       case "$line" in
         "commit "*) sweep; c=${line#commit }; paths="" ;;
         "") ;;
-        *) paths="$paths \"$line\""; n=$((n+1))
+        *) paths="$paths
+$line"; n=$((n+1))
            if [ "$n" -gt "$maxp" ]; then echo "CAPEXCEEDED $n"; return 7; fi ;;
       esac
     done <<EOF2
