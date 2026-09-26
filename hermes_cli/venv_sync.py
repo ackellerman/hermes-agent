@@ -371,6 +371,12 @@ def relaunch_command(
             options.append(original[index])
             index += 1
     prefix = f"import sys, runpy; sys.path.insert(0, {str(root)!r}); sys.argv = {argv!r}; "
+    if argv[0] == "-":
+        raise RuntimeError(
+            "refusing to relaunch a stdin program (argv[0]=='-'); "
+            "a program read from stdin cannot be re-entered by runpy "
+            "-- invoke it from a real script path instead"
+        )
     if argv[0] == "-c":
         body = f"exec({original[index + 1]!r})"
     elif module and module != "__main__":
