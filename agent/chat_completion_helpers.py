@@ -463,6 +463,52 @@ def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
     return None
 
 
+# provider_routing keys consumed as typed agent attributes / per-model overlay.
+# Everything else in the config block is forwarded verbatim into the OpenRouter
+# provider object (see _provider_routing_extra). "models" is structural (per-model
+# overlay), never a wire key — it is excluded by _provider_preferences_for_agent.
+_TYPED_PROVIDER_ROUTING_KEYS = frozenset({
+    "sort", "only", "ignore", "order", "require_parameters", "data_collection",
+})
+
+# Unknown passthrough keys already WARNING-logged this process, so a repeated
+# key on later requests/logins degrades to DEBUG instead of spamming (A2).
+_seen_provider_routing_keys: set = set()
+
+
+def _provider_routing_extra(pr, *, exclude: tuple = ()) -> dict:
+    """Forward unrecognized provider_routing keys verbatim (OpenRouter passthrough).
+
+    Typed keys and any ``exclude`` keys (e.g. "models") are skipped; every other
+    key passes through so OpenRouter fields like ``zdr``, ``preferred_min_throughput``,
+    ``preferred_max_latency``, ``quantizations``, ``max_price``, ``allow_fallbacks``
+    reach the wire without a release. Unknown keys log a WARNING to surface typos
+    (deduped to first-per-key-per-process; thereafter DEBUG).
+
+    A non-dict ``pr`` (malformed list/string config) yields ``{}`` so a bad config
+    can never raise AttributeError on every request (A1).
+    """
+    extra: dict = {}
+    skipped = _TYPED_PROVIDER_ROUTING_KEYS | set(exclude)
+    for key, val in (pr if isinstance(pr, dict) else {}).items():
+        if key in skipped:
+            continue
+        if not isinstance(key, str) or not key:
+            logger.warning("provider_routing: skipping non-string/empty key %r", key)
+            continue
+        if key not in _seen_provider_routing_keys:
+            _seen_provider_routing_keys.add(key)
+            logger.warning(
+                "provider_routing: forwarding unrecognized key %r to the provider "
+                "routing object (OpenRouter passthrough)", key)
+        else:
+            logger.debug(
+                "provider_routing: forwarding unrecognized key %r to the provider "
+                "routing object (OpenRouter passthrough)", key)
+        extra[key] = val
+    return extra
+
+
 def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
     """Build the validated provider-routing object shared by request paths.
 
@@ -472,16 +518,30 @@ def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
     flat = {"only": agent.providers_allowed, "ignore": agent.providers_ignored, "order": agent.providers_order,
         "sort": agent.provider_sort, "require_parameters": agent.provider_require_parameters,
         "data_collection": agent.provider_data_collection}
+    pr = {}
     per_model = {}
     with contextlib.suppress(Exception):
         from hermes_cli.config import load_config_readonly
         from hermes_constants import resolve_per_model_provider_routing
-        _pr = load_config_readonly().get("provider_routing")
-        per_model = resolve_per_model_provider_routing(agent.model, (_pr or {}).get("models") if isinstance(_pr, dict) else None)
+        pr = load_config_readonly().get("provider_routing")
+        # A non-dict provider_routing (malformed list/string config) must not raise
+        # AttributeError outside the suppress on every request (A1).
+        per_model = resolve_per_model_provider_routing(agent.model,
+            pr.get("models") if isinstance(pr, dict) else None)
     merged = {**flat, **{k: v for k, v in per_model.items() if k in flat}}
     merged["sort"] = _validated_openrouter_provider_sort(merged["sort"])
     merged["require_parameters"] = True if merged["require_parameters"] else None
-    return {key: value for key, value in merged.items() if value}
+    prefs = {key: value for key, value in merged.items() if value}
+
+    # Unknown-key passthrough (OpenRouter). Typed keys win; per-model overrides flat.
+    # Values pass VERBATIM — False/0 are meaningful (e.g. allow_fallbacks: false), so
+    # no truthiness filter here. "models" is structural and never a wire key.
+    _extra = {**_provider_routing_extra(pr, exclude=("models",)), **_provider_routing_extra(per_model)}
+    for _key, _val in _extra.items():
+        if _key in _TYPED_PROVIDER_ROUTING_KEYS or _key in prefs:
+            continue
+        prefs[_key] = _val
+    return prefs
 
 
 def _prompt_cache_scope_for_agent(agent) -> "str | None":
