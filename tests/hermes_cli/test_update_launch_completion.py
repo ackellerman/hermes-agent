@@ -172,6 +172,23 @@ def test_relaunch_keeps_invocation_and_checkout_imports(tmp_path, mode):
     assert json.loads(result.stdout) == ["from checkout", argv[1:]]
 
 
+def test_relaunch_refuses_stdin_program(tmp_path):
+    # A py-script invoked as `python -` (heredoc/stdin) has argv[0]=='-' and
+    # __main__.__spec__ is None, so module is "__main__" here. Such a program
+    # cannot be re-entered by runpy.run_path('<cwd>/-'), so the guard must
+    # refuse with a legible RuntimeError instead of a child FileNotFoundError.
+    root = tmp_path / "source"
+    root.mkdir()
+    argv = ["-", "abc123", "--no-restart"]
+    original = [str(Path(sys.executable)), "-", *argv[1:]]
+    with pytest.raises(
+        RuntimeError, match="refusing to relaunch a stdin program"
+    ):
+        venv_sync.relaunch_command(
+            Path(sys.executable), root, argv, original, module="__main__"
+        )
+
+
 @pytest.mark.parametrize("owner,argv", [(None, []), ("external", []), ("electron-updater", []), ("self", ["-p", "coder", "pm", "repair"])])
 def test_non_self_or_pm_launch_cannot_trigger_update(tmp_path, monkeypatch, owner, argv):
     import pm
