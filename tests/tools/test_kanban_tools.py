@@ -390,7 +390,8 @@ def test_block_dependency_requires_depends_on_and_writes_edge(worker_env):
     """
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
     try:
         parent = kb.create_task(conn, title="gate", assignee="test-worker")
     finally:
@@ -407,7 +408,7 @@ def test_block_dependency_requires_depends_on_and_writes_edge(worker_env):
     # merged kernel re-kinds a dependency with no open parent BEFORE it writes
     # the depends_on edge, so the edge must pre-exist for `todo` to apply).
     import os
-    conn2 = kb.connect()
+    conn2 = kbc.connect()
     try:
         run_card = kb.create_task(conn2, title="runner", assignee="test-worker")
         kb.claim_task(conn2, run_card)
@@ -429,7 +430,7 @@ def test_block_dependency_requires_depends_on_and_writes_edge(worker_env):
     assert d["ok"] is True, d
     assert d["status"] == "todo"
     assert d["block_kind"] == "dependency"
-    conn3 = kb.connect()
+    conn3 = kbc.connect()
     try:
         parents = {
             r["parent_id"] for r in conn3.execute(

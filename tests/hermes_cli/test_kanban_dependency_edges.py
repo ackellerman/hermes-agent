@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -53,7 +54,7 @@ def _parents(conn, child):
 def test_dependency_block_without_depends_on_is_refused(kanban_home):
     """The t_1bf1216b shape: prose names the parent, no edge. Must refuse
     and name the argument so the worker self-heals in one turn."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         child = _running_task(conn, "child")
         with pytest.raises(ValueError, match="depends_on"):
             kb.block_task(conn, child, reason="await t_deadbeef", kind="dependency")
@@ -63,7 +64,7 @@ def test_dependency_block_without_depends_on_is_refused(kanban_home):
 
 
 def test_dependency_block_writes_edge_and_parks_until_parent_done(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = _running_task(conn, "child")
         assert _parents(conn, child) == set()
@@ -85,7 +86,7 @@ def test_dependency_block_writes_edge_and_parks_until_parent_done(kanban_home):
 
 def test_dependency_block_on_already_done_parent_is_refused(kanban_home):
     """Nothing to wait on → the worker is wrong; refuse rather than park."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         _finish(conn, parent)
         child = _running_task(conn, "child")
@@ -97,7 +98,7 @@ def test_dependency_block_on_already_done_parent_is_refused(kanban_home):
 
 
 def test_dependency_block_unknown_parent_is_refused(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         child = _running_task(conn, "child")
         with pytest.raises(ValueError, match="unknown task"):
             kb.block_task(
@@ -108,7 +109,7 @@ def test_dependency_block_unknown_parent_is_refused(kanban_home):
 
 
 def test_dependency_block_self_or_cycle_is_refused(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         a = kb.create_task(conn, title="a", assignee="worker")
         b = _running_task(conn, "b")
         kb.link_tasks(conn, parent_id=b, child_id=a)  # b -> a
@@ -119,7 +120,7 @@ def test_dependency_block_self_or_cycle_is_refused(kanban_home):
 
 
 def test_dependency_block_event_carries_depends_on(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = _running_task(conn, "child")
         kb.block_task(conn, child, reason="await", kind="dependency", depends_on=[parent])
@@ -130,7 +131,7 @@ def test_dependency_block_event_carries_depends_on(kanban_home):
 def test_non_dependency_kinds_ignore_depends_on(kanban_home):
     """depends_on is only meaningful for kind=dependency; other kinds are
     unchanged (they still route to blocked/triage as before)."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         child = _running_task(conn, "child")
         assert kb.block_task(conn, child, reason="need a human", kind="needs_input")
         assert kb.get_task(conn, child).status == "blocked"

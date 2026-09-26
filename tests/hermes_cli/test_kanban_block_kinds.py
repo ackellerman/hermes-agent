@@ -228,7 +228,7 @@ def test_unblock_survives_kind_deliberately(kanban_home, tmp_path):
     the amnesia that let a cron unblock<->re-block loop unbounded (the breaker
     at BLOCK_RECURRENCE_LIMIT depends on the memory). Status is the authority
     on 'is it blocked now'; consumers must read status, not block_kind."""
-    conn = kb.connect(tmp_path / "b.db")
+    conn = kbc.connect(tmp_path / "b.db")
     t = kb.create_task(conn, title="x", assignee="w")
     assert kb.block_task(conn, t, reason="waiting on human", kind="needs_input")
     assert kb.unblock_task(conn, t)
