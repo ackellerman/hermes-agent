@@ -1863,6 +1863,21 @@ DEFAULT_CONFIG = {
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.
         "auto_subscribe_on_create": True,
+        # Interactive board resolution reads HERMES_KANBAN_BOARD only when this is
+        # true (default off — SPEC-0032). Off = env no longer binds an interactive
+        # session's board; resolution is config/project driven instead. Workers and
+        # cron children (HERMES_KANBAN_DB set) are exempt: their env board is always
+        # honored as defense-in-depth for the dispatcher's claimed-board pin.
+        "env_board_pin": False,
+        # Profile-level default board slug, consulted only when no project binding
+        # exists. Empty = no profile default (fall through to the current-file tail).
+        "default_board": "",
+        # Operator ceiling for a goal-mode card's turn budget: any goal_max_turns an agent or
+        # CLI caller supplies at task creation is capped to this value (create_task never
+        # refuses, it clamps). The worker itself cannot set a higher per-task value — this
+        # bound is not agent-overridable. An omitted goal_max_turns is untouched: the loop's
+        # own runtime default (20 turns) then applies, and the ceiling does not.
+        "goal_max_turns_ceiling": 100,
         # Poll and deliver Kanban subscriptions from this gateway. Disable on profiles that do
         # not own notification subscriptions to avoid an idle five-second board probe.
         "notify_in_gateway": True,
