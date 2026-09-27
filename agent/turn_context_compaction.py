@@ -35,9 +35,6 @@ class CompactionOutcome:
     compressed: bool = False
     # Preflight proved an immediate retry ineffective (no progress / insufficient).
     blocked: bool = False
-    # SPEC-0043 (AC-26/D5): the pipeline idle sweep already swapped the covered
-    # window, so the legacy idle summarizer must not also mutate this turn.
-    pipeline_swapped: bool = False
 
 
 # ── Helpers shared by every compression-attempt site ──
@@ -144,123 +141,13 @@ def run_turn_start_compaction(
     return out
 
 
-def _pipeline_idle_sweep(agent: Any, out: CompactionOutcome) -> None:
-    """SPEC-0042 idle seam: background pipeline duties (map updates, dump,
-    extraction, gate, degraded-queue drain, and the boundary batched swap
-    sweep). Default OFF — with ``compaction_pipeline.enabled`` false this is a
-    no-op that touches nothing (AC-19). Never raises into the live path.
-
-    SPEC-0046: BEFORE the normal pass, a staged pending swap whose packet hash
-    matches the live packet is applied as this turn's single prefix mutation
-    (AC-A3) and the record is cleared. A mismatching or corrupt record is
-    discarded (the region re-runs against the fresh packet); the R5 threshold
-    bypass and the idle-gate behavior below are unchanged.
-    """
-    if not getattr(agent, "compaction_pipeline_enabled", False):
-        return
-    try:
-        _apply_pending_swap(agent, out)
-        from agent.compaction_pipeline import idle_pipeline_sweep
-        idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
-        record = idle_pipeline_sweep(agent, out.messages, idle_gap)
-        if record.get("swapped_messages") is not None:
-            # The sweep already mutated the covered window: adopt it and tell
-            # the legacy idle compaction to skip that same window (D5/AC-26).
-            out.messages = record["swapped_messages"]
-            out.pipeline_swapped = True
-            logger.debug("compaction pipeline idle sweep swapped %s; legacy summarizer suppressed",
-                         record.get("swapped_regions"))
-        elif record.get("ran"):
-            logger.debug("compaction pipeline idle sweep: %s", record)
-    except Exception as exc:  # noqa: BLE001 — background duty must never break a turn
-        logger.warning("compaction pipeline idle sweep failed: %s", exc)
-
-
-def _apply_pending_swap(agent: Any, out: "CompactionOutcome") -> bool:
-    """SPEC-0046 (AC-A3): apply a staged between-turns swap at turn start.
-
-    The pending record is consumed FIRST — it is the staged boundary mutation
-    (the R5 bypass and the idle sweep proceed after, on the updated list).
-    Applies only when the staged packet hash still matches the live packet's
-    row identity (nothing changed the context between turns — no manual
-    /compress, branch, or rewind). A mismatch (context changed) or a corrupt
-    record is discarded, never applied and never raised; the dump stays valid
-    for rehydration either way. Telemetry: ``trigger="reinjected"``."""
-    if not getattr(agent, "compaction_pipeline_between_turns_sweep", True):
-        return False
-    from agent.compaction_pending_swap import (
-        clear_pending_swap,
-        compute_packet_hash,
-        read_pending_swap,
-    )
-
-    storage_root = getattr(agent, "compaction_pipeline_storage_root", "/tmp/hermes-compaction")
-    session_id = getattr(agent, "session_id", "") or ""
-    record = read_pending_swap(storage_root, session_id)
-    if record is None:
-        return False
-    staged_hash = str(record.get("packet_hash", ""))
-    if not staged_hash or compute_packet_hash(out.messages) != staged_hash:
-        # Packet identity changed since the stage (another mutation path won):
-        # the pending swap is stale — discard it; the region re-runs normally.
-        clear_pending_swap(storage_root, session_id)
-        logger.info("pending swap discarded (packet hash mismatch) for session %s",
-                    session_id)
-        return False
-    swapped = record.get("swapped_messages")
-    if not isinstance(swapped, list) or not swapped:
-        clear_pending_swap(storage_root, session_id)
-        return False
-    # Re-verify alternation on the staged list before it becomes the turn's
-    # prefix (the swap verified itself at stage time; a corrupt record must
-    # not smuggle a broken sequence into a turn).
-    try:
-        from agent.compaction_verify import check_alternation_invariant
-
-        is_valid, violations = check_alternation_invariant(list(swapped))
-        if not is_valid:
-            clear_pending_swap(storage_root, session_id)
-            logger.warning("pending swap discarded (alternation %s) for session %s",
-                           violations, session_id)
-            return False
-    except Exception:  # noqa: BLE001 — verifier unavailable: keep original semantics
-        pass
-    out.messages = [dict(m) if isinstance(m, dict) else m for m in swapped]
-    out.pipeline_swapped = True  # the boundary mutation happened; suppress the
-    # legacy idle summarizer for the covered window (same contract as D5/AC-26).
-    clear_pending_swap(storage_root, session_id)
-    try:
-        agent._compaction_pipeline_reinjected_regions = [
-            r.get("dump_id") for r in (record.get("region_refs") or [])
-        ]
-    except Exception:  # noqa: BLE001 — telemetry stamp must never break a turn
-        pass
-    logger.info(
-        "pending swap reinjected at turn start (packet hash matched, regions=%s, "
-        "trigger=reinjected) for session %s",
-        [r.get("dump_id") for r in (record.get("region_refs") or [])], session_id,
-    )
-    return True
-
-
 def _idle_compaction(
     agent: Any, out: CompactionOutcome, system_message: Optional[str], user_message: Any,
     effective_task_id: str,
 ) -> None:
     """Idle-triggered compaction (opt-in; ``idle_compact_after_seconds``): fires on the
-    wall-clock gap since ``_last_activity_ts``; a cheap gap check gates the estimate.
-
-    Also the idle seam for the SPEC-0042 pipeline background duties (map update
-    sweeps): gated on ``compaction_pipeline.enabled`` (default OFF, AC-19), runs
-    after the legacy path decision, never mutates the live message list."""
+    wall-clock gap since ``_last_activity_ts``; a cheap gap check gates the estimate."""
     from agent import turn_context as _tc
-
-    _pipeline_idle_sweep(agent, out)
-
-    # AC-26 (D5): the pipeline swap sweep already mutated the covered window —
-    # the legacy idle summarizer must not double-mutate this same window.
-    if out.pipeline_swapped:
-        return
 
     messages = out.messages
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)

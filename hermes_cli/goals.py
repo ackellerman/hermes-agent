@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 # ── Constants & defaults ──────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
-
 DEFAULT_JUDGE_TIMEOUT = 30.0
 # Judge output budget. Reasoning models burn hidden-reasoning tokens before the visible one-line
 # JSON verdict; 200 (the original) reliably truncated it and tripped the auto-pause. 4096 covers
@@ -45,12 +44,6 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # Consecutive transport failures (401, timeout, DNS) before auto-pause: a broken API key returns
 # 401 every call and must not spend every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
-
-
-def _judge_retry_sleep(seconds: float) -> None:
-    """Backoff between judge re-tries after a transport failure (K2).
-    Module-level so tests can stub it; never a worker turn."""
-    time.sleep(seconds)
 
 # Quality gates: deterministic shell commands that must pass before the judge may declare DONE. A
 # failed gate short-circuits the judge — its output IS the continuation prompt, so the agent works
@@ -1626,6 +1619,12 @@ def run_kanban_goal_loop(
             except Exception:
                 pass
 
+    def _block(message: str) -> None:
+        try:
+            block_fn(message)
+        except Exception as exc:
+            _log(f"kanban goal loop: block_fn failed ({exc})")
+
     def _result(outcome: str, reason: str) -> Dict[str, Any]:
         return {"outcome": outcome, "turns_used": turns_used, "reason": reason}
 
@@ -1636,13 +1635,6 @@ def run_kanban_goal_loop(
     last_response = first_response or ""
     turns_used = 1   # the first turn already consumed one unit of budget
     nudged_to_finalize = False
-    # Overlay K2: consecutive judge transport failures. A judge that cannot
-    # be reached is not evidence about the work; spending a full worker turn
-    # (the whole context, re-sent) on every judge error burned 19 turns in
-    # ~10 s on three cards on 2026-09-04 and sticky-blocked each as "budget
-    # exhausted". Retry the judge, not the worker; after the limit, block as
-    # transient naming the judge so the dispatcher's cooldown handles it.
-    judge_transport_failures = 0
 
     while True:
         try:
@@ -1670,49 +1662,6 @@ def run_kanban_goal_loop(
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)
-        # Overlay K2: consecutive judge transport failures. A judge that cannot
-        # be reached is not evidence about the work; spending a full worker turn
-        # (the whole context, re-sent) on every judge error burned 19 turns in
-        # ~10 s on three cards on 2026-09-04 and sticky-blocked each as "budget
-        # exhausted". Retry the judge, not the worker; after the limit, block as
-        # transient naming the judge so the dispatcher's cooldown handles it.
-        if _transport_failed:
-            judge_transport_failures += 1
-            _log(
-                f"kanban goal loop: judge unreachable "
-                f"({judge_transport_failures}/{DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES}): "
-                f"{_truncate(reason, 120)}; not spending a worker turn"
-            )
-            if judge_transport_failures >= DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES:
-                try:
-                    block_fn(
-                        f"Goal-mode judge unreachable {judge_transport_failures} "
-                        f"times in a row ({_truncate(reason, 200)}). The worker's "
-                        f"last turn was not evaluated; no worker turns were spent. "
-                        f"This is a provider/judge outage, not a defect in the "
-                        f"work — unblock when the judge provider is healthy.",
-                        kind="transient",
-                    )
-                except TypeError:
-                    # Legacy block_fn without a kind parameter.
-                    try:
-                        block_fn(
-                            f"Goal-mode judge unreachable {judge_transport_failures} "
-                            f"times in a row ({_truncate(reason, 200)}); no worker "
-                            f"turns were spent."
-                        )
-                    except Exception as exc:
-                        _log(f"kanban goal loop: block_fn failed ({exc})")
-                except Exception as exc:
-                    _log(f"kanban goal loop: block_fn failed ({exc})")
-                return _result(
-                    "blocked_judge_unreachable",
-                    f"judge transport failed x{judge_transport_failures}: {reason}",
-                )
-            # Brief pause, then re-judge the SAME response. No worker turn.
-            _judge_retry_sleep(min(2.0 * judge_transport_failures, 10.0))
-            continue
-        judge_transport_failures = 0
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
@@ -1722,37 +1671,17 @@ def run_kanban_goal_loop(
             # re-poking an impossible goal, and never let it land in done.
             # The judge ruled the goal cannot be satisfied at all — this is NOT done (#100954).
             _log(f"kanban goal loop: task {task_id} judged unachievable; blocking")
-            msg = f"Goal-mode judge ruled the goal unachievable: {reason}"
-            try:
-                block_fn(msg, kind="budget")
-            except TypeError:
-                # Legacy block_fn without a kind parameter: block kind-lessly.
-                try:
-                    block_fn(msg)
-                except Exception as exc:
-                    _log(f"kanban goal loop: block_fn failed ({exc})")
-            except Exception as exc:
-                _log(f"kanban goal loop: block_fn failed ({exc})")
+            _block(f"Goal-mode judge ruled the goal unachievable: {reason}")
             return _result("blocked_unachievable", f"judge verdict blocked: {reason}")
 
         if verdict == "done":
             if nudged_to_finalize:
                 # Already asked once to call kanban_complete — block for review rather than spin.
                 _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize; blocking")
-                msg = (
+                _block(
                     f"Goal-mode worker's output looked complete but it never "
                     f"called kanban_complete after a finalize nudge ({reason})."
                 )
-                try:
-                    block_fn(msg, kind="budget")
-                except TypeError:
-                    # Legacy block_fn without a kind parameter: block kind-lessly.
-                    try:
-                        block_fn(msg)
-                    except Exception as exc:
-                        _log(f"kanban goal loop: block_fn failed ({exc})")
-                except Exception as exc:
-                    _log(f"kanban goal loop: block_fn failed ({exc})")
                 return _result("blocked_budget", "judged done, never finalized")
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
             nudged_to_finalize = True
@@ -1762,21 +1691,11 @@ def run_kanban_goal_loop(
         # Budget check BEFORE spending another turn.
         if turns_used >= max_turns:
             _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
-            msg = (
+            _block(
                 f"Goal-mode worker exhausted its turn budget "
                 f"({turns_used}/{max_turns}) without completing the task. "
                 f"Last judge verdict: {_truncate(reason, 300)}"
             )
-            try:
-                block_fn(msg, kind="budget")
-            except TypeError:
-                # Legacy block_fn without a kind parameter: block kind-lessly.
-                try:
-                    block_fn(msg)
-                except Exception as exc:
-                    _log(f"kanban goal loop: block_fn failed ({exc})")
-            except Exception as exc:
-                _log(f"kanban goal loop: block_fn failed ({exc})")
             return _result("blocked_budget", "turn budget exhausted")
 
         try:
