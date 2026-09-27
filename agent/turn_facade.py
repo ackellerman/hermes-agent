@@ -51,12 +51,7 @@ class TurnFacadeMixin:
         from agent.review_idle_queue import QUEUE as _review_queue
         from agent.subagent_lifecycle import bind_subagent_parent
         from agent.interrupt_scope import track_in_interrupt_scope
-        from agent.turn_facade_lease import (
-            admit_durable_turn_lease,
-            cancel_between_turns_sweep,
-            carry_unadmitted_user_message,
-        )
-
+        from agent.turn_facade_lease import admit_durable_turn_lease, carry_unadmitted_user_message
         from hermes_cli.observability.relay_shared_metrics import finish_task_run, start_task_run
 
         effective_task_id = task_id or str(uuid.uuid4())
@@ -146,11 +141,6 @@ class TurnFacadeMixin:
             # A host that owns this thread (Hermes Console) may cancel the turn cross-thread.
             with bind_subagent_parent(self), scoped_runtime_main({}), track_in_interrupt_scope(self):
                 try:
-                    # SPEC-0046: a turn starting before the between-turns tick
-                    # fires cancels it (the tick must never run while a turn
-                    # is in flight). Agent-scoped: cancels a tick armed by any
-                    # earlier turn's teardown.
-                    cancel_between_turns_sweep(self)
                     if lease is not None:
                         lease.start()
                     result = run_conversation(
@@ -194,16 +184,6 @@ class TurnFacadeMixin:
                 finish_task_run(**task_context, error=exc)
             raise
         finally:
-            # SPEC-0046: arm the one-shot between-turns tick at turn end —
-            # exactly once per turn boundary, before the lease teardown cancels
-            # the periodic timers. Agent-scoped so the NEXT turn's start can
-            # cancel it; guarded so a failed arm never breaks teardown.
-            try:
-                from agent.turn_facade_lease import arm_between_turns_sweep
-
-                arm_between_turns_sweep(self)
-            except Exception:  # noqa: BLE001
-                logger.warning("between-turns sweep arm failed", exc_info=True)
             try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(relay_turn, outcome=relay_outcome)

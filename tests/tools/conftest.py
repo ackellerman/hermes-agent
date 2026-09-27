@@ -14,41 +14,6 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def all_assignees_spawnable(monkeypatch):
-    """Re-allow synthetic assignees for tools kanban tests.
-
-    ``create_task`` refuses non-profile assignees (SPEC-0031), and the
-    top-level ``_hermetic_profile_exists`` stub in tests/conftest.py keeps that
-    gate ACTIVE by default. Tools tests create cards with synthetic assignees,
-    so this autouse fixture re-allows them (overrides the refusing stub).
-    Tests that genuinely need refusal patch ``profile_exists`` themselves.
-
-    Returns the pre-patch ``profile_exists`` (the root conftest's hermetic
-    wrapper — real resolution against the sandboxed home) so
-    assignee-sensitive tests can restore real semantics for the handler under
-    test: the reviewer-guard pair does
-    ``monkeypatch.setattr(profiles, "profile_exists", all_assignees_spawnable)``.
-    A blanket ``lambda name: True`` here also neuters upstream's reviewer
-    guard in ``_handle_request_review`` (lazy import at call time sees the
-    patched symbol) — that is exactly how
-    ``test_request_review_rejects_unknown_reviewer_without_mutation`` came to
-    fail on this fork while passing on upstream.
-
-    ORDERING-DEPENDENT: the captured symbol is the root conftest's hermetic
-    wrapper only because pytest instantiates the root autouse
-    ``_hermetic_profile_exists`` (tests/conftest.py) BEFORE this tools-subdir
-    autouse fixture. Both wrappers resolve through HERMES_HOME, so the
-    behaviour is hermetic-correct either way — but a future autouse patch
-    inserted between them would capture the wrong symbol, in which case the
-    reject test fails loudly rather than silently passing.
-    """
-    from hermes_cli import profiles
-    real_profile_exists = profiles.profile_exists
-    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
-    return real_profile_exists
-
-
-@pytest.fixture(autouse=True)
 def _no_host_browser_use_cli():
     """Keep the host's PM-managed browser-use install out of tests.
 

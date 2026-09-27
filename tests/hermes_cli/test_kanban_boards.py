@@ -219,13 +219,6 @@ class TestConnectionIsolation:
         assert [t.title for t in tasks] == ["implicit"]
 
     def test_connect_env_var_overrides_current(self, fresh_home, monkeypatch):
-        # SPEC-0032 env pins are switch-gated: this test asserts env-resolution,
-        # which is the switch-ON contract (AC2). Open the switch so the env var
-        # is honored, preserving the test's intent (env board wins over current).
-        monkeypatch.setattr(
-            "hermes_cli.config.load_config",
-            lambda: {"kanban": {"env_board_pin": True}},
-        )
         kb.create_board("persist")
         kb.create_board("envwin")
         kb.set_current_board("persist")
@@ -321,11 +314,10 @@ class TestCLI:
         assert _cli(["boards", "create", "projA"], env_extra=env).returncode == 0
         assert _cli(["boards", "create", "projB"], env_extra=env).returncode == 0
 
-        # Create one task on each via --board (assignee must be a real profile
-        # in the hermetic HERMES_HOME since SPEC-0031: 'default' exists there).
-        r = _cli(["--board", "projA", "create", "Task A", "--assignee", "default"], env_extra=env)
+        # Create one task on each via --board.
+        r = _cli(["--board", "projA", "create", "Task A", "--assignee", "dev"], env_extra=env)
         assert r.returncode == 0, r.stderr
-        r = _cli(["--board", "projB", "create", "Task B", "--assignee", "default"], env_extra=env)
+        r = _cli(["--board", "projB", "create", "Task B", "--assignee", "dev"], env_extra=env)
         assert r.returncode == 0, r.stderr
 
         # list on each board only shows its own.
