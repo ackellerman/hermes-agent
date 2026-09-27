@@ -15,14 +15,23 @@ from hermes_cli import main_tui_launch
 
 
 @pytest.fixture(autouse=True)
-def _isolate_kanban_board_env():
+def _isolate_kanban_board_env(monkeypatch):
     """Snapshot `HERMES_KANBAN_BOARD` and restore it after the test.
 
     `_pin_kanban_board_env()` writes to ``os.environ`` directly, bypassing
     any ``monkeypatch.setenv`` tracking. Without this fixture the mutation
     leaks into subsequent tests and breaks anything that resolves a kanban
     path from the env (e.g. ``TestSharedBoardPaths`` in test_kanban_db.py).
+
+    SPEC-0032 (AC7 disposition, change item 2): the boot pin is now switch-
+    gated (``kanban.env_board_pin``), default OFF — which would POP a preset
+    env and turn the pin-mechanism assertions below into failures. These
+    tests assert the pin *mechanism* (write when unset, don't overwrite when
+    set), not the switch, so the fixture pins the switch ON for the whole file.
     """
+    monkeypatch.setattr(
+        main_tui_launch, "_kanban_env_board_pin_enabled", lambda: True,
+    )
     prev = os.environ.get("HERMES_KANBAN_BOARD")
     os.environ.pop("HERMES_KANBAN_BOARD", None)
     try:

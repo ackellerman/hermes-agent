@@ -780,7 +780,14 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
+        try:
+            depends_on = _coerce_str_list(args.get("depends_on"), "depends_on", "task ids", strip=True)
+            ok = kb.block_task(conn, tid, reason=reason, kind=kind,
+                               expected_run_id=_worker_run_id(tid), depends_on=depends_on)
+        except ValueError as e:
+            # Refused before any state moved (e.g. kind='dependency' with
+            # no/unknown/done depends_on). Say exactly what to re-call.
+            return tool_error(f"cannot block {tid}: {e}")
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
         landed_kind = kb.get_task(conn, tid).block_kind
         extra: dict = {"block_kind": landed_kind}

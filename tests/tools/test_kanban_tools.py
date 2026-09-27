@@ -196,16 +196,21 @@ def test_complete_reports_registered_attachments(worker_env):
     assert readback["attachments"] == d["attachments"]
 
 
-def test_request_review_rejects_unknown_reviewer_without_mutation(monkeypatch, worker_env, tmp_path):
+def test_request_review_rejects_unknown_reviewer_without_mutation(monkeypatch, worker_env, tmp_path, all_assignees_spawnable):
     """#106163: a non-profile ``reviewer`` (e.g. the literal "reviewer") must be
     refused with an error the model sees, leaving the task running under the
     implementer — never parked in ``review`` on an assignee nobody can spawn."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import profiles
     from tools import kanban_tools as kt
 
     (tmp_path / ".hermes" / "profiles" / "verifier").mkdir(parents=True)
     (tmp_path / ".hermes" / "profiles" / "verifier" / "config.yaml").write_text("{}\n")  # identity marker
+    # This test is assignee-sensitive: restore REAL profile_exists semantics for
+    # the reviewer guard (the autouse all_assignees_spawnable blanket would make
+    # any name a "profile" and the refusal would never fire — see the conftest).
+    monkeypatch.setattr(profiles, "profile_exists", all_assignees_spawnable)
     with kbc.connect() as conn:
         before = kb.get_task(conn, worker_env)
         before_events = kb.list_events(conn, worker_env)
@@ -220,13 +225,17 @@ def test_request_review_rejects_unknown_reviewer_without_mutation(monkeypatch, w
         assert kb.list_events(conn, worker_env) == before_events
 
 
-def test_request_review_accepts_installed_profile(monkeypatch, worker_env, tmp_path):
+def test_request_review_accepts_installed_profile(monkeypatch, worker_env, tmp_path, all_assignees_spawnable):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import profiles
     from tools import kanban_tools as kt
 
     (tmp_path / ".hermes" / "profiles" / "verifier").mkdir(parents=True)
     (tmp_path / ".hermes" / "profiles" / "verifier" / "config.yaml").write_text("{}\n")  # identity marker
+    # Same as above: the accept case must pass the REAL profile_exists, not the
+    # blanket-True fixture — otherwise the handler's guard is not exercised at all.
+    monkeypatch.setattr(profiles, "profile_exists", all_assignees_spawnable)
     with kbc.connect() as conn:
         monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb.get_task(conn, worker_env).current_run_id))
 
@@ -370,6 +379,71 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+def test_block_dependency_requires_depends_on_and_writes_edge(worker_env):
+    """K1 merged semantics: a dependency block is an edge or it is re-kinded.
+
+    The tool forwards ``depends_on`` to the kernel as an OPTIONAL enhancement —
+    when ids are present the edge lands in the same txn and the card cannot be
+    re-promoted until the parent is done. When no depends_on is named and no
+    open parent exists, upstream's re-kind owns the shape (needs_input, sticky)
+    instead of a hard empty-depends_on refusal.
+    """
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="gate", assignee="test-worker")
+    finally:
+        conn.close()
+
+    out = kt._handle_block({"reason": f"await {parent}", "kind": "dependency"})
+    d = json.loads(out)
+    # No open parent + no depends_on: NOT a refusal — re-kinded to needs_input.
+    assert d["ok"] is True, d
+    assert (d["status"], d["block_kind"]) == ("blocked", "needs_input")
+
+    # Re-kinding the worker card parks it; spin up a SECOND running card and
+    # pre-link an OPEN parent so the dependency block parks in `todo` (the
+    # merged kernel re-kinds a dependency with no open parent BEFORE it writes
+    # the depends_on edge, so the edge must pre-exist for `todo` to apply).
+    import os
+    conn2 = kbc.connect()
+    try:
+        run_card = kb.create_task(conn2, title="runner", assignee="test-worker")
+        kb.claim_task(conn2, run_card)
+        run_id = kb._current_run_id(conn2, run_card)
+        kb.link_tasks(
+            conn2, parent_id=parent, child_id=run_card,
+            expected_child_run_id=kb.get_task(conn2, run_card).current_run_id,
+        )
+    finally:
+        conn2.close()
+    os.environ["HERMES_KANBAN_TASK"] = run_card
+    os.environ["HERMES_KANBAN_RUN_ID"] = str(run_id)
+
+    out = kt._handle_block({
+        "reason": f"await {parent}", "kind": "dependency",
+        "depends_on": [parent],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["status"] == "todo"
+    assert d["block_kind"] == "dependency"
+    conn3 = kbc.connect()
+    try:
+        parents = {
+            r["parent_id"] for r in conn3.execute(
+                "SELECT parent_id FROM task_links WHERE child_id=?", (run_card,)
+            ).fetchall()
+        }
+        assert parents == {parent}
+        kb.recompute_ready(conn3)
+        assert kb.get_task(conn3, run_card).status == "todo"
+    finally:
+        conn3.close()
+
+
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     """Set up an isolated HERMES_HOME with one claimed goal_mode task,
     matching the pattern used by the kanban_complete judge gate tests."""
@@ -424,13 +498,16 @@ def test_block_goal_mode_rejects_missing_kind(monkeypatch, tmp_path):
 
 def test_block_goal_mode_rejects_disallowed_kind(monkeypatch, tmp_path):
     """`capability` / `transient` are valid kinds in general but must not
-    let a goal_mode worker exit the loop without going through the judge."""
+    let a goal_mode worker exit the loop without going through the judge.
+    `budget` (t_6a9c6b89) is reserved for the goal loop's OWN internal
+    terminal blocks — a worker's kanban_block call must be refused there too,
+    so the loop keeps exclusive ownership of the kind."""
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
 
     tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
-    for kind in ("capability", "transient"):
+    for kind in ("capability", "transient", "budget"):
         out = kt._handle_block({"reason": "blocked", "kind": kind})
         d = json.loads(out)
         assert "error" in d, f"kind={kind} should be rejected for goal_mode"
@@ -1195,3 +1272,5 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+

@@ -983,7 +983,9 @@ def _cmd_block(args: argparse.Namespace) -> int:
     kind = getattr(args, "kind", None)
     author = _profile_author()
     ids = _bulk_ids(args)
+    depends_on = getattr(args, "depends_on", None)
     suffix = f": {reason}" if reason else ""
+    explained: set[str] = set()  # ids whose refusal op() already printed in full
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
             # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
@@ -1000,9 +1002,37 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
             return f"Blocked {tid}{suffix}"
 
-        op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+        def op(tid):
+            try:
+                ok = kb.block_task(
+                    conn, tid, reason=reason, kind=kind,
+                    expected_run_id=_worker_run_id_for(tid), depends_on=depends_on,
+                )
+            except ValueError as e:
+                # Refused before any state moved (e.g. --kind dependency with
+                # no/unknown/done --depends-on). Say exactly what to re-run.
+                print(f"cannot block {tid}: {e}", file=sys.stderr)
+                explained.add(tid)
+                return False
+            if not ok:
+                row = kb.get_task(conn, tid)
+                st = row.status if row else "?"
+                print(
+                    f"cannot block {tid}: no blockable state from status={st!r}. "
+                    f"If you meant to gate it on a parent, use an edge instead: "
+                    f"hermes kanban link <parent-id> {tid} — the kernel promotes "
+                    f"it when the parent completes.",
+                    file=sys.stderr,
+                )
+                explained.add(tid)
+                return False
+            if ok and reason:
+                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
+            return ok
+
+        # None => op already printed the specific reason + repair for this id.
+        return _bulk_apply(ids, op, ok_msg,
+                           lambda tid: None if tid in explained else f"cannot block {tid}")
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:

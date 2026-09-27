@@ -192,7 +192,23 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "Why you're blocked. 'dependency' waits in todo and "
                 "resumes automatically when an incomplete parent finishes; "
                 "if no parent is open it is recorded as needs_input instead. "
-                "The others surface to a human. Omit only if none apply."
+                "The others surface to a human. Omit only if none apply. "
+                "With kind='dependency' you MAY name the parent task id(s) "
+                "via depends_on so the scheduler records the edge explicitly."
+            ),
+        },
+        "depends_on": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "OPTIONAL with kind='dependency': the task id(s) this "
+                "task is waiting on, e.g. ['t_1a2b3c4d']. When supplied the "
+                "scheduler links them as parents and this task is not "
+                "re-dispatched until they are all done. When absent, a "
+                "dependency block still waits on any already-linked "
+                "incomplete parent, or is recorded as needs_input if none "
+                "is open. A dependency mentioned only in `reason` is "
+                "invisible to the scheduler."
             ),
         },
     },
@@ -500,6 +516,11 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "provider — a model name alone is resolved against "
                 "the profile's provider and will fail if it belongs "
                 "to a different one. Requires 'model'."
+        )),
+        "spec": _prop("string", (
+                "Optional path to the specification file to attach. When "
+                "provided, the governance layer validates the file and "
+                "attaches it post-create."
         )),
     },
     ["title", "assignee"],

@@ -2,8 +2,15 @@
 
 Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db`` (pre-boards
 back-compat), other boards at ``<root>/kanban/boards/<slug>/``; a worker on one board never sees
-another. Board resolution: ``board=`` arg > ``HERMES_KANBAN_BOARD`` > ``HERMES_KANBAN_DB`` (pins the
-file path) > ``<root>/kanban/current`` > ``default``; the dispatcher injects these into workers.
+another. Board resolution: ``board=`` arg > context override > worker/env (switch-gated) >
+project layer (repo root -> projects.db ``board_slug`` / board ``default_workdir``) > profile
+default (``kanban.default_board``) > ``<root>/kanban/current`` > ``default``.
+
+Deliberate behavior change (switch ``kanban.env_board_pin`` off, the default): an interactive
+session's inherited ``HERMES_KANBAN_BOARD`` no longer binds resolution — a script that used to do
+``HERMES_KANBAN_BOARD=x hermes kanban …`` must pass ``--board`` (or enable the switch). Workers
+and cron children (``HERMES_KANBAN_DB`` set) are exempt: their env board is honored
+unconditionally, defense-in-depth for the dispatcher's claimed-board pin.
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
 locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
@@ -12,6 +19,7 @@ locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attach
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -104,11 +112,25 @@ VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", 
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "budget"}
+
+# A goal-mode worker's in-session terminal failures (judge-unachievable,
+# judged-done-never-finalized, turn-budget-exhausted) block as ``budget`` —
+# distinct from dispatcher spawn-failure ``capability``, so a card that ran
+# out of turns never masquerades as a spawn/infra failure (or a human
+# ``needs_input`` question). The goal loop is the only caller allowed to use
+# it; a worker's own kanban_block call is refused it (tools/kanban_tools.py).
+# The goal loop's three internal block sites are the sole legal source.
 
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
+
+# Ceiling an agent/CLI-supplied ``goal_max_turns`` may not exceed at create_task
+# (config ``kanban.goal_max_turns_ceiling`` overrides; None/omitted asks pass
+# through untouched — the loop's runtime DEFAULT_MAX_TURNS fallback is the
+# worker's default, not an ask, so the ceiling only bounds explicit values).
+DEFAULT_GOAL_MAX_TURNS_CEILING = 100
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
@@ -418,10 +440,123 @@ def current_board_path() -> Path:
     return kanban_home() / "kanban" / "current"
 
 
+def _board_resolution_config() -> dict:
+    """The ``kanban`` config block, fail-soft (never raise from a hot path).
+
+    Read-through of :func:`hermes_cli.config.load_config`, which is already
+    memoized on the config file's signature — so this costs a dict lookup, not
+    a disk read, on steady-state calls. ``env_board_pin`` (default False) gates
+    the interactive env layer; ``default_board`` (default empty) is the profile
+    layer.
+    """
+    try:
+        from hermes_cli.config import load_config
+        kanban = (load_config() or {}).get("kanban") or {}
+    except Exception:
+        return {}
+    return kanban if isinstance(kanban, dict) else {}
+
+
+# Project-layer memo, keyed by cwd. ``kanban_db.py`` has zero ``lru_cache``
+# today (verified); the git rev-parse below is a subprocess call on every
+# task-transition hook, so it must be memoized per-cwd (A2). Two dicts: the
+# repo root and the resolved board slug are different value types stored under
+# the same cwd key (a path vs. a slug) — sharing one dict lets a root be read
+# back as a slug. Kept separate on purpose.
+_repo_toplevel_cache: dict[str, str] = {}
+_project_board_cache: dict[str, Optional[str]] = {}
+
+
+def _repo_toplevel_for_cwd(cwd: str) -> str:
+    """The caller's repo root: ``git -C <cwd> rev-parse --show-toplevel``,
+    falling back to ``cwd``. Memoized per-cwd (hot-path guard, A2)."""
+    key = os.path.normcase(cwd)
+    if key in _repo_toplevel_cache:
+        return _repo_toplevel_cache[key]
+    root = cwd
+    try:
+        out = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            root = out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    _repo_toplevel_cache[key] = root
+    return root
+
+
+def _resolved_path(p: str) -> str:
+    """Absolute, user-expanded, trailing-sep-stripped path (mirrors
+    ``projects_db._normalize_path`` for comparable matching)."""
+    return os.path.abspath(os.path.expanduser(str(p).strip())).rstrip("/\\") or os.sep
+
+
+def _project_board_via_projects_db(root: str) -> Optional[str]:
+    """(a) a ``projects.db`` row whose ``primary_path`` equals ``root``; its
+    ``board_slug`` wins when set and names an existing board (fail soft)."""
+    try:
+        from hermes_cli import projects_db as pdb
+        db_path = pdb.projects_db_path()
+        if not db_path.exists():
+            return None
+        with pdb.connect_closing(db_path=db_path) as conn:
+            proj = pdb.find_by_primary_path(conn, root)
+        if proj is None or not proj.board_slug:
+            return None
+        normed = _normalize_board_slug(proj.board_slug)
+        if normed and board_exists(normed):
+            return normed
+    except (ValueError, Exception):
+        pass
+    return None
+
+
+def _project_board_via_workdir(root: str) -> Optional[str]:
+    """(b) the lexicographically-first board whose board.json ``default_workdir``
+    equals ``root``. Never creates a board at resolution time."""
+    try:
+        matches = []
+        for meta in list_boards():
+            slug = meta.get("slug")
+            wd = meta.get("default_workdir")
+            if slug and wd and _resolved_path(wd) == root:
+                matches.append(slug)
+        return sorted(matches)[0] if matches else None
+    except Exception:
+        return None
+
+
+def _project_board_for_cwd() -> Optional[str]:
+    """Project layer: repo root -> projects.db ``board_slug``, else board.json
+    ``default_workdir`` match. Memoized per-cwd (the git call + db read both
+    run on the task-transition hot path)."""
+    key = os.path.normcase(os.getcwd())
+    if key in _project_board_cache:
+        return _project_board_cache[key]
+    root = _repo_toplevel_for_cwd(os.getcwd())
+    result = _project_board_via_projects_db(root)
+    if result is None:
+        result = _project_board_via_workdir(root)
+    _project_board_cache[key] = result
+    return result
+
+
+def clear_project_board_cache() -> None:
+    """Forget memoized project-layer resolutions (tests that move a repo on
+    disk, or a board default_workdir change, must re-resolve)."""
+    _project_board_cache.clear()
+    _repo_toplevel_cache.clear()
+
+
 def get_current_board() -> str:
-    """Active slug: context override -> ``HERMES_KANBAN_BOARD`` -> ``<root>/kanban/current``
-    (only while that board exists) -> ``DEFAULT_BOARD``. A malformed/stale slug
-    falls through — the dispatcher must never crash on a hand-edited file."""
+    """Active slug, layered (later beats earlier, all fail-soft):
+    context override -> worker env (``HERMES_KANBAN_DB`` set, unconditional) ->
+    interactive env (switch-gated) -> project layer -> profile default ->
+    ``<root>/kanban/current`` (only while that board exists) -> ``DEFAULT_BOARD``.
+    A malformed/stale slug falls through — the dispatcher must never crash on a
+    hand-edited file."""
     def _existing(candidate: str) -> Optional[str]:
         if not candidate:
             return None
@@ -431,13 +566,37 @@ def get_current_board() -> str:
             return None
         return normed if normed and board_exists(normed) else None
 
-    for candidate in (
-        (_CURRENT_BOARD_OVERRIDE.get() or "").strip(),
-        os.environ.get("HERMES_KANBAN_BOARD", "").strip(),
-    ):
-        found = _existing(candidate)
+    # 1. ContextVar override — unchanged, first.
+    ctx = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+    found = _existing(ctx)
+    if found:
+        return found
+
+    env_val = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    is_worker = bool(os.environ.get("HERMES_KANBAN_DB", "").strip())
+
+    # 2. Worker exemption: DB var present -> env board honored unconditionally
+    #    (the dispatcher's defense-in-depth pin must survive).
+    if is_worker:
+        found = _existing(env_val)
         if found:
             return found
+    # 3. Interactive env, switch-gated (default False -> skipped entirely).
+    elif _board_resolution_config().get("env_board_pin"):
+        found = _existing(env_val)
+        if found:
+            return found
+
+    # 4. Project layer (repo root binding).
+    found = _existing(_project_board_for_cwd() or "")
+    if found:
+        return found
+
+    # 5. Profile layer: kanban.default_board.
+    found = _existing(_board_resolution_config().get("default_board") or "")
+    if found:
+        return found
+
     try:
         f = current_board_path()
         if f.exists():
@@ -1126,6 +1285,41 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _validate_assignee(assignee: Optional[str]) -> Optional[str]:
+    """Refuse a ``create_task`` assignee that is not a real Hermes profile.
+
+    Every create path (CLI, plugin tool call, ``fanout.py``) converges on
+    ``create_task``; a card whose assignee names no real profile sits in
+    ``ready`` forever while the dispatcher silently skips it on every tick
+    (``kanban_db_dispatch``'s ``profile_exists`` guard). Validate here so the
+    refusal happens at create time, not at dispatch, on every path.
+
+    ``None``/empty are returned unchanged — unassigned cards are legitimate
+    (``kanban.default_assignee`` may claim them later). A real profile passes
+    through. Anything else raises a ``ValueError`` naming the repair (the same
+    shape as the governance plugin's Rule 2 message) and listing up to ~10 real
+    profile names. Control-plane lanes need no carve-out: the fleet's
+    sweep-heal pass rewrites historical role-labeled rows by direct UPDATE,
+    which never routes through this function.
+
+    The lazy import keeps the dispatch-time-visible ``profile_exists`` patch
+    (see tests/conftest.py and each sub-conftest's ``all_assignees_spawnable``)
+    in effect for tests that create with synthetic assignees.
+    """
+    if not assignee:
+        return assignee
+    from hermes_cli.profiles import list_profile_names, profile_exists
+
+    if profile_exists(assignee):
+        return assignee
+    real = list_profile_names()
+    listing = ", ".join(real[:10]) if real else "(no profiles found)"
+    raise ValueError(
+        f"assignee {assignee!r} is not a real Hermes profile; the dispatcher "
+        f"would silently skip this card every tick; use one of: {listing}"
+    )
+
+
 def _resolve_project_link(
     conn: sqlite3.Connection, project_id: Optional[str], project_source_task_id: Optional[str],
     workspace_kind: str, workspace_path: Optional[str],
@@ -1289,6 +1483,7 @@ def create_task(
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    _validate_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -1319,6 +1514,25 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+
+    # An explicit goal_max_turns ask is not agent-overridable: cap it at the
+    # operator's ``kanban.goal_max_turns_ceiling`` (config wins over the shipped
+    # default) — mirror the failure_limit precedent: a value above the ceiling
+    # is silently capped, the create is never refused. An omitted ask (None)
+    # passes through: the loop's runtime DEFAULT_MAX_TURNS fallback is a
+    # default, not an ask, so the ceiling never touches it.
+    if goal_mode and goal_max_turns is not None:
+        from hermes_cli.config import cfg_get, load_config
+
+        ceiling = cfg_get(load_config(), "kanban", "goal_max_turns_ceiling",
+                          default=DEFAULT_GOAL_MAX_TURNS_CEILING)
+        try:
+            ceiling = int(ceiling)
+        except (TypeError, ValueError):
+            # A garbage operator value must not break task creation.
+            ceiling = DEFAULT_GOAL_MAX_TURNS_CEILING
+        if goal_max_turns > ceiling:
+            goal_max_turns = ceiling
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -3214,6 +3428,7 @@ def edit_task(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    depends_on: Optional[Iterable[str]] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
@@ -3221,6 +3436,12 @@ def block_task(
     promote it into a context-free respawn. ``transient`` still counts
     toward the loop breaker so a forever-flaky task escalates. True on any
     transition.
+
+    Overlay (2026-09-04): when a ``dependency`` block names ``depends_on``,
+    the kernel writes those task ids as ``task_links`` parents in the same
+    transaction, so a worker that names its inputs is honored. When it names
+    no parent, the re-kind above owns the shape — no hard refusal, so the
+    safe demotion to ``needs_input`` always runs.
 
     An already-``blocked`` card that the failure breaker parked UNTYPED
     (``block_kind IS NULL``, no live run) is classified in place when *kind*
@@ -3231,6 +3452,9 @@ def block_task(
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    dep_ids: list[str] = []
+    if kind == "dependency" and depends_on:
+        dep_ids = [str(d).strip() for d in depends_on if str(d).strip()]
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
@@ -3276,6 +3500,8 @@ def block_task(
         if rekind_reason:
             payload["requested_kind"] = requested_kind
             payload["rekind_reason"] = rekind_reason
+        elif kind == "dependency" and dep_ids:
+            payload["depends_on"] = dep_ids
         sql = f"""
                 UPDATE tasks
                    SET status        = '{new_status}',
@@ -3298,12 +3524,26 @@ def block_task(
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
         if kind == "dependency":
+            # The edge IS the dependency (overlay). Same transaction as the park,
+            # so a crash between the two cannot leave a parked card with no parent.
+            for dep in dep_ids:
+                conn.execute(
+                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
+                    "VALUES (?, ?)",
+                    (dep, task_id),
+                )
+                _append_event(
+                    conn, task_id, "linked",
+                    {"parent": dep, "child": task_id, "via": "dependency_block"},
+                    run_id=run_id,
+                )
+            if dep_ids:
+                _inherit_notify_subs(conn, task_id, tuple(dep_ids))
             # Historical ordering: the dependency lane fires inside the txn.
             _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
             return True
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
-
 
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
@@ -3501,9 +3741,22 @@ def _nonblank_str(value: Any) -> Optional[str]:
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Close an active reviewer run (claimed from ``review``) and hand the task
-    back to the implementer from the latest ``review_requested`` event, parent
-    gating reapplied. Returns ``(ok, implementer | reason)``."""
+    """Close an active reviewer run and route the task back for rework.
+
+    Model A (first-class handoff): the run was claimed from ``review`` — the
+    reviewer run is closed, the implementer recorded by the latest
+    ``review_requested`` event is restored, parent gating reapplied, and an
+    auditable ``changes_requested`` event emitted.
+
+    Model B fallback (overlay ``d3d4e0e93b1``) for runs NOT claimed from
+    ``review`` (a pre-created review child claimed from ``ready``, no event
+    provenance): the implementer is derived from the newest-done NON-REVIEWER
+    parent, a ``[rework]`` card is routed back to it and linked as a parent of
+    this review card, and a real ``changes_requested`` event is emitted. Zero
+    candidates or a completed_at tie still resolve to False — provenance is
+    never fabricated.
+
+    Returns ``(ok, implementer | reason)``."""
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
@@ -3523,7 +3776,18 @@ def request_changes(
         claimed_event = _latest_event(conn, task_id, "claimed", current_run_id)
         claimed_payload = _json_dict(_row_get(claimed_event, "payload"))
         if claimed_payload.get("source_status") != "review":
-            return False, "active run was not claimed from review"
+            # Model-B fallback (overlay d3d4e0e93b1): a pre-created review
+            # child was claimed from ``ready`` (no ``review_requested`` event,
+            # no ``source_status=review`` provenance on the claim). Derive the
+            # implementer from the newest-done NON-REVIEWER parent and route a
+            # rework card back to it instead of returning a hard False.
+            return _request_changes_model_b(
+                conn,
+                task_id,
+                reviewer=task_row["assignee"],
+                reason=reason,
+                current_run_id=current_run_id,
+            )
 
         requested_event = _latest_event(conn, task_id, "review_requested")
         if requested_event is None:
@@ -3565,6 +3829,143 @@ def request_changes(
             },
             run_id=run_id,
         )
+    return True, implementer
+
+
+def _derive_idempotency_key(parent_ids: Iterable[str]) -> str:
+    """Deterministic idempotency key for a set of parent task ids.
+
+    ``"+"``-join of the sorted parent ids, sha256-truncated to 32 hex.
+    Recovering the same key on a retried Model-B reject makes
+    :func:`create_task` return the existing rework card instead of
+    duplicating it.
+    """
+    joined = "+".join(sorted(str(p) for p in parent_ids))
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:32]
+
+
+def _request_changes_model_b(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reviewer: Optional[str],
+    reason: str,
+    current_run_id: int,
+) -> tuple[bool, Optional[str]]:
+    """Model-B reject path for a pre-created review child.
+
+    A review child the orchestrator pre-created and the reviewer claimed from
+    ``ready`` has no ``review_requested`` event to recover the implementer
+    from. This fallback derives it from the *newest-done* NON-REVIEWER parent
+    (the artifact under review), creates a ``[rework]`` card back to that
+    implementer, links the rework card as a PARENT of this review card (so the
+    next review pass re-promotes when rework lands), and emits a real
+    ``changes_requested`` event — giving the Model-B reviewer a legal native
+    reject verb instead of a forced ``kanban_block`` workaround.
+
+    When the parent set yields no unambiguous implementer (zero done
+    non-reviewer parents, or a completed_at tie) the call returns ``False``
+    with a diagnostic reason — provenance is never fabricated.
+
+    Assumes it is called from inside the ``request_changes`` write_txn, so the
+    parent link is inserted inline (``link_tasks`` opens its own transaction
+    and must not nest).
+    """
+    canonical_reviewer = (
+        _canonical_assignee(reviewer)
+        if reviewer and str(reviewer).strip()
+        else None
+    )
+    # Newest-done = largest completed_at among done parents whose assignee is
+    # NOT this review card's reviewer. Survives review cycles: each rework
+    # becomes a newer done parent on the next pass.
+    candidates = conn.execute(
+        """
+        SELECT p.id, p.title, p.assignee, p.completed_at
+          FROM task_links tl
+          JOIN tasks p ON p.id = tl.parent_id
+         WHERE tl.child_id = ? AND p.status = 'done'
+           AND p.completed_at IS NOT NULL
+        """,
+        (task_id,),
+    ).fetchall()
+    if canonical_reviewer is not None:
+        non_reviewers = [
+            c for c in candidates
+            if _canonical_assignee(c["assignee"]) != canonical_reviewer
+        ]
+    else:
+        non_reviewers = list(candidates)
+    if not non_reviewers:
+        return False, "no done non-reviewer parent to derive the implementer from"
+    best_ts = max(c["completed_at"] for c in non_reviewers)
+    tied = [c for c in non_reviewers if c["completed_at"] == best_ts]
+    if len(tied) != 1:
+        return False, "ambiguous newest-done parent — cannot route rework"
+    selected = tied[0]
+    implementer = _canonical_assignee(selected["assignee"])
+    if not implementer:
+        return False, "selected parent has no valid implementer assignee"
+
+    artifact_title = (selected["title"] or "").strip() or "untitled"
+    rework_title = f"[rework] {artifact_title}"
+    if len(rework_title) > 200:
+        rework_title = rework_title[:200]
+    rework_id = create_task(
+        conn,
+        title=rework_title,
+        body=(
+            f"Review of artifact `{selected['id']}` ({artifact_title}) "
+            f"requested changes from review card `{task_id}`.\n\n{reason}"
+        ),
+        assignee=implementer,
+        parents=[selected["id"]],
+        idempotency_key=_derive_idempotency_key([selected["id"]]),
+        created_by=canonical_reviewer or "review",
+        workspace_kind="scratch",
+    )
+    # Link the rework card as a PARENT of this review card. Rework is a fresh
+    # childless card, so no cycle is possible; the insert mirrors link_tasks'
+    # semantics inline (already inside the outer write_txn).
+    conn.execute(
+        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+        (rework_id, task_id),
+    )
+    conn.execute(
+        "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+        (task_id,),
+    )
+    _append_event(
+        conn, task_id, "linked",
+        {"parent": rework_id, "child": task_id},
+    )
+
+    # Close the reviewer's run and land the review card on parent gating.
+    new_status = _landing_status_after_parents(conn, task_id)
+    cur = conn.execute(
+        "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+        "worker_pid = NULL WHERE id = ? AND status = 'running' AND current_run_id = ?",
+        (new_status, task_id, int(current_run_id)),
+    )
+    if cur.rowcount != 1:
+        return False, "task changed during review handoff"
+    run_id = _end_run(
+        conn, task_id,
+        outcome="changes_requested",
+        status=new_status,
+        summary=reason,
+    )
+    _append_event(
+        conn, task_id, "changes_requested",
+        {
+            "reason": reason,
+            "implementer": implementer,
+            "reviewer": canonical_reviewer,
+            "status": new_status,
+            "rework": rework_id,
+        },
+        run_id=run_id,
+    )
     return True, implementer
 
 
