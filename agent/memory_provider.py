@@ -200,6 +200,20 @@ class MemoryProvider(ABC):
         callers may omit this field: ``old_text`` alone is not authoritative identity.
         """
 
+    def on_memory_evict(
+        self,
+        content: str,
+        target: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Called when the built-in memory tool would DROP a fact — i.e. a write
+        was rejected at capacity and consolidation failed (the terminal
+        'save skipped' result). Archive the would-be-dropped content to a
+        durable store so nothing is silently lost. Default is no-op.
+        """
+        return None
+
     def backup_paths(self) -> List[str]:
         """Absolute paths of provider state OUTSIDE HERMES_HOME for ``hermes backup``/``import``
         (paths outside the home dir are skipped). MUST work without ``initialize()`` or network."""
