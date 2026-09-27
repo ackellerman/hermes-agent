@@ -1,0 +1,152 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Set up the export service. Use CSV format for the reports."
+    },
+    {
+      "role": "assistant",
+      "content": "Starting the export service with CSV format.",
+      "tool_calls": [
+        {
+          "id": "c1",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"command\": \"python export.py --format csv\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "c1",
+      "content": "CSV exporter started on port 8080."
+    },
+    {
+      "role": "user",
+      "content": "Wait \u2014 actually, use JSONL format, not CSV. The downstream pipeline can't parse CSV safely."
+    },
+    {
+      "role": "assistant",
+      "content": "Understood: switching to JSONL format.",
+      "tool_calls": [
+        {
+          "id": "c2",
+          "function": {
+            "name": "terminal",
+            "arguments": "{\"command\": \"python export.py --format jsonl\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "c2",
+      "content": "JSONL exporter restarted on port 8080. Config written to export.yaml."
+    },
+    {
+      "role": "user",
+      "content": "Also commit to shipping the export module by Friday."
+    },
+    {
+      "role": "assistant",
+      "content": "Commitment noted: export module ships Friday."
+    },
+    {
+      "role": "user",
+      "content": "Should we use Postgres or SQLite for the audit log?"
+    },
+    {
+      "role": "assistant",
+      "content": "Decision: Postgres \u2014 concurrent audit writers; rejected SQLite (single-writer bottleneck at our volume)."
+    },
+    {
+      "role": "user",
+      "content": "Try the experimental streaming transport too."
+    },
+    {
+      "role": "assistant",
+      "content": "Abandoned: streaming transport \u2014 kept dropping connections under load; not worth the complexity now."
+    },
+    {
+      "role": "user",
+      "content": "Generate a summary report artifact."
+    },
+    {
+      "role": "assistant",
+      "content": "Wrote audit-summary.txt to /tmp (ephemeral node, unrecoverable): totals per day, 3 anomalies flagged."
+    },
+    {
+      "role": "user",
+      "content": "Deploy the exporter to staging."
+    },
+    {
+      "role": "assistant",
+      "content": "Deployed to staging (world effect: staging now runs the JSONL exporter; staging-42 provisioned)."
+    }
+  ],
+  "labels": {
+    "corrections": [
+      {
+        "what": "use JSONL, not CSV",
+        "cites": [
+          3,
+          3
+        ],
+        "counterfactual_anchor": [
+          5,
+          6
+        ]
+      }
+    ],
+    "commitments": [
+      {
+        "what": "ship export module Friday",
+        "cites": [
+          7,
+          8
+        ]
+      }
+    ],
+    "decisions": [
+      {
+        "what": "Postgres for audit log",
+        "cites": [
+          9,
+          10
+        ],
+        "rejected_alternatives": [
+          "SQLite"
+        ]
+      }
+    ],
+    "abandoned": [
+      {
+        "what": "streaming transport",
+        "cites": [
+          11,
+          12
+        ]
+      }
+    ],
+    "artifacts": [
+      {
+        "what": "audit-summary.txt",
+        "cites": [
+          13,
+          14
+        ],
+        "recoverable": false
+      }
+    ],
+    "world_effects": [
+      {
+        "what": "staging runs JSONL exporter",
+        "cites": [
+          15,
+          16
+        ]
+      }
+    ]
+  }
+}

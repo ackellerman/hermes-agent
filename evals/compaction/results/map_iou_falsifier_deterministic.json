@@ -1,0 +1,83 @@
+{
+  "mode": "deterministic",
+  "n_updates": 10,
+  "region_messages": 200,
+  "region_tokens": 97091,
+  "predicted_episodes": [
+    [
+      0,
+      24
+    ],
+    [
+      25,
+      49
+    ],
+    [
+      50,
+      74
+    ],
+    [
+      75,
+      99
+    ],
+    [
+      100,
+      124
+    ],
+    [
+      125,
+      149
+    ],
+    [
+      150,
+      174
+    ],
+    [
+      175,
+      199
+    ]
+  ],
+  "ground_truth_episodes": [
+    [
+      0,
+      24
+    ],
+    [
+      25,
+      49
+    ],
+    [
+      50,
+      74
+    ],
+    [
+      75,
+      99
+    ],
+    [
+      100,
+      124
+    ],
+    [
+      125,
+      149
+    ],
+    [
+      150,
+      174
+    ],
+    [
+      175,
+      199
+    ]
+  ],
+  "episode_iou_score": 1.0,
+  "ac3_iou_bar": 0.9,
+  "covers_monotonic": true,
+  "covers_regression": null,
+  "window_tax_ratio": 1.0695,
+  "ac5_tax_bar": 1.15,
+  "input_tokens_total": 103838,
+  "ac3_pass": true,
+  "ac5_pass": true
+}

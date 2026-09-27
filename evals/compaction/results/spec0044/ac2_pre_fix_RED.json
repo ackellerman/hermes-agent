@@ -1,0 +1,28 @@
+{
+  "ac": "AC-2",
+  "verdict": "FAIL",
+  "note": "",
+  "tree": {
+    "commit": "b064d4fb537944c8d3d336e38612582e9022183c",
+    "branch": "wt/t_c323acdf",
+    "dirty": true
+  },
+  "evidence": {
+    "fabrication_lines": [
+      "tests/agent/test_compaction_producer.py:229: sdir.mkdir(parents=True, exist_ok=True)",
+      "tests/agent/test_compaction_producer.py:284: q.parent.mkdir(parents=True, exist_ok=True)",
+      "tests/agent/test_compaction_producer.py:297: d.mkdir(parents=True, exist_ok=True)",
+      "tests/agent/test_compaction_producer.py:352: d.mkdir(parents=True, exist_ok=True)",
+      "tests/agent/test_compaction_backstop_wiring.py:183: ddir.mkdir(parents=True, exist_ok=True)",
+      "tests/agent/test_compaction_backstop_wiring.py:215: ddir.mkdir(parents=True, exist_ok=True)",
+      "evals/compaction/online_eval.py:135: (store.session_dir(session_id) / ref.dump_id).mkdir(parents=True, exist_ok=True)",
+      "evals/compaction/online_eval.py:455: Path(args.json).parent.mkdir(parents=True, exist_ok=True)"
+    ],
+    "scanned": [
+      "tests/agent/test_compaction_producer.py",
+      "tests/agent/test_compaction_backstop_wiring.py",
+      "evals/compaction/online_eval.py"
+    ],
+    "why": "test/eval-side mkdir still fabricates a region directory after write_dump, masking the producer layout"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "region_messages": 500,
+  "region_tokens_estimate": 59313,
+  "map_update_input_tokens": 4878,
+  "map_slot_tokens": 64000,
+  "map_headroom_pct": 92.4,
+  "map_pass": true,
+  "stage_b_input_tokens": 7772,
+  "stage_c_input_tokens": 3296,
+  "bc_slot_tokens": 256000,
+  "bc_headroom_pct": 97.0,
+  "bc_pass": true,
+  "ac19c_pass": true
+}

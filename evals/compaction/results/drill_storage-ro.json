@@ -1,0 +1,38 @@
+{
+  "mode": "drill",
+  "drill": "storage-ro",
+  "storage_root": "/tmp/spec43-drill-dlf749uh/storage",
+  "ts": 1789431477.855305,
+  "container": {
+    "container_image": "nousresearch/hermes-agent:latest",
+    "container_image_id": "sha256:1d4a19fcfc5452716bfde16970be6e9dbe3c1487a31d5fbb8b0a3e65c556f5d9",
+    "container_image_digest": "nousresearch/hermes-agent@sha256:877195433e2fe26d1082c9065b3f4ac98efe48b38f7c5525ab7c9188c05a3a05",
+    "container_commit": "07da5e399700e199ae9213d23ebc7c6986649b4d",
+    "container_tree_dirty": false,
+    "container_runtime": "docker",
+    "container_command": "python3 evals/compaction/drills.py storage-ro --json /out/drill_storage-ro.json"
+  },
+  "unwritable_mechanism": "non-directory-root",
+  "preflight_root_writable": false,
+  "ran": true,
+  "record": {
+    "ran": true,
+    "queued": 0,
+    "updated": false,
+    "map_error": "[Errno 20] Not a directory: '/tmp/spec43-drill-dlf749uh/storage/drill-session'",
+    "dump_error": "[Errno 20] Not a directory: '/tmp/spec43-drill-dlf749uh/storage/drill-session/0001-d7e7e281'",
+    "idle_window": [
+      2,
+      15
+    ]
+  },
+  "live_unchanged": true,
+  "process_crashed": false,
+  "assert": {
+    "preflight_proved_root_read_only": true,
+    "live_list_untouched": true,
+    "no_crash": true,
+    "storage_failure_recorded": true,
+    "nothing_written_to_readonly_root": true
+  }
+}

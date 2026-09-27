@@ -1,0 +1,42 @@
+{
+  "mode": "drill",
+  "drill": "kill-mid",
+  "storage_root": "/tmp/spec43-drill-rdxh3vyk/storage",
+  "ts": 1789431478.644507,
+  "container": {
+    "container_image": "nousresearch/hermes-agent:latest",
+    "container_image_id": "sha256:1d4a19fcfc5452716bfde16970be6e9dbe3c1487a31d5fbb8b0a3e65c556f5d9",
+    "container_image_digest": "nousresearch/hermes-agent@sha256:877195433e2fe26d1082c9065b3f4ac98efe48b38f7c5525ab7c9188c05a3a05",
+    "container_commit": "07da5e399700e199ae9213d23ebc7c6986649b4d",
+    "container_tree_dirty": false,
+    "container_runtime": "docker",
+    "container_command": "python3 evals/compaction/drills.py kill-mid --json /out/drill_kill-mid.json"
+  },
+  "child_killed_by_signal": true,
+  "child_returncode": -9,
+  "partial_region": "0001-a5b29f27",
+  "record": {
+    "ran": true,
+    "queued": 0,
+    "updated": true,
+    "dumped": "0001-a5b29f27",
+    "dump_window": [
+      0,
+      9
+    ],
+    "dumped_exists": true,
+    "extract_parked": "0001-a5b29f27",
+    "idle_window": [
+      0,
+      9
+    ]
+  },
+  "assert": {
+    "real_process_killed_mid_stage": true,
+    "partial_region_present": true,
+    "partial_region_has_no_stage_c": true,
+    "partial_region_never_swapped": true,
+    "live_list_untouched": true,
+    "no_crash": true
+  }
+}

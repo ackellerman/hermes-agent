@@ -1,0 +1,50 @@
+{
+  "spec": "SPEC-0044",
+  "ac": "AC-14(a) \u2014 RED baseline against the pre-fix parent commit",
+  "purpose": "Re-run the fixed tree's behaviours against the PRE-FIX code. Every probe below must report the RED condition; a probe that shows the fixed behaviour here would mean the fix was already present and the fixed-tree green proves nothing.",
+  "dated": "2026-09-14",
+  "reproduction": [
+    "git worktree add --detach <dir> 46822b15c",
+    "cp scripts/_spec0044_red_baseline.py <dir>/scripts/",
+    "cd <dir> && <repo-venv>/bin/python scripts/_spec0044_red_baseline.py <this-file>",
+    "control (must return 1 and report NO red conditions) on a fixed tree:",
+    "  python scripts/_spec0044_red_baseline.py /tmp/control.json --expect-fixed"
+  ],
+  "discriminates": "The fixed-tree control run reports all four red_conditions false, so the probes discriminate rather than always reporting RED.",
+  "tree": {
+    "commit": "46822b15cc4b8aa57faea94f794b0ba7b38934cf",
+    "path": "/tmp/spec44-base"
+  },
+  "AC-1/per-dump-layout": {
+    "dump_id": "0001-db5a7588",
+    "per_dump_dirs": [],
+    "flat_siblings": [
+      "0001-db5a7588.meta.json",
+      "0001-db5a7588.jsonl"
+    ],
+    "has_per_dump_dir": false,
+    "journal_inside_dir": false
+  },
+  "AC-1/extractor-fabrication": {
+    "extractor_created_dir": true,
+    "extractor_raised": null,
+    "asserts_instead_of_fabricating": false
+  },
+  "AC-21/dump-before-degrade": {
+    "action": "degrade",
+    "degraded": null,
+    "flat_journals": [],
+    "dump_dirs": [],
+    "queue_rows": 0,
+    "dumped_before_degrade": false,
+    "enqueued": false
+  },
+  "red_conditions": {
+    "no_per_dump_directory": true,
+    "journal_not_inside_dir": true,
+    "extractor_fabricated_the_dir": true,
+    "degrade_did_not_dump": true
+  },
+  "all_red_conditions_hold": true,
+  "mode": "pre-fix-red-baseline"
+}

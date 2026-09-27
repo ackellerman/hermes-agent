@@ -1,0 +1,61 @@
+{
+  "spec": "SPEC-0044",
+  "ac": "AC-11 / D8 \u2014 retired hand-edited receipt",
+  "retired_path": "evals/compaction/results/map_iou_falsifier_real.json",
+  "reason": "The file claimed to be a real-model (muse-glimmer) map-IoU run but carried fields the committed script never emits, so it was not script output; its own note also stated the ~100K-token real-model run was not executed. D8 requires either genuine reproducibility or removal/rename so the name stops claiming a real-model run exists. This is the removal/rename remedy.",
+  "fields_the_script_never_emits": [
+    "ac5_note",
+    "input_tokens_total_scaled",
+    "model",
+    "note_ac3",
+    "region_tokens_scaled"
+  ],
+  "script_fields": [
+    "ac3_iou_bar",
+    "ac3_pass",
+    "ac5_pass",
+    "ac5_tax_bar",
+    "covers_monotonic",
+    "covers_regression",
+    "episode_iou_score",
+    "ground_truth_episodes",
+    "input_tokens_total",
+    "mode",
+    "n_updates",
+    "predicted_episodes",
+    "region_messages",
+    "region_tokens",
+    "window_tax_ratio"
+  ],
+  "committed_fields": [
+    "ac3_iou_bar",
+    "ac3_pass",
+    "ac5_note",
+    "ac5_pass",
+    "ac5_tax_bar",
+    "covers_monotonic",
+    "covers_regression",
+    "episode_iou_score",
+    "input_tokens_total_scaled",
+    "mode",
+    "model",
+    "n_updates",
+    "note_ac3",
+    "region_messages",
+    "region_tokens_scaled",
+    "window_tax_ratio"
+  ],
+  "authoritative_numbers": {
+    "receipt": "evals/compaction/results/map_iou_falsifier_deterministic.json",
+    "claim": "AC-3 episode IoU and the AC-5 window-tax ratio are measured by the deterministic segmenter/fixture pair and reproduce from this script; the AC-5 ratio is a STRUCTURAL property of the update payload bytes and is model-independent.",
+    "not_claimed": "No real-model 100K-token map run is claimed here. A live muse-glimmer run is attempted separately and committed under its own receipt name only if it completes."
+  },
+  "probe": {
+    "command": "python evals/compaction/map_iou_falsifier.py --map-model deterministic --json <out>",
+    "interpreter": "repository virtualenv python (host path redacted for publication)",
+    "interpreter_note": "the corrected probe ran under this checkout's own virtualenv interpreter; that absolute host path is omitted because this branch publishes to a public fork and nothing here depends on the value",
+    "rc": 1,
+    "note": "the field-name diff is what AC-11 tests: any committed field the script does not emit proves the receipt was not script output"
+  },
+  "diff_method_corrected": "An earlier version of this record probed with bare `python3`, which could not import the tree and produced an empty field set \u2014 listing every field as extra. The diff below is from the corrected probe."
+}

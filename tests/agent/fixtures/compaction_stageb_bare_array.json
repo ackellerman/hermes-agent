@@ -1,0 +1,7 @@
+[
+  {"id": "ep-01-db-design-v1", "verdict": "keep", "cites": [[3, 16]]},
+  {"id": "ep-02-reexec-evidence", "verdict": "keep", "cites": [[16, 30]]},
+  {"id": "ep-03-gc-incident", "verdict": "keep", "cites": [[30, 44]]},
+  {"id": "ep-04-fallback-path", "verdict": "drop", "because": "superseded by the re-exec fix", "cites": [[44, 58]]},
+  {"id": "ent-05-rate-limiter", "verdict": "keep", "cites": [[58, 72]]}
+]

@@ -1,0 +1,93 @@
+{
+  "ac": "AC-5",
+  "verdict": "PASS",
+  "note": "",
+  "tree": {
+    "commit": "b064d4fb537944c8d3d336e38612582e9022183c",
+    "branch": "wt/t_c323acdf",
+    "dirty": true
+  },
+  "evidence": {
+    "sentinel": "SENTINEL-SPEC0044-REPLAY-9f3a",
+    "replay_rc": 0,
+    "replay_result": {
+      "mode": "soak",
+      "turns_run": 4,
+      "transcripts_consumed": 1,
+      "region_messages_per_pass": 24,
+      "turn_log_region_messages": [
+        24
+      ],
+      "transcript_count": 1,
+      "transcript_sha256": "7ce31b6bc40e54b7cd2ec10e1278c05ffb7ebaa1353949dd1fde640346d1e98e",
+      "transcript_source": "operator",
+      "total_messages_processed": 96,
+      "wall_seconds": 0.06,
+      "invariants": {
+        "ordering_swap_refuses_incomplete": true,
+        "lock_discipline_no_leak": true,
+        "map_monotonic": true,
+        "map_bounded_after_retire": true,
+        "batched_single_mutation": true,
+        "alternation_on_swap": true,
+        "transcripts_resolved": true,
+        "replay_drove_the_pass": true
+      },
+      "all_invariants_hold": true,
+      "violations": [],
+      "turn_log_tail": [
+        {
+          "tick": 1,
+          "dump_id": "0001-66e1f1f0",
+          "region_messages": 24,
+          "swapped_len": 1,
+          "map_covers_after": {
+            "start_msg": 24,
+            "end_msg": 23
+          },
+          "map_entries_after": 0
+        },
+        {
+          "tick": 2,
+          "dump_id": "0002-66e1f1f0",
+          "region_messages": 24,
+          "swapped_len": 1,
+          "map_covers_after": {
+            "start_msg": 24,
+            "end_msg": 23
+          },
+          "map_entries_after": 0
+        },
+        {
+          "tick": 3,
+          "dump_id": "0003-66e1f1f0",
+          "region_messages": 24,
+          "swapped_len": 1,
+          "map_covers_after": {
+            "start_msg": 24,
+            "end_msg": 23
+          },
+          "map_entries_after": 0
+        }
+      ]
+    },
+    "replay_source": "operator",
+    "replay_consumed": 1,
+    "replay_region_sizes": [
+      24
+    ],
+    "dumped_regions": [
+      "0000-66e1f1f0",
+      "0001-66e1f1f0",
+      "0002-66e1f1f0",
+      "0003-66e1f1f0"
+    ],
+    "sentinel_in_processed_region": true,
+    "control_rc": 0,
+    "control_source": "synthetic",
+    "control_region_sizes": [
+      16
+    ],
+    "control_sentinel_present": false
+  }
+}
