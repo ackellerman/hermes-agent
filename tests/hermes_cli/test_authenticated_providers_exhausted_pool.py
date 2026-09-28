@@ -7,7 +7,6 @@ during no-provider ``/model`` resolution, wins the model name, and sticks as
 the session provider (the "sticky provider fallback pollution" bug).
 """
 
-import threading
 import time
 
 import pytest
@@ -173,16 +172,11 @@ def test_available_pool_provider_still_authenticated(monkeypatch, tmp_path):
 
 
 def test_current_custom_endpoint_slow_probe_degrades_gracefully(monkeypatch, tmp_path):
-    """A slow CURRENT custom endpoint must not stall the open nor lose its row.
+    """A failing current custom endpoint does not lose its configured fallback row.
 
-    ``build_model_options_payload`` passes ``probe_current_custom_provider = not refresh``, so a
-    normal open live-probes the current custom endpoint. With ``for_picker`` enabled the discovery
-    timeout is 1.5s (was 5.0s) — this pins the degraded-endpoint behaviour on the surface that now
-    carries the shorter timeout, which previously had no coverage at all.
-
-    The stub sits at the INNER fetch and honours the ``timeout`` it is handed, so the real
-    discovery/timeout/fallback logic runs; blocking for more than the granted timeout makes the
-    real code time out, which is what a slow endpoint actually does.
+    A normal open live-probes the current custom endpoint. Cooldown visibility must not silently
+    shorten this surface's existing 5s probe budget. This checks fallback for a failing endpoint;
+    the adjacent slow-but-working test checks preservation of a catalog that needs that budget.
     """
     import requests
     from hermes_cli import models as models_mod
@@ -210,8 +204,61 @@ def test_current_custom_endpoint_slow_probe_degrades_gracefully(monkeypatch, tmp
 
     assert payload.get("providers") is not None
     assert elapsed < 20, f"picker open stalled for {elapsed:.1f}s"
-    # The probe ran with the PICKER timeout, not the generic 5.0s one.
-    assert seen and max(seen) <= 1.5, f"unexpected probe timeout(s): {seen}"
+    assert seen and all(t == 5.0 for t in seen), f"custom probe budget changed: {seen}"
+
+
+def test_model_options_preserves_slow_working_current_custom_catalog(monkeypatch, tmp_path):
+    """Cooldown visibility must not shorten a current custom endpoint's prior 5s probe budget."""
+    from hermes_cli import models as models_mod
+    from hermes_cli.inventory import build_model_options_payload, load_picker_context
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    seen = []
+
+    def _fetch(api_key, base_url, *, timeout=5.0, **kwargs):
+        seen.append(timeout)
+        return ["discovered-only-model"] if timeout >= 2.5 else None
+
+    monkeypatch.setattr(models_mod, "cached_fetch_api_models", _fetch)
+    ctx = load_picker_context().with_overrides(
+        current_provider="custom", current_model="configured-model",
+        current_base_url="http://127.0.0.1:9/v1")
+    rows = build_model_options_payload(ctx)["providers"]
+    row = next(r for r in rows if r["slug"] == "custom")
+    assert "discovered-only-model" in row["models"], (seen, row["models"])
+    assert seen and all(t == 5.0 for t in seen)
+
+
+def test_existing_fast_picker_probe_keeps_short_budget(monkeypatch, tmp_path):
+    """The old picker caller still opts into its established 1.5s custom probe."""
+    from hermes_cli import models as models_mod
+    from hermes_cli.model_switch_providers import list_picker_providers
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    seen = []
+
+    def _fetch(api_key, base_url, *, timeout=5.0, **kwargs):
+        seen.append(timeout)
+        return ["existing-model"]
+
+    monkeypatch.setattr(models_mod, "cached_fetch_api_models", _fetch)
+    list_picker_providers(
+        current_provider="custom", current_model="configured-model",
+        current_base_url="http://127.0.0.1:9/v1",
+        user_providers={}, custom_providers=[], probe_custom_providers=False,
+        probe_current_custom_provider=True)
+    assert seen and all(t == 1.5 for t in seen)
+
+
+def test_recommended_default_retains_all_cooldown_provider(monkeypatch, tmp_path):
+    """The dashboard recommendation must not mistake cooldown for missing setup."""
+    from hermes_cli.web_routers.models import get_recommended_default_model
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _patch_opencode_pool(monkeypatch, available=False)
+    result = get_recommended_default_model(provider="opencode-go")
+    assert result["provider"] == "opencode-go"
+    assert result["model"], result
 
 
 def test_show_model_picker_shows_exhausted_pool_provider(monkeypatch, tmp_path):
