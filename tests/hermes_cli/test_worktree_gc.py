@@ -321,10 +321,32 @@ class TestBranchGC:
 
         ``audit_branches`` compares against ``_worktree_merge_base_ref`` (``origin/HEAD``) and
         already refuses to delete a CHECKED-OUT branch — but reclaiming the tree that holds it
-        un-checks it out, and a project whose trunk is not literally ``main`` (e.g. a fork whose
-        integration branch is ``development`` while ``origin/HEAD`` is ``main``) then loses it."""
+        un-checks it out, and a project whose trunk is not literally ``main`` then loses it."""
         trunk = _local_branch_name(repo)
         assert worktree_gc._is_protected_branch(str(repo), trunk) is True
+
+    def test_trunk_protected_by_resolution_not_name_alone(self, tmp_path, monkeypatch):
+        """A trunk whose NAME is in no conventional list is still protected.
+
+        This is the half a name list cannot cover, and the reason the check resolves the ref
+        instead of comparing ``origin/HEAD`` (a REF) against a branch NAME."""
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        origin = tmp_path / "origin.git"
+        repo = tmp_path / "work"
+        _git(["init", "-q", "--bare", str(origin)], tmp_path)
+        _git(["init", "-q", str(repo)], tmp_path)
+        _git(["config", "user.name", "t"], repo)
+        _git(["config", "user.email", "t@t"], repo)
+        (repo / "a.txt").write_text("a")
+        _git(["add", "."], repo)
+        _git(["commit", "-qm", "init"], repo)
+        _git(["branch", "-m", "integration"], repo)          # trunk name in NO list
+        _git(["remote", "add", "origin", str(origin)], repo)
+        _git(["push", "-q", "-u", "origin", "integration"], repo)
+        _git(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/integration"], repo)
+        assert "integration" not in worktree_gc._PROTECTED_BRANCHES
+        assert worktree_gc._is_protected_branch(str(repo), "integration") is True
+        assert worktree_gc._is_protected_branch(str(repo), "some/topic") is False
 
     def test_development_is_a_protected_name(self, repo):
         """``development`` is the longest-standing convention for an integration branch and was
