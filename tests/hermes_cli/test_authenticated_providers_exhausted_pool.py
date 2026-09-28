@@ -7,6 +7,9 @@ during no-provider ``/model`` resolution, wins the model name, and sticks as
 the session provider (the "sticky provider fallback pollution" bug).
 """
 
+import threading
+import time
+
 import pytest
 
 
@@ -152,7 +155,11 @@ def test_model_options_payload_skeleton_is_not_mistaken_for_unconfigured(monkeyp
 
 
 def test_available_pool_provider_still_authenticated(monkeypatch, tmp_path):
-    """Guard: a healthy pool is unaffected by enabling the flag."""
+    """GUARD (not a RED test — passes pre-fix too): a healthy pool is unaffected by the flag.
+
+    ``_credential_pool_is_usable`` already returns True for an available pool, so
+    ``_overlay_has_creds`` short-circuits before the ``for_picker`` branch. This exists to catch a
+    future fix that breaks the healthy path, not to prove this one."""
     from hermes_cli.inventory import build_model_options_payload, load_picker_context
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -163,4 +170,76 @@ def test_available_pool_provider_still_authenticated(monkeypatch, tmp_path):
                 if p["slug"] == "opencode-go"), None)
     assert row is not None
     assert row["authenticated"] is True
+
+
+def test_current_custom_endpoint_slow_probe_degrades_gracefully(monkeypatch, tmp_path):
+    """A slow CURRENT custom endpoint must not stall the open nor lose its row.
+
+    ``build_model_options_payload`` passes ``probe_current_custom_provider = not refresh``, so a
+    normal open live-probes the current custom endpoint. With ``for_picker`` enabled the discovery
+    timeout is 1.5s (was 5.0s) — this pins the degraded-endpoint behaviour on the surface that now
+    carries the shorter timeout, which previously had no coverage at all.
+
+    The stub sits at the INNER fetch and honours the ``timeout`` it is handed, so the real
+    discovery/timeout/fallback logic runs; blocking for more than the granted timeout makes the
+    real code time out, which is what a slow endpoint actually does.
+    """
+    import requests
+    from hermes_cli import models as models_mod
+    from hermes_cli.inventory import build_model_options_payload, load_picker_context
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+    seen: list[float] = []
+
+    def _slow_fetch(api_key, base_url, *, timeout=5.0, **kwargs):
+        seen.append(float(timeout or 0.0))
+        time.sleep(float(timeout or 0.0) + 0.25)     # slower than granted -> real timeout
+        raise requests.Timeout("simulated slow endpoint")
+
+    # Stub the seam the discovery path actually calls (cache=True default path), so the REAL
+    # timeout/fallback logic runs with the timeout the picker granted.
+    monkeypatch.setattr(models_mod, "cached_fetch_api_models", _slow_fetch)
+
+    ctx = load_picker_context().with_overrides(
+        current_provider="custom", current_model="slow-model",
+        current_base_url="http://127.0.0.1:9/v1")
+    started = time.monotonic()
+    payload = build_model_options_payload(ctx)          # must not raise
+    elapsed = time.monotonic() - started
+
+    assert payload.get("providers") is not None
+    assert elapsed < 20, f"picker open stalled for {elapsed:.1f}s"
+    # The probe ran with the PICKER timeout, not the generic 5.0s one.
+    assert seen and max(seen) <= 1.5, f"unexpected probe timeout(s): {seen}"
+
+
+def test_show_model_picker_shows_exhausted_pool_provider(monkeypatch, tmp_path):
+    """The native terminal ``/model`` picker must honour the same cooldown contract.
+
+    ``cli_model_switch_mixin._show_model_picker`` is reachable via ``hermes_cli/cli.py`` ``/model``
+    and calls ``build_models_payload`` directly; it omitted ``for_picker``, so an all-cooldown pool
+    provider was silently dropped there too. It has no test coverage of its own.
+    """
+    import types
+    from hermes_cli.cli_model_switch_mixin import _show_model_picker
+    from hermes_cli.inventory import load_picker_context
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _patch_opencode_pool(monkeypatch, available=False)
+    printed: list[str] = []
+    monkeypatch.setattr("cli._cprint", lambda *a, **k: printed.append(" ".join(map(str, a))))
+    called: list[list] = []
+    cli = types.SimpleNamespace(
+        model="m", provider="p",
+        _open_model_picker=lambda providers, *a, **k: called.append(providers),
+    )
+
+    _show_model_picker(cli, load_picker_context(), force_refresh=False)
+
+    assert not any("No authenticated providers found" in line for line in printed), \
+        f"CLI picker dropped the cooldown provider: {printed[:3]}"
+    assert called, "CLI picker never opened"
+    assert any(r["slug"] == "opencode-go" for r in called[0]), \
+        "cooldown provider missing from the CLI picker's provider list"
 
