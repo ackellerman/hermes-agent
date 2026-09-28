@@ -274,6 +274,11 @@ def _show_model_picker(cli, ctx, force_refresh: bool) -> None:
             ctx, probe_custom_providers=force_refresh,
             probe_current_custom_provider=not force_refresh,
             capabilities=True,  # the effort step hides itself on reasoning-free routes
+            # This IS a picker, so it carries picker semantics: without the flag an all-cooldown
+            # pool provider (credentials present, none selectable this moment) was dropped here
+            # while the RPC/dashboard pickers kept it — same contract, different surface.
+            for_picker=True,
+            fast_custom_probe=False,  # retain this surface's original 5s custom-endpoint budget
         )["providers"]
     except Exception:
         providers = []

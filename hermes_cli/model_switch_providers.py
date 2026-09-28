@@ -584,7 +584,7 @@ def _group_display_name(display_name: str) -> str:
 def _discover_endpoint_models(
     api_key: Any, api_url: str, native_catalog_provider: str, has_explicit_models: bool, *,
     headers: dict | None, api_mode: str | None, probe_live: bool, discovery_allowed: bool,
-    for_picker: bool) -> tuple[list | None, bool]:
+    fast_probe: bool) -> tuple[list | None, bool]:
     """Return ``(models, native_catalog_empty)`` for a custom endpoint row.
 
     ``probe_live`` runs the native-aware picker fetch; otherwise, when discovery is allowed, a
@@ -592,7 +592,7 @@ def _discover_endpoint_models(
     ``has_explicit_models`` gates the *probe* (a network-cost guard for keyless endpoints that
     declare a catalog), never the cache read — applying it to the read re-pins the endpoint to
     its declared subset. Returns ``(None, False)`` when nothing usable was found."""
-    timeout = 1.5 if for_picker else 5.0
+    timeout = 1.5 if fast_probe else 5.0
     if probe_live:
         try:
             live_models = _fetch_picker_live_models(
@@ -680,6 +680,7 @@ class _PickerBuild:
     current_model: str
     max_models: int | None
     for_picker: bool
+    fast_custom_probe: bool
     force_fresh_nous_tier: bool
     probe_custom_providers: bool
     probe_current_custom_provider: bool
@@ -776,7 +777,7 @@ class _PickerBuild:
         discovered, native_catalog_empty = _discover_endpoint_models(
             api_key, api_url, native_provider, has_explicit_models,
             headers=headers, api_mode=api_mode, probe_live=probe_live,
-            discovery_allowed=discovery_allowed, for_picker=self.for_picker)
+            discovery_allowed=discovery_allowed, fast_probe=self.fast_custom_probe)
         return discovered, native_catalog_empty, probe_live
 
 
@@ -1036,7 +1037,7 @@ def _lap_bare_custom_row(b: _PickerBuild, custom_providers: list | None) -> None
         discovered, native_catalog_empty = _discover_endpoint_models(
             "", api_url, "custom", False, headers=None, api_mode=None,
             probe_live=bool(b.refresh or b.probe_current_custom_provider), discovery_allowed=True,
-            for_picker=b.for_picker)
+            fast_probe=b.fast_custom_probe)
         if discovered is not None:
             models = discovered
     except Exception:
@@ -1175,7 +1176,8 @@ def list_authenticated_providers(
     custom_providers: list | None = None, *, force_fresh_nous_tier: bool = False,
     max_models: int | None = None, current_model: str = "", refresh: bool = False,
     probe_custom_providers: bool = True, probe_current_custom_provider: bool = False,
-    for_picker: bool = False, excluded_providers: list | None = None,
+    for_picker: bool = False, fast_custom_probe: bool | None = None,
+    excluded_providers: list | None = None,
     non_blocking_catalogs: bool = False) -> List[dict]:
     """Detect which providers have credentials and list their curated (not full models.dev) models.
 
@@ -1218,7 +1220,9 @@ def list_authenticated_providers(
     # as (hermes_id / mdev_id / canonical slug).
     b = _PickerBuild(
         current_provider=current_provider, current_base_url=current_base_url, current_model=current_model,
-        max_models=max_models, for_picker=for_picker, force_fresh_nous_tier=force_fresh_nous_tier,
+        max_models=max_models, for_picker=for_picker,
+        fast_custom_probe=for_picker if fast_custom_probe is None else bool(fast_custom_probe),
+        force_fresh_nous_tier=force_fresh_nous_tier,
         probe_custom_providers=probe_custom_providers, probe_current_custom_provider=probe_current_custom_provider,
         refresh=refresh, excluded={str(p).strip().lower() for p in (excluded_providers or []) if p},
         non_blocking_catalogs=non_blocking_catalogs,
