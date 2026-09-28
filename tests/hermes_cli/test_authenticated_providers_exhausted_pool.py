@@ -103,3 +103,64 @@ def test_picker_shows_exhausted_pool_provider(monkeypatch):
         "Picker must show exhausted-pool providers so the user can select "
         "a different model under the same provider"
     )
+
+
+def test_model_options_payload_shows_exhausted_pool_provider(monkeypatch, tmp_path):
+    """The REAL picker payload must honour the same contract as the test above.
+
+    ``build_model_options_payload`` is what RPC ``model.options`` (TUI ``/model``), the dashboard
+    ``ModelPickerDialog`` and the gateway's ``/api/model/options`` all serve. It never passed
+    ``for_picker`` down to ``list_authenticated_providers``, so ``_overlay_has_creds`` skipped its
+    cooldown-tolerance branch and the provider was dropped (or degraded to an empty canonical
+    skeleton) even though its pool still holds credentials — the user lost the provider entirely.
+
+    ``list_picker_providers`` (asserted above) always passed the flag, which is why the divergence
+    went unnoticed: the contract was specified and tested, but not on the surface users hit.
+    """
+    from hermes_cli.inventory import build_model_options_payload, load_picker_context
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _patch_opencode_pool(monkeypatch, available=False)
+
+    ctx = load_picker_context()
+    row = next((p for p in build_model_options_payload(ctx)["providers"]
+                if p["slug"] == "opencode-go"), None)
+    assert row is not None, "exhausted-pool provider vanished from the picker payload"
+    assert row["authenticated"] is True, "cooldown pool reported as unauthenticated"
+    assert row["models"], "picker row carries no models"
+
+
+def test_model_options_payload_skeleton_is_not_mistaken_for_unconfigured(monkeypatch, tmp_path):
+    """On ``include_unconfigured=True`` the provider must keep models, not degrade to a skeleton.
+
+    ``_apply_picker_hints`` marks a row ``authenticated=False`` when its source is ``canonical``
+    with no models — which the picker renders as "(needs setup)" (#needs-setup). A cooldown pool
+    must not take that path.
+    """
+    from hermes_cli.inventory import build_model_options_payload, load_picker_context
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _patch_opencode_pool(monkeypatch, available=False)
+
+    ctx = load_picker_context()
+    rows = build_model_options_payload(ctx, include_unconfigured=True)["providers"]
+    row = next((p for p in rows if p["slug"] == "opencode-go"), None)
+    assert row is not None
+    assert not (row.get("source") == "canonical" and not row.get("models")), \
+        "provider degraded to an empty canonical skeleton"
+    assert row["authenticated"] is True
+
+
+def test_available_pool_provider_still_authenticated(monkeypatch, tmp_path):
+    """Guard: a healthy pool is unaffected by enabling the flag."""
+    from hermes_cli.inventory import build_model_options_payload, load_picker_context
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _patch_opencode_pool(monkeypatch, available=True)
+
+    ctx = load_picker_context()
+    row = next((p for p in build_model_options_payload(ctx)["providers"]
+                if p["slug"] == "opencode-go"), None)
+    assert row is not None
+    assert row["authenticated"] is True
+
