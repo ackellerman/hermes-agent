@@ -289,4 +289,3 @@ def test_show_model_picker_shows_exhausted_pool_provider(monkeypatch, tmp_path):
     assert called, "CLI picker never opened"
     assert any(r["slug"] == "opencode-go" for r in called[0]), \
         "cooldown provider missing from the CLI picker's provider list"
-
