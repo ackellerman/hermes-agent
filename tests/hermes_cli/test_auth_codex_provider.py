@@ -1,6 +1,8 @@
 """Tests for Codex auth — tokens stored in Hermes auth store (~/.hermes/auth.json)."""
 
+import base64
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +16,18 @@ from hermes_cli.auth import (
     refresh_codex_oauth_pure,
     resolve_codex_runtime_credentials,
 )
+
+
+def _jwt(claims: dict) -> str:
+    """Minimal three-part token; ``_decode_jwt_claims`` only needs the middle segment.
+
+    Local rather than imported: this repo's test modules define their own (see
+    ``test_auth_codex_quota_probe.py``, ``test_anon_surfaces.py``, …)."""
+    def _part(payload: dict) -> str:
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    return f"{_part({'alg': 'none'})}.{_part(claims)}.sig"
 
 
 def _setup_hermes_auth(hermes_home: Path, *, access_token: str = "access", refresh_token: str = "refresh"):
@@ -464,3 +478,141 @@ def test_pool_only_force_refresh_rotates_the_pool_entry(tmp_path, monkeypatch):
     assert resolved["api_key"] == "pool-fresh"
     assert resolved["source"] == "credential_pool"
     assert hints == ["pool-revoked"]
+
+
+def test_pool_skips_expired_entry_in_favour_of_live_one(tmp_path, monkeypatch):
+    """A dead higher-priority pool row must not shadow a live one.
+
+    ``_pool_codex_credential`` was expiry-blind, so the priority-0 row's expired JWT won
+    selection; ``_codex_catalog`` then dropped that token and the picker silently served the
+    static fallback (which deliberately omits the account-gated gpt-6-astra)."""
+    now = time.time()
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    dead = _jwt({"exp": int(now) - 86400})       # expired yesterday
+    live = _jwt({"exp": int(now) + 7 * 86400})   # valid for a week
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1, "providers": {},
+        "credential_pool": {"openai-codex": [
+            {"id": "dead", "label": "dead", "source": "manual:device_code",
+             "access_token": dead, "refresh_token": "rf-dead", "auth_type": "oauth",
+             "last_status": "exhausted", "priority": 0},
+            {"id": "live", "label": "live", "source": "manual:device_code",
+             "access_token": live, "refresh_token": "rf-live", "auth_type": "oauth",
+             "last_status": "ok", "priority": 1},
+        ]},
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    resolved = resolve_codex_runtime_credentials(read_only=True)
+    assert resolved["api_key"] == live
+    assert resolved["source"] == "credential_pool"
+
+
+def test_pool_all_expired_still_returns_a_refreshable_entry(tmp_path, monkeypatch):
+    """With every row expired, selection must still hand back a row so the refresh chain
+    (force_refresh rotation, _refresh_pending_entries) can rotate it — never ("", "").
+
+    Regression guard, not a RED test: this passes before and after the fix, and exists so a
+    later refactor cannot silently start returning ("", "") and break force_refresh rotation."""
+    now = time.time()
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    dead = _jwt({"exp": int(now) - 86400})
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1, "providers": {},
+        "credential_pool": {"openai-codex": [
+            {"id": "dead", "label": "dead", "source": "manual:device_code",
+             "access_token": dead, "refresh_token": "rf-dead", "auth_type": "oauth",
+             "last_status": "exhausted", "priority": 0},
+        ]},
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    resolved = resolve_codex_runtime_credentials(read_only=True)
+    assert resolved["api_key"] == dead          # unchanged from today
+    assert resolved["source"] == "credential_pool"
+
+
+def test_read_only_resolve_does_not_mutate_the_auth_store(tmp_path, monkeypatch):
+    """``resolve_codex_runtime_credentials(read_only=True)`` is the picker's path (#68004):
+    it must never write. Guards against re-introducing a write-capable pool load here.
+
+    ``load_pool`` is write-capable for single-use-token providers (openai-codex is in
+    SINGLE_USE_REFRESH_POOL_PROVIDERS: it runs heal_forked_single_use_oauth_grants and can
+    persist), so routing this read path through it would silently rewrite the auth store."""
+    import hashlib
+    now = time.time()
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    store = {"version": 1, "providers": {}, "credential_pool": {"openai-codex": [
+        {"id": "dead", "label": "dead", "source": "manual:device_code",
+         "access_token": _jwt({"exp": int(now) - 86400}), "refresh_token": "rf-dead",
+         "auth_type": "oauth", "last_status": "exhausted", "priority": 0},
+        {"id": "live", "label": "live", "source": "manual:device_code",
+         "access_token": _jwt({"exp": int(now) + 7 * 86400}), "refresh_token": "rf-live",
+         "auth_type": "oauth", "last_status": "ok", "priority": 1},
+    ]}}
+    path = hermes_home / "auth.json"
+    path.write_text(json.dumps(store))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    resolve_codex_runtime_credentials(read_only=True)
+
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+
+
+def test_pool_skips_non_string_token_like_the_original(tmp_path, monkeypatch):
+    """A non-string ``access_token`` cell stays skipped.
+
+    The original ``_nonempty_str(token)`` required a ``str``, so a corrupt/hand-edited cell
+    (e.g. an int) was skipped and a later row won. A ``str(...)`` coercion would instead hand
+    the caller a bogus token — this pins the original semantics."""
+    now = time.time()
+    live = _jwt({"exp": int(now) + 7 * 86400})
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1, "providers": {},
+        "credential_pool": {"openai-codex": [
+            {"id": "corrupt", "label": "corrupt", "source": "manual:device_code",
+             "access_token": 123, "refresh_token": "rf-bad", "auth_type": "api_key",
+             "last_status": "ok", "priority": 0},
+            {"id": "live", "label": "live", "source": "manual:device_code",
+             "access_token": live, "refresh_token": "rf-live", "auth_type": "oauth",
+             "last_status": "ok", "priority": 1},
+        ]},
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    resolved = resolve_codex_runtime_credentials(read_only=True)
+    assert resolved["api_key"] == live      # the corrupt cell is skipped, not coerced
+
+
+def test_pool_does_not_skip_a_token_the_caller_would_accept(tmp_path, monkeypatch):
+    """A JWT with <120s of life must still be selected when it is the first usable row.
+
+    ``_codex_catalog`` drops a token only at ``_codex_access_token_is_expiring(token, 0)``, so a
+    pool-side skew wider than the caller's would skip a token the caller would happily use and
+    could hand back a later opaque row of unknown validity — the very shadowing this fix removes."""
+    now = time.time()
+    soon = _jwt({"exp": int(now) + 60})     # 60s left: caller-acceptable (skew 0)
+    opaque = "opaque-gateway-key"           # non-JWT: validity unknowable
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1, "providers": {},
+        "credential_pool": {"openai-codex": [
+            {"id": "soon", "label": "soon", "source": "manual:device_code",
+             "access_token": soon, "refresh_token": "rf-soon", "auth_type": "oauth",
+             "last_status": "ok", "priority": 0},
+            {"id": "opaque", "label": "opaque", "source": "manual:device_code",
+             "access_token": opaque, "refresh_token": "rf-opq", "auth_type": "api_key",
+             "last_status": "ok", "priority": 1},
+        ]},
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    resolved = resolve_codex_runtime_credentials(read_only=True)
+    assert resolved["api_key"] == soon      # not displaced by the opaque row
