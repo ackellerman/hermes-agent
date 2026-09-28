@@ -946,11 +946,13 @@ def _pool_codex_credential() -> Tuple[str, str]:
     expired_fallback: Optional[Tuple[str, str]] = None
     try:
         for entry in _codex_pool_dicts(read_credential_pool("openai-codex")):
-            # ``_nonempty_str`` is a predicate, not a narrowing cast: bind the stripped token
-            # explicitly so the type checker follows it too.
-            token = str(entry.get("access_token") or "").strip()
-            if not _nonempty_str(token):
+            # Type-gate BEFORE stripping. The previous ``_nonempty_str(token)`` required a str, so a
+            # non-string cell (corrupt, or hand-edited) must stay skipped rather than be coerced
+            # into a token by ``str()``.
+            raw_token = entry.get("access_token")
+            if not isinstance(raw_token, str) or not _nonempty_str(raw_token):
                 continue
+            token = raw_token.strip()
             # Same normaliser as ``_codex_pool_rate_limit_status``: a millisecond epoch compared
             # raw reads as far-future here and as elapsed there, hiding a usable entry (#103349).
             reset_at = _parse_absolute_timestamp(entry.get("last_error_reset_at"))
@@ -958,7 +960,11 @@ def _pool_codex_credential() -> Tuple[str, str]:
             if in_cooldown:
                 continue
             row = (token, _stripped(entry.get("base_url")))
-            if _codex_access_token_is_expiring(token, CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS):
+            # Skew 0 — deliberately the CALLER's own threshold: ``_codex_catalog`` discards the
+            # token with ``_codex_access_token_is_expiring(token, 0)``. A wider skew here would skip
+            # a token the caller would still accept and could hand back a later opaque row of
+            # unknown validity, re-creating this very shadowing inside a narrow 0..skew window.
+            if _codex_access_token_is_expiring(token, 0):
                 # Remember the first expired-but-usable row: it is still the right answer when
                 # nothing live exists, because the refresh chain can rotate it.
                 if expired_fallback is None:
