@@ -88,6 +88,15 @@ def _verdict(records, name):
     return match[0]
 
 
+def _local_branch_name(repo_path):
+    """Local branch name of the remote's default branch (``origin/HEAD`` → ``main``).
+
+    ``origin/HEAD`` is a remote-tracking ref, so ``--abbrev-ref`` yields ``origin/main``; the
+    local name is what a worktree can be checked out on."""
+    ref = _git(["rev-parse", "--abbrev-ref", "origin/HEAD"], repo_path)
+    return ref.split("/", 1)[1] if "/" in ref else ref
+
+
 class TestAuditVerdicts:
     def test_clean_merged_tree_reaps(self, repo):
         _add_worktree(repo, "hermes-clean")
@@ -306,6 +315,73 @@ class TestBranchGC:
         by_name = {record.name: record for record in records}
         assert by_name["main"].verdict == "keep"
         assert by_name[branch].verdict == "keep"
+
+    def test_trunk_branch_kept_whatever_it_is_named(self, repo):
+        """The branch merged work is judged against must never be deleted, by any name.
+
+        ``audit_branches`` compares against ``_worktree_merge_base_ref`` (``origin/HEAD``) and
+        already refuses to delete a CHECKED-OUT branch — but reclaiming the tree that holds it
+        un-checks it out, and a project whose trunk is not literally ``main`` then loses it."""
+        trunk = _local_branch_name(repo)
+        assert worktree_gc._is_protected_branch(str(repo), trunk) is True
+
+    def test_trunk_protected_by_resolution_not_name_alone(self, tmp_path, monkeypatch):
+        """A trunk whose NAME is in no conventional list is still protected.
+
+        This is the half a name list cannot cover, and the reason the check resolves the ref
+        instead of comparing ``origin/HEAD`` (a REF) against a branch NAME."""
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        origin = tmp_path / "origin.git"
+        repo = tmp_path / "work"
+        _git(["init", "-q", "--bare", str(origin)], tmp_path)
+        _git(["init", "-q", str(repo)], tmp_path)
+        _git(["config", "user.name", "t"], repo)
+        _git(["config", "user.email", "t@t"], repo)
+        (repo / "a.txt").write_text("a")
+        _git(["add", "."], repo)
+        _git(["commit", "-qm", "init"], repo)
+        _git(["branch", "-m", "integration"], repo)          # trunk name in NO list
+        _git(["remote", "add", "origin", str(origin)], repo)
+        _git(["push", "-q", "-u", "origin", "integration"], repo)
+        _git(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/integration"], repo)
+        assert "integration" not in worktree_gc._PROTECTED_BRANCHES
+        assert worktree_gc._is_protected_branch(str(repo), "integration") is True
+        assert worktree_gc._is_protected_branch(str(repo), "some/topic") is False
+
+    def test_development_is_a_protected_name(self, repo):
+        """``development`` is the longest-standing convention for an integration branch and was
+        missing from the list while ``develop``/``dev`` were present."""
+        assert worktree_gc._is_protected_branch(str(repo), "development") is True
+        for name in ("main", "master", "develop", "dev", "trunk"):
+            assert worktree_gc._is_protected_branch(str(repo), name) is True
+
+    def test_ordinary_topic_branch_is_not_protected(self, repo):
+        assert worktree_gc._is_protected_branch(str(repo), "hb/some-topic") is False
+        assert worktree_gc._is_protected_branch(str(repo), "") is False
+
+    def test_reap_keeps_a_protected_name_branch_of_the_tree_it_removes(self, repo):
+        """End-to-end reproduction of the reported incident.
+
+        A fork whose integration branch is ``development`` (while ``origin/HEAD`` is ``main``) has
+        that branch checked out in a worktree, clean and fully merged, so the tree is reapable.
+        Reaping it must NOT delete ``development``. ``--trees-only`` does not help: the flag gates
+        the separate ``reclaim_branches`` pass, not ``reclaim_worktrees``' own per-tree
+        ``git branch -D``."""
+        _git(["branch", "development", _local_branch_name(repo)], repo)
+        _git(["push", "-q", "-u", "origin", "development"], repo)
+        tree = Path(repo) / ".worktrees" / "hermes-ondev"
+        _git(["worktree", "add", "-q", str(tree), "development"], repo)
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        record = _verdict(records, "hermes-ondev")
+        assert record.branch == "development"
+        assert record.verdict in worktree_gc._REAP_VERDICTS
+        worktree_gc.reclaim_worktrees(str(repo), records=records)
+        listing = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", "refs/heads/development"],
+            capture_output=True, text=True, cwd=str(repo),
+        )
+        assert listing.returncode == 0, "branch development was deleted by worktree reclaim"
+        assert listing.stdout.strip()
 
 
 class TestOlderThanGate:
