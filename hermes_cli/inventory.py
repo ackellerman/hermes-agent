@@ -77,7 +77,8 @@ def build_models_payload(
     pricing_cache_only: bool = False,
     capabilities: bool = False, featured: bool = False, force_fresh_nous_tier: bool = False,
     refresh: bool = False, probe_custom_providers: bool = True, probe_current_custom_provider: bool = False,
-    for_picker: bool = False, max_models: int | None = None, non_blocking_catalogs: bool = False,
+    for_picker: bool = False, fast_custom_probe: bool | None = None,
+    max_models: int | None = None, non_blocking_catalogs: bool = False,
 ) -> dict:
     """Build the ``{providers, model, provider}`` shape every consumer needs. ``explicit_only`` keeps
     only providers the user explicitly configured — hides ambient/auto-seeded credentials from
@@ -93,6 +94,7 @@ def build_models_payload(
         custom_providers=ctx.custom_providers, force_fresh_nous_tier=force_fresh_nous_tier,
         max_models=max_models, refresh=refresh, probe_custom_providers=probe_custom_providers,
         probe_current_custom_provider=probe_current_custom_provider, for_picker=for_picker,
+        fast_custom_probe=fast_custom_probe,
         excluded_providers=ctx.excluded_providers or [],
         non_blocking_catalogs=non_blocking_catalogs,
     )
@@ -240,7 +242,7 @@ def build_model_options_payload(
         # on ``for_picker`` because that is the existing seam ``_overlay_has_creds`` tests and the
         # one ``list_picker_providers`` already sets; without it the row is dropped (or degrades to
         # an empty canonical skeleton) and the picker shows an authenticated provider as unconfigured.
-        for_picker=True,
+        for_picker=True, fast_custom_probe=False,
         refresh=refresh, probe_custom_providers=refresh, probe_current_custom_provider=not refresh,
         non_blocking_catalogs=not refresh,
     )

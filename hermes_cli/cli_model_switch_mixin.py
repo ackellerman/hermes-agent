@@ -278,6 +278,7 @@ def _show_model_picker(cli, ctx, force_refresh: bool) -> None:
             # pool provider (credentials present, none selectable this moment) was dropped here
             # while the RPC/dashboard pickers kept it — same contract, different surface.
             for_picker=True,
+            fast_custom_probe=False,  # retain this surface's original 5s custom-endpoint budget
         )["providers"]
     except Exception:
         providers = []
