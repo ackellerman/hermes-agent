@@ -21,7 +21,33 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 # Branches never considered for deletion, in any mode.
-_PROTECTED_BRANCHES = {"main", "master", "develop", "dev", "trunk"}
+_PROTECTED_BRANCHES = {"main", "master", "develop", "development", "dev", "trunk"}
+
+
+def _is_protected_branch(repo_root: str, branch: str) -> bool:
+    """Whether *branch* is never eligible for deletion.
+
+    Two independent reasons, so a project is covered however it names its trunk:
+
+    * the conventional integration-branch names (``main``/``master``/``develop``/…), and
+    * the branch merged work is judged against — ``_worktree_merge_base_ref`` (``origin/HEAD``,
+      falling back to the local trunk). ``audit_branches`` already refuses to delete a CHECKED-OUT
+      branch, but reclaiming the tree that holds it un-checks it out, so a trunk that is not
+      literally ``main`` would become deletable in that window.
+
+    Deliberately conservative: a name list can never be complete, so anything that resolves
+    ambiguously (no repo, git failure) protects rather than deletes.
+    """
+    if not branch:
+        return False
+    if branch in _PROTECTED_BRANCHES:
+        return True
+    try:
+        from hermes_cli import worktree_ops as _ops
+        trunk = _ops._worktree_merge_base_ref(repo_root)
+    except Exception:
+        return True  # cannot tell what the trunk is — never delete on a guess
+    return bool(trunk) and branch == trunk
 
 # Trees owned by another lifecycle (kanban dispatcher gc) — never touched.
 _KANBAN_RE = re.compile(r"^t_[0-9a-f]+$")
@@ -307,7 +333,7 @@ def reclaim_worktrees(
             if record.verdict == "reap-keep-branch":
                 actions.append(f"removed {record.name} (branch {record.branch} kept — pushed open-PR lane)")
                 continue
-            if record.branch and record.branch not in _PROTECTED_BRANCHES:
+            if record.branch and not _is_protected_branch(repo_root, record.branch):
                 _git(["branch", "-D", record.branch], cwd=repo_root, timeout=10)
             actions.append(f"removed {record.name}")
         except Exception as exc:
@@ -349,7 +375,7 @@ def audit_branches(repo_root: str) -> List[BranchRecord]:
     merged = set(_lines(_git(["branch", "--merged", upstream, "--format=%(refname:short)"], cwd=repo_root, timeout=15)))
 
     def _classify_branch(branch: str) -> BranchRecord:
-        if branch in _PROTECTED_BRANCHES or branch in active:
+        if _is_protected_branch(repo_root, branch) or branch in active:
             return BranchRecord(branch, "keep", "protected or checked out")
         if branch in merged:
             return BranchRecord(branch, "delete", "fully merged into " + upstream)
