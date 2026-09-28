@@ -916,26 +916,58 @@ def _pool_entries(auth_store: Dict[str, Any], provider_id: str) -> Optional[List
 
 
 def _pool_codex_credential() -> Tuple[str, str]:
-    """``(access_token, row base_url)`` of the first pool entry with a non-empty access_token that is
-    not in an exhaustion cooldown window, so the caller routes the token to the host that row belongs
-    to; ``("", "")`` when none is usable.
+    """``(access_token, row base_url)`` of the first usable pool entry — not in an exhaustion
+    cooldown AND not an expired access token — so the caller routes the token to the host that row
+    belongs to; ``("", "")`` when none is usable.
 
-    Fallback for ``resolve_codex_runtime_credentials`` when the singleton has no creds; reads
-    through ``read_credential_pool`` so a profile inherits the global-root pool (#34143)."""
+    Expiry matters here because the CALLER (``hermes_cli.models._codex_catalog``) discards an
+    expiring token and silently falls back to the curated static catalog, which deliberately omits
+    account-gated slugs (gpt-6-astra). An expiry-blind pick therefore let a stale high-priority row
+    shadow a live one and the user saw a quieter model list with no error.
+
+    Fallback: when EVERY row is expired we still return the first non-cooldown row rather than
+    ``("", "")`` — the ``force_refresh`` rotation in ``resolve_codex_runtime_credentials`` needs a
+    token to hand ``try_refresh_matching`` as its hint, and an expired-but-refreshable credential is
+    exactly the case that path exists for.
+
+    Stays on ``read_credential_pool`` (pure read) on purpose: this runs on the picker's read-only
+    path (#68004), and ``load_pool`` is write-capable for single-use-token providers — openai-codex
+    is in ``SINGLE_USE_REFRESH_POOL_PROVIDERS``, so it would run
+    ``heal_forked_single_use_oauth_grants`` and can persist.
+
+    Reads through ``read_credential_pool`` so a profile inherits the global-root pool (#34143).
+
+    Scope: the expiring check needs a decodable JWT ``exp``; an opaque gateway key reports
+    not-expiring and is selected as before (never a new shadowing regression, but not covered).
+    """
     from agent.credential_pool import _parse_absolute_timestamp
     from hermes_cli.auth import _nonempty_str, read_credential_pool
+
+    expired_fallback: Optional[Tuple[str, str]] = None
     try:
         for entry in _codex_pool_dicts(read_credential_pool("openai-codex")):
-            token = entry.get("access_token")
+            # ``_nonempty_str`` is a predicate, not a narrowing cast: bind the stripped token
+            # explicitly so the type checker follows it too.
+            token = str(entry.get("access_token") or "").strip()
+            if not _nonempty_str(token):
+                continue
             # Same normaliser as ``_codex_pool_rate_limit_status``: a millisecond epoch compared
             # raw reads as far-future here and as elapsed there, hiding a usable entry (#103349).
             reset_at = _parse_absolute_timestamp(entry.get("last_error_reset_at"))
             in_cooldown = reset_at is not None and reset_at > time.time()
-            if _nonempty_str(token) and not in_cooldown:
-                return token.strip(), _stripped(entry.get("base_url"))
+            if in_cooldown:
+                continue
+            row = (token, _stripped(entry.get("base_url")))
+            if _codex_access_token_is_expiring(token, CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS):
+                # Remember the first expired-but-usable row: it is still the right answer when
+                # nothing live exists, because the refresh chain can rotate it.
+                if expired_fallback is None:
+                    expired_fallback = row
+                continue
+            return row
     except Exception:
         logger.debug("Codex pool fallback lookup failed", exc_info=True)
-    return "", ""
+    return expired_fallback or ("", "")
 
 
 def _login_openai_codex(args, pconfig: ProviderConfig, *, force_new_login: bool = False) -> None:
