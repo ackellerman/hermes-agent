@@ -561,3 +561,58 @@ def test_read_only_resolve_does_not_mutate_the_auth_store(tmp_path, monkeypatch)
     resolve_codex_runtime_credentials(read_only=True)
 
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+
+
+def test_pool_skips_non_string_token_like_the_original(tmp_path, monkeypatch):
+    """A non-string ``access_token`` cell stays skipped.
+
+    The original ``_nonempty_str(token)`` required a ``str``, so a corrupt/hand-edited cell
+    (e.g. an int) was skipped and a later row won. A ``str(...)`` coercion would instead hand
+    the caller a bogus token — this pins the original semantics."""
+    now = time.time()
+    live = _jwt({"exp": int(now) + 7 * 86400})
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1, "providers": {},
+        "credential_pool": {"openai-codex": [
+            {"id": "corrupt", "label": "corrupt", "source": "manual:device_code",
+             "access_token": 123, "refresh_token": "rf-bad", "auth_type": "api_key",
+             "last_status": "ok", "priority": 0},
+            {"id": "live", "label": "live", "source": "manual:device_code",
+             "access_token": live, "refresh_token": "rf-live", "auth_type": "oauth",
+             "last_status": "ok", "priority": 1},
+        ]},
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    resolved = resolve_codex_runtime_credentials(read_only=True)
+    assert resolved["api_key"] == live      # the corrupt cell is skipped, not coerced
+
+
+def test_pool_does_not_skip_a_token_the_caller_would_accept(tmp_path, monkeypatch):
+    """A JWT with <120s of life must still be selected when it is the first usable row.
+
+    ``_codex_catalog`` drops a token only at ``_codex_access_token_is_expiring(token, 0)``, so a
+    pool-side skew wider than the caller's would skip a token the caller would happily use and
+    could hand back a later opaque row of unknown validity — the very shadowing this fix removes."""
+    now = time.time()
+    soon = _jwt({"exp": int(now) + 60})     # 60s left: caller-acceptable (skew 0)
+    opaque = "opaque-gateway-key"           # non-JWT: validity unknowable
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1, "providers": {},
+        "credential_pool": {"openai-codex": [
+            {"id": "soon", "label": "soon", "source": "manual:device_code",
+             "access_token": soon, "refresh_token": "rf-soon", "auth_type": "oauth",
+             "last_status": "ok", "priority": 0},
+            {"id": "opaque", "label": "opaque", "source": "manual:device_code",
+             "access_token": opaque, "refresh_token": "rf-opq", "auth_type": "api_key",
+             "last_status": "ok", "priority": 1},
+        ]},
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    resolved = resolve_codex_runtime_credentials(read_only=True)
+    assert resolved["api_key"] == soon      # not displaced by the opaque row
