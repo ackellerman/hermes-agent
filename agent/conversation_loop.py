@@ -1702,7 +1702,12 @@ def run_conversation(
 
 
 def _context_usage_snapshot(agent) -> Optional[Dict[str, Any]]:
-    """The TUI gauge's end-of-turn reading for out-of-process callers; None when unknown."""
+    """The TUI gauge's end-of-turn reading for out-of-process callers; None when unknown.
+
+    Results that never ran a turn (turn-lease refusal, Ctrl-C before the loop, ``-z`` setup
+    failure) bypass ``run_conversation``; their machine outputs carry ``context: null``, which is
+    also what the gauge shows for a process that has no reading.
+    """
     comp = getattr(agent, "context_compressor", None)
     if comp is None:
         return None
