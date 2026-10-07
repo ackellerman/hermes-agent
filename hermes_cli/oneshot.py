@@ -20,6 +20,7 @@ from typing import Optional
 
 from gateway.session_context import declare_stateless_channel
 from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.stream_json import result_context
 
 _ALL_TOOLSETS = {"all", "*"}
 
@@ -226,6 +227,7 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         report = {key: result.get(key) for key in _USAGE_KEYS}
         report["failed"] = bool(result.get("failed")) or failure is not None
         report["service_tier"] = result.get("service_tier")
+        report["context"] = result_context(result)
         if isinstance(result.get("auxiliary_usage"), dict):
             _auxiliary_report(report, result["auxiliary_usage"])
         if failure is not None:
