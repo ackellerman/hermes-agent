@@ -34,6 +34,19 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+_CONTEXT_KEYS = (("used", "context_used"), ("max", "context_max"), ("percent", "context_percent"),
+                 ("source", "context_source"), ("estimated", "context_estimated"))
+
+
+def result_context(data: Any) -> dict | None:
+    """The run result's ``context_usage`` as the public ``context`` object
+    (``used``/``max``/``percent``/``source``/``estimated``); None when the turn has no reading."""
+    usage = data.get("context_usage") if isinstance(data, dict) else None
+    if not isinstance(usage, dict) or not usage:
+        return None
+    return {key: usage.get(field) for key, field in _CONTEXT_KEYS}
+
+
 class StreamJsonEmitter:
     """Agent-callback sink that writes JSONL events to stdout and flushes each line."""
 
@@ -88,7 +101,7 @@ class StreamJsonEmitter:
                    "tokens": {"input": data.get("input_tokens") or 0, "output": data.get("output_tokens") or 0,
                               "total": data.get("total_tokens") or 0, "cache_read": data.get("cache_read_tokens") or 0,
                               "cache_write": data.get("cache_write_tokens") or 0},
-                   "duration_ms": int((time.time() - self._start) * 1000)}
+                   "duration_ms": int((time.time() - self._start) * 1000), "context": result_context(data)}
         if data.get("error"):
             payload["error"] = str(data["error"])
         self._emit(payload)
