@@ -114,3 +114,23 @@ class TestAuxiliaryLedger:
         finally:
             db.close()
         assert result["auxiliary_usage"]["title_generation"]["api_calls"] == 1
+
+
+def test_usage_report_adds_the_stream_json_context_block_and_keeps_existing_keys(tmp_path):
+    """The usage report is a superset of the pre-change report; ``context`` is the same object the
+    stream-json ``result`` record carries, ``null`` when the run has no reading (failure path)."""
+    from hermes_cli.oneshot import _USAGE_KEYS
+    from hermes_cli.stream_json import result_context
+
+    fields = {"context_used": 12_345, "context_max": 200_000, "context_percent": 6,
+              "context_source": "provider_usage", "context_estimated": False}
+    path = tmp_path / "usage.json"
+    _write_usage_file(str(path), _result())
+    before = json.loads(path.read_text())
+    _write_usage_file(str(path), _result(context_usage=fields))
+    report = json.loads(path.read_text())
+    assert {k: report[k] for k in before if k != "context"} == {k: v for k, v in before.items() if k != "context"}
+    assert set(_USAGE_KEYS) | {"failed", "service_tier"} <= set(report)
+    assert report["context"] == result_context({"context_usage": fields}) is not None
+    _write_usage_file(str(path), {}, failure="boom")
+    assert json.loads(path.read_text())["context"] is None

@@ -142,3 +142,23 @@ def test_chat_stream_json_rejects_interactive_combinations(monkeypatch, capsys, 
         cli_entry.cmd_chat(parser.parse_args(argv))
     assert exc_info.value.code == 2
     assert message in capsys.readouterr().err
+
+
+_FIELDS = {"context_used": 12_345, "context_max": 200_000, "context_percent": 6, "context_source": "provider_usage",
+           "context_estimated": False}
+
+
+@pytest.mark.parametrize("usage", [_FIELDS, None, "absent"])
+def test_result_record_carries_the_context_reading_or_null(capsys, usage):
+    """``context`` is always on the ``result`` record: the run result's reading, ``null`` when it has none;
+    the ``tokens`` block is unaffected."""
+    from hermes_cli.stream_json import result_context
+
+    data = {"final_response": "ok", "input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+    if usage != "absent":
+        data["context_usage"] = usage
+    StreamJsonEmitter(session_id="s-1").emit_result(data)
+    record = _events(capsys)[-1]
+    assert record["context"] == result_context(data)
+    assert (record["context"] is None) is (usage != _FIELDS)
+    assert record["tokens"] == {"input": 3, "output": 2, "total": 5, "cache_read": 0, "cache_write": 0}
