@@ -182,6 +182,9 @@ Every event carries `timestamp` (Unix epoch milliseconds).
 
 `context` is the session's context-window occupancy at end of turn: `used`/`max`/`percent`/`estimated` are the
 TUI/desktop context gauge's reading (`~` ⇔ `estimated`); the classic CLI status bar may differ by display anchoring.
+`context` is `null` when this process has no reading: no API response reported usage yet (e.g. a resumed
+session whose first request failed), the context window is unknown, or no turn ran. It is not persisted across
+processes, so a caller showing a meter should keep its last non-null value.
 
 Once a conversation starts, its terminal record is always `result` — including
 `exit_code: 130` when it is interrupted with Ctrl-C. Treat that record as the

@@ -63,3 +63,17 @@ def test_every_run_result_carries_the_gauge_reading(monkeypatch, envelope):
     result = conversation_loop.run_conversation(agent, "say ok")
     gauge = _get_usage(agent)
     assert result_context(result) == {key: gauge[gauge_key] for key, gauge_key in _GAUGE_KEYS.items()}
+
+
+def test_a_failing_context_engine_never_fails_the_turn(monkeypatch):
+    """Third-party context engines own their occupancy figure; one that raises yields no reading, not a crash."""
+    class _Raising:
+        @property
+        def last_prompt_tokens(self):
+            raise RuntimeError("engine bug")
+
+    agent = _agent(_Raising())
+    monkeypatch.setattr(conversation_loop, "_run_conversation_turn", lambda *_a, **_k: {"final_response": "ok", "messages": []})
+    result = conversation_loop.run_conversation(agent, "say ok")
+    assert result["final_response"] == "ok"
+    assert result["context_usage"] is None
