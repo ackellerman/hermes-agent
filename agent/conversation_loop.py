@@ -1696,7 +1696,22 @@ def run_conversation(
         )
     result = export_current_turn_boundary(agent, result, user_message)
     _close_durable_failed_turn(agent, result)
+    if isinstance(result, dict):
+        result["context_usage"] = _context_usage_snapshot(agent)
     return result
+
+
+def _context_usage_snapshot(agent) -> Optional[Dict[str, Any]]:
+    """The TUI gauge's end-of-turn reading for out-of-process callers; None when unknown."""
+    comp = getattr(agent, "context_compressor", None)
+    if comp is None:
+        return None
+    from agent.context_breakdown import context_usage_fields
+    try:
+        return context_usage_fields(comp) or None
+    except Exception:  # a display gauge must never fail a finished turn
+        logger.debug("context usage snapshot failed", exc_info=True)
+        return None
 
 
 def _close_durable_failed_turn(agent, result: Any) -> None:
