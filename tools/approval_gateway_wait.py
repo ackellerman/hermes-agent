@@ -24,9 +24,11 @@ logger = logging.getLogger("tools.approval")
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("acknowledged", "cancelled", "data", "event", "expired", "observers", "reason", "result", "settle")
+    __slots__ = ("acknowledged", "cancelled", "data", "event", "expired", "observers", "owner", "reason", "result",
+                 "settle")
 
     def __init__(self, data: dict):
+        self.owner = None
         self.event = threading.Event()
         self.data = dict(data)
         self.data.setdefault("request_id", uuid.uuid4().hex)
@@ -163,8 +165,11 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         "pattern_keys": list(approval_data.get("pattern_keys", [primary_key])),
         "session_key": session_key, "surface": surface,
     }
+    from tools.approval_notify_lease import current
+    owner = current(session_key)
     keys = list(approval_data.get("pattern_keys") or [])
     entry = _ApprovalEntry(approval_data)
+    entry.owner = owner
     # Captured before the entry is published: a coalesced follower can find it while the pre-request
     # hooks still run, and must wait this same timeout rather than re-read a since-edited config.
     timeout_s = entry.data["timeout_s"] = _ctx._get_approval_timeout()
@@ -182,7 +187,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             leader = None
             if not preparing_terminal_approval():
                 leader = next((e for e in _approval._gateway_queues.get(session_key, [])
-                               if e.data.get("command") == approval_data.get("command")
+                               if e.owner is owner and e.data.get("command") == approval_data.get("command")
                                and list(e.data.get("pattern_keys") or []) == keys), None)
             if leader is None:
                 _enqueue()
