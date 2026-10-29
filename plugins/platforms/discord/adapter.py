@@ -4333,7 +4333,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 self._reset_voice_timeout(guild_id)
                 self._bind_voice_text_channel(guild_id, text_channel_id, source)
                 return True
-            await self._end_stale_voice_session_locked(guild_id)
+            if not self._voice_client_reconnecting(existing, channel):
+                await self._end_stale_voice_session_locked(guild_id)
             vc_cls = self._voice_client_class()
             vc = await (channel.connect(cls=vc_cls) if vc_cls else channel.connect())
             self._voice_clients[guild_id] = vc
