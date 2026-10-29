@@ -288,3 +288,34 @@ async def test_two_bots_in_one_guild_keep_separate_sessions():
     finally:
         await fx.stop_voice_tasks(one)
         await fx.stop_voice_tasks(two)
+
+
+@pytest.mark.asyncio
+async def test_a_concurrent_leave_waits_for_the_final_flush_to_be_recorded(adapter):
+    """The inactivity timer firing while ``/voice leave`` transcribes the final flush must not end the
+    session before that utterance is recorded: the second leave waits on the guild's voice lock."""
+    rec = _Recorder(adapter)
+    await _join(adapter)
+    fx.FakeReceiver.instances[-1].pending = [(42, b"\x00" * 9600)]
+    in_stt, release = asyncio.Event(), asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    async def runner_input(*, guild_id, user_id, transcript):
+        adapter.note_voice_session_speech(guild_id, str(user_id), "agent:main:discord:group:700:42")
+
+    def transcribe(_path):
+        loop.call_soon_threadsafe(in_stt.set)
+        asyncio.run_coroutine_threadsafe(release.wait(), loop).result(10)
+        return {"success": True, "transcript": "the last sentence"}
+
+    adapter._voice_input_callback = runner_input
+    with patch("tools.transcription_tools.transcribe_audio", side_effect=transcribe):
+        first = asyncio.ensure_future(adapter.leave_voice_channel(fx.GUILD))
+        await in_stt.wait()
+        second = asyncio.ensure_future(
+            adapter.leave_voice_channel(fx.GUILD, reason="auto_leave", trigger="inactivity"))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+
+    assert [(e.reason, e.participants) for e in rec.ends] == [("command", ("42",))]
