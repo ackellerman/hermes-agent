@@ -169,10 +169,23 @@ class GatewayVoiceMixin:
         try:
             success = await adapter.join_voice_channel(voice_channel)
         except Exception as e:
-            logger.warning("Failed to join voice channel: %s", e)
+            # ``asyncio.TimeoutError`` stringifies to '' — the join then reports
+            # "Failed to join voice channel:" with no reason at all, which is indistinguishable
+            # from a permission refusal and sends the reader hunting in the wrong layer. Name the
+            # type, and on a timeout say which two network paths the handshake needs.
+            reason = str(e).strip()
+            if not reason:
+                reason = f"{type(e).__name__}: no detail"
+                if isinstance(e, asyncio.TimeoutError):
+                    reason += (
+                        " — the voice websocket/UDP handshake did not complete within the connect"
+                        " timeout; check outbound TCP 2087 and UDP 50000-65535 to the voice"
+                        " endpoint reported in the log above"
+                    )
+            logger.warning("Failed to join voice channel: %s", reason)
             adapter._voice_input_callback = None
-            if not any(tok in str(e).lower() for tok in ("pynacl", "nacl", "davey")):
-                return t("gateway.voice.channel_join_failed", error=e)
+            if not any(tok in reason.lower() for tok in ("pynacl", "nacl", "davey")):
+                return t("gateway.voice.channel_join_failed", error=reason)
             return t("gateway.voice.channel_deps_missing", hint=install_hint("discord"))
         if not success:
             adapter._voice_input_callback = None

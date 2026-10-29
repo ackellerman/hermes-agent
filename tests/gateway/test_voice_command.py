@@ -1,5 +1,6 @@
 """Tests for the /voice command and auto voice reply in the gateway."""
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -513,6 +514,42 @@ class TestVoiceChannelCommands:
         result = await runner._handle_voice_channel_join(event)
 
         assert "PyNaCl" in result
+
+    @pytest.mark.asyncio
+    async def test_join_timeout_says_so_instead_of_an_empty_reason(self, runner):
+        """An ``asyncio.TimeoutError`` stringifies to '' — the join must still name the cause.
+
+        A bare "Failed to join voice channel:" is indistinguishable from a permission refusal and
+        sends the reader hunting in the wrong layer (it cost a firewall hunt once).
+        """
+        mock_channel = MagicMock()
+        mock_channel.name = "General"
+        mock_adapter = AsyncMock()
+        mock_adapter.join_voice_channel = AsyncMock(side_effect=asyncio.TimeoutError())
+        mock_adapter.get_user_voice_channel = AsyncMock(return_value=mock_channel)
+        event = self._make_discord_event()
+        runner.adapters[event.source.platform] = mock_adapter
+
+        result = await runner._handle_voice_channel_join(event)
+
+        assert "TimeoutError" in result, result
+        assert "2087" in result, "the timeout message should name the voice websocket port"
+        assert result.strip() != "Failed to join voice channel:", "the reason must never be empty"
+
+    @pytest.mark.asyncio
+    async def test_join_error_with_no_message_still_names_the_type(self, runner):
+        """Any empty-string exception must report its type, not a dangling colon."""
+        mock_channel = MagicMock()
+        mock_channel.name = "General"
+        mock_adapter = AsyncMock()
+        mock_adapter.join_voice_channel = AsyncMock(side_effect=RuntimeError())
+        mock_adapter.get_user_voice_channel = AsyncMock(return_value=mock_channel)
+        event = self._make_discord_event()
+        runner.adapters[event.source.platform] = mock_adapter
+
+        result = await runner._handle_voice_channel_join(event)
+
+        assert "RuntimeError" in result, result
 
     # -- _handle_voice_channel_leave --
 
