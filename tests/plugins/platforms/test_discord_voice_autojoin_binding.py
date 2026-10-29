@@ -60,6 +60,9 @@ class _Stub:
     _select_auto_join_text_channel = DiscordAdapter._select_auto_join_text_channel
     _do_auto_join = DiscordAdapter._do_auto_join
     leave_voice_channel = DiscordAdapter.leave_voice_channel
+    _leave_voice_locked = DiscordAdapter._leave_voice_locked
+    _take_voice_session = DiscordAdapter._take_voice_session
+    _emit_voice_session_end = DiscordAdapter._emit_voice_session_end
 
     def __init__(self, channels=(), *, env_home=None, config_home=None):
         self._by_id = {ch.id: ch for ch in channels}

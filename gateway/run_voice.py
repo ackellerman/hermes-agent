@@ -215,7 +215,7 @@ class GatewayVoiceMixin:
                 and adapter.is_in_voice_channel(guild_id)):
             return t("gateway.voice.channel_not_joined")
         try:
-            await adapter.leave_voice_channel(guild_id)
+            await adapter.leave_voice_channel(guild_id, reason="command")
         except Exception as e:
             logger.warning("Error leaving voice channel: %s", e)
         # Always clean up state even if leave raised an exception. The input callback stays bound:

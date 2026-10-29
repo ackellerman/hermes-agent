@@ -1261,10 +1261,11 @@ from plugins.platforms.discord.adapter_media import DiscordMediaMixin
 from plugins.platforms.discord.adapter_slash_auth import DiscordSlashAuthMixin
 from plugins.platforms.discord.adapter_thread_titles import DiscordThreadTitlesMixin, SemanticThreadRenames
 from plugins.platforms.discord.adapter_voice_info import DiscordVoiceInfoMixin
+from plugins.platforms.discord.adapter_voice_session import DiscordVoiceSessionMixin
 
 
-class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceInfoMixin, DiscordSlashAuthMixin,
-                     BasePlatformAdapter):
+class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceInfoMixin, DiscordVoiceSessionMixin,
+                     DiscordSlashAuthMixin, BasePlatformAdapter):
     """Discord bot adapter: guild/DM messages, threads, slash commands, button approvals, reactions."""
 
     MAX_MESSAGE_LENGTH = 2000
@@ -1318,6 +1319,10 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         self._voice_listen_tasks: dict[int, asyncio.Task] = {}  # guild_id -> listen loop
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
+        # Voice sessions (adapter_voice_session.py): guild -> record; the end handler set by run.py.
+        self._voice_sessions: dict[int, Any] = {}
+        self._voice_session_end_tasks: set[asyncio.Task] = set()
+        self._voice_session_end_callback: Optional[Callable] = None
         # Voice-reply mode ("off"|"voice_only"|"all") per linked text-channel id (set by run.py) so
         # the inactivity timer keeps the bot in channel for /voice off, unlike /voice leave.
         self._voice_mode_getter: Optional[Callable] = None  # set by run.py
@@ -1791,7 +1796,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                                             "auto-leaving guild %d",
                                             guild_id,
                                         )
-                                        await adapter_self.leave_voice_channel(guild_id)
+                                        await adapter_self.leave_voice_channel(
+                                            guild_id, reason="auto_leave", trigger="no_authorized_users")
                     except Exception:
                         logger.warning(
                             "Auto-leave handler failed", exc_info=True,
@@ -2362,9 +2368,10 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         # gateway WS (run by the bot task) or it blocks until the timeout.
         for guild_id in list(self._voice_clients.keys()):
             try:
-                await self.leave_voice_channel(guild_id)
+                await self.leave_voice_channel(guild_id, reason="shutdown")
             except Exception as e:  # pragma: no cover - defensive logging
                 logger.debug("[%s] Error leaving voice channel %s: %s", self.name, guild_id, e)
+        await self._await_voice_session_end_tasks()
         # Cancel the bot task before closing: after a connect() timeout client.start() may still run
         # and discord.py's reconnect loop can ignore the closed flag mid-handshake.
         await self._cancel_bot_task()
@@ -4326,8 +4333,11 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 self._reset_voice_timeout(guild_id)
                 self._bind_voice_text_channel(guild_id, text_channel_id, source)
                 return True
-            vc = await channel.connect()
+            await self._end_stale_voice_session_locked(guild_id)
+            vc_cls = self._voice_client_class()
+            vc = await (channel.connect(cls=vc_cls) if vc_cls else channel.connect())
             self._voice_clients[guild_id] = vc
+            self._start_voice_session(guild_id, vc)
             self._reset_voice_timeout(guild_id)
             self._bind_voice_text_channel(guild_id, text_channel_id, source)
             try:
@@ -4346,52 +4356,6 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 except Exception as e:
                     logger.warning("Voice mixer failed to start: %s", e)
             return True
-
-    async def leave_voice_channel(self, guild_id: int) -> None:
-        """Disconnect from the voice channel in a guild."""
-        async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
-            receiver = self._voice_receivers.pop(guild_id, None)
-            pending_inputs = []
-            if receiver:
-                pending_inputs = receiver.flush_pending()
-                receiver.stop()
-            listen_task = self._voice_listen_tasks.pop(guild_id, None)
-            if listen_task:
-                listen_task.cancel()
-            guild = self._client.get_guild(guild_id) if self._client is not None else None
-            captured_for = self._voice_text_channels.get(guild_id)
-            for user_id, pcm_data in pending_inputs:
-                if self._is_allowed_user(str(user_id), guild=guild, is_dm=False):
-                    await self._process_voice_input(guild_id, user_id, pcm_data, captured_for)
-            # Tear down the mixer (stops the continuous outgoing stream).
-            if getattr(self, "_voice_mixers", None) is not None:
-                self._voice_mixers.pop(guild_id, None)
-            vc = self._voice_clients.pop(guild_id, None)
-            if vc and vc.is_connected():
-                try:
-                    if vc.is_playing():
-                        vc.stop()
-                except Exception:
-                    pass
-                await vc.disconnect()
-            task = self._voice_timeout_tasks.pop(guild_id, None)
-            if task:
-                task.cancel()
-            # Undo the auto-join's implicit "speak in this chat" opt-in. Without this the enabled
-            # set outlives the voice session: every later reply in that channel is synthesised,
-            # including replies to plain text, and once the bot has left the VC it degrades to an
-            # audio attachment on each one. Only chats THIS path enabled are cleared, so a user's
-            # explicit /voice tts survives.
-            auto_tts_chats = getattr(self, "_auto_join_tts_chats", None)
-            if isinstance(auto_tts_chats, set) and captured_for is not None:
-                key = str(captured_for)
-                if key in auto_tts_chats:
-                    auto_tts_chats.discard(key)
-                    enabled = getattr(self, "_auto_tts_enabled_chats", None)
-                    if isinstance(enabled, set):
-                        enabled.discard(key)
-            self._voice_text_channels.pop(guild_id, None)
-            self._voice_sources.pop(guild_id, None)
 
     async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
         """Play audio in the VC: via the mixer (layered over the ambient bed, ducking it)
@@ -4477,61 +4441,6 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         if not member or not member.voice:
             return None
         return member.voice.channel
-
-    def _cancel_voice_timeout(self, guild_id: int) -> None:
-        task = self._voice_timeout_tasks.pop(guild_id, None)
-        if task:
-            task.cancel()
-
-    def _reset_voice_timeout(self, guild_id: int) -> None:
-        """Reset the auto-disconnect inactivity timer."""
-        self._cancel_voice_timeout(guild_id)
-        timeout = self._voice_timeout_limit()
-        if timeout <= 0:
-            logger.debug("Voice inactivity timeout disabled (guild=%d)", guild_id)
-            return
-        self._voice_timeout_tasks[guild_id] = asyncio.ensure_future(
-            self._voice_timeout_handler(guild_id, timeout)
-        )
-
-    async def _voice_timeout_handler(self, guild_id: int, timeout: Optional[int] = None) -> None:
-        """Auto-disconnect after the configured inactivity timeout."""
-        timeout = self._voice_timeout_limit() if timeout is None else int(timeout)
-        if timeout <= 0:
-            return
-        try:
-            await asyncio.sleep(timeout)
-        except asyncio.CancelledError:
-            return
-        text_ch_id = self._voice_text_channels.get(guild_id)
-        # ``/voice off`` keeps the bot in the channel; only the bot's own audio counts as
-        # activity, so the timer would fire every VOICE_TIMEOUT and spam "Left voice channel".
-        _mode_getter = getattr(self, "_voice_mode_getter", None)
-        if text_ch_id is not None and _mode_getter is not None:
-            try:
-                if _mode_getter(str(text_ch_id)) == "off":
-                    return
-            except Exception:
-                pass
-        await self.leave_voice_channel(guild_id)
-        # Notify the runner so it can clean up voice_mode state
-        if self._on_voice_disconnect and text_ch_id:
-            try:
-                self._on_voice_disconnect(str(text_ch_id))
-            except Exception:
-                pass
-        if text_ch_id and self._client:
-            ch = self._client.get_channel(text_ch_id)
-            if ch:
-                try:
-                    await ch.send(t("platform.discord.voice.left_inactivity"))
-                except Exception:
-                    pass
-
-    def is_in_voice_channel(self, guild_id: int) -> bool:
-        """Check if the bot is connected to a voice channel in this guild."""
-        vc = self._voice_clients.get(guild_id)
-        return vc is not None and vc.is_connected()
 
     # --- Voice listening (Phase 2) ---
 
