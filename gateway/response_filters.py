@@ -113,6 +113,23 @@ def display_kind_for_event(event: Any) -> str | None:
     return None
 
 
+VOICE_REPLY_SUPPRESSED_KEY = "hermes_suppress_voice_reply"
+
+
+def voice_reply_suppressed(event: Any) -> bool:
+    """A turn whose reply must be posted as text only, never spoken (a voice-session wrap-up)."""
+    return (getattr(event, "metadata", None) or {}).get(VOICE_REPLY_SUPPRESSED_KEY) is True
+
+
+def copy_queued_terminal_metadata(event: Any, agent_result: dict) -> None:
+    """A queued chain's final send is judged against the OPENING event: carry the terminal turn's
+    notification category and text-only flag onto it."""
+    if "queued_terminal_notification_category" in agent_result:
+        event.metadata["notification_category"] = agent_result["queued_terminal_notification_category"]
+    if agent_result.get("queued_terminal_suppress_voice_reply") is True:
+        event.metadata[VOICE_REPLY_SUPPRESSED_KEY] = True
+
+
 def is_machinery_display_kind(display_kind: Any) -> bool:
     """Only a machinery turn may vanish on a bare silence marker; a human turn gets a visible fallback.
 

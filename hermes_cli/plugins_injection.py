@@ -11,8 +11,10 @@ logger = logging.getLogger("hermes_cli.plugins")
 
 def inject_plugin_message(
     ctx: Any, content: str, role: str, *, session_key: Optional[str],
-    origin: Optional[Mapping[str, Any]],
+    origin: Optional[Mapping[str, Any]], suppress_voice_reply: bool = False,
 ) -> bool:
+    """``suppress_voice_reply`` (host-internal, not on ``PluginContext.inject_message``): the turn's
+    reply is posted as text, never spoken. Forwarded to the gateway injector only when set."""
     manager = ctx._manager
     msg = content if role == "user" else f"[{role}] {content}"
     cli = manager._cli_ref
@@ -56,7 +58,8 @@ def inject_plugin_message(
         # there or nowhere (never the ambient HERMES_HOME of whatever thread called us).
         target = {"origin": dict(origin), "plugin_home": manager.home_path}
     try:
-        return bool(manager.inject_gateway_message(**target, content=msg, plugin_id=ctx.plugin_id))
+        extra = {"suppress_voice_reply": True} if suppress_voice_reply else {}
+        return bool(manager.inject_gateway_message(**target, content=msg, plugin_id=ctx.plugin_id, **extra))
     except Exception:
         logger.warning("inject_message: gateway scheduling failed for plugin %s", ctx.plugin_id, exc_info=True)
         return False

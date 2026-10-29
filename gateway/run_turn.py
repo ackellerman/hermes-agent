@@ -26,7 +26,8 @@ from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent
 from gateway.response_filters import (
-    display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
+    copy_queued_terminal_metadata, display_kind_for_event, is_machinery_display_kind, reply_expected_metadata,
+    silence_allowed, voice_reply_suppressed,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
@@ -2213,16 +2214,14 @@ class GatewayTurnMixin:
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
-            # A queued (/queue) chain answered the LAST message of the chain, so the outer final
-            # send (bracketed by the adapter against this event) must be ledgered under that
-            # message's id or it collides with an earlier turn's row carrying the same text. Reply
-            # routing is untouched: the anchor still comes from this event.
+            # A queued (/queue) chain answered the LAST message of the chain, so the outer final send
+            # (bracketed by the adapter against this event) is ledgered under that message's id, else it
+            # collides with an earlier turn's row of the same text. Reply routing still anchors here.
             if isinstance(agent_result, dict):
                 _terminal_inbound = agent_result.get("queued_terminal_inbound_id")
                 if _terminal_inbound:
                     event.ledger_message_id = str(_terminal_inbound)
-                if "queued_terminal_notification_category" in agent_result:
-                    event.metadata["notification_category"] = agent_result["queued_terminal_notification_category"]
+                copy_queued_terminal_metadata(event, agent_result)
                 if isinstance(agent_result.get("_notification_reply_muted"), bool):
                     event._notification_reply_muted = agent_result["_notification_reply_muted"]
 
@@ -3970,6 +3969,7 @@ class GatewayTurnMixin:
                 "queued_terminal_inbound_id": next_inbound_id,
                 "queued_terminal_display_kind": next_display_kind,
                 "queued_terminal_reply_expected": next_reply_expected,
+                "queued_terminal_suppress_voice_reply": voice_reply_suppressed(pending_event),
                 "queued_terminal_notification_category": (
                     (pending_event.metadata or {}).get("notification_category", "result")
                     if pending_event is not None and pending_event.internal else "result"),

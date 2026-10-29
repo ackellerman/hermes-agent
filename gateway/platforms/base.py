@@ -430,6 +430,7 @@ from gateway.platforms.base_exec_approval import (
     ea_reason_label_text, ea_smart_deny_line_text, format_approval_deadline_line)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.warning_notifications import diagnostic_wake_muted
+from gateway.response_filters import voice_reply_suppressed
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
 from gateway.session import SessionSource, build_session_key
 from gateway.session_transcript import TranscriptReadError
@@ -4221,13 +4222,12 @@ class BasePlatformAdapter(ABC):
 
     def _wants_auto_tts(self, event: MessageEvent, session_key: str, interrupt_event: asyncio.Event,
                         text_content: str, media_files: list) -> bool:
-        """Auto-TTS on voice input (voice-first), gated by /voice or voice.auto_tts;
-        skipped when streaming TTS already delivered audio this turn."""
+        """Auto-TTS on voice input (gated by /voice or voice.auto_tts); never twice, never text-only turns."""
         generation = getattr(interrupt_event, "_hermes_run_generation", None)
         return bool(
             self._should_auto_tts_for_chat(event.source.chat_id)
             and event.message_type == MessageType.VOICE and text_content and not media_files
-            and not self._streaming_tts_turn_completed(session_key, generation, event=event))
+            and not self._streaming_tts_turn_completed(session_key, generation, event=event) and not voice_reply_suppressed(event))
 
     async def _play_tts_file(
         self, event: MessageEvent, text_content: str, tts_path: str, first: bool,

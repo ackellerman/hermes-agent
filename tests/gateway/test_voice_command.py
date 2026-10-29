@@ -565,7 +565,7 @@ class TestVoiceChannelCommands:
         runner._voice_mode["discord:123"] = "all"
         await runner._handle_voice_channel_leave(event)
         assert runner._voice_mode["discord:123"] == "off"
-        mock_adapter.leave_voice_channel.assert_called_once_with(111)
+        mock_adapter.leave_voice_channel.assert_called_once_with(111, reason="command")
 
     # -- _handle_voice_channel_input --
 
@@ -768,8 +768,8 @@ class TestDiscordVoiceChannelMethods:
         async def cancel_bot_task():
             events.append("cancel_bot_task")
 
-        async def leave_voice_channel(guild_id):
-            events.append(f"leave_voice_channel:{guild_id}")
+        async def leave_voice_channel(guild_id, *, reason="command", trigger=None):
+            events.append(f"leave_voice_channel:{guild_id}:{reason}")
 
         async def close():
             events.append("close_client")
@@ -787,7 +787,7 @@ class TestDiscordVoiceChannelMethods:
 
         assert events == [
             "cancel_liveness_task",
-            "leave_voice_channel:111",
+            "leave_voice_channel:111:shutdown",
             "cancel_bot_task",
             "close_client",
         ]
@@ -873,8 +873,8 @@ class TestCallbackWiringOrder:
 
 
     @pytest.mark.asyncio
-    async def test_join_failure_clears_callback(self, tmp_path):
-        """If join fails with exception, callback is cleaned up."""
+    async def test_join_failure_keeps_the_input_callback_bound(self, tmp_path):
+        """A failed join leaves the input callback bound: a later auto-join never rebinds it."""
         runner = _make_runner(tmp_path)
 
         mock_channel = MagicMock()
@@ -892,7 +892,7 @@ class TestCallbackWiringOrder:
 
         result = await runner._handle_voice_channel_join(event)
         assert "failed" in result.lower()
-        assert mock_adapter._voice_input_callback is None
+        assert mock_adapter._voice_input_callback is not None
 
 
 # =====================================================================
@@ -923,7 +923,6 @@ class TestLeaveExceptionHandling:
 
         await runner._handle_voice_channel_leave(event)
         assert runner._voice_mode["telegram:123"] == "off"
-        assert mock_adapter._voice_input_callback is None
 
 
 class TestStreamTtsToSpeaker:

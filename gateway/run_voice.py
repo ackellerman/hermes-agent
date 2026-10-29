@@ -22,6 +22,8 @@ from agent.i18n import t
 from gateway.config import Platform
 from gateway.platforms.base import build_auto_tts_output_path
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.response_filters import voice_reply_suppressed
+from gateway.run_voice_session_end import GatewayVoiceSessionEndMixin
 from gateway.session import SessionSource
 
 logger = logging.getLogger("gateway.run")  # log-record parity with the origin module
@@ -31,7 +33,7 @@ _OFF_SET, _ON_SET = "_auto_tts_disabled_chats", "_auto_tts_enabled_chats"
 _VOICE_MODES = {"off", "voice_only", "all"}
 
 
-class GatewayVoiceMixin:
+class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
     def _voice_key(self, platform: Platform, chat_id: str, profile: Optional[str] = None) -> str:
         """``<profile>:<platform>:<chat_id>`` under multiplexing (else two bots in one channel
         share a key and one ``/voice`` flips the other's); default keeps ``<platform>:<chat>``.
@@ -51,10 +53,12 @@ class GatewayVoiceMixin:
         return self._voice_key(source.platform, source.chat_id, profile=profile)
 
     def _bind_voice_input_callback(self, adapter) -> None:
-        """Route voice transcripts back through the adapter that captured them."""
+        """Route voice transcripts (and voice-session ends) back through the adapter that captured them."""
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = functools.partial(
                 self._handle_voice_channel_input, adapter=adapter)
+        if hasattr(adapter, "_voice_session_end_callback"):
+            adapter._voice_session_end_callback = functools.partial(self._on_voice_session_end, adapter=adapter)
 
     def _load_voice_modes(self) -> dict[str, str]:
         try:
@@ -189,12 +193,10 @@ class GatewayVoiceMixin:
                         " endpoint reported in the log above"
                     )
             logger.warning("Failed to join voice channel: %s", reason)
-            adapter._voice_input_callback = None
             if not any(tok in reason.lower() for tok in ("pynacl", "nacl", "davey")):
                 return t("gateway.voice.channel_join_failed", error=reason)
             return t("gateway.voice.channel_deps_missing", hint=install_hint("discord"))
         if not success:
-            adapter._voice_input_callback = None
             return t("gateway.voice.channel_join_permissions")
         text_channel_id = int(event.source.chat_id)
         # Moving to another text channel drops speech buffered for the old one (a same-channel rejoin
@@ -217,14 +219,13 @@ class GatewayVoiceMixin:
                 and adapter.is_in_voice_channel(guild_id)):
             return t("gateway.voice.channel_not_joined")
         try:
-            await adapter.leave_voice_channel(guild_id)
+            await adapter.leave_voice_channel(guild_id, reason="command")
         except Exception as e:
             logger.warning("Error leaving voice channel: %s", e)
-        # Always clean up state even if leave raised an exception
+        # Always clean up state even if leave raised an exception. The input callback stays bound:
+        # it is per adapter and idle with no receiver, and an auto-join never binds it again.
         self._apply_voice_mode(adapter, self._voice_key_for_source(event.source),
                                event.source.chat_id, "off")
-        if hasattr(adapter, "_voice_input_callback"):
-            adapter._voice_input_callback = None
         return t("gateway.voice.channel_left")
 
     def _handle_voice_timeout_cleanup(self, chat_id: str, *, adapter=None) -> None:
@@ -323,7 +324,7 @@ class GatewayVoiceMixin:
         # #106019): drop the pin so the seam re-resolves for THIS speaker.
         from gateway.session_identity import clear_identity
         clear_identity(source)
-        if self._canonicalize(source, transport_profile=getattr(adapter, "_owner_profile", None)) is None:
+        if (identity := self._canonicalize(source, transport_profile=getattr(adapter, "_owner_profile", None))) is None:
             logger.warning("Dropping voice input: its profile route targets an unserved profile")
             return
         # Validate the session owner against the current allowlist before auto-resuming. A session created
@@ -371,6 +372,7 @@ class GatewayVoiceMixin:
             source=source, text=transcript, message_type=MessageType.VOICE,
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
             channel_prompt=channel_prompt, auto_skill=auto_skill)
+        self._note_voice_session_speech(adapter, guild_id, user_id, source, identity)
         await adapter.handle_message(event)
 
     def _should_send_voice_reply(
@@ -379,8 +381,8 @@ class GatewayVoiceMixin:
         """False when voice_mode is off for this chat, the response is empty/an error, the agent
         already called text_to_speech this turn, or voice input + base adapter auto-TTS handled it
         — UNLESS streaming consumed the response (already_sent): then the runner must do it."""
-        if not response or response.startswith("Error:"):
-            return False
+        if not response or response.startswith("Error:") or voice_reply_suppressed(event):
+            return False  # a text-only turn (voice-session wrap-up) is never spoken
         # A2A is agent-to-agent text. The adapter has no native send_voice, so
         # global voice.auto_tts (Desktop "Read replies aloud") would synthesize
         # an MP3 and then fail delivery with "Couldn't deliver the audio
