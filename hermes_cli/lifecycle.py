@@ -29,6 +29,14 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:
     return _plugin_hooks(hook_name, **kwargs)
 
 
+def invoke_hook_attributed(hook_name: str, *, timeout: float | None = None, **kwargs: Any) -> list[Any]:
+    """:func:`invoke_hook` whose plugin results are ``(plugin_key | None, result)`` pairs."""
+    _observe(hook_name, **kwargs)
+    from hermes_cli import plugins
+
+    return plugins._delivery_manager().invoke_hook_attributed(hook_name, timeout=timeout, **kwargs)
+
+
 async def ainvoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:
     """:func:`invoke_hook` for callers on an event loop: same observers-then-plugins
     composition, with ``async def`` plugin callbacks awaited on that loop."""
