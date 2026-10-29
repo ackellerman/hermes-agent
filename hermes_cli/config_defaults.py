@@ -1617,6 +1617,18 @@ DEFAULT_CONFIG = {
                 "On it.",
             ],
         },
+        # Opt-in Discord voice auto-join (issue #33683).  OFF by default for
+        # safety — auto-joining a voice channel means transcribing everyone who
+        # speaks.  Both CHANNEL allowlist (channel_ids) and USER allowlist
+        # (user_ids) MUST be non-empty for the feature to activate; there is
+        # deliberately no "allow all" fallthrough.
+        "voice_auto_join": {
+            "enabled": False,
+            "channel_ids": [],      # VC IDs the bot may auto-join (required, non-empty, to activate)
+            "user_ids": [],         # user IDs whose VC entry triggers auto-join (required, non-empty)
+            "join_mode": "user_prompt",  # "user_prompt" | "automatic"
+            "require_text_opt_in": True,
+        },
     },
 
     "whatsapp": {
