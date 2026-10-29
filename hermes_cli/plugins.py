@@ -175,17 +175,13 @@ VALID_HOOKS: set[str] = {
     #   (privacy: task ids, assignees, workspace paths).
     "on_kanban_worker_spawned", "on_kanban_worker_exited", "on_kanban_worker_stale_claim",
     "on_kanban_task_updated", "on_kanban_dispatch_tick",
+    # on_voice_session_end: the Discord bot left a voice channel; may return {"followup_turn": str} (hooks.md).
+    "on_voice_session_end",
     # gateway_platform_event: normalized envelopes only, never raw SDK objects or adapter handles.
     # Kwargs: platform, event_type, payload (event_type-local; see hooks.md). New event types land
     # only together with real fire-sites.
-    # on_kanban_dispatch_tick fires once per dispatcher tick in dispatch_once, strictly AFTER the board's
-    # single-writer dispatch lock has been released (the #56066 original fired inside the lock — the #64231
-    # disposition mandates the post-lock re-port), so a slow subscriber can never extend the writer critical
-    # section. Kwargs: board: str | None, profile_name: str, dry_run: bool, outcome: "ok" | "skipped_locked"
-    # | "idle", result: hermes_cli.kanban_db.DispatchResult (spawned, reclaimed, promoted,
-    # reconciled_orphans, crashed, stale, timed_out, auto_blocked, rate_limited, auto_assigned_default,
-    # respawn_guarded, skipped_per_profile_capped, skipped_unassigned, skipped_nonspawnable,
-    # skipped_locked). Privacy: result carries task ids, assignees, and workspace paths.
+    # on_kanban_dispatch_tick fires strictly AFTER the dispatch lock is released (#64231 post-lock re-port of
+    # #56066); result: hermes_cli.kanban_db.DispatchResult counters (privacy: task ids, assignees, workspaces).
     # Gateway platform-boundary observer hooks (#64176). Observer-only; each callback isolated by
     # invoke_hook. This surface grants no adapter handles or platform actions. Fired today: Telegram
     # "reaction" + "message_edited"; Discord "message_edited", "message_deleted", "thread_created",
@@ -950,6 +946,8 @@ class PluginContext:
             logger.warning("Plugin '%s' registered unknown %s '%s' (valid: %s)", self.manifest.name, kind,
                            key, ", ".join(sorted(valid)))
         mapping.setdefault(key, []).append(callback)
+        if mapping is self._manager._hooks:  # owner attribution for invoke_hook_attributed
+            self._manager._hook_owner_keys[(key, id(callback))] = (callback, self.plugin_id)
         handle = self._track(kind, key, lambda: self._manager._remove_callback(mapping, key, callback))
         logger.debug("Plugin %s registered %s: %s", self.manifest.name, kind, key)
         return handle
@@ -1178,6 +1176,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # (matcher, callback, plugin_name), platform handler factories (lowercase platform -> list).
         self._plugins: dict[str, LoadedPlugin] = {}
         self._hooks: dict[str, list[Callable]] = {}
+        self._hook_owner_keys: dict[tuple[str, int], tuple[Callable, str]] = {}  # (hook, id(cb)) -> (cb, plugin)
         # Fallback hooks registered by a memory provider before general discovery.
         self._memory_hook_registrations: dict[tuple[str, str], list[PluginRegistration]] = {}
         self._middleware: dict[str, list[Callable]] = {}

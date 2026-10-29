@@ -45,6 +45,8 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
     "pre_auxiliary_call", "post_auxiliary_call", "pre_verify", "on_session_start", "on_session_end",
     # Fail-open consumer on every inbound gateway message: a hung plugin must not stall the profile.
     "post_gateway_admission",
+    # Fired off-loop per Discord voice-session end; a hung consumer must not hold the leave or shutdown.
+    "on_voice_session_end",
 }
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).
@@ -53,6 +55,9 @@ _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: set[str] = {"pre_tool_call"}
 _HOOK_CALLER_THREAD_HOOKS: set[str] = {"subagent_stop"}
 # After a timeout, suppress the same callback this long so a hung hook cannot pile up threads.
 _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
+# Once-per-session observers: a timeout must not swallow the NEXT session's call (each carries its own
+# ``voice_session_id``); the abandoned-worker cap below still bounds a hung callback.
+_HOOK_NO_TIMEOUT_SUPPRESSION_HOOKS: set[str] = {"on_voice_session_end"}
 # Live workers a hung callback may accumulate before it is skipped outright (#105223 / #98382).
 _HOOK_MAX_ABANDONED_WORKERS = 3
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
@@ -166,7 +171,7 @@ def _hook_call_identity(kwargs: dict[str, Any]) -> Optional[str]:
     payload; nothing new is plumbed. Deliberately not ``api_request_id`` — one API request
     carries many tool calls, which would re-collapse the keys.
     """
-    for field in ("tool_call_id", "turn_id"):
+    for field in ("tool_call_id", "turn_id", "voice_session_id"):
         value = kwargs.get(field)
         if isinstance(value, str) and value:
             return value
@@ -217,13 +222,32 @@ class PluginDispatchMixin:
         closed with a block directive, others skip. ``_HOOK_CALLER_THREAD_HOOKS`` always run on the
         caller thread. ``pre_llm_call`` may return ``{"context": "..."}`` (or a str) to inject.
         """
+        return [ret for _cb, ret in self._iter_hook_results(hook_name, kwargs)]
+
+    def invoke_hook_attributed(
+        self, hook_name: str, *, timeout: Optional[float] = None, **kwargs: Any
+    ) -> list[tuple[Optional[str], Any]]:
+        """:meth:`invoke_hook` whose results carry the owning plugin key (``None`` for callbacks no
+        plugin registered, e.g. shell hooks). ``timeout`` can only tighten the configured bound."""
+        return [(self._hook_owner_key(hook_name, cb), ret)
+                for cb, ret in self._iter_hook_results(hook_name, kwargs, timeout)]
+
+    def _hook_owner_key(self, hook_name: str, cb: Callable) -> Optional[str]:
+        owner = getattr(self, "_hook_owner_keys", {}).get((hook_name, id(cb)))
+        return owner[1] if owner is not None and owner[0] is cb else None
+
+    def _iter_hook_results(self, hook_name: str, kwargs: dict[str, Any], timeout: Optional[float] = None):
+        """Yield ``(callback, result)`` for each non-``None`` result (the shared body of the invokers)."""
         from hermes_cli.plugins import _resolve_hook_callback_timeout
         # Gateway platform events define event-local envelopes; a bus-wide version here would turn
         # unrelated adapter payloads into one monolithic compatibility contract.
         if hook_name != "gateway_platform_event":
             kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
-        results: list[Any] = []
-        timeout = _resolve_hook_callback_timeout()
+        configured = _resolve_hook_callback_timeout()
+        if timeout is not None:
+            timeout = min(configured, timeout) if configured > 0 else timeout
+        else:
+            timeout = configured
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
         for cb in self._hooks.get(hook_name, []):
@@ -232,17 +256,16 @@ class PluginDispatchMixin:
                     ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
                     if ret is _HOOK_SKIPPED:
                         if fail_closed:  # policy hook: fail closed with a block directive
-                            results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
+                            yield cb, {"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}
                         continue
                 else:
                     ret = self._invoke_hook_callback(cb, kwargs)
                 if ret is not None:
-                    results.append(ret)
-            except (Exception, SystemExit) as exc:
+                    yield cb, ret
+            except (Exception, SystemExit) as exc:  # health: allow BLE001 -- per-callback plugin isolation; reported (warn-once) below
                 self._report_hook_failure(hook_name, cb, kwargs, exc)
                 if fail_closed:  # a guard that raised made no decision: same veto as a timeout
-                    results.append(_policy_error_block_directive(hook_name, cb, exc))
-        return results
+                    yield cb, _policy_error_block_directive(hook_name, cb, exc)
 
     def _report_hook_failure(
         self, hook_name: str, cb: Callable, kwargs: dict[str, Any], exc: BaseException, *, surface: str = "Hook"
@@ -282,7 +305,8 @@ class PluginDispatchMixin:
         gate_key = (*suppression_key, _hook_call_identity(kwargs))
         token = object()
         with self._hook_timeout_lock:
-            suppressed_until = self._hook_timeout_suppressed_until.get(suppression_key)
+            suppressed_until = (None if hook_name in _HOOK_NO_TIMEOUT_SUPPRESSION_HOOKS
+                                else self._hook_timeout_suppressed_until.get(suppression_key))
             if (gate_key in self._hook_running_callbacks
                     or (suppressed_until is not None and suppressed_until > time.monotonic())):
                 logger.warning(
