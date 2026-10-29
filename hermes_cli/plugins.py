@@ -947,8 +947,8 @@ class PluginContext:
                            key, ", ".join(sorted(valid)))
         mapping.setdefault(key, []).append(callback)
         if mapping is self._manager._hooks:  # owner attribution for invoke_hook_attributed
-            self._manager._hook_owner_keys[(key, id(callback))] = (callback, self.plugin_id)
-        handle = self._track(kind, key, lambda: self._manager._remove_callback(mapping, key, callback))
+            self._manager._note_hook_owner(key, callback, self.plugin_id)
+        handle = self._track(kind, key, lambda: self._manager._remove_callback(mapping, key, callback, self.plugin_id))
         logger.debug("Plugin %s registered %s: %s", self.manifest.name, kind, key)
         return handle
 
@@ -1176,7 +1176,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # (matcher, callback, plugin_name), platform handler factories (lowercase platform -> list).
         self._plugins: dict[str, LoadedPlugin] = {}
         self._hooks: dict[str, list[Callable]] = {}
-        self._hook_owner_keys: dict[tuple[str, int], tuple[Callable, str]] = {}  # (hook, id(cb)) -> (cb, plugin)
+        self._hook_owner_keys: dict[tuple[str, int], tuple[Callable, tuple[str, ...]]] = {}  # -> (cb, registrants)
         # Fallback hooks registered by a memory provider before general discovery.
         self._memory_hook_registrations: dict[tuple[str, str], list[PluginRegistration]] = {}
         self._middleware: dict[str, list[Callable]] = {}

@@ -228,13 +228,17 @@ class PluginDispatchMixin:
         self, hook_name: str, *, timeout: Optional[float] = None, **kwargs: Any
     ) -> list[tuple[Optional[str], Any]]:
         """:meth:`invoke_hook` whose results carry the owning plugin key (``None`` for callbacks no
-        plugin registered, e.g. shell hooks). ``timeout`` can only tighten the configured bound."""
-        return [(self._hook_owner_key(hook_name, cb), ret)
-                for cb, ret in self._iter_hook_results(hook_name, kwargs, timeout)]
+        plugin registered, e.g. shell hooks, or one several plugins share). ``timeout`` can only
+        tighten the configured bound. Owners are read when the call starts, so a plugin unloaded
+        while its callback runs keeps its attribution (its follow-up is then refused as unloaded)."""
+        owners = {id(cb): self._hook_owner_key(hook_name, cb) for cb in list(self._hooks.get(hook_name, ()))}
+        return [(owners.get(id(cb)), ret) for cb, ret in self._iter_hook_results(hook_name, kwargs, timeout)]
 
     def _hook_owner_key(self, hook_name: str, cb: Callable) -> Optional[str]:
-        owner = getattr(self, "_hook_owner_keys", {}).get((hook_name, id(cb)))
-        return owner[1] if owner is not None and owner[0] is cb else None
+        entry = getattr(self, "_hook_owner_keys", {}).get((hook_name, id(cb)))
+        if entry is None or entry[0] is not cb or len(set(entry[1])) != 1:
+            return None
+        return entry[1][0]
 
     def _iter_hook_results(self, hook_name: str, kwargs: dict[str, Any], timeout: Optional[float] = None):
         """Yield ``(callback, result)`` for each non-``None`` result (the shared body of the invokers)."""

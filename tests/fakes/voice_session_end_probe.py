@@ -38,8 +38,21 @@ def register(ctx):
     ctx.register_hook("on_voice_session_end", _on_voice_session_end)
 '''
 
+# Registers one module-level function that every "shared" probe plugin also registers.
+_SHARED_SOURCE = '''
+def register(ctx):
+    from tests.fakes import voice_session_end_probe as probe
+    ctx.register_hook("on_voice_session_end", probe.shared_callback)
+'''
+SHARED_RESULT = {"followup_turn": "from the shared callable"}
+
+
+def shared_callback(**_kwargs):
+    return SHARED_RESULT
+
 _GATES: dict[tuple[str, str], threading.Event] = {}
 _STARTED: dict[tuple[str, str], threading.Event] = {}
+_FINISHED: dict[tuple[str, str], threading.Event] = {}
 _CHECKS: dict[tuple[str, str], Callable[[dict], Any]] = {}
 CHECK_RESULTS: list[tuple[str, Any]] = []
 _LOCK = threading.Lock()
@@ -50,13 +63,13 @@ def _key(home: Path | str, name: str) -> tuple[str, str]:
 
 
 def install_probe(home: Path, name: str = "vse-probe", *, returns: Any = None, allow_injection: bool | None = None,
-                  enabled: bool = True, **behaviour: Any) -> Path:
+                  enabled: bool = True, shared: bool = False, **behaviour: Any) -> Path:
     plugin_dir = home / "plugins" / name
     plugin_dir.mkdir(parents=True, exist_ok=True)
     (plugin_dir / "plugin.yaml").write_text(
         yaml.safe_dump({"name": name, "version": "0.1.0", "description": "voice-session-end probe"}),
         encoding="utf-8")
-    (plugin_dir / "__init__.py").write_text(_PLUGIN_SOURCE, encoding="utf-8")
+    (plugin_dir / "__init__.py").write_text(_SHARED_SOURCE if shared else _PLUGIN_SOURCE, encoding="utf-8")
     set_behaviour(home, name, returns=returns, **behaviour)
     cfg_path = home / "config.yaml"
     cfg = (yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}) if cfg_path.exists() else {}
@@ -103,6 +116,12 @@ def started(home: Path | str, name: str) -> threading.Event:
         return _STARTED.setdefault(_key(home, name), threading.Event())
 
 
+def finished(home: Path | str, name: str) -> threading.Event:
+    """Set when a call's callback body has returned (after any block): "is it still running?"."""
+    with _LOCK:
+        return _FINISHED.setdefault(_key(home, name), threading.Event())
+
+
 def set_check(home: Path, name: str, check: Callable[[dict], Any]) -> None:
     with _LOCK:
         _CHECKS[_key(home, name)] = check
@@ -120,6 +139,7 @@ def run_hooks(home: str, name: str, kwargs: dict, behaviour: dict) -> None:
     if block is True or (isinstance(block, list) and kwargs.get("voice_session_id") in block
                          ) or (block == "first" and len(records(Path(home))) == 1):
         gate(home, name).wait(30)
+    finished(home, name).set()
 
 
 def reset() -> None:
@@ -129,5 +149,6 @@ def reset() -> None:
             event.set()
         _GATES.clear()
         _STARTED.clear()
+        _FINISHED.clear()
         _CHECKS.clear()
         CHECK_RESULTS.clear()
