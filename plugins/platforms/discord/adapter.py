@@ -1327,6 +1327,9 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         self._voice_fx_cfg: dict[str, Any] = self._load_voice_fx_config()
         # Voice auto-join debounce timestamps: key -> time.monotonic()
         self._auto_join_debounce: dict[str, float] = {}
+        # Text chats whose spoken replies were enabled BY an auto-join (not by /voice), so leaving
+        # the voice channel can undo exactly those and never a user's explicit choice.
+        self._auto_join_tts_chats: set[str] = set()
         self._auto_join_cfg: dict[str, Any] = self._load_voice_auto_join_config()
         # Threads the bot participated in (no @mention needed there); persisted across restarts.
         self._threads = ThreadParticipationTracker("discord")
@@ -3940,6 +3943,54 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         except Exception:
             return False
 
+    def _auto_join_home_text_channel(self, guild) -> Optional[int]:
+        """This seat's own home channel, when it is a sendable text channel in ``guild``.
+
+        The upstream auto-join picks ``guild.system_channel``, which is the server's default text
+        channel (#general here) rather than the channel the seat actually talks in. A seat with a
+        dedicated channel then answers in the wrong room.
+        """
+        if guild is None:
+            return None
+        candidates: list[str] = []
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            home = (((cfg.get("platforms") or {}).get("discord") or {}).get("home_channel") or {})
+            if isinstance(home, dict) and home.get("chat_id"):
+                candidates.append(str(home["chat_id"]))
+        except Exception as e:
+            logger.debug("Could not read home_channel for auto-join binding: %s", e)
+        env_home = self._gate_env("DISCORD_HOME_CHANNEL")
+        if env_home:
+            candidates.append(str(env_home))
+        if not candidates:
+            logger.debug("Auto-join binding: no home channel configured; using the guild default")
+            return None
+        text_channel_cls = getattr(discord, "TextChannel", None)
+        client = getattr(self, "_client", None)
+        for candidate in candidates:
+            try:
+                ch = client.get_channel(int(candidate)) if client is not None else None
+            except (TypeError, ValueError):
+                continue
+            except Exception:
+                continue
+            if ch is None or getattr(ch, "guild", None) is None or ch.guild.id != guild.id:
+                continue
+            if text_channel_cls is not None and not isinstance(ch, text_channel_cls):
+                continue
+            try:
+                if ch.permissions_for(guild.me).send_messages:
+                    logger.info(
+                        "Auto-join binding: seat home channel %s (guild %s)", ch.id, guild.id
+                    )
+                    return ch.id
+            except Exception:
+                continue
+        logger.debug("Auto-join binding: home channel not usable here; using the guild default")
+        return None
+
     def _select_auto_join_text_channel(
         self,
         guild,
@@ -3948,12 +3999,23 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         """Select the best text channel for voice transcription binding.
 
         Priority:
+        0. The seat's own home channel (``platforms.discord.home_channel`` / DISCORD_HOME_CHANNEL)
+           when it is a sendable text channel in this guild — a seat with a dedicated channel must
+           answer there, not in the server's default one.
         1. ``guild.system_channel`` if the bot can send messages there.
         2. First guild text channel where the bot has ``send_messages``.
         3. None (log warning, skip announcement).
         """
         if guild is None:
             return None
+
+        # Tier 0: this seat's own home channel
+        try:
+            home_id = self._auto_join_home_text_channel(guild)
+            if home_id is not None:
+                return home_id
+        except Exception:
+            logger.debug("Home-channel lookup failed for auto-join binding", exc_info=True)
 
         # Tier 1: guild.system_channel
         try:
@@ -4067,7 +4129,28 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             voice_channel,
             text_channel_id=text_ch_id,
         )
+        # An auto-join is the user's opt-in to voice, so the bound chat must SPEAK: ``/voice
+        # channel`` does exactly this through the runner (``_apply_voice_mode(..., "all")``), and
+        # without it the reply is text-only — the bot sits in the room saying nothing.
+        # The enable is scoped to the voice session: leave_voice_channel() undoes it for exactly
+        # the chats recorded in ``_auto_join_tts_chats``, so it can never leak into text
+        # conversation, while a chat the user enabled by hand is never recorded here.
         if succeeded and text_ch_id is not None:
+            key = str(text_ch_id)
+            # Only claim ownership when this session still owns the binding: a leave woken by the
+            # lock we just released can pop it first, and an enable installed afterwards would
+            # belong to no session and never be torn down.
+            if self._voice_text_channels.get(guild_id) == text_ch_id:
+                enabled = getattr(self, "_auto_tts_enabled_chats", None)
+                if isinstance(enabled, set):
+                    already_on = key in enabled
+                    enabled.add(key)
+                    tracker = getattr(self, "_auto_join_tts_chats", None)
+                    if isinstance(tracker, set) and not already_on:
+                        tracker.add(key)
+                disabled = getattr(self, "_auto_tts_disabled_chats", None)
+                if isinstance(disabled, set):
+                    disabled.discard(key)
             try:
                 ch = self._client.get_channel(text_ch_id)
                 if ch is not None:
@@ -4292,6 +4375,19 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             task = self._voice_timeout_tasks.pop(guild_id, None)
             if task:
                 task.cancel()
+            # Undo the auto-join's implicit "speak in this chat" opt-in. Without this the enabled
+            # set outlives the voice session: every later reply in that channel is synthesised,
+            # including replies to plain text, and once the bot has left the VC it degrades to an
+            # audio attachment on each one. Only chats THIS path enabled are cleared, so a user's
+            # explicit /voice tts survives.
+            auto_tts_chats = getattr(self, "_auto_join_tts_chats", None)
+            if isinstance(auto_tts_chats, set) and captured_for is not None:
+                key = str(captured_for)
+                if key in auto_tts_chats:
+                    auto_tts_chats.discard(key)
+                    enabled = getattr(self, "_auto_tts_enabled_chats", None)
+                    if isinstance(enabled, set):
+                        enabled.discard(key)
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
 

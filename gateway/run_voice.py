@@ -91,6 +91,12 @@ class GatewayVoiceMixin:
         target.add(chat_id)
         if isinstance(other := getattr(adapter, clear_from, None), set):
             other.discard(chat_id)
+        if enable:
+            # An explicit /voice on|tts now owns this chat: stop attributing its enablement to the
+            # auto-join, or leaving the voice channel would clear a preference the user set by hand.
+            tracker = getattr(adapter, "_auto_join_tts_chats", None)
+            if isinstance(tracker, set):
+                tracker.discard(chat_id)
 
     def _set_adapter_auto_tts_disabled(self, adapter, chat_id: str, disabled: bool) -> None:
         self._toggle_adapter_auto_tts_set(adapter, chat_id, disabled, enable=False)
