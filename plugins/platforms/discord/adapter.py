@@ -1325,6 +1325,9 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         self._voice_mixers: dict[int, Any] = {}  # guild_id -> VoiceMixer
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: dict[str, Any] = self._load_voice_fx_config()
+        # Voice auto-join debounce timestamps: key -> time.monotonic()
+        self._auto_join_debounce: dict[str, float] = {}
+        self._auto_join_cfg: dict[str, Any] = self._load_voice_auto_join_config()
         # Threads the bot participated in (no @mention needed there); persisted across restarts.
         self._threads = ThreadParticipationTracker("discord")
         self._semantic_thread_renames = SemanticThreadRenames()
@@ -1600,12 +1603,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             @self._client.event
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
-                bot_guild_ids = set(adapter_self._voice_clients.keys())
-                if not bot_guild_ids:
-                    return
-                guild_id = member.guild.id
-                if guild_id not in bot_guild_ids:
-                    return
+                # Ignore the bot itself (loop-prevention blocker — must run
+                # before any policy code).
                 if member == adapter_self._client.user:
                     return
                 joined = before.channel is None and after.channel is not None
@@ -1615,6 +1614,100 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                     and after.channel is not None
                     and before.channel != after.channel
                 )
+
+                # ------------------------------------------------------------------
+                # Auto-join: evaluate policy on user join events (runs even when
+                # the bot is not yet connected to any voice channel).
+                # ------------------------------------------------------------------
+                if joined:
+                    try:
+                        guild = member.guild
+                        channel = after.channel
+                        policy_cfg = adapter_self._auto_join_cfg
+
+                        # Cheap early-out: only read config for joined events
+                        if not policy_cfg.get("enabled", False):
+                            pass  # fall through to existing logging
+                        else:
+                            from plugins.platforms.discord.voice_policy import (
+                                AutoJoinPolicy,
+                                VoicePolicyEvaluator,
+                            )
+
+                            guild_id = guild.id
+                            channel_id = str(channel.id)
+                            member_id = str(member.id)
+
+                            debounce_key = f"aj:{guild_id}:{member_id}:{channel_id}"
+                            if adapter_self._auto_join_debounced(debounce_key, seconds=60.0):
+                                pass  # already processed / rate-limited
+                            else:
+                                policy = AutoJoinPolicy(
+                                    enabled=policy_cfg.get("enabled", False),
+                                    channel_ids=frozenset(policy_cfg.get("channel_ids", [])),
+                                    user_ids=frozenset(policy_cfg.get("user_ids", [])),
+                                    join_mode=policy_cfg.get("join_mode", "user_prompt"),
+                                    require_text_opt_in=policy_cfg.get("require_text_opt_in", True),
+                                )
+
+                                # Resolve text channel for permissions check
+                                text_ch_id = adapter_self._select_auto_join_text_channel(
+                                    guild, channel,
+                                )
+                                text_ch = None
+                                if text_ch_id is not None:
+                                    text_ch = adapter_self._client.get_channel(text_ch_id)
+
+                                member_has_access = True
+                                if policy.require_text_opt_in:
+                                    member_has_access = adapter_self._member_has_text_access(
+                                        guild, member, text_ch,
+                                    )
+
+                                should_join, reason = VoicePolicyEvaluator.should_join(
+                                    policy,
+                                    channel_id=channel_id,
+                                    member_id=member_id,
+                                    member_has_text_access=member_has_access,
+                                )
+
+                                if should_join:
+                                    join_mode = policy.join_mode
+
+                                    if join_mode == "user_prompt":
+                                        prompt_key = f"prompt:{guild_id}:{member_id}:{channel_id}"
+                                        prompted = adapter_self._auto_join_debounced(
+                                            prompt_key, seconds=60.0,
+                                        )
+                                        if not prompted:
+                                            await adapter_self._prompt_auto_join_approval(
+                                                guild, text_ch, member, channel,
+                                            )
+                                    else:
+                                        # "automatic" — join directly
+                                        await adapter_self._do_auto_join(
+                                            channel, text_ch_id, guild_id,
+                                        )
+                                else:
+                                    logger.debug(
+                                        "Auto-join skipped for %s in %s: %s",
+                                        member_id, channel_id, reason,
+                                    )
+                    except Exception:
+                        logger.warning(
+                            "Auto-join handler failed", exc_info=True,
+                        )
+
+                # ------------------------------------------------------------------
+                # Existing tracking: only track channels where the bot is connected.
+                # ------------------------------------------------------------------
+                bot_guild_ids = set(adapter_self._voice_clients.keys())
+                if not bot_guild_ids:
+                    return
+                guild_id = member.guild.id
+                if guild_id not in bot_guild_ids:
+                    return
+
                 if joined or left or switched:
                     logger.info(
                         "Voice state: %s (%d) %s (guild %d)",
@@ -1637,6 +1730,69 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                             or after.channel == bot_channel
                         ):
                             receiver.refresh_credentials("membership change")
+
+                # ------------------------------------------------------------------
+                # Leave-when-no-authorized-users: if the last tracked user left and
+                # no non-bot member in the channel is allowlisted, auto-leave.
+                # ------------------------------------------------------------------
+                if left:
+                    try:
+                        # Derive guild locally: on a bare left event the outer
+                        # ``guild`` variable (set inside the ``if joined:``
+                        # block above) is unbound.
+                        guild = member.guild
+                        policy_cfg = adapter_self._auto_join_cfg
+                        if policy_cfg.get("enabled", False):
+                            # Count remaining non-bot members in the channel
+                            # that pass the adapter's user allowlist.
+                            left_channel = before.channel
+                            if left_channel is None:
+                                # Cannot determine which channel was left; skip.
+                                logger.debug(
+                                    "Skipping auto-leave: left_channel is None (guild %d)",
+                                    guild_id,
+                                )
+                                pass
+                            else:
+                                authorized_remaining = 0
+                                if left_channel.members:
+                                    for m in left_channel.members:
+                                        if m != adapter_self._client.user:
+                                            m_id = str(m.id)
+                                            allowed = adapter_self._is_allowed_user(
+                                                m_id, guild=guild, is_dm=False,
+                                            )
+                                            if allowed:
+                                                authorized_remaining += 1
+                                                break  # one is enough
+
+                                leave_key = f"leave:{guild_id}:{left_channel.id}"
+                                if authorized_remaining == 0:
+                                    # Guard: only leave if the bot is actually connected
+                                    # to the channel that was left (not a different channel
+                                    # in the same guild).
+                                    vc = adapter_self._voice_clients.get(guild_id)
+                                    if (
+                                        vc is None
+                                        or getattr(vc, "channel", None) is None
+                                        or vc.channel.id != left_channel.id
+                                    ):
+                                        logger.debug(
+                                            "Skipping auto-leave: bot not connected to "
+                                            "left channel %s (guild %d)",
+                                            left_channel.id, guild_id,
+                                        )
+                                    elif not adapter_self._auto_join_debounced(leave_key):
+                                        logger.info(
+                                            "No authorized users remain in voice; "
+                                            "auto-leaving guild %d",
+                                            guild_id,
+                                        )
+                                        await adapter_self.leave_voice_channel(guild_id)
+                    except Exception:
+                        logger.warning(
+                            "Auto-leave handler failed", exc_info=True,
+                        )
 
             # Register slash commands
             if self._slash_commands:
@@ -3685,6 +3841,246 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
 
     def _voice_timeout_limit(self) -> int:
         return int(getattr(self, "_voice_timeout_seconds", self.VOICE_TIMEOUT))
+
+    # ------------------------------------------------------------------
+    # Voice auto-join config
+    # ------------------------------------------------------------------
+
+    def _load_voice_auto_join_config(self) -> Dict[str, Any]:
+        """Read voice auto-join settings from config.yaml.
+
+        All settings live under ``discord.voice_auto_join``.  The feature is
+        OFF by default; users opt in by setting ``enabled: true`` AND
+        populating both allowlists (see :mod:`voice_policy`).
+
+        Returns a dict with safe defaults so callers never KeyError.
+        """
+        defaults: Dict[str, Any] = {
+            "enabled": False,
+            "channel_ids": [],
+            "user_ids": [],
+            "join_mode": "user_prompt",
+            "require_text_opt_in": True,
+        }
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            raw = ((cfg.get("discord") or {}).get("voice_auto_join") or {})
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    if k in defaults and v is not None:
+                        defaults[k] = v
+        except Exception as e:
+            logger.debug("Could not load discord.voice_auto_join config: %s", e)
+
+        # Coerce scalar strings to one-element lists before normalization
+        if isinstance(defaults.get("channel_ids"), str):
+            defaults["channel_ids"] = [defaults["channel_ids"]]
+        if isinstance(defaults.get("user_ids"), str):
+            defaults["user_ids"] = [defaults["user_ids"]]
+
+        # Normalize allowlists to lists of strings
+        if isinstance(defaults.get("channel_ids"), (list, tuple)):
+            defaults["channel_ids"] = [str(c) for c in defaults["channel_ids"] if c]
+        else:
+            defaults["channel_ids"] = []
+        if isinstance(defaults.get("user_ids"), (list, tuple)):
+            defaults["user_ids"] = [str(u) for u in defaults["user_ids"] if u]
+        else:
+            defaults["user_ids"] = []
+
+        # Validate join_mode
+        mode = defaults.get("join_mode", "user_prompt")
+        if mode not in ("user_prompt", "automatic"):
+            defaults["join_mode"] = "user_prompt"
+
+        return defaults
+
+    # ------------------------------------------------------------------
+    # Auto-join helpers
+    # ------------------------------------------------------------------
+
+    def _auto_join_debounced(self, key: str, seconds: float = 30.0) -> bool:
+        """Returns True when key is inside its debounce window (the
+        triggering event should be ignored); returns False otherwise
+        and records now as the new timestamp.
+        """
+        now = time.monotonic()
+        last = self._auto_join_debounce.get(key)
+        if last is not None and (now - last) < seconds:
+            return True  # still within the window
+        self._auto_join_debounce[key] = now
+
+        # Bounded eviction: when the dict grows past 256 entries, purge
+        # entries older than 300s.  300s far exceeds the largest used
+        # window (60s) so no active entry is evicted.
+        if len(self._auto_join_debounce) > 256:
+            stale = [k for k, ts in self._auto_join_debounce.items()
+                     if (now - ts) >= 300]
+            for k in stale:
+                del self._auto_join_debounce[k]
+
+        return False
+
+    @staticmethod
+    def _member_has_text_access(
+        guild,
+        member,
+        text_channel,
+    ) -> bool:
+        """Check if ``member`` has ``read_messages`` in ``text_channel``.
+
+        Returns False when ``text_channel`` or ``guild`` is unavailable.
+        """
+        if guild is None or text_channel is None or member is None:
+            return False
+        try:
+            permissions = text_channel.permissions_for(member)
+            return bool(permissions.read_messages)
+        except Exception:
+            return False
+
+    def _select_auto_join_text_channel(
+        self,
+        guild,
+        voice_channel,
+    ) -> Optional[int]:
+        """Select the best text channel for voice transcription binding.
+
+        Priority:
+        1. ``guild.system_channel`` if the bot can send messages there.
+        2. First guild text channel where the bot has ``send_messages``.
+        3. None (log warning, skip announcement).
+        """
+        if guild is None:
+            return None
+
+        # Tier 1: guild.system_channel
+        try:
+            sys_ch = guild.system_channel
+            if sys_ch is not None:
+                perms = sys_ch.permissions_for(guild.me)
+                if perms.send_messages:
+                    return sys_ch.id
+        except Exception:
+            pass
+
+        # Tier 2: first text channel with send_messages
+        try:
+            for ch in guild.text_channels:
+                perms = ch.permissions_for(guild.me)
+                if perms.send_messages:
+                    return ch.id
+        except Exception:
+            pass
+
+        # Tier 3: nothing suitable
+        logger.warning(
+            "Could not find a text channel for voice auto-join binding "
+            "(guild %s); proceeding without text binding.",
+            guild.id,
+        )
+        return None
+
+    async def _prompt_auto_join_approval(self, guild, text_ch, member, voice_channel):
+        """Post an approval prompt with ✅/❌ reactions and wait for response.
+
+        The caller rate-limits via ``_auto_join_debounced`` (once per 60
+        seconds per (guild, member, channel)), so this method does not
+        re-check.  On ✅ the bot joins; on ❌/timeout it logs and aborts.
+
+        Safety: failure to prompt = failure to join (fail-closed).  When
+        ``text_ch`` is None or the prompt cannot be sent, the method logs
+        a warning and returns without joining — the bot never auto-joins
+        silently when it cannot first obtain user approval.
+        """
+        if text_ch is None:
+            logger.warning(
+                "No suitable text channel for approval prompt; "
+                "aborting auto-join (guild %s)",
+                guild.id,
+            )
+            return
+
+        guild_id = guild.id
+        channel_id = voice_channel.id
+        member_id = member.id
+
+        try:
+            msg = await text_ch.send(
+                f"{member.mention} 🤖 Hermes wants to join "
+                f"<#{channel_id}> for voice transcription. "
+                "React ✅ to approve or ❌ to deny."
+            )
+        except Exception:
+            logger.warning(
+                "Could not send auto-join prompt; aborting auto-join "
+                "(guild %s)",
+                guild_id,
+            )
+            return
+
+        def check(reaction, reactor):
+            return (
+                reactor == member
+                and reaction.message.id == msg.id
+                and str(reaction.emoji) in ("✅", "❌")
+            )
+
+        try:
+            reaction, reactor = await self._client.wait_for(
+                "reaction_add", timeout=60.0, check=check,
+            )
+            if str(reaction.emoji) == "✅":
+                # User approved
+                try:
+                    await msg.clear_reactions()
+                except Exception:
+                    pass
+                await self._do_auto_join(voice_channel, text_ch.id, guild_id)
+            else:
+                logger.info(
+                    "Auto-join denied by user %s (guild %s)",
+                    member_id, guild_id,
+                )
+                try:
+                    await msg.clear_reactions()
+                except Exception:
+                    pass
+        except asyncio.TimeoutError:
+            logger.info(
+                "Auto-join prompt timed out (guild %s, member %s)",
+                guild_id, member_id,
+            )
+            try:
+                await msg.clear_reactions()
+            except Exception:
+                pass
+
+    async def _do_auto_join(self, voice_channel, text_ch_id, guild_id):
+        """Execute the auto-join: call ``join_voice_channel`` then announce."""
+        logger.info(
+            "Auto-joining voice channel %s (guild %d)",
+            voice_channel.id, guild_id,
+        )
+        succeeded = await self.join_voice_channel(
+            voice_channel,
+            text_channel_id=text_ch_id,
+        )
+        if succeeded and text_ch_id is not None:
+            try:
+                ch = self._client.get_channel(text_ch_id)
+                if ch is not None:
+                    await ch.send(
+                        "🤖 Hermes auto-joined <#{}> — transcribing for "
+                        "allowlisted users. Use `/voice leave` to disconnect."
+                        .format(voice_channel.id)
+                    )
+            except Exception:
+                logger.debug(
+                    "Failed to send auto-join announcement (guild %d)",
+                    guild_id,
+                )
 
     def _playback_timeout_limit(self) -> int:
         return int(getattr(self, "_playback_timeout_seconds", self.PLAYBACK_TIMEOUT))
