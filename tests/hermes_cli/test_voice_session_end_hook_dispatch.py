@@ -93,3 +93,42 @@ def test_a_timed_out_session_end_does_not_suppress_the_next_one(home, caplog):
     finally:
         probe.gate(home, "alpha").set()
     assert [r["voice_session_id"] for r in probe.records(home)] == ["s1", "s2"]
+
+
+def _spy_bounded(manager, monkeypatch) -> list:
+    """Record the timeout each bounded callback run is given (the dispatch's effective bound)."""
+    seen: list = []
+    real = manager._run_hook_callback_bounded
+
+    def spy(hook_name, cb, kwargs, timeout):
+        seen.append(timeout)
+        return real(hook_name, cb, kwargs, timeout)
+
+    monkeypatch.setattr(manager, "_run_hook_callback_bounded", spy)
+    return seen
+
+
+def test_a_per_call_timeout_tightens_but_never_loosens_the_configured_bound(home, monkeypatch):
+    probe.install_probe(home, "alpha", returns="done")
+    manager = probe.discover(home)
+    seen = _spy_bounded(manager, monkeypatch)
+    configured = plugins_mod._resolve_hook_callback_timeout()
+    assert configured == plugins_mod._HOOK_CALLBACK_TIMEOUT_SECS > 2.0
+
+    for session, per_call in (("s1", 2.0), ("s2", None), ("s3", configured * 2)):
+        assert manager.invoke_hook_attributed(HOOK, timeout=per_call, **_payload(session)) == [("alpha", "done")]
+
+    assert seen == [2.0, configured, configured]
+
+
+def test_an_owner_entry_naming_another_callable_attributes_nothing(home):
+    """``(hook, id(cb))`` can be reused after GC: an entry whose callable is not THIS one is stale."""
+    probe.install_probe(home, "alpha", returns="a")
+    manager = probe.discover(home)
+    shell = lambda **_kw: "shell"  # noqa: E731 - a callback no plugin registered
+    manager._hooks[HOOK].append(shell)
+    _alpha_cb, alpha_owner = next(iter(manager._hook_owner_keys.values()))
+    manager._hook_owner_keys[(HOOK, id(shell))] = (object(), alpha_owner)   # forged stale entry
+
+    assert sorted(manager.invoke_hook_attributed(HOOK, **_payload("s1")), key=repr) == sorted(
+        [("alpha", "a"), (None, "shell")], key=repr)
