@@ -51,7 +51,8 @@ def select_voice_followup(results: list[tuple[Optional[str], Any]]) -> Optional[
             logger.info("%s: follow-up from %s ignored: one follow-up per session end, %s already won",
                         HOOK, owner or "a non-plugin hook", winner[0])
         elif owner is None:
-            logger.info("%s: dropping a follow-up from a hook no plugin owns (no injection gate)", HOOK)
+            logger.info("%s: dropping a follow-up from a hook no single plugin owns (a shell hook, or a "
+                        "callable several plugins registered): no injection gate to apply", HOOK)
         elif len(text) > _FOLLOWUP_MAX_CHARS:
             logger.warning("%s: dropping follow-up from plugin %s: %d chars > %d",
                            HOOK, owner, len(text), _FOLLOWUP_MAX_CHARS)

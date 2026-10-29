@@ -53,10 +53,10 @@ def test_owner_map_follows_unload_of_one_plugin_and_of_all(home):
     probe.install_probe(home, "alpha", returns="a")
     probe.install_probe(home, "beta", returns="b")
     manager = probe.discover(home)
-    assert sorted(owner for _cb, owner in manager._hook_owner_keys.values()) == ["alpha", "beta"]
+    assert sorted(owners for _cb, owners in manager._hook_owner_keys.values()) == [("alpha",), ("beta",)]
 
     manager.unload("alpha")
-    assert [owner for _cb, owner in manager._hook_owner_keys.values()] == ["beta"]
+    assert [owners for _cb, owners in manager._hook_owner_keys.values()] == [("beta",)]
     assert manager.invoke_hook_attributed(HOOK, **_payload("s1")) == [("beta", "b")]
 
     manager.unload()
@@ -145,3 +145,49 @@ def test_a_per_call_timeout_bounds_the_call_even_when_the_configured_bound_is_of
     assert seen == []                              # no bound: inline
     assert manager.invoke_hook_attributed(HOOK, timeout=30.0, **_payload("s2")) == [("alpha", "done")]
     assert seen == [30.0]
+
+
+def test_a_callable_two_plugins_register_is_attributed_to_neither_until_one_unloads(home, caplog):
+    """Whose injection gate would apply is ambiguous: refuse attribution (and say so), never let the
+    last registrant win silently."""
+    probe.install_probe(home, "alpha", shared=True)
+    probe.install_probe(home, "beta", shared=True)
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+        manager = probe.discover(home)
+    assert any("alpha" in r.getMessage() and "beta" in r.getMessage() and HOOK in r.getMessage()
+               for r in caplog.records if r.levelno == logging.WARNING)
+
+    assert manager.invoke_hook_attributed(HOOK, **_payload("s1")) == [(None, probe.SHARED_RESULT)] * 2
+
+    manager.unload("alpha")
+    assert manager.invoke_hook_attributed(HOOK, **_payload("s2")) == [("beta", probe.SHARED_RESULT)]
+    manager.unload("beta")
+    assert manager._hook_owner_keys == {}
+
+
+@pytest.mark.asyncio
+async def test_a_plugin_unloaded_while_its_callback_runs_keeps_its_attribution(home, caplog):
+    """Attribution is taken when the call starts: the follow-up is then dropped as "no longer
+    loaded", not misreported as coming from a hook no plugin owns."""
+    from gateway.run_voice_session_end import GatewayVoiceSessionEndMixin, select_voice_followup
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    probe.install_probe(home, "alpha", returns={"followup_turn": "wrap up"}, block=["s1"])
+    manager = probe.discover(home)
+    call = asyncio.ensure_future(asyncio.to_thread(manager.invoke_hook_attributed, HOOK, **_payload("s1")))
+    try:
+        await asyncio.to_thread(probe.started(home, "alpha").wait, 10)
+        manager.unload("alpha")
+    finally:
+        probe.gate(home, "alpha").set()
+    results = await call
+
+    assert results == [("alpha", {"followup_turn": "wrap up"})]
+    assert select_voice_followup(results) == ("alpha", "wrap up")
+    token = set_hermes_home_override(str(home))
+    try:
+        with caplog.at_level(logging.INFO, logger="gateway.run"):
+            assert GatewayVoiceSessionEndMixin._inject_voice_followup(
+                "alpha", "wrap up", "agent:main:discord:group:700:42") is False
+    finally:
+        reset_hermes_home_override(token)
+    assert any("alpha" in r.getMessage() and "no longer loaded" in r.getMessage() for r in caplog.records)

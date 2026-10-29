@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -327,13 +326,13 @@ async def test_t5_a_hung_hook_does_not_hold_shutdown_past_its_budget(homes):
     adapter = rig.add_adapter()
     adapter._client.close = AsyncMock()
     await _join(adapter)
-    rig.runner._running = False
+    rig.runner._running, rig.runner._draining = False, True
     try:
-        started = time.monotonic()
-        await adapter.disconnect()
-        elapsed = time.monotonic() - started
+        await adapter.disconnect()      # bounded by its own 2 s wait; the hook call by its 2 s timeout
         assert probe.started(homes.default, "vse-probe").is_set(), "the hook never ran"
-        assert elapsed < 5.0, elapsed
+        assert not probe.finished(homes.default, "vse-probe").is_set(), "disconnect() waited for the hung hook"
+        await rig.settle()              # the dispatch finishes too: the hung call was abandoned
+        assert not probe.finished(homes.default, "vse-probe").is_set()
     finally:
         probe.gate(homes.default, "vse-probe").set()
         await rig.settle()
@@ -570,8 +569,9 @@ async def test_t9_speech_routed_to_another_profile_records_no_session_and_starts
 
 
 @pytest.mark.asyncio
-async def test_t10_a_raising_hook_runs_after_teardown_and_never_fails_the_leave(homes, caplog):
+async def test_t10_a_raising_hook_runs_after_teardown_and_never_fails_the_leave(homes):
     probe.install_probe(homes.default, **{"raise": True})
+    probe.install_probe(homes.default, "wrap-up", returns={"followup_turn": WRAP_UP}, allow_injection=True)
     probe.discover(homes.default)
     rig = Rig(homes.tmp)
     adapter = rig.add_adapter()
@@ -579,18 +579,22 @@ async def test_t10_a_raising_hook_runs_after_teardown_and_never_fails_the_leave(
         fx.GUILD in adapter._voice_clients, fx.GUILD in adapter._voice_text_channels,
         fx.GUILD in adapter._voice_sessions))
     await _join(adapter)
+    await _speak(adapter)
 
-    with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
-        await adapter.leave_voice_channel(fx.GUILD)      # returns: never raises, never waits on the hook
-        await rig.settle()
+    await adapter.leave_voice_channel(fx.GUILD)      # returns: never raises, never waits on the hook
+    await rig.settle()
 
     assert probe.CHECK_RESULTS == [("vse-probe", (False, False, False))]
-    assert any("on_voice_session_end" in r.getMessage() and "raised" in r.getMessage() for r in caplog.records)
+    # The raise is isolated to its callback: the other plugin was called and its follow-up started.
+    assert sorted(r["plugin"] for r in probe.records(homes.default)) == ["vse-probe", "wrap-up"]
+    assert rig.injector.call_count == 1 and rig.injector.call_args.kwargs["plugin_id"] == "wrap-up"
+    [followup] = await async_wait_until(lambda: _followups(adapter), timeout=10, what="follow-up turn")
+    assert followup.metadata["hermes_plugin_id"] == "wrap-up"
 
 
 @pytest.mark.asyncio
-async def test_t10_a_hung_hook_is_abandoned_at_the_timeout_and_the_leave_does_not_wait(homes, caplog):
-    probe.install_probe(homes.default, block=True)
+async def test_t10_a_hung_hook_is_abandoned_at_the_timeout_and_the_leave_does_not_wait(homes):
+    probe.install_probe(homes.default, returns={"followup_turn": WRAP_UP}, allow_injection=True, block=True)
     cfg = homes.default / "config.yaml"
     import hermes_yaml as yaml
     data = yaml.safe_load(cfg.read_text(encoding="utf-8"))
@@ -600,13 +604,14 @@ async def test_t10_a_hung_hook_is_abandoned_at_the_timeout_and_the_leave_does_no
     rig = Rig(homes.tmp)
     adapter = rig.add_adapter()
     await _join(adapter)
+    await _speak(adapter)
     try:
         await adapter.leave_voice_channel(fx.GUILD)
         assert not adapter.is_in_voice_channel(fx.GUILD)
-        assert not probe.gate(homes.default, "vse-probe").is_set()   # returned while the hook still hangs
-        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
-            await rig.settle()
-        assert any("timed out" in r.getMessage() for r in caplog.records)
+        assert not probe.finished(homes.default, "vse-probe").is_set()   # returned while the hook hangs
+        await rig.settle()                                              # the dispatch gave up on it ...
+        assert not probe.finished(homes.default, "vse-probe").is_set()   # ... while it still hangs
+        assert not rig.injector.called                              # and its late result is never used
     finally:
         probe.gate(homes.default, "vse-probe").set()
     assert len(probe.records(homes.default)) == 1

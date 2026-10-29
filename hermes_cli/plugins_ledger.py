@@ -127,14 +127,36 @@ class PluginLedgerMixin:
         del values[index]
         return True
 
-    def _remove_callback(self, mapping: dict[str, list[Callable]], key: str, callback: Callable) -> None:
+    def _note_hook_owner(self, key: str, callback: Callable, plugin_key: str) -> None:
+        """Record *plugin_key* as an owner of *callback* for ``invoke_hook_attributed``. A callable
+        several plugins register is attributed to none of them while they share it (whose injection
+        gate applies is ambiguous); a stale entry left by ``id()`` reuse is replaced."""
+        slot = (key, id(callback))
+        entry = self._hook_owner_keys.get(slot)
+        owners = entry[1] if entry is not None and entry[0] is callback else ()
+        others = sorted({o for o in owners if o != plugin_key})
+        if others:
+            logger.warning("Plugins %s and %s registered the same %s callback %s; its results are "
+                           "attributed to no plugin while they share it", ", ".join(others), plugin_key, key,
+                           getattr(callback, "__qualname__", repr(callback)))
+        self._hook_owner_keys[slot] = (callback, (*owners, plugin_key))
+
+    def _remove_callback(
+        self, mapping: dict[str, list[Callable]], key: str, callback: Callable, owner: Optional[str] = None,
+    ) -> None:
         callbacks = mapping.get(key)
         if callbacks is None:
             return
         self._remove_identity(callbacks, callback)
-        owner = self._hook_owner_keys.get((key, id(callback))) if mapping is self._hooks else None
-        if owner is not None and owner[0] is callback and not any(cb is callback for cb in callbacks):
-            self._hook_owner_keys.pop((key, id(callback)), None)
+        entry = self._hook_owner_keys.get((key, id(callback))) if mapping is self._hooks else None
+        if entry is not None and entry[0] is callback:
+            owners = list(entry[1])
+            if owner in owners:
+                owners.remove(owner)
+            if owners and any(cb is callback for cb in callbacks):
+                self._hook_owner_keys[(key, id(callback))] = (callback, tuple(owners))
+            else:
+                self._hook_owner_keys.pop((key, id(callback)), None)
         if not callbacks:
             mapping.pop(key, None)
 
