@@ -14,7 +14,9 @@ The Discord adapter hands over an immutable :class:`VoiceSessionEnd` when a voic
   notification whose reply is posted as text and never spoken.
 
 The hook call and the injection (which reads the gate from config) run on a worker thread, never on
-the event loop; a ``shutdown`` end gets a 2 s hook bound and its follow-up is dropped.
+the event loop. Every hook call is bounded (the configured ``plugins.hook_callback_timeout``, or
+30 s when that is off), a ``shutdown`` end gets a 2 s bound and its follow-up is dropped. An owner
+profile that no longer resolves skips the hook rather than dispatching it to the launch profile.
 """
 from __future__ import annotations
 
@@ -27,6 +29,12 @@ logger = logging.getLogger("gateway.run")
 HOOK = "on_voice_session_end"
 _FOLLOWUP_MAX_CHARS = 8000
 _SHUTDOWN_HOOK_TIMEOUT_SECS = 2.0
+# Used when plugins.hook_callback_timeout is 0 (worker path off): a hung plugin must not pin an
+# executor thread per session end for as long as it hangs.
+_DEFAULT_HOOK_TIMEOUT_SECS = 30.0
+# The last transcript's turn opens its session from a background task; a session that utterance
+# created may not be in the store yet when the end is dispatched.
+_SESSION_ENTRY_WAIT_SECS = 5.0
 
 
 def select_voice_followup(results: list[tuple[Optional[str], Any]]) -> Optional[tuple[str, str]]:
@@ -92,11 +100,17 @@ class GatewayVoiceSessionEndMixin:
     async def _dispatch_voice_session_end(self, end: Any, reason: str, adapter: Any) -> None:
         try:
             from gateway.run import _async_profile_runtime_scope
+            from gateway.run_adapters import UNRESOLVED_PROFILE_HOME
             profile, home = self._voice_session_end_owner(adapter)
+            if home is UNRESOLVED_PROFILE_HOME:
+                logger.warning("%s skipped for voice session %s: the bot owner's profile %s does not "
+                               "resolve (not dispatched to another profile's plugins)",
+                               HOOK, end.voice_session_id, profile)
+                return
             async with self._async_scope_or_null(_async_profile_runtime_scope, home):
                 session_id = None
                 if end.session_key:
-                    entry = await self.async_session_store.lookup_by_session_key(end.session_key)
+                    entry = await self._voice_session_entry(end.session_key, patient=reason != "shutdown")
                     session_id = getattr(entry, "session_id", None)
                 payload = {
                     "platform": "discord", "profile": profile, "session_id": session_id,
@@ -114,12 +128,36 @@ class GatewayVoiceSessionEndMixin:
             logger.warning("%s dispatch failed for voice session %s", HOOK,
                            getattr(end, "voice_session_id", "?"), exc_info=True)
 
+    async def _voice_session_entry(self, session_key: str, *, patient: bool) -> Any:
+        """The store entry of the session the last transcript went into. When that transcript opened
+        the session, its turn (a background task) may not have created the entry yet: wait for it,
+        bounded (``patient``; never at shutdown). ``None`` when it does not appear."""
+        loop = asyncio.get_running_loop()
+        deadline, delay = loop.time() + _SESSION_ENTRY_WAIT_SECS, 0.02
+        while True:
+            entry = await self.async_session_store.lookup_by_session_key(session_key)
+            if entry is not None or not patient or loop.time() >= deadline:
+                if entry is None and patient:
+                    logger.info("%s: session %s was not opened within %.0fs; the hook sees no session_id",
+                                HOOK, session_key, _SESSION_ENTRY_WAIT_SECS)
+                return entry
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 0.25)
+
+    @staticmethod
+    def _voice_session_end_hook_timeout(reason: str) -> float:
+        """Always finite: the configured bound, or the default when it is off; 2 s at shutdown."""
+        from hermes_cli.plugins import _resolve_hook_callback_timeout
+        configured = _resolve_hook_callback_timeout()
+        timeout = configured if configured > 0 else _DEFAULT_HOOK_TIMEOUT_SECS
+        return min(timeout, _SHUTDOWN_HOOK_TIMEOUT_SECS) if reason == "shutdown" else timeout
+
     def _run_voice_session_end_hook(self, payload: dict[str, Any]) -> None:
         """Worker thread, inside the owner's scope: fire the hook, then start the follow-up (if any)."""
-        from hermes_cli.lifecycle import invoke_hook_attributed
+        from hermes_cli import lifecycle
         reason = payload["reason"]
-        results = invoke_hook_attributed(
-            HOOK, timeout=_SHUTDOWN_HOOK_TIMEOUT_SECS if reason == "shutdown" else None, **payload)
+        results = lifecycle.invoke_hook_attributed(
+            HOOK, timeout=self._voice_session_end_hook_timeout(reason), **payload)
         selected = select_voice_followup(results)
         if selected is None:
             return
