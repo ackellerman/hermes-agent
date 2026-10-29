@@ -3982,7 +3982,9 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 continue
             try:
                 if ch.permissions_for(guild.me).send_messages:
-                    logger.info(
+                    # DEBUG: the binding is resolved for every joined event in the guild, before
+                    # the policy decides; the join itself logs the bound channel at INFO.
+                    logger.debug(
                         "Auto-join binding: seat home channel %s (guild %s)", ch.id, guild.id
                     )
                     return ch.id
@@ -4122,8 +4124,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
     async def _do_auto_join(self, voice_channel, text_ch_id, guild_id):
         """Execute the auto-join: call ``join_voice_channel`` then announce."""
         logger.info(
-            "Auto-joining voice channel %s (guild %d)",
-            voice_channel.id, guild_id,
+            "Auto-joining voice channel %s (guild %d), text channel %s",
+            voice_channel.id, guild_id, text_ch_id,
         )
         succeeded = await self.join_voice_channel(
             voice_channel,
