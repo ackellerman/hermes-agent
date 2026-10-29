@@ -873,8 +873,8 @@ class TestCallbackWiringOrder:
 
 
     @pytest.mark.asyncio
-    async def test_join_failure_clears_callback(self, tmp_path):
-        """If join fails with exception, callback is cleaned up."""
+    async def test_join_failure_keeps_the_input_callback_bound(self, tmp_path):
+        """A failed join leaves the input callback bound: a later auto-join never rebinds it."""
         runner = _make_runner(tmp_path)
 
         mock_channel = MagicMock()
@@ -892,7 +892,7 @@ class TestCallbackWiringOrder:
 
         result = await runner._handle_voice_channel_join(event)
         assert "failed" in result.lower()
-        assert mock_adapter._voice_input_callback is None
+        assert mock_adapter._voice_input_callback is not None
 
 
 # =====================================================================
@@ -923,7 +923,6 @@ class TestLeaveExceptionHandling:
 
         await runner._handle_voice_channel_leave(event)
         assert runner._voice_mode["telegram:123"] == "off"
-        assert mock_adapter._voice_input_callback is None
 
 
 class TestStreamTtsToSpeaker:

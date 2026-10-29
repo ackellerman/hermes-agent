@@ -189,12 +189,10 @@ class GatewayVoiceMixin:
                         " endpoint reported in the log above"
                     )
             logger.warning("Failed to join voice channel: %s", reason)
-            adapter._voice_input_callback = None
             if not any(tok in reason.lower() for tok in ("pynacl", "nacl", "davey")):
                 return t("gateway.voice.channel_join_failed", error=reason)
             return t("gateway.voice.channel_deps_missing", hint=install_hint("discord"))
         if not success:
-            adapter._voice_input_callback = None
             return t("gateway.voice.channel_join_permissions")
         text_channel_id = int(event.source.chat_id)
         # Moving to another text channel drops speech buffered for the old one (a same-channel rejoin
@@ -220,11 +218,10 @@ class GatewayVoiceMixin:
             await adapter.leave_voice_channel(guild_id)
         except Exception as e:
             logger.warning("Error leaving voice channel: %s", e)
-        # Always clean up state even if leave raised an exception
+        # Always clean up state even if leave raised an exception. The input callback stays bound:
+        # it is per adapter and idle with no receiver, and an auto-join never binds it again.
         self._apply_voice_mode(adapter, self._voice_key_for_source(event.source),
                                event.source.chat_id, "off")
-        if hasattr(adapter, "_voice_input_callback"):
-            adapter._voice_input_callback = None
         return t("gateway.voice.channel_left")
 
     def _handle_voice_timeout_cleanup(self, chat_id: str, *, adapter=None) -> None:
