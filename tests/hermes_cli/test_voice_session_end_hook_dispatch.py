@@ -132,3 +132,16 @@ def test_an_owner_entry_naming_another_callable_attributes_nothing(home):
 
     assert sorted(manager.invoke_hook_attributed(HOOK, **_payload("s1")), key=repr) == sorted(
         [("alpha", "a"), (None, "shell")], key=repr)
+
+
+def test_a_per_call_timeout_bounds_the_call_even_when_the_configured_bound_is_off(home, monkeypatch):
+    """``hook_callback_timeout: 0`` disables the worker path; a per-call bound still applies."""
+    probe.install_probe(home, "alpha", returns="done")
+    manager = probe.discover(home)
+    seen = _spy_bounded(manager, monkeypatch)
+    monkeypatch.setattr(plugins_mod, "_resolve_hook_callback_timeout", lambda: 0.0)
+
+    assert manager.invoke_hook_attributed(HOOK, **_payload("s1")) == [("alpha", "done")]
+    assert seen == []                              # no bound: inline
+    assert manager.invoke_hook_attributed(HOOK, timeout=30.0, **_payload("s2")) == [("alpha", "done")]
+    assert seen == [30.0]

@@ -78,6 +78,10 @@ class Rig:
         runner._is_user_authorized = lambda source, **_kw: True
         self.runner = runner
         self.injector = MagicMock(side_effect=runner._schedule_plugin_message_injection)
+        # The dispatched voice turn opens its session from a background task, as the real turn does
+        # (run_turn: get_or_create_session); a test may hold it back to model a slow turn.
+        self.turn_may_open = asyncio.Event()
+        self.turn_may_open.set()
         plugins_mod.publish_gateway_message_host(runner, self.injector)
 
     def add_adapter(self, *, owner=None, bot_user_id=999):
@@ -87,7 +91,20 @@ class Rig:
         else:
             self.runner.adapters[Platform.DISCORD] = adapter
         self.runner._bind_voice_input_callback(adapter)  # what adapter wiring does at connect
+        adapter.handle_message = AsyncMock(side_effect=self._turn_opens_its_session)
         return adapter
+
+    async def _turn_opens_its_session(self, event):
+        if event.message_type != MessageType.VOICE:
+            return
+
+        async def turn():
+            await self.turn_may_open.wait()
+            await self.runner.async_session_store.get_or_create_session(event.source)
+
+        task = asyncio.get_running_loop().create_task(turn())
+        self.runner._background_tasks.add(task)
+        task.add_done_callback(self.runner._background_tasks.discard)
 
     async def settle(self):
         """Wait for every scheduled end dispatch (the hook and the follow-up decision) to finish."""
@@ -592,4 +609,122 @@ async def test_t10_a_hung_hook_is_abandoned_at_the_timeout_and_the_leave_does_no
         assert any("timed out" in r.getMessage() for r in caplog.records)
     finally:
         probe.gate(homes.default, "vse-probe").set()
+    assert len(probe.records(homes.default)) == 1
+
+
+# --- F5: an owner profile that no longer resolves ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_t9_an_unresolvable_owner_profile_skips_the_hook(homes, monkeypatch, caplog):
+    """The scope cannot be entered: the event must not fall through to the launch profile's plugins."""
+    import hermes_cli.profiles as profiles
+    probe.install_probe(homes.default, returns={"followup_turn": WRAP_UP}, allow_injection=True)
+    probe.discover(homes.default)
+    rig = Rig(homes.tmp)
+    adapter = rig.add_adapter(owner="ghost", bot_user_id=998)
+    real_get_profile_dir = profiles.get_profile_dir
+
+    def get_profile_dir(name):
+        if name == "ghost":
+            raise OSError("profile home vanished mid-run")
+        return real_get_profile_dir(name)
+
+    monkeypatch.setattr(profiles, "get_profile_dir", get_profile_dir)
+    await _join(adapter)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        await adapter.leave_voice_channel(fx.GUILD)
+        await rig.settle()
+
+    assert probe.records(homes.default) == []
+    assert not rig.injector.called
+    assert any(r.levelno == logging.WARNING and "on_voice_session_end" in r.getMessage() and "ghost" in r.getMessage()
+               for r in caplog.records)
+
+
+# --- F6: the last utterance opened the session ------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn", ["prompt", "slow"])
+async def test_t6_a_session_opened_by_the_final_utterance_gets_its_id_and_the_followup(homes, monkeypatch, turn):
+    """A single utterance, flushed inside the leave, is the session's first message: its turn opens
+    the session from a background task, possibly after the end dispatch first looks it up."""
+    probe.install_probe(homes.default, returns={"followup_turn": WRAP_UP}, allow_injection=True)
+    probe.discover(homes.default)
+    rig = Rig(homes.tmp)
+    adapter = rig.add_adapter()
+    store = rig.runner.session_store
+    misses = []
+    real_lookup = store.lookup_by_session_key
+
+    def lookup(session_key):
+        entry = real_lookup(session_key)
+        if entry is None:
+            misses.append(session_key)
+        return entry
+
+    monkeypatch.setattr(store, "lookup_by_session_key", lookup)
+    if turn == "slow":
+        rig.turn_may_open.clear()
+    await _join(adapter)
+    fx.FakeReceiver.instances[-1].pending = [(SPEAKER, b"\x00" * 9600)]
+
+    with patch("tools.transcription_tools.transcribe_audio",
+               return_value={"success": True, "transcript": "one open question"}):
+        await adapter.leave_voice_channel(fx.GUILD, reason="auto_leave", trigger="no_authorized_users")
+    if turn == "slow":
+        await async_wait_until(lambda: misses, timeout=10, what="the end dispatch looking the session up")
+        rig.turn_may_open.set()
+    await rig.settle()
+
+    [voice_event] = _voice_events(adapter)
+    key = rig.runner._session_key_for_source(voice_event.source)
+    entry = real_lookup(key)
+    assert entry is not None, "the voice turn never opened its session"
+    [record] = probe.records(homes.default)
+    assert (record["session_key"], record["session_id"]) == (key, entry.session_id)
+    [followup] = await async_wait_until(lambda: _followups(adapter), timeout=10, what="follow-up turn")
+    assert (followup.metadata["gateway_session_key"], followup.metadata["gateway_session_id"]) == (key, entry.session_id)
+
+
+# --- F7: every hook call gets a finite bound ----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured, state, expected", [
+    (0, "command", 30.0), (10, "command", 10.0), (None, "command", 30.0), (0, "stop", 2.0), (None, "stop", 2.0)])
+async def test_t10_every_hook_call_gets_a_finite_timeout(homes, monkeypatch, configured, state, expected):
+    """``plugins.hook_callback_timeout: 0`` turns the bounded worker off for every hook; this hook must
+    still never pin a default-executor thread for as long as a plugin hangs."""
+    import hermes_cli.lifecycle as lifecycle
+    import hermes_yaml as yaml
+    probe.install_probe(homes.default)
+    if configured is not None:
+        cfg = homes.default / "config.yaml"
+        data = yaml.safe_load(cfg.read_text(encoding="utf-8"))
+        data["plugins"]["hook_callback_timeout"] = configured
+        cfg.write_text(yaml.safe_dump(data), encoding="utf-8")
+    probe.discover(homes.default)
+    timeouts = []
+    real_invoke = lifecycle.invoke_hook_attributed
+
+    def invoke(hook_name, *, timeout=None, **kwargs):
+        timeouts.append(timeout)
+        return real_invoke(hook_name, timeout=timeout, **kwargs)
+
+    monkeypatch.setattr(lifecycle, "invoke_hook_attributed", invoke)
+    rig = Rig(homes.tmp)
+    adapter = rig.add_adapter()
+    adapter._client.close = AsyncMock()
+    await _join(adapter)
+    if state == "stop":
+        rig.runner._running, rig.runner._draining = False, True
+        await adapter.disconnect()
+    else:
+        await adapter.leave_voice_channel(fx.GUILD)
+    await rig.settle()
+
+    assert timeouts == [expected]
     assert len(probe.records(homes.default)) == 1

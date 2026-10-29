@@ -144,6 +144,31 @@ async def test_the_inactivity_timer_ends_the_session_as_auto_leave(adapter):
 
 
 @pytest.mark.asyncio
+async def test_the_inactivity_leave_posts_its_notice_on_a_send_that_suspends(adapter):
+    """The timer task runs the leave itself; the leave must not cancel it, or the cancellation lands
+    at the notice's first real suspension (an HTTP send) and the notice is lost."""
+    rec = _Recorder(adapter)
+    adapter._voice_timeout_seconds = 1
+    entered, release, sent = asyncio.Event(), asyncio.Event(), []
+
+    async def send(*args, **_kw):
+        entered.set()
+        await release.wait()             # a real send suspends on the network
+        sent.append(args)
+
+    adapter._fake_text.send = send
+    await _join(adapter)
+    timer = adapter._voice_timeout_tasks[fx.GUILD]
+
+    await asyncio.wait_for(entered.wait(), timeout=10)
+    release.set()
+    await asyncio.gather(timer, return_exceptions=True)
+
+    assert [(e.reason, e.trigger) for e in rec.ends] == [("auto_leave", "inactivity")]
+    assert not timer.cancelled() and len(sent) == 1
+
+
+@pytest.mark.asyncio
 async def test_the_no_authorized_users_auto_leave_through_the_real_handler(adapter, monkeypatch):
     rec = _Recorder(adapter)
     handlers = await fx.connect_capturing_handlers(adapter, monkeypatch)

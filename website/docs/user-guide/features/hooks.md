@@ -1377,7 +1377,7 @@ def register(ctx):
 |-----------|------|-------------|
 | `platform` | `str` | `"discord"`. |
 | `profile` | `str` | The profile whose bot left (the adapter owner; the primary bot reports its own profile name). |
-| `session_id` | `str \| None` | Current id of `session_key`'s session (looked up when the session ends, so a `/new` during the drive is seen), or `None`. |
+| `session_id` | `str \| None` | Current id of `session_key`'s session (looked up when the session ends, so a `/new` during the drive is seen; when the last utterance opened the session, the lookup waits up to 5 s for its turn to create it), or `None`. |
 | `session_key` | `str \| None` | The session the most recent voice transcript was dispatched into; `None` when no transcript was dispatched for this bot's profile. |
 | `session_keys` | `list[str]` | Every session a transcript was dispatched into, first-seen order (with per-user group sessions each speaker has their own). |
 | `guild_id` | `str` | |
@@ -1398,9 +1398,9 @@ def register(ctx):
 - `reason="shutdown"`: the hook fires (bounded to 2 s) and any follow-up is dropped with an INFO log line, so a consumer can fall back to its own summary. `session_key=None`: the follow-up is dropped with an INFO line.
 - When a `gateway.profile_routes` entry re-homes the bot's voice speech into another profile, that speech records no `session_key` for this event (the follow-up would otherwise run in another profile's session); the speaker still counts as a participant.
 
-**Fail-safe.** The event is handed over after the bot has left and its state is torn down; the leave never waits for the hook. The callback runs on a worker thread bounded by `plugins.hook_callback_timeout` (default 30 s); a timeout or exception is logged and skipped, and an earlier timeout never suppresses the next session's event. When the gateway stops, the adapter waits at most 2 s for its end handlers. A crash or `SIGKILL` fires nothing.
+**Fail-safe.** The event is handed over after the bot has left and its state is torn down; the leave never waits for the hook. The callback runs on a worker thread bounded by `plugins.hook_callback_timeout` (default 30 s; this hook stays bounded at 30 s when that setting is `0`); a timeout or exception is logged and skipped, and an earlier timeout never suppresses the next session's event. When the gateway stops, the adapter waits at most 2 s for its end handlers. A crash or `SIGKILL` fires nothing.
 
-**Multiplexed gateway.** Only the profile whose bot left gets the event: each bot's voice sessions belong to its own adapter, and the hook is dispatched under that profile's scope, so only that profile's plugins are called.
+**Multiplexed gateway.** Only the profile whose bot left gets the event: each bot's voice sessions belong to its own adapter, and the hook is dispatched under that profile's scope, so only that profile's plugins are called. If that profile's home no longer resolves (deleted or renamed mid-run), the event is skipped with a WARNING rather than dispatched to the launch profile.
 
 ---
 

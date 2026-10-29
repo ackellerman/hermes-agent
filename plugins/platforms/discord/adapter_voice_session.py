@@ -258,7 +258,9 @@ class DiscordVoiceSessionMixin:
                     logger.debug("Stopping voice playback before the leave failed", exc_info=True)
                 await vc.disconnect()
             task = self._voice_timeout_tasks.pop(guild_id, None)
-            if task:
+            if task and task is not asyncio.current_task():
+                # Not the inactivity timer running this very leave: cancelling itself would land
+                # at its next suspension, the "left (inactivity)" notice's send, and lose it.
                 task.cancel()
             # Undo the auto-join's implicit "speak in this chat" opt-in. Without this the enabled
             # set outlives the voice session: every later reply in that channel is synthesised,
