@@ -192,9 +192,25 @@ class DiscordVoiceSessionMixin:
             except Exception:
                 logger.debug("voice disconnect cleanup failed", exc_info=True)
 
+    @staticmethod
+    def _voice_client_reconnecting(existing: Any, channel: Any) -> bool:
+        """A tracked client that is not connected but still registered with discord.py is inside its
+        reconnect window (``cleanup()``, which unregisters it, runs only on a final disconnect). A
+        join then must leave the session alone: ``connect()`` refuses with "Already connected" as it
+        always did, and the reconnect brings the tracked client back."""
+        if existing is None:
+            return False
+        guild = getattr(channel, "guild", None)
+        if getattr(guild, "voice_client", None) is existing:
+            logger.info("Voice client in guild %s is still reconnecting; the join leaves its session alone",
+                        getattr(guild, "id", "?"))
+            return True
+        return False
+
     async def _end_stale_voice_session_locked(self, guild_id: int) -> None:
-        """Cold join while a record survives (the previous connection dropped unseen): end it as
-        ``disconnect`` first, keeping the text binding for a join that names none."""
+        """Cold join while a record survives and discord.py has dropped the previous client (it
+        closed unseen): end it as ``disconnect`` first, keeping the text binding for a join that
+        names none."""
         if guild_id not in (getattr(self, "_voice_sessions", None) or {}):
             return
         binding, source = self._voice_text_channels.get(guild_id), self._voice_sources.get(guild_id)

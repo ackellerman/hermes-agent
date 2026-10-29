@@ -23,7 +23,11 @@ GUILD, TEXT, VOICE_A, VOICE_B = 1, 700, 900, 901
 
 
 class FakeVoiceClient:
-    """discord.py ``VoiceProtocol`` surface: ``disconnect()`` ends in ``cleanup()`` as the real one does."""
+    """discord.py ``VoiceProtocol`` surface: ``disconnect()`` ends in ``cleanup()`` as the real one does.
+
+    As in discord.py, the client stays registered (``guild.voice_client``) until ``cleanup()``, which
+    only a final disconnect runs; a reconnect leaves it registered but not connected.
+    """
 
     def __init__(self, client: Any, channel: Any) -> None:
         self.client, self.channel = client, channel
@@ -41,6 +45,9 @@ class FakeVoiceClient:
 
     def cleanup(self) -> None:
         self.cleanups += 1
+        guild = getattr(self.channel, "guild", None)
+        if getattr(guild, "voice_client", None) is self:
+            guild.voice_client = None  # VoiceProtocol.cleanup(): state._remove_voice_client(guild.id)
 
     async def disconnect(self, *, force: bool = False) -> None:
         self._connected = False
@@ -54,6 +61,11 @@ class FakeVoiceClient:
         self._connected = False
         self.cleanup()
 
+    def reconnecting(self) -> None:
+        """discord.py's reconnect window (``_potential_reconnect`` / 4015 resume): not connected, but
+        ``cleanup()`` has not run, so the client is still registered for the guild."""
+        self._connected = False
+
 
 class FakeVoiceChannel:
     def __init__(self, cid: int, guild: Any, *, name: str = "drive", members: Optional[list] = None) -> None:
@@ -63,7 +75,12 @@ class FakeVoiceChannel:
 
     async def connect(self, *, cls: Any = None, **_kw: Any) -> Any:
         self.connect_classes.append(cls)
-        return (cls or FakeVoiceClient)(self.guild._client, self)
+        if getattr(self.guild, "voice_client", None) is not None:
+            # discord.py ``Connectable.connect``: ClientException while a client is still registered.
+            raise RuntimeError("Already connected to a voice channel.")
+        vc = (cls or FakeVoiceClient)(self.guild._client, self)
+        self.guild.voice_client = vc
+        return vc
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, FakeVoiceChannel) and other.id == self.id
@@ -103,7 +120,7 @@ class FakeReceiver:
 
 
 def make_guild(client: Any, gid: int = GUILD) -> Any:
-    guild = SimpleNamespace(id=gid, name="Garage", _client=client, get_member=lambda uid: None)
+    guild = SimpleNamespace(id=gid, name="Garage", _client=client, get_member=lambda uid: None, voice_client=None)
     return guild
 
 

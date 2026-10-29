@@ -225,7 +225,7 @@ async def test_a_cold_rejoin_after_an_unseen_drop_ends_the_old_session_first(ada
     rec = _Recorder(adapter)
     await _join(adapter)
     old = adapter._voice_sessions[fx.GUILD]
-    adapter._voice_clients[fx.GUILD]._connected = False    # dropped; nothing told us
+    adapter._voice_clients[fx.GUILD].closed_by_discord()   # dropped for good; no notifier on a plain client
 
     assert await adapter.join_voice_channel(fx.voice_channel(adapter)) is True   # names no text channel
 
@@ -233,6 +233,72 @@ async def test_a_cold_rejoin_after_an_unseen_drop_ends_the_old_session_first(ada
     assert new.voice_session_id != old.voice_session_id
     assert [(e.voice_session_id, e.reason) for e in rec.ends] == [(old.voice_session_id, "disconnect")]
     assert adapter._voice_text_channels[fx.GUILD] == fx.TEXT    # the binding survives the stale end
+    await adapter.leave_voice_channel(fx.GUILD)
+    assert [e.voice_session_id for e in rec.ends] == [old.voice_session_id, new.voice_session_id]
+
+
+class _AutoJoinCaller:
+    """The two callers of a cold join: ``/voice join`` (the runner calls ``join_voice_channel``) and
+    the adapter's own auto-join (``_do_auto_join``)."""
+
+    @staticmethod
+    async def voice_join(adapter, channel):
+        return await adapter.join_voice_channel(channel, text_channel_id=fx.TEXT)
+
+    @staticmethod
+    async def auto_join(adapter, channel):
+        return await adapter._do_auto_join(channel, fx.TEXT, fx.GUILD)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", ["voice_join", "auto_join"])
+async def test_a_join_during_discord_reconnect_window_keeps_the_session(adapter, hermes_voice_client, caller):
+    """discord.py is still reconnecting (client registered, not connected, cleanup() not run): a join
+    landing then must not end the session, stop the receiver or drop the client. ``connect()``
+    refuses as discord.py does (base behaviour); once the reconnect completes the bot is still
+    tracked and its real leave ends the session exactly once."""
+    rec = _Recorder(adapter)
+    channel = fx.voice_channel(adapter)
+    await adapter.join_voice_channel(channel, text_channel_id=fx.TEXT)
+    vc, receiver = adapter._voice_clients[fx.GUILD], fx.FakeReceiver.instances[-1]
+    session = adapter._voice_sessions[fx.GUILD]
+    vc.reconnecting()
+
+    outcome = "returned"
+    try:
+        await getattr(_AutoJoinCaller, caller)(adapter, fx.voice_channel(adapter))
+    except RuntimeError:
+        outcome = "raised"                       # discord.py's "Already connected" (base behaviour)
+    vc._connected = True                         # discord.py finished reconnecting
+
+    state = dict(ends=[e.reason for e in rec.ends], tracked=adapter._voice_clients.get(fx.GUILD) is vc,
+                 receiver_alive=not receiver.stopped and adapter._voice_receivers.get(fx.GUILD) is receiver,
+                 record=adapter._voice_sessions.get(fx.GUILD) is session,
+                 bound=adapter._voice_text_channels.get(fx.GUILD))
+    assert state == dict(ends=[], tracked=True, receiver_alive=True, record=True, bound=fx.TEXT), (outcome, state)
+    assert adapter.is_in_voice_channel(fx.GUILD)
+
+    await adapter.leave_voice_channel(fx.GUILD)
+    assert [(e.voice_session_id, e.reason) for e in rec.ends] == [(session.voice_session_id, "command")]
+
+
+@pytest.mark.asyncio
+async def test_a_stale_close_after_a_rejoin_ends_only_the_old_session(adapter, hermes_voice_client):
+    """Drop, then a cold re-join runs before the scheduled close task: the close task finds a NEW
+    client for the guild and must leave it alone (the "is this still our client?" checks)."""
+    rec = _Recorder(adapter)
+    await _join(adapter)
+    old = adapter._voice_sessions[fx.GUILD]
+    adapter._voice_clients[fx.GUILD].closed_by_discord()        # close task scheduled, not yet run
+    await _join(adapter)
+    new = adapter._voice_sessions[fx.GUILD]
+    new_vc = adapter._voice_clients[fx.GUILD]
+
+    await asyncio.gather(*adapter.__dict__.get("_voice_close_tasks", ()), return_exceptions=True)
+
+    assert [(e.voice_session_id, e.reason) for e in rec.ends] == [(old.voice_session_id, "disconnect")]
+    assert adapter._voice_sessions.get(fx.GUILD) is new and adapter._voice_clients.get(fx.GUILD) is new_vc
+    assert adapter.is_in_voice_channel(fx.GUILD) and not fx.FakeReceiver.instances[-1].stopped
     await adapter.leave_voice_channel(fx.GUILD)
     assert [e.voice_session_id for e in rec.ends] == [old.voice_session_id, new.voice_session_id]
 
