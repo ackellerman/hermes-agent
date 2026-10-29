@@ -478,6 +478,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `pre_gateway_dispatch` | Directive/control | Incoming non-internal message before auth/pairing/dispatch; first valid `skip`, `rewrite`, or `allow` controls flow. | `event`, `gateway`, `session_store` | Extremely privileged in-process objects expose inbound user/routing data and host handles. |
 | `post_gateway_admission` | Directive/control (fail-open) | Admitted non-internal message after auth, pause/drain, pending-reply, running-session and slash-command lanes, inside the claimed session slot and the routed profile's scope; first `handled` result skips the agent turn, anything else (including a raise or timeout) runs it. | `session_key`, `platform`, `source` (dict snapshot), `message_id`, `text` | Inbound text is untrusted user data; no runner or session-store handles are passed. |
 | `gateway_platform_event` | Observer | After the gateway's profile-scoped authorization succeeds, when a supported platform-native event is normalized at the gateway boundary (Telegram: reactions, message edits; Discord: message edits/deletes, thread created/renamed); return ignored. | `platform`, `event_type`, `payload` (event-type-specific dict — see the per-event contracts below) | Normalized plain-dict envelope only; raw SDK objects, adapter handles, and bot clients are never exposed. |
+| `on_voice_session_end` | Directive (one follow-up turn, fail-open) | Once per Discord voice session, after the bot left the voice channel and its leave finished, off the event loop and under the scope of the profile whose bot left; the first plugin returning `{"followup_turn": str}` gets one text-only `[system]` turn in that session (needs `allow_gateway_injection`). | `platform`, `profile`, `session_id`, `session_key`, `session_keys`, `guild_id`, `voice_channel_id`, `text_channel_id`, `started_at`, `ended_at`, `reason`, `trigger`, `participants`, `voice_session_id` | Speaker user ids and session keys of a voice conversation. |
 | `pre_command` | Observer | Recognized slash command about to be dispatched, before the handler runs, on CLI and gateway cold-path dispatch; return ignored in v1 (directive-shaped dicts are logged at debug). Gateway running-agent intercept commands (`/stop`, `/approve` during an active run) are deliberately excluded — control-plane escape hatches must stay outside plugin reach. | `surface` (`"cli"` \| `"gateway"`), `command` (canonical name), `alias_used`, `args_raw`, `session_key`, `platform` | `args_raw` may contain user content or secrets typed after the command. |
 | `pre_approval_request` | Observer | Before prompted or smart approval; return ignored. | `command`, `description`, `pattern_key`, `pattern_keys`, `session_key`, `surface`, `turn_id`, `tool_call_id` | Command may contain secrets; smart observer preparation force-redacts, but surfaces do not all have identical redaction. |
 | `post_approval_response` | Observer | After a decision, timeout, or gateway notification failure; return ignored. | `command`, `description`, `pattern_key`, `pattern_keys`, `session_key`, `surface`, `turn_id`, `tool_call_id`, `choice`; smart path may add `decided_by` | Same command sensitivity plus decision metadata. |
@@ -1355,6 +1356,51 @@ Every payload is additive and event-specific; there is no monolithic gateway pay
 The bot's own progressive message edits (streaming) never fire `message_edited` on Discord — bot-authored events are dropped at the fire-site.
 
 This hook is observer-only: it does **not** add raw-event access or adapter access. **Raw SDK payload access is deliberately not shipped** — adapter SDK objects change shape without notice and would become un-evolvable API surface; where genuinely needed it requires its own explicit capability (`gateway.raw_events`) with a "no stability guarantee" label and its own design (tracked in #64228). For *acting* on a platform (adding a reaction, renaming a thread), use the capability-gated `ctx.platform_actions` facade documented in the [plugins guide](plugins.md#platform-actions) — it is gated off by default behind the `gateway.platform_actions` capability. `PluginContext.dispatch_tool()` can only call tools registered in the tool registry; `send_message` is intentionally not registered there (its transport is reserved for explicit CLI, cron, kanban, and MCP delivery paths). A future outbound-delivery contract must first provide stable delivered content/handles across all adapters; this slice does not pre-register an inert `gateway_message_delivered` hook.
+
+---
+
+### `on_voice_session_end`
+
+Fires **once per Discord voice session**, when the bot leaves the voice channel. A voice session starts when the bot connects to a voice channel (a `/voice join` or an auto-join) and ends with the first leave; moving between channels, re-joining the channel it is in and discord.py's own reconnects never start or end one.
+
+```python
+def on_voice_session_end(reason, participants, session_key, **kwargs):
+    if reason == "shutdown" or not participants:
+        return None
+    return {"followup_turn": "Write a short wrap-up of this drive for the notes channel."}
+
+def register(ctx):
+    ctx.register_hook("on_voice_session_end", on_voice_session_end)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `platform` | `str` | `"discord"`. |
+| `profile` | `str` | The profile whose bot left (the adapter owner; the primary bot reports its own profile name). |
+| `session_id` | `str \| None` | Current id of `session_key`'s session (looked up when the session ends, so a `/new` during the drive is seen; when the last utterance opened the session, the lookup waits up to 5 s for its turn to create it), or `None`. |
+| `session_key` | `str \| None` | The session the most recent voice transcript was dispatched into; `None` when no transcript was dispatched for this bot's profile. |
+| `session_keys` | `list[str]` | Every session a transcript was dispatched into, first-seen order (with per-user group sessions each speaker has their own). |
+| `guild_id` | `str` | |
+| `voice_channel_id` | `str \| None` | The channel the bot was in when it left (after any moves). |
+| `text_channel_id` | `str \| None` | The text channel the voice session was bound to. |
+| `started_at` / `ended_at` | `float` | Epoch seconds: connect, and end of the leave. |
+| `reason` | `str` | `auto_leave`, `command` (`/voice leave`, or a programmatic leave), `disconnect` (Discord closed the connection, or the adapter was recycled while the gateway keeps running), or `shutdown` (the gateway is stopping). |
+| `trigger` | `str \| None` | For `auto_leave`: `no_authorized_users` or `inactivity` (the voice inactivity timeout); otherwise `None`. |
+| `participants` | `list[str]` | User ids whose transcripts were dispatched as turns, first-spoken order. Unauthorized speech, STT hallucinations and suppressed duplicates do not count. |
+| `voice_session_id` | `str` | Unique per voice session; use it to deduplicate. |
+
+**Return value.** `None` or anything else is ignored. `{"followup_turn": "<instruction>"}` from a **plugin** asks for one agent turn in `session_key`'s session:
+
+- The turn runs through the same path as `ctx.inject_message(...)`, as the returning plugin, so it requires `plugins.entries.<plugin>.allow_gateway_injection: true` in that profile's config. Without it the hook still fires and the follow-up is refused with the usual warning. The session's origin user must pass the gateway's current authorization by user id (a Discord-role-only grant does not count for plugin-started turns).
+- The instruction is recorded as system-originated: the turn text is `[system] <instruction>` followed by the gateway's internal-notification footer, persisted as an internal-notification row (not a user bubble).
+- The reply is posted as **text** in the session's chat and is **never spoken**, whatever `/voice` mode the chat has, including when the follow-up queues behind a voice turn that is still running.
+- One follow-up per session end: the first plugin in registration order wins; later ones are logged and dropped. A callback no plugin owns (a shell hook) cannot start one. Instructions over 8000 characters are dropped.
+- `reason="shutdown"`: the hook fires (bounded to 2 s) and any follow-up is dropped with an INFO log line, so a consumer can fall back to its own summary. `session_key=None`: the follow-up is dropped with an INFO line.
+- When a `gateway.profile_routes` entry re-homes the bot's voice speech into another profile, that speech records no `session_key` for this event (the follow-up would otherwise run in another profile's session); the speaker still counts as a participant.
+
+**Fail-safe.** The event is handed over after the bot has left and its state is torn down; the leave never waits for the hook. The callback runs on a worker thread bounded by `plugins.hook_callback_timeout` (default 30 s; this hook stays bounded at 30 s when that setting is `0`); a timeout or exception is logged and skipped, and an earlier timeout never suppresses the next session's event. When the gateway stops, the adapter waits at most 2 s for its end handlers. A crash or `SIGKILL` fires nothing.
+
+**Multiplexed gateway.** Only the profile whose bot left gets the event: each bot's voice sessions belong to its own adapter, and the hook is dispatched under that profile's scope, so only that profile's plugins are called. If that profile's home no longer resolves (deleted or renamed mid-run), the event is skipped with a WARNING rather than dispatched to the launch profile.
 
 ---
 

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.response_filters import VOICE_REPLY_SUPPRESSED_KEY
 from gateway.session import SessionSource
 
 logger = logging.getLogger("gateway.run")
@@ -38,6 +39,7 @@ class GatewayPluginInjectionMixin:
     def _schedule_plugin_message_injection(
         self, *, content: str, plugin_id: str, session_key: Optional[str] = None,
         origin: Optional[Mapping[str, Any]] = None, plugin_home: Optional[Path] = None,
+        suppress_voice_reply: bool = False,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe).
 
@@ -58,6 +60,7 @@ class GatewayPluginInjectionMixin:
             target = f"session={session_key}"
             coro = self._dispatch_plugin_message_injection(
                 session_key=session_key, content=content, plugin_id=plugin_id,
+                suppress_voice_reply=suppress_voice_reply,
             )
         try:
             current_loop = asyncio.get_running_loop()
@@ -124,7 +127,7 @@ class GatewayPluginInjectionMixin:
         return authorized
 
     async def _dispatch_plugin_message_injection(
-        self, *, session_key: str, content: str, plugin_id: str
+        self, *, session_key: str, content: str, plugin_id: str, suppress_voice_reply: bool = False,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         if not self._plugin_injection_accepting():
@@ -150,6 +153,8 @@ class GatewayPluginInjectionMixin:
                     "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
                     "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
                     "gateway_session_strict": True,
+                    # Text-only reply (a voice-session wrap-up): every TTS decision point honours it.
+                    **({VOICE_REPLY_SUPPRESSED_KEY: True} if suppress_voice_reply else {}),
                 },
             ))
         logger.info(
