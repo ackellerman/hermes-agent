@@ -266,9 +266,18 @@ async def test_t4_a_connection_discord_closed_fires_disconnect_and_clears_stale_
 # --- T5: shutdown fires, its follow-up is dropped; a recycle is a disconnect -------------------------
 
 
+# (gateway _running, _draining) at adapter teardown -> the reason the hook sees.
+_TEARDOWN_STATES = {
+    "stop": (False, True, "shutdown"),            # GatewayRunner.stop(): _stop_begin_teardown
+    "restart_drain": (True, True, "shutdown"),    # request_restart(): still running, draining
+    "recycle": (True, False, "disconnect"),       # adapter recycle / profile removal, gateway runs on
+}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("gateway_stopping", [True, False])
-async def test_t5_teardown_fires_and_only_a_real_shutdown_drops_the_followup(homes, caplog, gateway_stopping):
+@pytest.mark.parametrize("state", list(_TEARDOWN_STATES))
+async def test_t5_teardown_fires_and_only_a_real_shutdown_drops_the_followup(homes, caplog, state):
+    running, draining, expected_reason = _TEARDOWN_STATES[state]
     probe.install_probe(homes.default, returns={"followup_turn": WRAP_UP}, allow_injection=True)
     probe.discover(homes.default)
     rig = Rig(homes.tmp)
@@ -276,7 +285,7 @@ async def test_t5_teardown_fires_and_only_a_real_shutdown_drops_the_followup(hom
     adapter._client.close = AsyncMock()
     await _join(adapter)
     await _speak(adapter)
-    rig.runner._running = not gateway_stopping   # the injector stays published either way
+    rig.runner._running, rig.runner._draining = running, draining   # the injector stays published
 
     with caplog.at_level(logging.INFO), caplog.at_level(logging.INFO, logger="plugins.platforms.discord.adapter"):
         await adapter.disconnect()
@@ -286,11 +295,10 @@ async def test_t5_teardown_fires_and_only_a_real_shutdown_drops_the_followup(hom
     dropped = [r for r in caplog.records if "dropping follow-up" in r.getMessage() and "reason=shutdown" in r.getMessage()]
     assert not [r for r in caplog.records if "still running after" in r.getMessage()], \
         "disconnect() had to abandon the end handler"
-    if gateway_stopping:
-        assert record["reason"] == "shutdown"
+    assert record["reason"] == expected_reason
+    if expected_reason == "shutdown":
         assert dropped and not rig.injector.called
     else:  # an adapter recycle while the gateway keeps running: a disconnect, follow-up allowed
-        assert record["reason"] == "disconnect"
         assert not dropped and rig.injector.call_count == 1
 
 
@@ -315,6 +323,14 @@ async def test_t5_a_hung_hook_does_not_hold_shutdown_past_its_budget(homes):
 
 
 # --- T6/T7/T8: the follow-up: system-originated, text only, behind the injection gate ---------------
+
+
+def test_t8_a_followup_from_a_callback_no_plugin_owns_is_never_selected():
+    """Shell hooks (and anything else no plugin registered) have no injection gate to honour."""
+    from gateway.run_voice_session_end import select_voice_followup
+    assert select_voice_followup([(None, {"followup_turn": "from a shell hook"})]) is None
+    assert select_voice_followup([(None, {"followup_turn": "from a shell hook"}),
+                                  ("alpha", {"followup_turn": "from alpha"})]) == ("alpha", "from alpha")
 
 
 async def _followup_session(homes, *, allow: bool):
