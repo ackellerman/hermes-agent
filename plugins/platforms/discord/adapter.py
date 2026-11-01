@@ -2340,6 +2340,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                         task.cancel()
         self._pending_text_batch_tasks.clear()
         self._pending_text_batches.clear()
+        await self._cancel_typing_tasks()
         await super().cancel_background_tasks()
 
     def _text_batch_flush_deadline_seconds(self) -> float:
@@ -2364,6 +2365,9 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         self._disconnecting = True
         # Cancel the liveness probe first so it can't fire a spurious fatal/reconnect mid-teardown.
         await self._cancel_liveness_task()
+        # Typing loops next, before anything that can use up the disconnect budget: if
+        # client.close() is never reached, a surviving loop keeps POSTing from a dead adapter.
+        await self._cancel_typing_tasks()
         # Leave voice *before* cancelling the bot task: VoiceClient.disconnect() needs the main
         # gateway WS (run by the bot task) or it blocks until the timeout.
         for guild_id in list(self._voice_clients.keys()):
@@ -4786,10 +4790,13 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Start a persistent typing loop (POST typing every 12s; indicator lasts ~10s).
-        TYPING_START is unreliable for bots in DMs; 429 sleeps ``retry_after``; CancelledError ends it."""
-        if not self._client:
+        TYPING_START is unreliable for bots in DMs; 429 sleeps ``retry_after``; CancelledError ends it.
+        Refused while disconnecting: teardown has already cleared the registry, and a loop
+        registered now would outlive the adapter if ``client.close()`` is never reached."""
+        if not self._client or getattr(self, "_disconnecting", False):
             return
-        if chat_id in self._typing_tasks:
+        existing = self._typing_tasks.get(chat_id)
+        if existing is not None and not existing.done():
             return
 
         async def _typing_loop() -> None:
@@ -4818,18 +4825,52 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             except asyncio.CancelledError:
                 pass
             finally:
-                self._typing_tasks.pop(chat_id, None)
+                # Only clear the registry entry if it still points at THIS
+                # loop. A concurrent send_typing() can re-register a fresh
+                # loop after stop_typing() popped this one (the tool-progress
+                # path in gateway/run.py and the base _keep_typing refresh both
+                # call send_typing during a turn). Popping unconditionally
+                # would orphan that newer loop — it would run forever, hitting
+                # the typing endpoint every 12s, and stop_typing() could never
+                # cancel it because it is no longer in the dict. Result: the
+                # Discord "is typing…" indicator stays on permanently.
+                if self._typing_tasks.get(chat_id) is asyncio.current_task():
+                    self._typing_tasks.pop(chat_id, None)
         self._typing_tasks[chat_id] = asyncio.create_task(_typing_loop())
 
     async def stop_typing(self, chat_id: str) -> None:
-        """Stop the persistent typing indicator for a channel."""
-        task = self._typing_tasks.pop(chat_id, None)
-        if task:
+        """Stop the persistent typing indicator for a channel.
+
+        The entry stays registered until the loop has unwound, so a concurrent ``send_typing``
+        sees it and cannot start an untracked second loop; it is dropped afterwards only if it is
+        still this loop, and even when a second CancelledError aborts the await."""
+        task = self._typing_tasks.get(chat_id)
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        finally:
+            if self._typing_tasks.get(chat_id) is task:
+                self._typing_tasks.pop(chat_id, None)
+
+    async def _cancel_typing_tasks(self) -> None:
+        """Teardown: cancel every typing loop and clear the registry (bounded). Loops started
+        with no owning turn are otherwise reachable only through this adapter instance."""
+        registry = getattr(self, "_typing_tasks", None)  # tests build adapters via object.__new__
+        if not registry:
+            return
+        tasks = [task for task in registry.values() if not task.done()]
+        registry.clear()
+        for task in tasks:
             task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        if tasks:
+            _done, still = await asyncio.wait(tasks, timeout=1.0)
+            if still:
+                logger.warning("[%s] %d typing loop(s) did not exit within 1s of cancel",
+                               self.name, len(still))
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         """Get information about a Discord channel."""
