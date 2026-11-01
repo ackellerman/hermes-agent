@@ -3418,6 +3418,13 @@ class BasePlatformAdapter(ABC):
                         pass  # Slow network — abandon this tick, stay on schedule.
                     except Exception as typing_err:
                         logger.debug("[%s] send_typing error (non-fatal): %s", self.name, typing_err)
+                    # CPython 3.11 asyncio.wait_for returns the inner result (or raises its error)
+                    # when a cancel races the inner's completion, so the cancel is swallowed here.
+                    # The request is still counted on the task: honour it instead of refreshing on
+                    # as an orphan that re-creates platform typing after the turn stopped it.
+                    _current = asyncio.current_task()
+                    if _current is not None and _current.cancelling():
+                        return
                 if stop_event is None:
                     await asyncio.sleep(interval)
                     continue
@@ -3458,9 +3465,11 @@ class BasePlatformAdapter(ABC):
             self._typing_paused.discard(chat_id)
 
     async def _stop_typing_quietly(self, chat_id: str, metadata=None) -> None:
-        """Best-effort platform stop_typing; adapter errors are swallowed."""
-        with contextlib.suppress(Exception):
+        """Best-effort platform stop_typing; adapter errors are logged, never raised."""
+        try:
             await self._stop_typing_with_metadata(chat_id, metadata)
+        except Exception as e:
+            logger.warning("[%s] stop_typing failed for %s: %s", self.name, chat_id, e)
 
     def pause_typing_for_chat(self, chat_id: str) -> None:
         """Pause typing for a chat (approval waits); GIL-safe from the sync agent thread."""
