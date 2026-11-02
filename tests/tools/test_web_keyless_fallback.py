@@ -290,6 +290,11 @@ class TestProviderRouting:
 
     def test_keyless_disabled_falls_through_to_key_error(self, monkeypatch):
         monkeypatch.setattr(registry, "_keyless_tier_enabled", lambda: False)
+        # These two tests are about the KEY error, not the SDK. `_client` pre-flights the
+        # vendor's lazy install before the key check, so a host where `parallel-web` is absent
+        # (and conftest disables lazy installs) reported "Parallel SDK not installed" instead.
+        # Pin the SDK as available so the assertion measures the key path it was written for.
+        monkeypatch.setattr("pm.ensure_import", lambda name: None)
         provider = ParallelWebSearchProvider()
         out = provider.search("q")
         assert out["success"] is False
@@ -319,6 +324,7 @@ class TestProviderRouting:
 
     def test_tier_paid_forces_keyed_without_key(self, monkeypatch):
         monkeypatch.setattr(keyless_mcp, "provider_tier", lambda name: "paid")
+        monkeypatch.setattr("pm.ensure_import", lambda name: None)  # SDK availability is not the subject
         provider = ParallelWebSearchProvider()
         with patch.object(keyless_mcp, "parallel_search_keyless") as keyless:
             out = provider.search("q")

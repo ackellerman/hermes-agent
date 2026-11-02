@@ -106,6 +106,29 @@ def _hermes_home_points_at_production(value: str) -> bool:
     return resolved.parent.name == "profiles" and resolved.parent.parent == real_root
 
 
+# ── ONE definition of the environment a test may see ────────────────────────
+# ``tests/_fixtures/env_policy.py`` is read by ``scripts/run_tests.sh`` (to build the
+# ``env -i`` argument list), by ``scripts/run_tests_parallel.py`` (to build every pytest
+# child's env) and here. Before it existed, the script carried an allowlist and this file
+# carried a hand-written behavioural list; they drifted, and the drift is exactly what made
+# a test pass under ``pytest`` and fail under the canonical runner. Measured on one host: a
+# bare run handed the child 111 env names where the runner handed it 23, including
+# ``TERMINAL_*``, ``HERMES_SESSION_*`` and the operator's ``TMP``/``TEMP`` pointing into the
+# real ``~/.hermes/cache/scratch``.
+#
+# Applying the allowlist HERE (not only in the bash launcher) is what makes the two paths
+# agree: a developer's ``pytest tests/tools/test_x.py`` now exposes the runner's environment,
+# not the developer shell's. Per-test fixture work below still blanks credentials and
+# behavioural names a *previous test in the same file* may have set.
+from tests._fixtures.env_policy import blank_names as _blank_names, sanitize_temp_vars as _sanitize_temp_vars
+
+#: Names this import removed from the ambient environment (readable by tests that assert on
+#: the contract; see tests/tools/test_test_runner_env_policy.py).
+SWEPT_ENV_NAMES = tuple(sorted(_blank_names(os.environ)))
+for _name in SWEPT_ENV_NAMES:
+    del os.environ[_name]
+
+
 # ``import hermes_bootstrap`` (transitively: any entry-point module) runs
 # ``export_scratch_tmp_env()``, which points TMPDIR/TMP/TEMP at
 # ``<HERMES_HOME>/cache/scratch`` unless a temp var is already set — and a
@@ -118,14 +141,9 @@ def _hermes_home_points_at_production(value: str) -> bool:
 # relocate even user-set temp directories inside a guarded home. Pin the
 # system default so the import-time hook stays a no-op. The parallel runner
 # exports its own disk-backed TMPDIR anyway.
-from hermes_constants import SCRATCH_DIR_MARKER_ENV, SCRATCH_TMP_ENV_VARS
+from hermes_constants import SCRATCH_DIR_MARKER_ENV
 
-_HERMES_EXPORTED_TMP = os.environ.get(SCRATCH_DIR_MARKER_ENV, "")
-if _HERMES_EXPORTED_TMP:
-    for _key in SCRATCH_TMP_ENV_VARS:
-        if os.environ.get(_key, "").strip() == _HERMES_EXPORTED_TMP:
-            del os.environ[_key]
-    del os.environ[SCRATCH_DIR_MARKER_ENV]
+os.environ.pop(SCRATCH_DIR_MARKER_ENV, None)
 
 from hermes_state_guard import _real_platform_state_root
 
@@ -134,12 +152,10 @@ _guarded_tmp_roots = [_real_test_root]
 _custom_test_home = os.environ.get("HERMES_HOME")
 if _custom_test_home:
     _guarded_tmp_roots.append(Path(_custom_test_home).expanduser().resolve())
-for _key in SCRATCH_TMP_ENV_VARS:
-    _value = os.environ.get(_key)
-    if _value:
-        _path = Path(_value).expanduser().resolve()
-        if any(_path.is_relative_to(_root) for _root in _guarded_tmp_roots):
-            del os.environ[_key]
+# Compared literally AND resolved: ``$HERMES_HOME/cache/scratch`` is commonly a symlink into
+# disk-backed storage, so a resolved-only test (what this block used to do) let an operator
+# temp pointer survive and hand the real home to every ``tempfile`` default in a child.
+SWEPT_TEMP_VARS = tuple(_sanitize_temp_vars(os.environ, _guarded_tmp_roots))
 tempfile.tempdir = None  # re-resolve after stripping guarded temp directories
 os.environ.setdefault("TMPDIR", tempfile.gettempdir())
 
