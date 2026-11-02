@@ -358,26 +358,55 @@ def _list_pins(token: str, channel_id: str, **_kwargs: Any) -> str:
 def _create_thread(
     token: str, channel_id: str, name: str, message_id: Optional[str] = None,
     auto_archive_duration: int = 1440, user_id: Optional[str] = None,
-    message: str = "", applied_tags: Optional[List[str]] = None,
+    applied_tags: Optional[list[str]] = None, content: str = "",
     **_kwargs: Any) -> str:
-    """Create a thread — anchored to ``message_id`` when given, else standalone public.
+    """Create a thread in a channel.
 
-    ``user_id`` is added as a thread member after creation. Discord only lists a thread in a
-    user's sidebar when they are a member of it, and a standalone public thread starts with
-    the bot as its only member — so a thread created for a user must add them explicitly or
-    they never see it.
+    Three shapes:
+
+    - ``message_id`` given → thread anchored to an existing message
+      (text/announcement channel). No message body, no type field, and no
+      channel pre-fetch (the anchor endpoint is unambiguous).
+    - target is a GUILD_FORUM or GUILD_MEDIA channel (``type`` 15 or 16) → a
+      post. Forum and media channels REQUIRE the message-object endpoint
+      (``POST /channels/{forum_id}/threads`` with a ``message`` object) and
+      REJECT the text-style "Start Thread" call — so the target is detected by
+      channel type, NOT by whether tags were supplied. ``applied_tags`` is
+      purely OPTIONAL here: a tagless forum post is normal. Discord rejects an
+      empty message, so ``content`` falls back to the thread ``name`` (and
+      finally a single space) when not supplied.
+    - otherwise → a standalone PUBLIC_THREAD (``type: 11``) in a text channel,
+      the original behavior (no message body).
+
+    Detection costs one extra ``GET /channels/{channel_id}`` per non-anchored
+    create_thread, which is acceptable for a thread-create.
+
+    ``user_id`` is added as a thread member after creation on every shape.
+    Discord only lists a thread in a user's sidebar when they are a member of
+    it, and a thread starts with the bot as its only member — so a thread
+    created for a user must add them explicitly or they never see it.
     """
-    body: dict[str, Any] = {"name": name, "auto_archive_duration": auto_archive_duration}
-    path = f"/channels/{channel_id}/threads"
     if message_id:
+        # Create thread from an existing message — no pre-fetch needed.
         path = f"/channels/{channel_id}/messages/{message_id}/threads"
+        body: dict[str, Any] = {"name": name, "auto_archive_duration": auto_archive_duration}
     else:
-        body["type"] = 11  # PUBLIC_THREAD
-        # A forum post carries its opening content and tags on the create call.
-        if message:
-            body["message"] = {"content": message}
-        if applied_tags is not None:
-            body["applied_tags"] = applied_tags
+        # Tag presence is not a reliable discriminator: tagless forum/media posts
+        # still require the message-object endpoint.
+        channel = _discord_request("GET", f"/channels/{channel_id}", token)
+        path = f"/channels/{channel_id}/threads"
+        if channel.get("type") in (15, 16):
+            # Forum/media post: required message object; tags optional.
+            body = {
+                "name": name,
+                "auto_archive_duration": auto_archive_duration,
+                "message": {"content": content or name or " "},
+            }
+            if applied_tags:
+                body["applied_tags"] = list(applied_tags)
+        else:
+            # Standalone text-channel thread (original behavior).
+            body = {"name": name, "auto_archive_duration": auto_archive_duration, "type": 11}
     thread = _discord_request("POST", path, token, body=body)
     member_added: Optional[bool] = None
     if user_id:
@@ -392,6 +421,40 @@ def _create_thread(
         result["user_id"] = user_id
         result["user_added_as_thread_member"] = member_added
     return json.dumps(result)
+
+
+def _list_forum_tags(token: str, channel_id: str, **_kwargs: Any) -> str:
+    """List the tags configured on a forum channel (its ``available_tags``).
+
+    Read-only — GET the channel and surface the tag set a forum post can draw
+    from. ``channel_id`` is the GUILD_FORUM channel ID.
+    """
+    ch = _discord_request("GET", f"/channels/{channel_id}", token)
+    tags = [
+        {
+            "id": t.get("id"), "name": t.get("name"),
+            # Either a unicode emoji name or a custom emoji id may be set.
+            "emoji": t.get("emoji_name") or t.get("emoji_id"),
+            "moderated": t.get("moderated", False)}
+        for t in ch.get("available_tags") or []]
+    return json.dumps({"success": True, "channel_id": channel_id, "available_tags": tags})
+
+
+def _set_thread_tags(
+    token: str, channel_id: str, applied_tags: Optional[list[str]] = None, **_kwargs: Any) -> str:
+    """Re-tag a forum post by PATCHing its ``applied_tags``.
+
+    ``channel_id`` is the forum POST/thread ID. ``applied_tags`` is the FULL
+    desired list of tag IDs — Discord replaces (does not merge) the set, so an
+    empty list intentionally CLEARS all tags. We therefore deliberately do not
+    gate on truthiness; ``[]`` is a valid request, not a missing param.
+    """
+    tags = list(applied_tags or [])
+    thread = _discord_request(
+        "PATCH", f"/channels/{channel_id}", token, body={"applied_tags": tags}) or {}
+    return json.dumps({
+        "success": True, "thread_id": thread.get("id", channel_id),
+        "applied_tags": thread.get("applied_tags", tags)})
 
 
 def _add_thread_member(token: str, channel_id: str, user_id: str, **_kwargs: Any) -> str:
@@ -473,8 +536,12 @@ _ACTION_MANIFEST = [
     ("unpin_message", _unpin_message, "(channel_id, message_id)", "unpin a message"),
     ("delete_message", _delete_message, "(channel_id, message_id)", "delete a message"),
     ("create_thread", _create_thread, "(channel_id, name)",
-     "create a public thread; optional message_id anchor, user_id adds that user as a thread "
-     "member (they only see threads they are a member of)"),
+     "create a thread; forum channels become forum posts (optional applied_tags/content); "
+     "optional message_id anchor, user_id adds that user as a thread member (they only see "
+     "threads they are a member of)"),
+    ("set_thread_tags", _set_thread_tags, "(channel_id)",
+     "set forum tags on a forum post (thread); empty list clears"),
+    ("list_forum_tags", _list_forum_tags, "(channel_id)", "list a forum channel's available tags"),
     ("send_message", _send_message, "(channel_id, content)",
      "post a message into a channel or thread; optional message_id replies to it"),
     ("react", _react, "(channel_id, message_id, emoji)", "add the bot's reaction to a message"),
@@ -496,7 +563,7 @@ _REQUIRED_PARAMS: dict[str, list[str]] = {
 # user wants) and ``discord_admin`` (everything else).
 _CORE_ACTION_NAMES = frozenset({
     "fetch_messages", "search_members", "create_thread", "send_message", "react",
-    "archive_thread", "add_thread_member"})
+    "archive_thread", "add_thread_member", "list_forum_tags"})
 _CORE_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _CORE_ACTION_NAMES}
 _ADMIN_ACTIONS = {k: v for k, v in _ACTIONS.items() if k not in _CORE_ACTION_NAMES}
 
@@ -564,14 +631,14 @@ _SCHEMA_PROPERTIES: dict[str, Any] = {
     "message_id": {"type": "string", "description": "Discord message ID."},
     "query": {"type": "string", "description": "Member name prefix to search for (search_members)."},
     "name": {"type": "string", "description": "New thread name (create_thread)."},
-    "message": {
-        "type": "string",
-        "description": "Opening post content (create_thread on a forum channel).",
-    },
     "applied_tags": {
         "type": "array",
         "items": {"type": "string"},
-        "description": "Forum tag IDs to apply (create_thread).",
+        "description": (
+            "Forum tag IDs. Required for set_thread_tags (the full desired set; an empty list "
+            "clears all tags). Optional for create_thread when the target is a forum channel "
+            "(tags are not required to post)."
+        ),
     },
     "limit": {
         "type": "integer",
@@ -588,7 +655,11 @@ _SCHEMA_PROPERTIES: dict[str, Any] = {
     },
     "content": {
         "type": "string",
-        "description": "Message text (send_message, edit_message). Supports Discord markdown.",
+        "description": (
+            "Message text (send_message, edit_message). Supports Discord markdown. Also the "
+            "initial post body for create_thread on a forum channel, where it defaults to the "
+            "thread name if omitted."
+        ),
     },
     "emoji": {
         "type": "string",
@@ -667,6 +738,10 @@ _ACTION_403_HINT = {
     "react": "Bot lacks ADD_REACTIONS in this channel, or the emoji/id is invalid.",
     "archive_thread": "Bot lacks MANAGE_THREADS (or is not a thread member) on this thread.",
     "add_thread_member": "Bot cannot add members to this thread (it must be a member itself, and the thread must not be archived).",
+    "set_thread_tags": (
+        "Bot lacks MANAGE_THREADS in this forum (or is not the thread owner). "
+        "Editing applied_tags on someone else's post requires MANAGE_THREADS."),
+    "list_forum_tags": "Bot cannot view this forum channel (missing VIEW_CHANNEL).",
     "add_role": (
         f"{_ROLE_HIERARCHY} Roles can only be assigned below the bot's own position in the role hierarchy."),
     "remove_role": _ROLE_HIERARCHY,
@@ -696,7 +771,7 @@ _HANDLER_DEFAULTS = {
     "guild_id": "", "channel_id": "", "user_id": "", "role_id": "", "message_id": "", "query": "",
     "name": "", "limit": 50, "before": "", "after": "", "auto_archive_duration": 1440,
     "content": "", "emoji": "", "archived": True,
-    "message": "", "applied_tags": None}
+    "applied_tags": None}
 
 
 def _run_discord_action(action: str, valid_actions: dict[str, Any], tool_label: str, **params: Any) -> str:
