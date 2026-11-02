@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import sys
+import importlib
 
 import pytest
 
@@ -295,8 +296,11 @@ class TestSkillViewQualifiedName:
         def fail_if_loaded(name):
             raise AssertionError(f"unexpected provider load: {name}")
 
-        monkeypatch.setattr("plugins.memory._get_active_memory_provider", lambda: "active")
-        monkeypatch.setattr("plugins.memory.load_memory_provider", fail_if_loaded)
+        # Explicit import: the string form getattr-walks `plugins.memory` and only works when
+        # something earlier in the process happened to import it.
+        plugins_memory = importlib.import_module("plugins.memory")
+        monkeypatch.setattr(plugins_memory, "_get_active_memory_provider", lambda: "active")
+        monkeypatch.setattr(plugins_memory, "load_memory_provider", fail_if_loaded)
 
         result = json.loads(skill_view("inactive:maintenance"))
 
