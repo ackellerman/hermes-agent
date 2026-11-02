@@ -209,15 +209,49 @@ class TestSnapshotFileModes:
             def cleanup(self):
                 pass
 
+        # The mode a USER command's files get is decided by the child shell's umask, and the
+        # child is a login shell: it sources the operator's rc, where `umask 0002` is common.
+        # The pytest process's umask therefore does not reach it (this assertion used to
+        # assume it did, and failed on every host whose ~/.bashrc sets a user-private default).
+        # Measure the child's real umask and assert the *invariant* the class documents: the
+        # snapshot is private and Hermes leaves the user's umask alone.
+        def _umask_from(text):
+            import re
+            for line in reversed(text.splitlines()):
+                match = re.fullmatch(r"\s*([0-7]{3,4})\s*", line)
+                if match:
+                    return int(match.group(1), 8)
+            raise AssertionError(f"no umask in shell output: {text!r}")
+
         old_umask = os.umask(0o022)
         try:
             env = ExecutableEnv(tmp_path)
             env.init_session()
 
+            # This fake `_run_bash` drains the pipe itself, so `execute()` returns no output —
+            # measure the login shell's umask directly, through the same `[bash, "-lc", ...]`
+            # invocation shape the backend uses.
+            baseline = _umask_from(subprocess.run(
+                [bash, "-lc", "umask"], capture_output=True, text=True, timeout=30, check=False,
+            ).stdout)
+
             user_file = tmp_path / "user-created.txt"
             env.execute(f"touch {user_file}")
 
-            assert stat.S_IMODE(user_file.stat().st_mode) == 0o644
+            # A plain login shell creating the same file, with no Hermes in the path.
+            control = tmp_path / "control.txt"
+            subprocess.run(
+                [bash, "-lc", f"touch {control}"], cwd=str(tmp_path),
+                env=dict(os.environ), check=True, timeout=30,
+            )
+
+            # Hermes must not perturb the login shell's umask: the file its shell creates has
+            # the same mode as one created by the operator's own shell, and that mode is
+            # exactly the shell's own umask applied to 0666. A product that clamped the child
+            # to 0077, or chmod'ed user output to 0600, breaks both.
+            assert stat.S_IMODE(user_file.stat().st_mode) == stat.S_IMODE(control.stat().st_mode)
+            assert stat.S_IMODE(user_file.stat().st_mode) == 0o666 & ~baseline
+            # … while its own metadata is private whatever the umask is.
             assert stat.S_IMODE(Path(env._snapshot_path).stat().st_mode) == 0o600
             # The cwd temp file is no longer written (cwd travels via the
             # stdout marker for every backend) — nothing to leak on disk.

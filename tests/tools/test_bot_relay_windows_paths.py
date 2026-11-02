@@ -51,6 +51,15 @@ def test_local_delivery_resolves_sibling_hermes(tmp_path, monkeypatch):
     sibling.touch()
     sibling.chmod(0o755)
     monkeypatch.setattr("sys.executable", str(bin_dir / "python"))
+    # Keep this checkout's own published install launcher out of the resolution when probing
+    # the fallback ladder (#124868). `_hermes_cli` prefers `<install>/.hermes/bin/hermes`
+    # above the interpreter sibling, and a developer checkout has one, so without this the
+    # test measured the published-launcher rung instead of the sibling rung.
+    monkeypatch.setattr(bot_relay, "__file__", str(tmp_path / "nowhere" / "bot_relay.py"))
+    # The sibling must beat a PATH hit, not merely exist when PATH has none.
+    monkeypatch.setattr(
+        bot_relay.shutil, "which", lambda name: str(tmp_path / "usr-local-bin" / name)
+    )
 
     argv = bot_relay.local_delivery_command("ops", "query.json")
     assert argv[0] == str(sibling)

@@ -8,9 +8,10 @@
 #     subprocess. No xdist, no shared workers, no module-level leakage
 #     between files.
 #   * TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0 (deterministic)
-#   * Env vars blanked (conftest.py also does this, but this
-#     is belt-and-suspenders for anyone running pytest outside our
-#     conftest path — e.g. on a single file)
+#   * Env vars blanked by ONE definition: tests/_fixtures/env_policy.py, which this
+#     script, run_tests_parallel.py and tests/conftest.py all read. It used to be two
+#     hand-maintained lists (this file's allowlist and conftest's behavioural list) that
+#     drifted — see the policy module's docstring for the failure that caused.
 #   * The checkout's test environment (via scripts/run-in-hermes-env when needed)
 #
 # Usage:
@@ -74,105 +75,41 @@ else
 fi
 
 
-# ── Live-gateway plugin (computed before we drop env) ───────────────────────
-EXTRA_PYTHONPATH=""
-EXTRA_PYTEST_PLUGINS=""
+# ── Hermetic environment (ONE definition, owned by tests/_fixtures/env_policy.py) ────────
+# This script does not enumerate environment names any more. It asks the policy module —
+# the same module run_tests_parallel.py uses to build each child's env and conftest.py uses
+# to decide what a bare `pytest` run may see — for the assignments to hand `env -i`:
+#
+#   * PATH/HOME (the two locations every test may read)
+#   * TZ/LANG/LC_ALL/PYTHONHASHSEED/PYTHONUTF8 (deterministic)
+#   * the temp pointers (TMPDIR is the runner's per-attempt root)
+#   * the documented test-runner knobs (HERMES_TEST_*, SSL_CERT_*, CI, E2E opt-ins) — these
+#     are read by the runner at argparse-default time and by suites such as
+#     tests/docker/conftest.py, tests/e2e/core/windows_update, tests/tools/test_ssh_environment.py
+#   * native Windows location + toolchain variables
+#
+# Why it moved here: the two lists drifted. `env -i` dropped HERMES_SCRATCH_DIR (the marker
+# saying "Hermes exported these temp pointers") while the Windows block forwarded TEMP/TMP
+# on POSIX, so a developer's real ~/.hermes/cache/scratch reached test processes and conftest
+# could no longer recognise it as an exported value. TEMP/TMP are Windows-only now, decided
+# in the module rather than by whatever the calling shell happens to export.
+#
+# PYTHONPATH/PYTEST_PLUGINS carry the developer's live-gateway guard; they are in the
+# allowlist, so exporting them here is enough.
 if [ -f "$HOME/.hermes/pytest_live_guard.py" ]; then
-  EXTRA_PYTHONPATH="$HOME/.hermes"
-  EXTRA_PYTEST_PLUGINS="pytest_live_guard"
+  export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$HOME/.hermes"
+  export PYTEST_PLUGINS="${PYTEST_PLUGINS:+$PYTEST_PLUGINS,}pytest_live_guard"
 fi
 
-
-# ── Windows location variables (computed before we drop env) ───────────────
-# `env -i` forwards HOME, which is enough on POSIX. Native Windows CPython
-# resolves Path.home() from USERPROFILE (or HOMEDRIVE+HOMEPATH), stdlib
-# platform paths come from LOCALAPPDATA/APPDATA, ssl/sockets need SYSTEMROOT,
-# and tempfile needs TEMP/TMP. Dropping them breaks collection on native
-# Windows (issues #67385, #70813). PATHEXT is also required: without .EXE,
-# PowerShell opens a native child as a document without waiting for its exit.
-# These are location variables, not
-# credentials, so forwarding them keeps the isolation intent intact. Each is
-# only forwarded when actually set, so POSIX runs are byte-for-byte unchanged.
-WIN_ENV=()
-for _win_var in USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA APPDATA SYSTEMROOT TEMP TMP \
-    ComSpec PATHEXT PROGRAMFILES ProgramFiles PROGRAMDATA ProgramData; do
-  if [ -n "${!_win_var:-}" ]; then
-    WIN_ENV+=("$_win_var=${!_win_var}")
-  fi
-done
-# Native build toolchain (Windows arm64 has no wheels for every pinned C extension, so
-# `uv sync` inside a PM test compiles ruamel-yaml-clib and friends). The MSVC developer
-# environment is exported by scripts/build/windows-deps.ps1 into the job env; without
-# INCLUDE/LIB/VSINSTALLDIR the build backend reports "Visual C++ 14.0 or greater is
-# required". These describe compiler locations, not credentials.
-for _tool_var in INCLUDE LIB LIBPATH VSINSTALLDIR VCINSTALLDIR VCToolsInstallDir VCToolsVersion \
-    VCToolsRedistDir WindowsSdkDir WindowsSDKVersion WindowsSdkBinPath WindowsSdkVerBinPath \
-    WindowsLibPath UCRTVersion UniversalCRTSdkDir VSCMD_ARG_HOST_ARCH VSCMD_ARG_TGT_ARCH VSCMD_VER \
-    DevEnvDir ExtensionSdkDir Platform CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN \
-    CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER CC_aarch64_pc_windows_msvc CC CXX AR \
-    VCPKG_ROOT OPENSSL_DIR OPENSSL_STATIC OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR; do
-  if [ -n "${!_tool_var:-}" ]; then
-    WIN_ENV+=("$_tool_var=${!_tool_var}")
-  fi
-done
-# setuptools locates the compiler through vswhere under "%ProgramFiles(x86)%\Microsoft Visual
-# Studio\Installer"; without that variable a primed INCLUDE/LIB still reads as "Visual C++ 14.0
-# or greater is required". The parenthesised name cannot be read with ${!var}.
-_pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
-[ -z "$_pf86" ] || WIN_ENV+=("ProgramFiles(x86)=$_pf86")
-
-# ── Test-runner knobs (computed before we drop env) ────────────────────────
-# The runner's own documented environment knobs must survive the hermetic
-# `env -i` below, or they are silent no-ops for anyone invoking this script:
-#
-#   * HERMES_TEST_WORKERS / PATHS / FILE_TIMEOUT / FILE_RETRIES / SLICE are
-#     read by run_tests_parallel.py at argparse-default time — inside the
-#     stripped environment.
-#   * HERMES_TEST_IMAGE is read by tests/docker/conftest.py to skip its
-#     session-scoped `docker build`. CI's docker.yml sets it to the image
-#     the build step just loaded; stripping it made every per-file pytest
-#     subprocess rebuild the 5GB image from a cold builder cache instead
-#     (~4 min per worker per run, and the rebuilt image lacked the
-#     HERMES_GIT_SHA build-arg the workflow bakes in).
-#   * HERMES_E2E_REQUIRE_TUI turns a missing Ink TUI build into a failure in
-#     tests/e2e/core/terminal instead of a skip (set by the e2e CI job).
-#   * CI / GITHUB_ACTIONS tell suites they run on a disposable runner (e.g.
-#     tests/e2e/core/upgrade runs the real updater unsandboxed only there).
-#   * HERMES_E2E_WINDOWS_INSTALL opts tests/e2e/core/windows_update into running
-#     the real install.ps1 (it writes HKCU PATH); HERMES_E2E_MACHINE_ROOT,
-#     HERMES_E2E_PROFILES_ROOT and HERMES_E2E_ARTIFACTS place its fake machines,
-#     their user profiles and the transcripts CI uploads.
-#   * HERMES_E2E_STRICT_ACCEPTANCE makes tests/e2e/core/_pending_fixes.py's
-#     known gaps hard failures in an acceptance run (workflow dispatch input).
-#   * HERMES_TEST_SSH_HOST / _USER / _PORT / _KEY and HERMES_TEST_DOCKER_IMAGE
-#     arm the real-backend tests (tests/tools/test_ssh_environment.py,
-#     tests/tools/test_docker_backend_real.py); remote-backends.yml points them at
-#     a throwaway sshd container and a small public image. The key is a
-#     per-run throwaway, never a credential.
-#
-# These are test-infrastructure knobs, not credentials — same class as the
-# HERMES_RUN_SLOW_PET_TESTS / HERMES_E2E_BROWSER / HERMES_RUN_E2E opt-ins
-# forwarded below.
-# SSL_CERT_FILE/DIR are trust-store locations: the pinned interpreter's
-# OpenSSL has no compiled-in bundle path on NixOS, so network tests (PM
-# downloads, channel reads) need the host's pointer to verify TLS.
-# Keep this an explicit allowlist (no HERMES_TEST_* glob) so the "no
-# credential can leak" property stays auditable at a glance.
-TEST_ENV=()
-for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
-  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE \
-  SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
-  HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS \
-  HERMES_E2E_STRICT_ACCEPTANCE HERMES_TEST_SSH_HOST HERMES_TEST_SSH_USER HERMES_TEST_SSH_PORT \
-  HERMES_TEST_SSH_KEY HERMES_TEST_DOCKER_IMAGE; do
-  if [ -n "${!_test_var:-}" ]; then
-    TEST_ENV+=("$_test_var=${!_test_var}")
-  fi
-done
+ENV_POLICY="$REPO_ROOT/tests/_fixtures/env_policy.py"
+HERMETIC_ENV=()
+while IFS= read -r _assignment; do
+  [ -n "$_assignment" ] && HERMETIC_ENV+=("$_assignment")
+done < <("$PYTHON" "$ENV_POLICY" --runner-env)
 
 # ── Run in hermetic env ──────────────────────────────────────────────────────
-# env -i: start with empty environment, opt-in only what we need.
-# No credential var can leak — you'd have to explicitly add it here.
+# env -i: start with empty environment, opt-in only what the policy allows.
+# No credential var can leak — you'd have to add it to the policy module.
 echo "▶ running per-file parallel test suite via run_tests_parallel.py"
 echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
 
@@ -188,18 +125,5 @@ echo "▶ pre-compiling bytecode cache"
 
 echo "▶ launching test runner"
 exec env -i \
-  PATH="$PATH" \
-  HOME="$HOME" \
-  ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
-  ${TEST_ENV[@]+"${TEST_ENV[@]}"} \
-  TZ=UTC \
-  LANG=C.UTF-8 \
-  LC_ALL=C.UTF-8 \
-  PYTHONHASHSEED=0 \
-  PYTHONUTF8=1 \
-  ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
-  ${HERMES_E2E_BROWSER:+HERMES_E2E_BROWSER="$HERMES_E2E_BROWSER"} \
-  ${HERMES_RUN_E2E:+HERMES_RUN_E2E="$HERMES_RUN_E2E"} \
-  ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
-  ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
+  "${HERMETIC_ENV[@]}" \
   "$PYTHON" "$SCRIPT_DIR/run_tests_parallel.py" "$@"

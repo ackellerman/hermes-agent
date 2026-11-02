@@ -64,6 +64,12 @@ from typing import Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.ci.list_os_marked_tests import gated_specs, spec_hosts
 
+# The ONE definition of what a test process may see, shared with scripts/run_tests.sh and
+# tests/conftest.py (see that module's docstring). Applied here as well as by the bash
+# launcher so a direct `python scripts/run_tests_parallel.py` run cannot hand a child an
+# environment the canonical path would never produce.
+from tests._fixtures.env_policy import forwarded_env
+
 
 def _sweep_killed_run_roots(root: str) -> None:
     """Remove per-file temp roots older runs left behind. Each attempt deletes its own root
@@ -640,12 +646,18 @@ def _run_one_file_once(
     #
     # One root for each subprocess removes the shared directory that the race
     # needs. The parent deletes the root after the attempt.
-    env = os.environ.copy()
+    env = forwarded_env(os.environ)
     temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
     # Every tempfile.* call inside the test process lands in the same per-run root, so the
     # parent's cleanup of ``temproot`` removes them too instead of leaving them in /tmp.
     env["TMPDIR"] = temproot
+    # The other two spellings of "temp" must not survive from the runner's own shell: on POSIX
+    # they are only ever operator leftovers, and a value under the real Hermes home used to be
+    # inherited by every child (see tests/_fixtures/env_policy.py). Windows needs both.
+    if sys.platform != "win32":
+        env.pop("TMP", None)
+        env.pop("TEMP", None)
 
     subproc_start = time.monotonic()
     # launch the pytest process

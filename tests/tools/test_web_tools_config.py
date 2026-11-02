@@ -528,7 +528,8 @@ class TestExaClientConfig:
             homes[name].mkdir()
             (homes[name] / ".env").write_text(line)
         monkeypatch.setenv("EXA_API_KEY", "key-launch")
-        monkeypatch.setattr("plugins.web.keyless_mcp.keyless_enabled", lambda: False)
+        monkeypatch.setattr(importlib.import_module("plugins.web.keyless_mcp"),
+                            "keyless_enabled", lambda: False)
         monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
 
         def sent_with(name):
@@ -549,7 +550,8 @@ class TestExaClientConfig:
         """Control: no profile scope bound (plain CLI / systemd-injected env) keeps reading os.environ."""
         from plugins.web.exa.provider import ExaWebSearchProvider
         monkeypatch.setenv("EXA_API_KEY", "key-env")
-        monkeypatch.setattr("plugins.web.keyless_mcp.keyless_enabled", lambda: False)
+        monkeypatch.setattr(importlib.import_module("plugins.web.keyless_mcp"),
+                            "keyless_enabled", lambda: False)
         result = ExaWebSearchProvider().search("q")
         assert result["success"], result
         assert result["data"]["web"][0]["description"] == "key-env"
