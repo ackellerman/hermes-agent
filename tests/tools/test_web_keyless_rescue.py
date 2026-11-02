@@ -14,6 +14,7 @@ Covers:
 """
 
 import json
+import importlib
 from unittest.mock import patch
 
 import pytest
@@ -96,8 +97,9 @@ class TestEligibility:
         monkeypatch.setattr(
             "agent.web_search_provider.get_provider_env", lambda name: ""
         )
-        monkeypatch.setattr("plugins.web.firecrawl.provider._env", lambda name: "")
-        monkeypatch.setattr("plugins.web.firecrawl.provider._is_tool_gateway_ready", lambda: True)
+        firecrawl_provider = importlib.import_module("plugins.web.firecrawl.provider")
+        monkeypatch.setattr(firecrawl_provider, "_env", lambda name: "")
+        monkeypatch.setattr(firecrawl_provider, "_is_tool_gateway_ready", lambda: True)
         monkeypatch.setattr(
             "tools.tool_backend_helpers.read_selection", lambda kind: "nous"
         )
@@ -105,7 +107,8 @@ class TestEligibility:
         monkeypatch.setattr(
             "tools.tool_backend_helpers.read_selection", lambda kind: "firecrawl"
         )
-        monkeypatch.setattr("plugins.web.keyless_mcp._web_config_selects", lambda name: name == "firecrawl")
+        monkeypatch.setattr(importlib.import_module("plugins.web.keyless_mcp"),
+                            "_web_config_selects", lambda name: name == "firecrawl")
         assert web_tools_rescue._rescue_eligible(_GatewayFirecrawlBoomProvider()) is False
 
     def test_non_ring_backend_is_eligible(self):

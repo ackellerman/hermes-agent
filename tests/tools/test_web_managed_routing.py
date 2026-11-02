@@ -1,6 +1,7 @@
 """Real config, dispatch and local HTTP must preserve web billing boundaries."""
 
 import json
+import importlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
@@ -58,7 +59,11 @@ def local_gateway(monkeypatch):
             )
             return response.json()
 
-    monkeypatch.setattr("plugins.web.firecrawl.provider.Firecrawl", FirecrawlSDK)
+    # Import the module explicitly: pytest's string form imports only the first segment and
+    # getattr-walks the rest, so it silently depended on an earlier import in the process
+    # having bound `plugins.web`. In a shared process (bare `pytest tests/tools`) it is gone.
+    firecrawl_provider = importlib.import_module("plugins.web.firecrawl.provider")
+    monkeypatch.setattr(firecrawl_provider, "Firecrawl", FirecrawlSDK)
     monkeypatch.setattr("tools.web_tools._firecrawl_client", None, raising=False)
     try:
         yield requests
