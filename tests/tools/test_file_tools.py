@@ -47,12 +47,16 @@ class TestReadFileHandler:
 class TestWriteFileHandler:
 
     @patch("tools.file_tools._get_file_ops")
-    def test_permission_error_returns_error_json_without_error_log(self, mock_get, caplog):
+    def test_permission_error_returns_error_json_without_error_log(self, mock_get, caplog, tmp_path):
         mock_get.side_effect = PermissionError("read-only filesystem")
 
         from tools.file_tools import write_file_tool
+        # A fixed /tmp path made this test depend on whatever a previous run left
+        # behind (the overwrite guard fires before the permission error). tmp_path
+        # keeps it hermetic and off a shared /tmp.
+        target = tmp_path / "out.txt"
         with caplog.at_level(logging.DEBUG, logger="tools.file_tools"):
-            result = json.loads(write_file_tool("/tmp/out.txt", "data"))
+            result = json.loads(write_file_tool(str(target), "data"))
         assert "error" in result
         assert "read-only" in result["error"]
         assert not any(r.levelno >= logging.ERROR for r in caplog.records)
