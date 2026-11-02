@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import traceback
+import weakref
 from collections import defaultdict
 from contextlib import nullcontext, suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
@@ -604,6 +605,174 @@ _GATE_ENV_KEYS = (
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOW_BOTS",
     "GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS",
 )
+
+# ── reloadable policy keys ──────────────────────────────────────────────── Owner ruling (2026-11-02):
+# gates live, plugins restart-only. ``allow_bots`` and ``free_response_channels`` are re-read per
+# message off this profile's own ``.env``/``config.yaml``, so a policy edit stops needing a gateway
+# restart. Everything that owns a socket (plugins, voice) stays load-once — a reload there would mean
+# tearing down live connections, and the drift check reports it instead.
+_LIVE_POLICY_ENV_KEYS = ("DISCORD_ALLOW_BOTS", "DISCORD_FREE_RESPONSE_CHANNELS")
+_ALLOW_BOTS_MODES = frozenset({"none", "mentions", "all"})
+
+# home -> (file signature, {"env": {...}, "yaml": {...}}). Cache key is the two files' stat identity,
+# so a message costs two stat() calls and only an actually-edited file is re-parsed. Deliberately NOT
+# a TTL: mtime_ns+size+ino+ctime_ns already change on every write, and a TTL window would mean a just
+# -edited gate is silently ignored for up to its remainder (the exact "I edited it, nothing happened"
+# complaint this fix exists for). See UPSTREAM-PENDING.md.
+_LIVE_POLICY_CACHE: dict[str, tuple[tuple, dict]] = {}
+_LIVE_POLICY_LOCK = threading.Lock()
+
+
+def _file_signature(path) -> tuple:
+    """Cheap change detector for one config file; ``("missing",)`` when it isn't there."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ("missing",)
+    return (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
+
+
+def _discard_yaml_env(name: str, value: Any) -> None:
+    """No-op ``set_env`` for a read-only ``_apply_yaml_config`` pass (no env writes off the hot path)."""
+
+
+def _read_config_yaml(path) -> Optional[dict]:
+    """Parse one ``config.yaml``; ``None`` when absent or unreadable (callers keep the snapshot)."""
+    try:
+        import hermes_yaml
+        with open(path, encoding="utf-8-sig") as handle:
+            data = hermes_yaml.safe_load(handle)
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logger.debug("[Discord] live policy: %s unreadable", path, exc_info=True)
+        return None
+    return data if isinstance(data, dict) else {}
+
+
+def _policy_keys_from_yaml(cfg: Optional[dict]) -> dict:
+    """``allow_bots``/``free_response_channels`` as the startup bridge resolves them, from a raw config."""
+    if not isinstance(cfg, dict):
+        return {}
+    section = cfg.get("discord") if isinstance(cfg.get("discord"), dict) else None
+    if section is None:
+        platforms = cfg.get("platforms")
+        nested = platforms.get("discord") if isinstance(platforms, dict) else None
+        section = nested if isinstance(nested, dict) else {}
+    try:
+        # Same translator the plugin's startup YAML→env bridge runs: one resolution, no second opinion
+        # about which of ``discord:`` / ``platforms.discord.extra`` owns a key.
+        seeded = _apply_yaml_config(cfg, section, set_env=_discard_yaml_env) or {}
+    except Exception:
+        logger.debug("[Discord] live policy: YAML policy extraction failed", exc_info=True)
+        return {}
+    return {key: seeded[key] for key in ("allow_bots", "free_response_channels") if key in seeded}
+
+
+def _read_policy_file_values(home) -> dict:
+    """Re-read this profile's reloadable policy keys from ``.env`` + ``config.yaml`` (cached by signature)."""
+    home = _Path(home)
+    env_path = home / ".env"
+    cfg_path = home / "config.yaml"
+    signature = (_file_signature(env_path), _file_signature(cfg_path))
+    key = str(home)
+    with _LIVE_POLICY_LOCK:
+        cached = _LIVE_POLICY_CACHE.get(key)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    values: dict = {"env": {}, "yaml": {}}
+    try:
+        from agent.secret_scope import load_env_file
+        env_values = load_env_file(env_path)
+        values["env"] = {
+            name: str(env_values[name]).strip()
+            for name in _LIVE_POLICY_ENV_KEYS
+            if str(env_values.get(name) or "").strip()
+        }
+    except Exception:
+        logger.debug("[Discord] live policy: .env read failed", exc_info=True)
+    values["yaml"] = _policy_keys_from_yaml(_read_config_yaml(cfg_path))
+    with _LIVE_POLICY_LOCK:
+        _LIVE_POLICY_CACHE[key] = (signature, values)
+    return values
+
+
+def _resolve_profile_home():
+    """The profile directory that owns this adapter's policy files (scope first, then the process home)."""
+    try:
+        from agent.secret_scope import current_secret_scope_home
+        home = current_secret_scope_home()
+        if home:
+            return _Path(home)
+    except Exception:
+        pass
+    try:
+        from hermes_constants import get_hermes_home
+        return _Path(get_hermes_home())
+    except Exception:
+        return None
+
+
+def _normalize_allow_bots(raw) -> str:
+    """``DISCORD_ALLOW_BOTS`` → one of none|mentions|all; anything else fails CLOSED to ``none``.
+
+    A typo used to match neither admission branch and therefore admit every bot; the ruling is that an
+    unparseable value keeps the pre-existing "no bot admission" behaviour instead of opening the gate.
+    """
+    mode = str(raw or "none").strip().lower() or "none"
+    return mode if mode in _ALLOW_BOTS_MODES else "none"
+
+
+def _enabled_plugins_signature(cfg: Optional[dict]) -> str:
+    """Stable string for ``plugins.enabled`` (restart-only: the plugin manager reads it once)."""
+    plugins_cfg = cfg.get("plugins") if isinstance(cfg, dict) else None
+    names = plugins_cfg.get("enabled") if isinstance(plugins_cfg, dict) else None
+    if names is None:
+        return ""
+    if isinstance(names, str):
+        names = [names]
+    try:
+        return ",".join(sorted(str(name) for name in names))
+    except TypeError:
+        return str(names)
+
+
+def _voice_fx_signature(fx: Optional[dict]) -> str:
+    """Stable string for the voice mixer settings (restart-only)."""
+    try:
+        return json.dumps(fx or {}, sort_keys=True, default=str)
+    except Exception:
+        return str(fx)
+
+
+# Connected adapters whose loaded policy the process-wide drift monitor compares to disk. Weak so a
+# discarded adapter cannot keep the monitor (or the process) alive.
+_DRIFT_ADAPTERS: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def _config_drift_keys_for_adapters() -> list:
+    """Drift rows for every connected adapter; keys are prefixed only when more than one is live."""
+    adapters = [a for a in list(_DRIFT_ADAPTERS) if getattr(a, "_policy_snapshot", None)]
+    prefix_for = (lambda a: f"{getattr(a, 'name', 'discord')}: ") if len(adapters) > 1 else (lambda a: "")
+    rows: list = []
+    for adapter in adapters:
+        try:
+            rows.extend(adapter._config_drift_keys(prefix=prefix_for(adapter)))
+        except Exception:
+            logger.debug("[Discord] config drift row build failed", exc_info=True)
+    return rows
+
+
+def _start_config_drift_monitor(adapter) -> None:
+    """Register a connected adapter and ensure the once-a-minute drift check is running."""
+    if getattr(adapter, "_live_policy_home", None) is None:
+        return
+    try:
+        _DRIFT_ADAPTERS.add(adapter)
+        from gateway.config_drift import start_monitor
+        start_monitor(_config_drift_keys_for_adapters, scope="discord")
+    except Exception:
+        logger.debug("[Discord] config drift monitor did not start", exc_info=True)
 
 
 def _multiplex_active() -> bool:
@@ -1820,6 +1989,9 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             # startup failure reported as ``fatal`` for the life of the process (#102554).
             self._mark_connected()
             self._start_liveness_probe()
+            # Once a minute, compare this process's loaded policy to the files on disk (one WARNING):
+            # gates apply live now, but plugins/voice still need a restart and that must not be silent.
+            _start_config_drift_monitor(self)
             # Plugin-registered native handlers (discord.py Bot — add_listener()/event hooks).
             self._wire_plugin_handlers(self._client)
             return True
@@ -1879,35 +2051,63 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         return ("discord_connect_error", f"Discord startup failed: {error}", True)
 
     def _discord_message_admission(self, message: Any, *, claim: bool) -> tuple[bool, bool]:
-        """Return ``(admitted, role_authorized)`` for one Discord event."""
+        """Return ``(admitted, role_authorized)`` for one Discord event.
+
+        Every refusal is logged with its reason, one line per message: the drop paths are the only
+        events an operator cannot tell apart from "the gateway never received the event" — a bot
+        message dropped by ``allow_bots: none`` used to leave no trace at all.
+        """
         message_id = str(getattr(message, "id", ""))
+        author = getattr(message, "author", None)
+        author_id = str(getattr(author, "id", "") or "")
+        author_is_bot = bool(getattr(author, "bot", False))
+        channel_id = str(getattr(getattr(message, "channel", None), "id", "") or "")
+
+        def _decision(reason: str, *, admit: bool = False) -> tuple[bool, bool]:
+            # One record per decision, never per chunk or attachment: identity first, reason last so
+            # a `grep reason=` / `grep author=` sweep works on the whole admission trail.
+            logger.log(
+                logging.DEBUG if admit else logging.INFO,
+                "[%s] admission: %s message %s (author=%s bot=%s channel=%s reason=%s)",
+                getattr(self, "name", "discord"), "admitted" if admit else "dropping",
+                message_id or "?", author_id or "?", author_is_bot, channel_id or "?", reason,
+            )
+            return admit, False
+
+        def _drop(reason: str) -> tuple[bool, bool]:
+            return _decision(reason)
+
         if claim:
             if self._dedup.is_duplicate(message_id):
-                return False, False
+                return _drop("dedup")
         elif self._dedup.contains(message_id):
-            return False, False
+            return _drop("dedup")
         if message.author == self._client.user:
-            return False, False
+            return _drop("self-message")
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
-            return False, False
+            try:  # IntEnum in discord.py; ``.value`` covers stubs/mocks that aren't int-coercible
+                type_reason = f"type:{int(message.type)}"
+            except (TypeError, ValueError):
+                type_reason = f"type:{getattr(message.type, 'value', message.type)}"
+            return _drop(type_reason)
         role_authorized = False
         if getattr(message.author, "bot", False):
             allow_bots = self._get_allow_bots()
             bot_tag_continuation = self._is_bot_tag_debounce_continuation(message)
             if allow_bots == "none":
-                return False, False
+                return _drop("bot-not-allowed")
             if (
                 allow_bots == "mentions"
                 and not self._self_is_explicitly_mentioned(message)
                 and not bot_tag_continuation
             ):
-                return False, False
+                return _drop("bot-mention-required")
             if (
                 self._discord_bots_require_inline_mention()
                 and not self._self_is_raw_mentioned(message)
                 and not bot_tag_continuation
             ):
-                return False, False
+                return _drop("bot-inline-mention-required")
         else:
             msg_guild = getattr(message, "guild", None)
             is_dm = isinstance(message.channel, discord.DMChannel) or msg_guild is None
@@ -1922,7 +2122,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 channel_ids=msg_channel_ids,
             ):
                 self._warn_if_fail_closed_default()
-                return False, False
+                return _drop("user-not-allowed")
             role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
         raw_self_mention = self._self_is_explicitly_mentioned(message)
         if not isinstance(message.channel, discord.DMChannel) and (
@@ -1933,7 +2133,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 for mentioned in message.mentions
             )
             if other_bots_mentioned and not raw_self_mention:
-                return False, False
+                return _drop("other-bot-addressed")
             ignore_no_mention = _scoped_gate_env("DISCORD_IGNORE_NO_MENTION", "true").lower() in {"true", "1", "yes"}
             if ignore_no_mention and not raw_self_mention and not other_bots_mentioned:
                 # A thread the bot joined is not someone else's conversation, and the other two
@@ -1949,14 +2149,11 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                     free_channels = self._discord_free_response_channels()
                     channel_keys = self._discord_channel_keys(message, parent_id)
                     if "*" not in free_channels and not (channel_keys & free_channels):
-                        # Every other silent return in this function is at least guessable from
-                        # the outside; this one is not, and an operator seeing no log line cannot
-                        # tell it apart from the gateway never receiving the event.
-                        logger.debug(
-                            "[%s] admission: dropping message %s — mentions others, not self, "
-                            "not a bot thread, channel not free-response",
-                            self.name, getattr(message, "id", "?"))
-                        return False, False
+                        # The reason string carries what the old prose comment said: this is the drop
+                        # an operator cannot guess from the outside (mentions someone else, the bot is
+                        # not a participant, the channel is not free-response).
+                        return _drop("mentions-others-not-free-channel")
+        _decision("admitted", admit=True)
         return True, role_authorized
 
     async def _dispatch_discord_message(self, message: Any) -> bool:
@@ -3803,8 +4000,12 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
 
     # --- Voice channel methods (join / leave / play) ---
 
-    def _load_voice_fx_config(self) -> dict[str, Any]:
-        """Read ``discord.voice_fx`` from config.yaml (not .env; off by default) with safe defaults."""
+    def _load_voice_fx_config(self, cfg: Optional[dict] = None) -> dict[str, Any]:
+        """Read ``discord.voice_fx`` from config.yaml (not .env; off by default) with safe defaults.
+
+        ``cfg`` lets the drift check re-resolve the same settings from the file on disk right now,
+        through this one merge (no second set of defaults to drift apart).
+        """
         defaults: dict[str, Any] = {
             "enabled": False,        # master switch for the mixer subsystem
             "ambient_enabled": True, # idle "thinking" bed while tools run
@@ -3818,8 +4019,9 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             "ack_phrases": None,     # None = the localized defaults (``_default_voice_ack_phrases``)
         }
         try:
-            from hermes_cli.config import read_raw_config
-            cfg = read_raw_config() or {}
+            if cfg is None:
+                from hermes_cli.config import read_raw_config
+                cfg = read_raw_config() or {}
             fx = ((cfg.get("discord") or {}).get("voice_fx") or {})
             if isinstance(fx, dict):
                 for k, v in fx.items():
@@ -5480,6 +5682,11 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         """Snapshot gate env vars; must run inside the owning profile's runtime scope
         (connect() does under multiplex) to capture that profile's values."""
         self._gate_env_snapshot = {key: _scoped_gate_env(key) for key in _GATE_ENV_KEYS}
+        # The profile whose .env/config.yaml own this adapter's policy: the live re-read and the drift
+        # check read THESE files, never another profile's. Binding it here (rather than at import) is
+        # what keeps the live read inert for an adapter that was never connected.
+        self._live_policy_home = _resolve_profile_home()
+        self._capture_policy_snapshot()
 
     def _gate_env(self, name: str, default: str = "") -> str:
         """Read a gate env var from this adapter's snapshot (scope fallback)."""
@@ -5496,6 +5703,70 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         extra = getattr(getattr(self, "config", None), "extra", None)
         if isinstance(extra, dict):
             return extra.get(extra_key)
+        return None
+
+    # ── live policy re-read (owner ruling 2026-11-02: gates live, plugins restart-only) ──────────
+
+    def _policy_typo_once(self, key: str, raw) -> bool:
+        """True the first time this adapter sees an unparseable value for ``key`` (log-once latch)."""
+        seen = getattr(self, "_policy_typo_seen", None)
+        if seen is None:
+            seen = set()
+            self._policy_typo_seen = seen
+        marker = (key, str(raw))
+        if marker in seen:
+            return False
+        seen.add(marker)
+        return True
+
+    def _parse_allow_bots(self, raw) -> str:
+        """``allow_bots`` normalized to none|mentions|all; an unparseable value fails closed + one WARNING."""
+        mode = _normalize_allow_bots(raw)
+        if mode == "none" and str(raw or "").strip().lower() not in {"", "none"}:
+            if self._policy_typo_once("allow_bots", raw):
+                logger.warning(
+                    "[%s] Unparseable allow_bots value %r — treating it as 'none' (no bot messages "
+                    "admitted). Valid values: none, mentions, all.",
+                    getattr(self, "name", "discord"), raw,
+                )
+        return mode
+
+    def _policy_csv_set(self, raw, *, key: str) -> set:
+        """CSV/JSON-list policy value; a malformed JSON list fails CLOSED (empty set) and logs once."""
+        if isinstance(raw, str) and raw.lstrip().startswith("["):
+            try:
+                json.loads(raw)
+            except ValueError:
+                if self._policy_typo_once(key, raw):
+                    logger.warning(
+                        "[%s] Unparseable %s value %r — ignoring it (no channels enabled by it). "
+                        "Expected a comma-separated list or a JSON list.",
+                        getattr(self, "name", "discord"), key, raw,
+                    )
+                return set()
+        return self._gate_csv_set(raw)
+
+    def _live_gate_value(self, extra_key: str, env_key: str):
+        """This profile's value for a reloadable policy key, re-read from disk right now.
+
+        ``None`` when the adapter has no profile home yet (never connected) or neither file mentions
+        the key — the caller then keeps the connect-time snapshot, which is also the fail-closed path
+        for an unreadable/typoed file.
+        """
+        home = getattr(self, "_live_policy_home", None)
+        if home is None:
+            return None
+        try:
+            values = _read_policy_file_values(home)
+        except Exception:
+            logger.debug("[%s] live policy re-read failed", getattr(self, "name", "discord"), exc_info=True)
+            return None
+        env_value = values.get("env", {}).get(env_key)
+        if env_value:
+            return env_value
+        yaml_value = values.get("yaml", {}).get(extra_key)
+        if yaml_value is not None and str(yaml_value).strip():
+            return yaml_value
         return None
 
     @staticmethod
@@ -5567,9 +5838,15 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         return self._gate_env("GATEWAY_ALLOW_ALL_USERS").strip().lower() in {"true", "1", "yes"}
 
     def _get_allow_bots(self) -> str:
-        """Per-profile DISCORD_ALLOW_BOTS mode (none|mentions|all)."""
-        raw = self._gate_raw("allow_bots", "DISCORD_ALLOW_BOTS")
-        return str(raw or "none").lower().strip() or "none"
+        """Per-profile DISCORD_ALLOW_BOTS mode (none|mentions|all), re-read from disk per message.
+
+        The connect-time snapshot is the fallback, not the only source: changing bot policy used to
+        need a gateway restart (owner ruling 2026-11-02). An unparseable value fails closed.
+        """
+        raw = self._live_gate_value("allow_bots", "DISCORD_ALLOW_BOTS")
+        if raw is None:
+            raw = self._gate_raw("allow_bots", "DISCORD_ALLOW_BOTS")
+        return self._parse_allow_bots(raw)
 
     @staticmethod
     def _bot_tag_debounce_key(message: Any) -> str:
@@ -5611,11 +5888,83 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         return True
 
     def _discord_free_response_channels(self) -> set:
-        """Channel IDs/names needing no mention; a lone "*" is preserved for wildcard short-circuit."""
-        raw = self.config.extra.get("free_response_channels")
+        """Channel IDs/names needing no mention; a lone "*" is preserved for wildcard short-circuit.
+
+        Re-read from this profile's ``.env``/``config.yaml`` per message: widening the free-response
+        list used to take a gateway restart (owner ruling 2026-11-02).
+        """
+        raw = self._live_gate_value("free_response_channels", "DISCORD_FREE_RESPONSE_CHANNELS")
+        if raw is None:
+            raw = self.config.extra.get("free_response_channels")
         if raw is None:
             raw = self._gate_env("DISCORD_FREE_RESPONSE_CHANNELS")
-        return self._gate_csv_set(raw)
+        return self._policy_csv_set(raw, key="free_response_channels")
+
+    # ── config drift: what this process loaded vs. what the files say now ─────────────────────────
+
+    def _capture_policy_snapshot(self) -> None:
+        """Record the policy THIS PROCESS IS RUNNING WITH, once, at connect().
+
+        The drift check compares these values to the files on disk. For the reloadable keys the
+        comparison is informational (they are applied live); for ``plugins.enabled`` and the voice
+        mixer it is the only way an operator learns their edit is inert until a restart.
+
+        The gate values come from the same live-aware getters enforcement uses, so "the snapshot"
+        cannot disagree with behaviour at t0 (which would report drift that nobody caused).
+        """
+        try:
+            home = getattr(self, "_live_policy_home", None)
+            cfg = _read_config_yaml(home / "config.yaml") if home is not None else None
+            self._policy_snapshot = {
+                "allow_bots": self._get_allow_bots(),
+                "free_response_channels": " ".join(sorted(self._discord_free_response_channels())),
+                "plugins.enabled": _enabled_plugins_signature(cfg),
+                "discord.voice_fx": _voice_fx_signature(getattr(self, "_voice_fx_cfg", None)),
+            }
+        except Exception:
+            logger.debug("[%s] could not capture the policy snapshot", getattr(self, "name", "discord"),
+                         exc_info=True)
+            self._policy_snapshot = None
+
+    def _config_drift_keys(self, *, prefix: str = "") -> list:
+        """One :class:`DriftKey` per comparable setting, with the disk side re-read now.
+
+        Empty until connect() has both bound the profile home and captured the snapshot — a bare or
+        unconnected adapter has nothing to compare and must not read the host's files.
+        """
+        from gateway.config_drift import DriftKey
+
+        home = getattr(self, "_live_policy_home", None)
+        snapshot = getattr(self, "_policy_snapshot", None)
+        if home is None or not snapshot:
+            return []
+        rows: list = []
+
+        def _add(name: str, snap: Any, disk: Any, *, reloadable: bool) -> None:
+            rows.append(DriftKey(
+                name=f"{prefix}{name}", snapshot=str(snap or ""), disk=str(disk or ""),
+                reloadable=reloadable,
+            ))
+
+        # Reloadable: these apply per message, so drift here is an FYI, not a restart demand.
+        live_allow_bots = self._live_gate_value("allow_bots", "DISCORD_ALLOW_BOTS")
+        _add("allow_bots", snapshot.get("allow_bots"),
+             _normalize_allow_bots(live_allow_bots) if live_allow_bots is not None
+             else snapshot.get("allow_bots"), reloadable=True)
+        live_free = self._live_gate_value("free_response_channels", "DISCORD_FREE_RESPONSE_CHANNELS")
+        _add("free_response_channels", snapshot.get("free_response_channels"),
+             " ".join(sorted(self._policy_csv_set(live_free, key="free_response_channels")))
+             if live_free is not None else snapshot.get("free_response_channels"), reloadable=True)
+
+        # Restart-only: the process loaded these once (plugin manager, voice mixer at __init__).
+        cfg = _read_config_yaml(home / "config.yaml")
+        _add("plugins.enabled", snapshot.get("plugins.enabled"),
+             _enabled_plugins_signature(cfg), reloadable=False)
+        if cfg is not None:
+            fresh_fx = self._load_voice_fx_config(cfg)
+            _add("discord.voice_fx", snapshot.get("discord.voice_fx"),
+                 _voice_fx_signature(fresh_fx), reloadable=False)
+        return rows
 
     def _raw_mentioned_user_ids(self, message: Any) -> set:
         """Extract user-mention IDs (``<@ID>`` and legacy ``<@!ID>``) from raw content,
@@ -7762,18 +8111,21 @@ _YAML_WEBSOCKET_LIVENESS_KEYS = (
 )
 
 
-def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
+def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict, *, set_env=None) -> dict | None:
     """Translate ``config.yaml`` ``discord:`` keys into env vars (``apply_yaml_config_fn``).
     The adapter reads ``DISCORD_*`` via ``os.getenv()`` at ~50 sites, so this hook owns YAML→env;
     ``extra`` stays the per-adapter truth for liveness (multiplex isolation). Returns liveness settings.
 
     Implements the ``apply_yaml_config_fn`` contract (#24836). Mirrors the legacy ``discord_cfg`` block that
     used to live in ``gateway/config.py::load_gateway_config()`` before this migration.
+
+    ``set_env`` overrides the env writer: the live policy re-read calls this with a no-op so it gets the
+    SAME key resolution without mutating process env from a message-handling path.
     """
     # Every env write is first-writer-wins (an explicit env var beats YAML) and is skipped for a
     # profile-scoped multiplex load: a secondary profile's settings must never land in process-global
     # env where they'd become another profile's policy (#72348). Everything is seeded into extra too.
-    _env_default = _yaml_env_setter()
+    _env_default = set_env if set_env is not None else _yaml_env_setter()
 
     def _csv(value) -> str:
         return ",".join(str(v) for v in value) if isinstance(value, list) else str(value)
