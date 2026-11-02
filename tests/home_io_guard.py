@@ -89,10 +89,23 @@ class HomeIOGuard:
             # ``shutil.which`` stats/accesses ``<PATH entry>/<name>``. A developer shell puts
             # PM's tool store (~/.hermes/tools/...) on PATH; probing an executable there is
             # command lookup, not reading Hermes state. CI has no such entries.
+            #
+            # The entry itself is probed too: PATH resolution asks whether a directory *is* a
+            # Hermes-managed bin dir (``mcp_tool_config._is_hermes_managed_bin_dir`` resolves
+            # every PATH entry), and that ``stat`` on ``~/.hermes/tools/ripgrep-…`` is the same
+            # command lookup one level up. Without this, every MCP stdio test failed on a
+            # developer host ("TEST BUG: file I/O against the REAL hermes home").
             if metadata:
                 path = os.environ.get("PATH", "")
                 cwd = os.getcwd() if self._relative_path_entries(path) else None
-                if os.path.dirname(absolute) in self._path_entries(path, cwd):
+                entries = self._path_entries(path, cwd)
+                if absolute in entries or os.path.dirname(absolute) in entries:
+                    return
+                # ``Path(entry).resolve()`` walks the entry's whole component chain, so the
+                # ancestors of a PATH entry are probed too (``~/.hermes/tools/<runtime>`` is
+                # the parent of the ``<runtime>/bin`` entry). Metadata-only, on a chain the
+                # operator's own PATH already points at.
+                if any(_contains(absolute, entry) for entry in entries):
                     return
             # The interpreter's own installation (a PM-managed python under ~/.hermes/tools):
             # stdlib source reads (linecache, traceback) are not Hermes state either, nor is
