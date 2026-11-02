@@ -1,6 +1,7 @@
 """Tests for the Discord server introspection and management tool."""
 
 import json
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -270,21 +271,37 @@ class TestFetchMessages:
 # ---------------------------------------------------------------------------
 
 class TestCreateThread:
+    """create_thread discriminates forum vs text by CHANNEL TYPE.
+
+    For a non-anchored create_thread the handler first GETs the channel to
+    learn its type (15 == GUILD_FORUM), then POSTs the appropriate body. So
+    these tests drive ``_discord_request`` with a two-call side_effect:
+    [channel object, created thread].
+    """
+
     @patch("tools.discord_tool._discord_request")
     def test_create_standalone_thread(self, mock_req, monkeypatch):
+        """Non-forum channel (type 0) → text-thread path (type 11, no message)."""
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
-        mock_req.return_value = {"id": "800", "name": "New Thread"}
+        mock_req.side_effect = [
+            {"id": "11", "type": 0},               # GET channel
+            {"id": "800", "name": "New Thread"},   # POST thread
+        ]
         result = json.loads(discord_core(action="create_thread", channel_id="11", name="New Thread"))
         assert result["success"] is True
         assert result["thread_id"] == "800"
-        # Verify the API call
-        mock_req.assert_called_once_with(
-            "POST", "/channels/11/threads", "test-token",
-            body={"name": "New Thread", "auto_archive_duration": 1440, "type": 11},
-        )
+        # First call inspects the channel type.
+        assert mock_req.call_args_list[0].args == ("GET", "/channels/11", "test-token")
+        # Second call creates the text thread.
+        post_call = mock_req.call_args_list[1]
+        assert post_call.args == ("POST", "/channels/11/threads", "test-token")
+        assert post_call.kwargs["body"] == {
+            "name": "New Thread", "auto_archive_duration": 1440, "type": 11,
+        }
 
     @patch("tools.discord_tool._discord_request")
     def test_create_thread_from_message(self, mock_req, monkeypatch):
+        """Anchored create (message_id) is unambiguous — no channel pre-fetch."""
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
         mock_req.return_value = {"id": "801", "name": "Discussion"}
         result = json.loads(discord_core(
@@ -295,6 +312,366 @@ class TestCreateThread:
             "POST", "/channels/11/messages/1001/threads", "test-token",
             body={"name": "Discussion", "auto_archive_duration": 1440},
         )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_create_thread_adds_requested_user_as_member(self, mock_req, monkeypatch):
+        """A standalone thread starts with the bot as its only member; user_id must be added."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [{"id": "11", "type": 0}, {"id": "802", "name": "Owned"}, None]
+        result = json.loads(discord_core(
+            action="create_thread", channel_id="11", name="Owned", user_id="42",
+        ))
+        assert result["success"] is True
+        assert result["user_added_as_thread_member"] is True
+        mock_req.assert_any_call("PUT", "/channels/802/thread-members/42", "test-token")
+
+    @patch("tools.discord_tool._discord_request")
+    def test_create_thread_survives_failed_member_add(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "11", "type": 0}, {"id": "803", "name": "Owned"}, DiscordAPIError(403, "{}")]
+        result = json.loads(discord_core(
+            action="create_thread", channel_id="11", name="Owned", user_id="42",
+        ))
+        assert result["success"] is True
+        assert result["user_added_as_thread_member"] is False
+
+    @patch("tools.discord_tool._discord_request")
+    def test_forum_post_adds_member_after_the_forum_path(self, mock_req, monkeypatch):
+        """The thread-membership fix must survive the forum discriminator, not be
+        shadowed by it: a forum post created for a human adds them too."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [{"id": "55", "type": 15}, {"id": "900", "name": "Post"}, None]
+        result = json.loads(discord_core(
+            action="create_thread", channel_id="55", name="Post", user_id="42",
+        ))
+        assert result["user_added_as_thread_member"] is True
+        mock_req.assert_any_call("PUT", "/channels/900/thread-members/42", "test-token")
+
+    @patch("tools.discord_tool._discord_request")
+    def test_forum_post_message_and_tags_reach_the_api(self, mock_req, monkeypatch):
+        """#37666's case, carried onto the channel-type discriminator below.
+
+        The opening content and the tag ids ride in the create body of a forum post.
+        """
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [{"id": "55", "type": 15}, {"id": "802", "name": "Forum Post"}]
+        result = json.loads(discord_core(
+            action="create_thread", channel_id="55", name="Forum Post",
+            content="Opening content", applied_tags=["9001", "9002"],
+        ))
+        assert result["success"] is True
+        post_call = mock_req.call_args_list[1]
+        assert post_call.args == ("POST", "/channels/55/threads", "test-token")
+        assert post_call.kwargs["body"] == {
+            "name": "Forum Post",
+            "auto_archive_duration": 1440,
+            "message": {"content": "Opening content"},
+            "applied_tags": ["9001", "9002"],
+        }
+
+    @patch("tools.discord_tool._discord_request")
+    def test_message_and_tags_ignored_when_anchored_to_a_message(self, mock_req, monkeypatch):
+        # Threads anchored to an existing message take their opening content from
+        # that message; Discord rejects `message`/`applied_tags` on that route.
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "803", "name": "Discussion"}
+        result = json.loads(discord_core(
+            action="create_thread", channel_id="11", name="Discussion", message_id="1001",
+            content="Opening content", applied_tags=["9001"],
+        ))
+        assert result["success"] is True
+        mock_req.assert_called_once_with(
+            "POST", "/channels/11/messages/1001/threads", "test-token",
+            body={"name": "Discussion", "auto_archive_duration": 1440},
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_create_forum_post_with_applied_tags(self, mock_req, monkeypatch):
+        """Forum channel (type 15) with tags → message-object body + applied_tags,
+        and NO type:11 field."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "55", "type": 15},              # GET channel → forum
+            {"id": "900", "name": "Bug report"},   # POST thread
+        ]
+        result = json.loads(discord_core(
+            action="create_thread", channel_id="55", name="Bug report",
+            applied_tags=["111", "222"], content="It broke",
+        ))
+        assert result["success"] is True
+        assert result["thread_id"] == "900"
+        post_call = mock_req.call_args_list[1]
+        assert post_call.args == ("POST", "/channels/55/threads", "test-token")
+        assert post_call.kwargs["body"] == {
+            "name": "Bug report",
+            "auto_archive_duration": 1440,
+            "message": {"content": "It broke"},
+            "applied_tags": ["111", "222"],
+        }
+
+    @patch("tools.discord_tool._discord_request")
+    def test_create_forum_post_without_tags(self, mock_req, monkeypatch):
+        """Regression: a TAGLESS forum post (type 15, no applied_tags) must
+        still use the message-object endpoint — a forum REJECTS the text-style
+        'Start Thread' call, so this is the previously-broken case. Content
+        falls back to the thread name; no applied_tags key, no type:11."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "55", "type": 15},          # GET channel → forum
+            {"id": "910", "name": "Topic"},    # POST thread
+        ]
+        result = json.loads(discord_core(
+            action="create_thread", channel_id="55", name="Topic",
+        ))
+        assert result["success"] is True
+        assert result["thread_id"] == "910"
+        body = mock_req.call_args_list[1].kwargs["body"]
+        assert body["message"] == {"content": "Topic"}   # defaulted to name
+        assert "applied_tags" not in body               # tags optional, none given
+        assert "type" not in body                       # not a text thread
+
+    @patch("tools.discord_tool._discord_request")
+    def test_create_media_post_uses_message_body(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "56", "type": 16},
+            {"id": "911", "name": "Media post"},
+        ]
+        discord_core(action="create_thread", channel_id="56", name="Media post")
+        body = mock_req.call_args_list[1].kwargs["body"]
+        assert body["message"] == {"content": "Media post"}
+        assert "type" not in body
+
+    @patch("tools.discord_tool._discord_request")
+    def test_create_forum_post_defaults_content_to_name(self, mock_req, monkeypatch):
+        """Forum post with tags but no content → content falls back to name."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "55", "type": 15},          # GET channel → forum
+            {"id": "901", "name": "Topic"},    # POST thread
+        ]
+        discord_core(
+            action="create_thread", channel_id="55", name="Topic",
+            applied_tags=["111"],
+        )
+        body = mock_req.call_args_list[1].kwargs["body"]
+        assert body["message"] == {"content": "Topic"}
+        assert body["applied_tags"] == ["111"]
+        assert "type" not in body
+
+    @patch("tools.discord_tool._discord_request")
+    def test_create_thread_text_channel_ignores_tags(self, mock_req, monkeypatch):
+        """Regression guard: a non-forum channel (type 0) always takes the text
+        path (type 11, no message object) — even if applied_tags is passed."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "11", "type": 0},           # GET channel → text
+            {"id": "802", "name": "Plain"},    # POST thread
+        ]
+        discord_core(action="create_thread", channel_id="11", name="Plain")
+        post_call = mock_req.call_args_list[1]
+        assert post_call.args == ("POST", "/channels/11/threads", "test-token")
+        body = post_call.kwargs["body"]
+        assert body == {"name": "Plain", "auto_archive_duration": 1440, "type": 11}
+        assert "message" not in body
+        assert "applied_tags" not in body
+
+    @patch("tools.discord_tool.urllib.request.urlopen")
+    def test_forum_post_tags_reach_the_http_body(self, mock_urlopen, monkeypatch):
+        """Hermetic wire test: the tag ids survive all the way into the JSON that
+        urllib sends (patched at ``urlopen``, one layer below ``_discord_request``).
+
+        The mocks above prove the handler→request contract; this proves the
+        serialized request body that Discord would actually receive.
+        """
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        sent: list[Any] = []
+        responses = [{"id": "55", "type": 15}, {"id": "900", "name": "Bug report"}]
+
+        def _fake_urlopen(req, timeout=None):
+            data = req.data
+            sent.append(json.loads(data.decode("utf-8")) if data is not None else None)
+            return _mock_urlopen(responses[len(sent) - 1])
+
+        mock_urlopen.side_effect = _fake_urlopen
+        result = json.loads(discord_core(
+            action="create_thread", channel_id="55", name="Bug report",
+            content="It broke", applied_tags=["111", "222"],
+        ))
+        assert result["thread_id"] == "900"
+        assert sent[-1] == {
+            "name": "Bug report",
+            "auto_archive_duration": 1440,
+            "message": {"content": "It broke"},
+            "applied_tags": ["111", "222"],
+        }
+
+
+# ---------------------------------------------------------------------------
+# Actions: send_message / react / archive_thread / add_thread_member
+# ---------------------------------------------------------------------------
+
+class TestMessagingActions:
+    @patch("tools.discord_tool._discord_request")
+    def test_send_message(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "500", "channel_id": "11"}
+        result = json.loads(discord_core(action="send_message", channel_id="11", content="hello"))
+        assert result == {"success": True, "message_id": "500", "channel_id": "11"}
+        mock_req.assert_called_once_with(
+            "POST", "/channels/11/messages", "test-token", body={"content": "hello"})
+
+    @patch("tools.discord_tool._discord_request")
+    def test_send_message_as_reply(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "501", "channel_id": "11"}
+        discord_core(action="send_message", channel_id="11", content="hi", message_id="9")
+        mock_req.assert_called_once_with(
+            "POST", "/channels/11/messages", "test-token",
+            body={"content": "hi", "message_reference": {"message_id": "9"}})
+
+    @patch("tools.discord_tool._discord_request")
+    def test_react_url_encodes_emoji(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = None
+        result = json.loads(discord_core(
+            action="react", channel_id="11", message_id="9", emoji="\U0001F44D"))
+        assert result["success"] is True
+        mock_req.assert_called_once_with(
+            "PUT", "/channels/11/messages/9/reactions/%F0%9F%91%8D/@me", "test-token")
+
+    @patch("tools.discord_tool._discord_request")
+    def test_archive_thread_archives_without_locking(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {}
+        result = json.loads(discord_core(action="archive_thread", channel_id="77"))
+        assert result["success"] is True
+        # `locked` must never be sent: the user reopens threads by hand.
+        mock_req.assert_called_once_with(
+            "PATCH", "/channels/77", "test-token", body={"archived": True})
+
+    @patch("tools.discord_tool._discord_request")
+    def test_archive_thread_can_reopen(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {}
+        discord_core(action="archive_thread", channel_id="77", archived=False)
+        mock_req.assert_called_once_with(
+            "PATCH", "/channels/77", "test-token", body={"archived": False})
+
+    @patch("tools.discord_tool._discord_request")
+    def test_add_thread_member(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = None
+        result = json.loads(discord_core(
+            action="add_thread_member", channel_id="77", user_id="42"))
+        assert result["success"] is True
+        mock_req.assert_called_once_with(
+            "PUT", "/channels/77/thread-members/42", "test-token")
+
+    @patch("tools.discord_tool._discord_request")
+    def test_edit_message(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "500"}
+        result = json.loads(discord_admin_handler(
+            action="edit_message", channel_id="11", message_id="500", content="fixed"))
+        assert result["success"] is True
+        mock_req.assert_called_once_with(
+            "PATCH", "/channels/11/messages/500", "test-token", body={"content": "fixed"})
+
+    @patch("tools.discord_tool._discord_request")
+    def test_edit_message_refuses_foreign_message(self, mock_req, monkeypatch):
+        """The bot-author guard is Discord's: editing another user's message is a 403.
+
+        The handler must surface it as an error carrying the edit-own-messages hint —
+        never report success.
+        """
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = DiscordAPIError(403, '{"message": "Cannot edit a message authored by another user", "code": 50005}')
+        result = json.loads(discord_admin_handler(
+            action="edit_message", channel_id="11", message_id="500", content="fixed"))
+        assert "error" in result
+        assert "Only messages the bot itself authored can be edited." in result["error"]
+        assert "50005" in result["error"]  # raw body preserved
+        mock_req.assert_called_once_with(
+            "PATCH", "/channels/11/messages/500", "test-token", body={"content": "fixed"})
+
+
+# ---------------------------------------------------------------------------
+# Action: list_forum_tags
+# ---------------------------------------------------------------------------
+
+class TestListForumTags:
+    @patch("tools.discord_tool._discord_request")
+    def test_list_forum_tags(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {
+            "id": "55",
+            "type": 15,
+            "available_tags": [
+                {"id": "111", "name": "bug", "moderated": False, "emoji_id": None, "emoji_name": "🐛"},
+                {"id": "222", "name": "staff-only", "moderated": True, "emoji_id": "999", "emoji_name": None},
+            ],
+        }
+        result = json.loads(discord_core(action="list_forum_tags", channel_id="55"))
+        assert result["success"] is True
+        assert result["channel_id"] == "55"
+        assert result["available_tags"] == [
+            {"id": "111", "name": "bug", "emoji": "🐛", "moderated": False},
+            {"id": "222", "name": "staff-only", "emoji": "999", "moderated": True},
+        ]
+        mock_req.assert_called_once_with("GET", "/channels/55", "test-token")
+
+    @patch("tools.discord_tool._discord_request")
+    def test_list_forum_tags_no_tags(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "55", "type": 15}  # available_tags absent
+        result = json.loads(discord_core(action="list_forum_tags", channel_id="55"))
+        assert result["available_tags"] == []
+
+
+# ---------------------------------------------------------------------------
+# Action: set_thread_tags
+# ---------------------------------------------------------------------------
+
+class TestSetThreadTags:
+    @patch("tools.discord_tool._discord_request")
+    def test_set_thread_tags(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "900", "applied_tags": ["111", "222"]}
+        result = json.loads(discord_admin_handler(
+            action="set_thread_tags", channel_id="900", applied_tags=["111", "222"],
+        ))
+        assert result["success"] is True
+        assert result["thread_id"] == "900"
+        assert result["applied_tags"] == ["111", "222"]
+        mock_req.assert_called_once_with(
+            "PATCH", "/channels/900", "test-token",
+            body={"applied_tags": ["111", "222"]},
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_set_thread_tags_empty_clears(self, mock_req, monkeypatch):
+        """An empty applied_tags list is a valid 'clear all tags' request and
+        must not be rejected as a missing param."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "900", "applied_tags": []}
+        result = json.loads(discord_admin_handler(
+            action="set_thread_tags", channel_id="900", applied_tags=[],
+        ))
+        assert "error" not in result
+        assert result["applied_tags"] == []
+        mock_req.assert_called_once_with(
+            "PATCH", "/channels/900", "test-token", body={"applied_tags": []},
+        )
+
+    def test_set_thread_tags_requires_channel_id(self, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        result = json.loads(discord_admin_handler(
+            action="set_thread_tags", applied_tags=["1"],
+        ))
+        assert "error" in result
+        assert "channel_id" in result["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +706,28 @@ class TestRegistration:
         """Core + admin actions should cover all known actions."""
         assert set(_CORE_ACTIONS.keys()) | set(_ADMIN_ACTIONS.keys()) == set(_ACTIONS.keys())
         assert set(_CORE_ACTIONS.keys()) & set(_ADMIN_ACTIONS.keys()) == set()
+
+    def test_forum_tag_actions_in_correct_schemas(self):
+        """list_forum_tags is read-only → CORE; set_thread_tags mutates → ADMIN."""
+        from tools.registry import registry
+        core_actions = set(
+            registry._tools["discord"].schema["parameters"]["properties"]["action"]["enum"]
+        )
+        admin_actions = set(
+            registry._tools["discord_admin"].schema["parameters"]["properties"]["action"]["enum"]
+        )
+        assert "list_forum_tags" in core_actions
+        assert "list_forum_tags" not in admin_actions
+        assert "set_thread_tags" in admin_actions
+        assert "set_thread_tags" not in core_actions
+
+    def test_applied_tags_and_content_properties_present(self):
+        from tools.registry import registry
+        for tool_name in ("discord", "discord_admin"):
+            props = registry._tools[tool_name].schema["parameters"]["properties"]
+            assert props["applied_tags"]["type"] == "array"
+            assert props["applied_tags"]["items"] == {"type": "string"}
+            assert props["content"]["type"] == "string"
 
 
 # ---------------------------------------------------------------------------
