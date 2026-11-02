@@ -31,6 +31,16 @@ _INTERPRETER_PREFIXES = tuple({
 _normcase = os.path.normcase
 _INTERPRETER_PREFIX_STRS = tuple(_normcase(os.fspath(p)) for p in _INTERPRETER_PREFIXES)
 
+# The generation root AROUND the interpreter (``<env>/venv`` → ``<env>``). Metadata-only: this
+# is where the interpreter's own install metadata lives, and ``hermes_cli.update_owning_install
+# .owning_install_root()`` decides "in-place install or PM-managed?" by ``is_file()`` on
+# ``<venv>/../hermes_cli/main.py`` — a probe of the running interpreter's installation, which
+# is not Hermes *state*. Only the metadata branch below uses it, so a test still cannot open,
+# write or list anything there.
+_INTERPRETER_TREE_STRS = tuple(_normcase(os.fspath(p)) for p in {
+    Path(sys.prefix).parent.resolve(), Path(sys.base_prefix).parent.resolve(),
+})
+
 
 def _within(path: str, prefix: str) -> bool:
     """``Path(path).is_relative_to(prefix)`` for two normalized, case-folded absolute strings."""
@@ -113,6 +123,8 @@ class HomeIOGuard:
             for prefix in _INTERPRETER_PREFIX_STRS:
                 if _within(absolute, prefix) or (metadata and _contains(absolute, prefix)):
                     return
+            if metadata and any(_within(absolute, tree) for tree in _INTERPRETER_TREE_STRS):
+                return
             # Check the lexical path first: resolving must not probe a protected
             # tree merely to decide that the original path was forbidden.
             for root in roots:
