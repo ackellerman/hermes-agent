@@ -849,6 +849,7 @@
   "messaging.revokeDesc": ["ar","ja","zh-hant"],
   "messaging.revokeTitle": ["ar","ja","zh-hant"],
   "messaging.revokedUser": ["ar","ja","zh-hant"],
+  "messaging.revokeSurvives": ["ar","ja","zh-hant"],
   "messaging.revoking": ["ar","ja","zh-hant"],
   "messaging.waitingSince": ["ar","ja","zh-hant"],
   "modelAssignment.confirmAction": ["ru"],

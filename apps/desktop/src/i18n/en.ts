@@ -2662,6 +2662,7 @@ export const en: Translations = {
     approvedUser: name => `${name} approved`,
     approvedHint: 'They are recognized automatically on their next message.',
     revokedUser: name => `${name} revoked`,
+    revokeSurvives: location => `Pairing record revoked, but ${location} still authorizes this user`,
     failedApprove: name => `Failed to approve ${name}`,
     failedRevoke: name => `Failed to revoke ${name}`,
     pairingLockedOut: 'Too many failed approvals — this platform is locked out. Try again later.',

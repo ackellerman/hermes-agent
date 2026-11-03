@@ -3065,6 +3065,8 @@ export const frOverrides = {
     approvedUser: name => `${name} approuvé`,
     approvedHint: 'Cet utilisateur sera reconnu automatiquement à partir de son prochain message.',
     revokedUser: name => `Accès de ${name} révoqué`,
+    revokeSurvives: location =>
+      `Enregistrement d'appairage révoqué, mais ${location} autorise toujours cet utilisateur`,
     failedApprove: name => `Échec de l'approbation de ${name}`,
     failedRevoke: name => `Échec de la révocation de l'accès de ${name}`,
     pairingLockedOut:

@@ -3052,6 +3052,8 @@ export const esOverrides = {
     approvedUser: name => `${name} aprobado`,
     approvedHint: 'Se le reconoce automáticamente en su próximo mensaje.',
     revokedUser: name => `${name} revocado`,
+    revokeSurvives: location =>
+      `Registro de emparejamiento revocado, pero ${location} todavía autoriza a este usuario`,
     failedApprove: name => `No se pudo aprobar a ${name}`,
     failedRevoke: name => `No se pudo revocar a ${name}`,
     pairingLockedOut: 'Demasiados fallos de aprobación — esta plataforma está bloqueada. Inténtalo de nuevo más tarde.',
