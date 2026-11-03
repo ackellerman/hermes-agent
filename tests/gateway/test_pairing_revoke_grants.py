@@ -976,7 +976,7 @@ def test_wecom_per_group_sender_list_is_reported_and_removable(home, capsys):
     store = _store()
     grants = _find(store=store, platform="wecom")
     located = [s for s in grants
-               if s.location == f"config.yaml platforms.wecom.extra.groups.{_WECOM_CHAT}.allow_from"]
+               if s.location == f"config.yaml platforms.wecom.extra.groups.[redacted].allow_from"]
     assert [s.entry for s in located] == [USER]
     assert located[0].kind == "yaml"
     assert located[0].chat_scope == GROUP  # a sender list: group/forum, never channel
@@ -984,14 +984,14 @@ def test_wecom_per_group_sender_list_is_reported_and_removable(home, capsys):
 
     assert _revoke_cli(store, platform="wecom") == 3
     out = capsys.readouterr().out
-    assert f"platforms.wecom.extra.groups.{_WECOM_CHAT}.allow_from" in out
+    assert f"platforms.wecom.extra.groups.[redacted].allow_from" in out
     assert "No other configured source names" not in out
     assert USER in (home / "config.yaml").read_text(encoding="utf-8")
 
     # --effective drops only this principal from that chat's list.
     assert _revoke_cli(store, platform="wecom", effective=True) == 0
     out = capsys.readouterr().out
-    assert f"Removed config.yaml platforms.wecom.extra.groups.{_WECOM_CHAT}.allow_from" in out
+    assert f"Removed config.yaml platforms.wecom.extra.groups.[redacted].allow_from" in out
     assert "No other configured source names" in out
     text = (home / "config.yaml").read_text(encoding="utf-8")
     assert USER not in text and KEPT in text
@@ -1012,7 +1012,7 @@ def test_wecom_sole_entry_removal_leaves_a_chat_grant_not_a_false_success(home, 
 
     assert _revoke_cli(store, platform="wecom", effective=True) == 3
     out = capsys.readouterr().out
-    assert "Removed config.yaml platforms.wecom.extra.groups.wrABC123.allow_from" in out
+    assert "Removed config.yaml platforms.wecom.extra.groups.[redacted].allow_from" in out
     assert "No other configured source names" not in out
     assert "no sender entries left" in out and "every sender in that chat is admitted" in out
     text = (home / "config.yaml").read_text(encoding="utf-8")
@@ -1092,13 +1092,13 @@ def test_unmodelled_config_key_naming_the_user_is_a_name_scan_hit(home, capsys):
     scan = [s for s in grants if s.kind == "unresolved"]
     # ``entry`` is blanked on net rows: the same walk sees credentials that contain the principal.
     assert [(s.location, s.entry) for s in scan] == [
-        ("config.yaml platforms.discord.extra.owner_ids", "")]
+        ("config.yaml [unmodeled path redacted]", "")]
     assert scan[0].authorizes_now is None and scan[0].removable is False
     assert "does not model what reads it" in scan[0].reason
 
     assert _revoke_cli(store) == 3
     out = capsys.readouterr().out
-    assert "config.yaml platforms.discord.extra.owner_ids" in out
+    assert "config.yaml [unmodeled path redacted]" in out
     assert "No other configured source names" not in out
     # Nothing removable: --effective must not invent a success either.
     assert _revoke_cli(store, effective=True) == 3
@@ -1136,7 +1136,7 @@ def test_per_group_camelcase_spelling_is_modelled_and_removable(home):
     store = _store()
     grants = _find(store=store, platform="wecom")
     located = [s for s in grants
-               if s.location == "config.yaml platforms.wecom.extra.groups.g-2.allowFrom"]
+               if s.location == "config.yaml platforms.wecom.extra.groups.[redacted].allowFrom"]
     assert [s.entry for s in located] == [USER]
     assert located[0].removable is True and located[0].chat_scope == GROUP
 
@@ -1195,10 +1195,10 @@ def test_non_numeric_principal_gets_the_same_unresolved_net(home):
 
 
 @pytest.mark.parametrize("config_yaml, expected_path", [
-    ('plugin:\n  ids: [1002]\n', "config.yaml plugin.ids"),                     # a list of ints
-    ('plugin:\n  ids: "1002,1003"\n', "config.yaml plugin.ids"),                # one CSV string
-    ('plugin:\n  users:\n    "1002": true\n', "config.yaml plugin.users"),      # a mapping KEY
-    ('plugin:\n  ids: "*,1003"\n', "config.yaml plugin.ids"),                   # wildcard in CSV
+    ('plugin:\n  ids: [1002]\n', "config.yaml [unmodeled path redacted]"),                     # a list of ints
+    ('plugin:\n  ids: "1002,1003"\n', "config.yaml [unmodeled path redacted]"),                # one CSV string
+    ('plugin:\n  users:\n    "1002": true\n', "config.yaml [unmodeled path redacted]"),      # a mapping KEY
+    ('plugin:\n  ids: "*,1003"\n', "config.yaml [unmodeled path redacted]"),                   # wildcard in CSV
 ])
 def test_the_net_catches_non_string_and_composite_spellings(home, config_yaml, expected_path):
     """The net must not depend on a value being a bare string.
@@ -1219,7 +1219,7 @@ def test_whatsapp_jid_entry_aliases_a_bare_phone_principal(home):
     """A JID is a phone number in a suffix wrapper — not an email shape to be screened out."""
     _write_home(home, 'plugin:\n  ids: ["15551234567@s.whatsapp.net"]\n')
     grants = _find(store=_store(), platform="whatsapp", user="15551234567")
-    rows = [s for s in grants if s.location == "config.yaml plugin.ids"]
+    rows = [s for s in grants if s.location == "config.yaml [unmodeled path redacted]"]
     assert rows and rows[0].kind == "unresolved"
 
 
@@ -1230,7 +1230,7 @@ def test_reports_never_echo_an_unrelated_secret(home):
     secret = "synthetic-secret-token-abc123"
     _write_home(home, f'plugin:\n  credential: "alice,{secret}"\n')
     grants = _find(store=_store(), user="alice")
-    assert [s.location for s in grants if s.kind == "unresolved"] == ["config.yaml plugin.credential"]
+    assert [s.location for s in grants if s.kind == "unresolved"] == ["config.yaml [unmodeled path redacted]"]
     blob = json.dumps(describe(grants))
     assert secret not in blob and "alice," not in blob
     assert all(row["entry"] == "" for row in describe(grants) if row["kind"] == "unresolved")
@@ -1337,3 +1337,62 @@ def test_no_live_gateway_means_a_file_removal_is_a_denial(home, monkeypatch, cap
             'discord:\n  enabled: true\n  allow_from: ["1001", "1002"]\n', encoding="utf-8")
         monkeypatch.setattr(pairing_cli, "_live_gateway_pid", lambda store: 0)
         assert _revoke_cli(_store(), effective=True) == 0
+
+
+def test_effective_partial_write_failure_reports_changed_sources(home, monkeypatch, capsys):
+    import hermes_cli.config as config
+    _write_home(home, 'discord:\n  allow_from: ["1002"]\n', 'DISCORD_ALLOWED_USERS=1002\n')
+    store = _store()
+    store._approve_user(PLATFORM, USER, "")
+    def fail(*args, **kwargs):
+        raise OSError("synthetic-secret-error")
+    monkeypatch.setattr(config, "remove_env_value", fail)
+    assert _revoke_cli(store, effective=True) == 1
+    out = capsys.readouterr().out
+    assert "config.yaml" in out and "changed" in out.lower()
+    assert "nothing was changed" not in out.lower()
+    assert "synthetic-secret-error" not in out
+    assert store.is_approved(PLATFORM, USER)
+    assert "1002" not in (home / "config.yaml").read_text()
+    assert "1002" in (home / ".env").read_text()
+
+
+def test_unmodeled_yaml_secret_keys_are_redacted(home, capsys):
+    from gateway.access_grants import describe
+    secret = "synthetic-private-key-abcdef"
+    _write_home(home, f'plugin:\n  {secret}:\n    nested-secret-123: ["1002"]\n')
+    grants = _find(store=_store())
+    assert any(s.kind == "unresolved" for s in grants)
+    assert secret not in json.dumps(describe(grants))
+    assert "nested-secret-123" not in json.dumps(describe(grants))
+    assert _revoke_cli(_store()) == 3
+    out = capsys.readouterr().out
+    assert secret not in out and "nested-secret-123" not in out
+
+
+def test_failed_env_write_may_have_changed_target(home, monkeypatch, capsys):
+    import hermes_cli.config as config
+    _write_home(home, 'discord:\n  allow_from: ["1002"]\n', 'DISCORD_ALLOWED_USERS=1002\n')
+    store = _store()
+    store._approve_user(PLATFORM, USER, "")
+    def change_then_fail(*args, **kwargs):
+        (home / ".env").write_text("# changed before failure\n")
+        raise OSError("private diagnostic")
+    monkeypatch.setattr(config, "remove_env_value", change_then_fail)
+    assert _revoke_cli(store, effective=True) == 1
+    out = capsys.readouterr().out
+    assert "config.yaml discord.allow_from" in out
+    assert ".env DISCORD_ALLOWED_USERS may also have changed" in out
+    assert "private diagnostic" not in out
+    assert store.is_approved(PLATFORM, USER)
+
+
+def test_group_mapping_key_is_redacted_from_reports(home, capsys):
+    from gateway.access_grants import describe
+    secret = "secret-group-key-123456"
+    _write_home(home, f'platforms:\n  wecom:\n    extra:\n      groups:\n        {secret}:\n          allow_from: ["1002", "1001"]\n')
+    rows = _find(store=_store(), platform="wecom")
+    assert any(s.kind == "yaml" for s in rows)
+    assert secret not in json.dumps(describe(rows))
+    assert _revoke_cli(_store(), platform="wecom") == 3
+    assert secret not in capsys.readouterr().out

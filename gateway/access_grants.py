@@ -164,7 +164,11 @@ _EMPTY_GROUP_REASON = (
 
 
 class AccessGrantError(RuntimeError):
-    """A grant removal was refused. Raised BEFORE the first write, so nothing half-applies."""
+    """A grant removal was refused before any write."""
+
+
+class AccessGrantWriteError(AccessGrantError):
+    """A write failed; preceding writes may already have changed their targets."""
 
 
 @dataclass(frozen=True)
@@ -946,7 +950,7 @@ def _per_group_sender_sources(
             key: _entries(group_cfg.get(key)) for key in _PER_GROUP_KEYS if key in group_cfg}
         for key, entries in entries_by_key.items():
             path = (*container_path, "groups", str(chat), key)
-            location = "config.yaml " + ".".join(path)
+            location = "config.yaml " + ".".join((*container_path, "groups", "[redacted]", key))
             suffix = path[len(container_path):]
             effective_entries = (
                 {str(entry).strip() for entry in _entries(_value_at(effective, suffix))}
@@ -959,13 +963,13 @@ def _per_group_sender_sources(
                     yaml_only_env=yaml_only_env, loader_known=loader_known)
                 out.append(GrantSource(
                     kind="yaml", location=location, chat_scope=GROUP, entry=entry, removable=extra_container,
-                    reason="" if authorizes else _PER_GROUP_REASON.format(chat=chat),
+                    reason="" if authorizes else _PER_GROUP_REASON.format(chat="[redacted]"),
                     authorizes_now=authorizes, _path=path, _platform=platform, _user_id=user_id))
         if own_policy_like and not any(entries_by_key.values()):
             path = (*container_path, "groups", str(chat))
             out.append(_chat_grant(
-                platform, user_id, "config.yaml " + ".".join(path), path, str(chat), "groups",
-                reason=_EMPTY_GROUP_REASON.format(chat=chat)))
+                platform, user_id, "config.yaml " + ".".join((*container_path, "groups", "[redacted]")), path, "[redacted]", "groups",
+                reason=_EMPTY_GROUP_REASON.format(chat="[redacted]")))
     return out
 
 
@@ -1089,7 +1093,7 @@ def _name_scan_sources(
     def add(kind: str, location: str, reason: str) -> None:
         # ``entry`` stays EMPTY on the net's rows: the walk sees every authored scalar, including
         # credentials and tokens, so carrying the raw value into a report (and the dashboard JSON)
-        # would leak unrelated secrets. The path is the actionable part.
+        # would leak unrelated secrets. Mapping keys can also be secrets, so redact the path.
         if (kind, location) in seen:
             return
         seen.add((kind, location))
@@ -1102,7 +1106,7 @@ def _name_scan_sources(
             continue
         if not any(named(entry) for entry in _entries(value)):
             continue
-        add("unresolved", "config.yaml " + ".".join(path), _UNMODELLED_REASON)
+        add("unresolved", "config.yaml [unmodeled path redacted]", _UNMODELLED_REASON)
 
     from agent.secret_scope import load_env_file
 
@@ -1171,9 +1175,8 @@ def remove_user_grants(
     """Remove every removable source; returns what was actually removed.
 
     Order: validate everything → write ``config.yaml`` → write ``.env`` → purge live adapters.
-    Any refusal (unreadable/pinned ``config.yaml``, managed ``.env`` key, a value that changed
-    between the scan and the write) raises :class:`AccessGrantError` before the first write, so the
-    command can refuse instead of half-applying (a narrowed ``.env`` with the YAML grant intact).
+    Validation refusals occur before writes. A later write failure raises
+    :class:`AccessGrantWriteError` and may leave completed changes in place.
     """
     sources = list(sources)
     platform = next((source._platform for source in sources if source._platform), "")
@@ -1249,20 +1252,31 @@ def remove_user_grants(
             env_writes.append((var, after))
             env_removed.extend(source for source in env_plan if source._path[0] == var)
 
-    # ---- write: config.yaml first, then .env ----
+    # A write can fail after modifying its target. Do not roll back: without a
+    # cross-file lock a rollback could overwrite another writer's changes.
     removed: list[GrantSource] = []
-    if staged is not None and yaml_plan:
-        try:
+    completed: list[str] = []
+    target = "config.yaml"
+    try:
+        if staged is not None and yaml_plan:
             atomic_config_write(config_path, staged)
-        except (RuntimeError, ValueError) as exc:
-            raise AccessGrantError(f"config.yaml was not written: {exc}") from exc
-        removed.extend(yaml_plan)
-    for var, after in env_writes:
-        if after:
-            save_env_value(var, after)
-        else:
-            remove_env_value(var)
-    removed.extend(env_removed)
+            removed.extend(yaml_plan)
+            completed.extend(dict.fromkeys(s.location for s in yaml_plan))
+        for var, after in env_writes:
+            target = f".env {var}"
+            if after:
+                save_env_value(var, after)
+            else:
+                remove_env_value(var)
+            completed.append(target)
+            removed.extend(s for s in env_removed if s._path[0] == var)
+    except Exception:
+        done = ", ".join(completed) if completed else "none confirmed"
+        raise AccessGrantWriteError(
+            f"Write failed. Completed changes: {done}. "
+            f"The failed target {target} may also have changed; inspect it. "
+            "No rollback was attempted; concurrent edits cannot be ruled out. "
+            "The pairing record was not touched; a running gateway may retain old grants.") from None
 
     for source in pairing_plan:
         if store is not None and store.revoke(platform, user_id):
