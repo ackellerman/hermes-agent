@@ -157,7 +157,11 @@ def test_yaml_grant_survives_plain_revoke_real_verdict(home):
 
 
 def test_revoke_effective_flag_is_unknown():
-    """``hermes pairing revoke --effective`` must parse; on base argparse exits 2."""
+    """``hermes pairing revoke --effective`` must parse; on base argparse exits 2.
+
+    Wrapped so a bare archive fails by ASSERTION (naming the defect) instead of an escaping
+    ``SystemExit`` — F9: the RED row must reproduce the gap, not error out of the test body.
+    """
     import argparse
 
     from hermes_cli.subcommands.pairing import build_pairing_parser
@@ -166,7 +170,11 @@ def test_revoke_effective_flag_is_unknown():
     subparsers = parser.add_subparsers(dest="command")
     build_pairing_parser(subparsers, cmd_pairing=lambda args: None)
 
-    args = parser.parse_args(["pairing", "revoke", "--effective", PLATFORM, USER])
+    try:
+        args = parser.parse_args(["pairing", "revoke", "--effective", PLATFORM, USER])
+    except SystemExit as exc:  # base: `--effective` is an unknown argument (exit 2)
+        raise AssertionError(
+            f"`pairing revoke --effective` must parse; argparse exited {exc.code}") from None
     assert args.effective is True
     assert (args.platform, args.user_id) == (PLATFORM, USER)
 
