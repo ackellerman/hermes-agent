@@ -27,7 +27,8 @@ def build_pairing_parser(subparsers, *, cmd_pairing: Callable) -> None:
         description=(
             "Remove the user's pairing record. A config.yaml allow list is an INDEPENDENT grant: "
             "plain revoke reports it and exits 3 while it still authorizes. --effective also "
-            "removes removable config.yaml/.env entries so the user is denied without a restart. "
+            "removes removable config.yaml/.env entries, so the files stop granting the user (a "
+            "separately running gateway applies the change when it next loads its config). "
             "Exit codes: 0 nothing names the user, 3 a named grant survives or cannot be evaluated, "
             "1 refused (config.yaml unreadable/pinned, managed .env) — nothing written."))
     pairing_revoke_parser.add_argument("platform", help="Platform name")

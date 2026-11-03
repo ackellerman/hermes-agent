@@ -6,7 +6,9 @@ allow list is an independent grant the command must not edit silently:
 * plain ``revoke`` — pairing record only. Every other source that still names the user is
   reported, and the exit code says whether one still authorizes.
 * ``revoke --effective`` — also removes the removable sources (``config.yaml`` entries, the
-  profile ``.env`` allowlist) so the user is denied without a restart. Wildcards, allow-all
+  profile ``.env`` allowlist), so the FILES stop granting the user. A caller inside the gateway
+  process also drops the live adapter snapshot; a separately running gateway applies the change
+  when it next loads its config. Wildcards, allow-all
   flags, role lists, the cross-platform global allowlist and anything that cannot be evaluated
   offline are reported and left alone.
 
@@ -132,7 +134,11 @@ def _cmd_revoke(store, platform: str, user_id: str, effective: bool = False):
     else:
         print(f"  No pairing record for user {user_id} on {platform}.")
 
+    seen_locations: list[str] = []
     for source in removed:
+        if source.location in seen_locations:
+            continue  # one line per list, even when it held two spellings of the same principal
+        seen_locations.append(source.location)
         print(f"  Removed {source.location} [{source.chat_scope}]")
 
     surviving = [source for source in grants if source.authorizes_now is not False]

@@ -620,18 +620,24 @@ def remove_user_grants(
             staged = require_readable_config_before_write(config_path)
         except RuntimeError as exc:
             raise AccessGrantError(str(exc)) from exc
+        # Group by authored path: several entry spellings of the SAME principal (``1002`` and
+        # ``<@1002>``) are several sources but ONE list. Staging per path, not per source, keeps the
+        # second pass from seeing its own first-pass write and refusing as "changed since reported".
+        staged_paths: dict[tuple[str, ...], list] = {}
         for source in yaml_plan:
-            value = _value_at(staged, source._path)
+            staged_paths.setdefault(source._path, []).append(source)
+        for path, group in staged_paths.items():
+            value = _value_at(staged, path)
             if value is None:
                 raise AccessGrantError(
-                    f"{source.location} no longer exists (the file changed since it was reported); "
+                    f"{group[0].location} no longer exists (the file changed since it was reported); "
                     "nothing was removed.")
             remaining = _strip(value, platform, user_id)
             if _entries(remaining) == _entries(value):
                 raise AccessGrantError(
-                    f"{source.location} no longer names {user_id} (the file changed since it was "
+                    f"{group[0].location} no longer names {user_id} (the file changed since it was "
                     "reported); nothing was removed.")
-            _set_at(staged, source._path, remaining)
+            _set_at(staged, path, remaining)
 
     env_path = resolved_home / ".env"
     env_writes: list[tuple[str, str]] = []

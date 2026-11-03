@@ -435,6 +435,26 @@ def test_mention_form_entry_is_matched_and_removable(home):
         assert "<@!1002>" not in text and "1001" in text
 
 
+def test_one_list_with_two_spellings_of_the_same_principal_removes_cleanly(home):
+    """``1002`` and ``<@1002>`` are two sources but ONE list: staging per path, not per source.
+
+    Regression: staging each source in turn made the second pass see the first pass's write and
+    refuse with "no longer names" — ``--effective`` could not remove a list that spelled the same
+    principal twice, which is exactly the list an operator ends up with after copying a mention.
+    """
+    with _secondary_profile(home) as secondary:
+        (secondary / "config.yaml").write_text(
+            'discord:\n  enabled: true\n  allow_from: ["1001", "1002", "<@1002>"]\n', encoding="utf-8")
+        store = _store()
+        grants = _find(store=store)
+        assert sorted(s.entry for s in grants if s.kind == "yaml") == ["1002", "<@1002>"]
+
+        removed = _remove(grants, store=store)
+        assert {s.entry for s in removed} == {"1002", "<@1002>"}
+        text = (secondary / "config.yaml").read_text(encoding="utf-8")
+        assert "1002" not in text and "1001" in text
+
+
 def test_username_entry_cannot_be_evaluated_offline(home, monkeypatch):
     """F3: a username-shaped entry may resolve to this numeric id at connect time."""
     _write_home(home, "", f"DISCORD_ALLOWED_USERS={KEPT},some_user\n")

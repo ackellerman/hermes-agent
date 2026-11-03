@@ -95,9 +95,11 @@ export default function PairingPage() {
           // independent grant, so a bare "Revoked" here would be a lie: name the survivor.
           const survivor = res.still_authorized_by?.[0];
           if (survivor) {
+            // useToast only ships error|success. This is not a failure (the pairing record IS gone)
+            // but the user is still admitted, so it must not read as a success either.
             showToast(
               `Pairing record revoked, but ${survivor.location} still authorizes this user`,
-              "warning",
+              "error",
             );
           } else {
             showToast(
