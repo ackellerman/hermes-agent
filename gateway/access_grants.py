@@ -949,6 +949,33 @@ def _accounted_for(path: tuple[str, ...], modelled: Iterable[tuple[str, ...]]) -
         bool(model) and len(model) <= len(path) and path[:len(model)] == model for model in modelled)
 
 
+_ALIAS_SHAPE_PAIRS = frozenset({
+    # authz normalises these pairs to a common form before comparing
+    # (WhatsApp phone ↔ JID is numeric↔numeric, Buzz npub ↔ hex is the other pair),
+    # so only an entry whose form can alias the principal needs the real predicate.
+    ("numeric", "numeric"), ("email", "email"), ("opaque", "opaque"),
+    ("npub", "npub"), ("hex64", "hex64"), ("npub", "hex64"), ("hex64", "npub"),
+})
+
+
+def _scan_match(platform: str, entry: Any, user_id: str, user_shape: str) -> bool:
+    """Does this authored value name the principal? Cheap screen, then authz's own predicate.
+
+    The scan walks every string in the file, so the predicate (which builds a ``SessionSource``) is
+    reached only for values whose shape can alias the principal's. A value of an unrelated form
+    (a tool name, a URL, a path) cannot be compared to a numeric id by any adapter, so it costs one
+    set lookup instead of a predicate call — the guarantee is unchanged, only the constant is.
+    """
+    if _is_wildcard(entry):
+        return True
+    entry_shape = _shape_class(entry)
+    if not entry_shape:
+        return False
+    if entry_shape != user_shape and (entry_shape, user_shape) not in _ALIAS_SHAPE_PAIRS:
+        return False
+    return _names_principal(platform, entry, user_id)
+
+
 def _env_var_owner(var: str) -> str:
     """The platform a known per-platform allowlist env var belongs to (``""`` when unknown).
 
@@ -989,9 +1016,10 @@ def _name_scan_sources(
     """
     modelled = [source._path for source in sources if source._path]
     rows: list[GrantSource] = []
+    user_shape = _shape_class(user_id)
 
     def named(entry: Any) -> bool:
-        return _is_wildcard(entry) or _names_principal(platform, entry, user_id)
+        return _scan_match(platform, entry, user_id, user_shape)
 
     for path, value in _iter_authored_strings(config):
         if not named(value) or _accounted_for(path, modelled):
