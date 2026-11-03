@@ -547,9 +547,10 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
       const survivor = result.still_authorized_by?.[0]
       if (survivor) {
         // Not a failure (the record IS gone) but the user is still admitted, so it must not read
-        // as a success either — the shared toast ships only error|success.
+        // as a success either. The desktop's own NotificationKind has 'warning', which is the
+        // accurate severity (the shared web toast has no warning kind and keeps 'error').
         notify({
-          kind: 'error',
+          kind: 'warning',
           title: m.revokedUser(pairingLabel(user)),
           message: m.revokeSurvives(survivor.location)
         })
