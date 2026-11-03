@@ -24,8 +24,8 @@ from pathlib import Path
 import pytest
 
 try:  # Collection-time fastapi import: pydantic's plugin loader scans distribution entry points
-    # (the venv's editable install lives under the real ~/.hermes tree), and doing that inside a
-    # test would trip tests/home_io_guard.py for a reason unrelated to the code under test.
+    # of the running interpreter's environment, and doing that inside a test would trip
+    # tests/home_io_guard.py for a reason unrelated to the code under test.
     import hermes_cli.web_server_files  # noqa: F401
 except ImportError:  # pragma: no cover - fastapi/starlette absent
     pass
@@ -36,6 +36,7 @@ from gateway.session import SessionSource
 PLATFORM = "discord"
 USER = "1002"
 KEPT = "1001"
+GROUP = "group"  # chat_scope label of a group-scoped grant row
 
 _LEAKY_ENV = (
     "DISCORD_ALLOWED_USERS",
@@ -66,14 +67,22 @@ def home(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _reset_bridge_provenance(monkeypatch):
-    """Bridge provenance is process-scoped state; never let it leak between rows."""
+    """Bridge provenance is process-scoped state; never let it leak between rows.
+
+    ``getattr`` keeps this file importable (and the two RED rows failing by ASSERTION) against a
+    tree that predates ``_BRIDGED_ENV_NAMES`` — F9: a base-archive run must reproduce the defect
+    instead of erroring in the fixture.
+    """
     import gateway.config_loader as config_loader
     from gateway.platforms import _shared
 
-    monkeypatch.setattr(config_loader, "_BRIDGED_ALLOW_ALL_USERS", False)
-    _shared._BRIDGED_ENV_NAMES.clear()
+    monkeypatch.setattr(config_loader, "_BRIDGED_ALLOW_ALL_USERS", False, raising=False)
+    recorded = getattr(_shared, "_BRIDGED_ENV_NAMES", None)
+    if recorded is not None:
+        recorded.clear()
     yield
-    _shared._BRIDGED_ENV_NAMES.clear()
+    if recorded is not None:
+        recorded.clear()
 
 
 def _write_home(home, config_yaml: str, env_text: str = "") -> None:
@@ -210,6 +219,23 @@ def _assert_report_agrees(sources, verdict: bool) -> None:
         )
 
 
+def _assert_report_agrees_per_context(sources, *, dm: bool, group: bool) -> None:
+    """F4: every authorizing row must be backed by the verdict for the context its scope claims.
+
+    A ``group``-scoped row is judged by group traffic, so a group list can never pass this gate on a
+    DM grant — and no row may be reported authorizing in a context the real verdict denies.
+    """
+    authorizing = [s for s in sources if s.authorizes_now is True]
+    for source in authorizing:
+        if source.chat_scope == GROUP:
+            assert group is True, f"{source.location} claims a group grant; group verdict denied"
+        else:
+            assert dm is True, f"{source.location} claims a dm/platform grant; dm verdict denied"
+    if not authorizing and not [s for s in sources if s.authorizes_now is None]:
+        assert dm is False and group is False, (
+            "report found no authorizing and no unknown source, but a context verdict authorized")
+
+
 @contextlib.contextmanager
 def _secondary_profile(home: Path, name: str = "work"):
     """A multiplexed secondary profile scope: the YAML→env bridge is skipped, no env allowlist."""
@@ -265,7 +291,12 @@ def test_effective_removes_multiplex_yaml_grant_and_denies(home):
 
 
 def test_single_profile_yaml_grant_reports_the_bridged_env_source(home):
-    """Single-profile: the bridge owns DISCORD_ALLOWED_USERS; report it as non-removable."""
+    """Single-profile: the bridge owns DISCORD_ALLOWED_USERS; report it as non-removable.
+
+    F1: the YAML entry is the AUTHORED grant behind that bridged value, so it authorizes now —
+    reporting it ``False`` (as the pre-fix replica did when any process env allowlist existed) is
+    what let the CLI drop it and exit 0.
+    """
     _write_home(home, 'discord:\n  allow_from:\n    - "1001"\n    - "1002"\n')
     extra = _adapter_extra_from_loaded_config()
     store = _store()
@@ -274,9 +305,11 @@ def test_single_profile_yaml_grant_reports_the_bridged_env_source(home):
     bridged = [s for s in grants if s.kind == "env"]
     assert [s.location for s in bridged] == ["env DISCORD_ALLOWED_USERS (bridged from config.yaml)"]
     assert bridged[0].removable is False and bridged[0].authorizes_now is True
-    # The YAML entry is declared, but env-shape precedence means it is not what authorizes.
+    # The YAML row is the authored source of that bridged value: it authorizes, and it is removable.
     yaml_source = [s for s in grants if s.kind == "yaml"]
-    assert yaml_source and yaml_source[0].authorizes_now is False
+    assert yaml_source and yaml_source[0].authorizes_now is True
+    assert yaml_source[0].removable is True
+    assert "no authored env allowlist" in yaml_source[0].reason
     _assert_report_agrees(grants, _verdict(extra, store))
 
 
@@ -356,8 +389,11 @@ def test_both_sources_plain_revoke_narrows_mirror_and_reports_yaml(home, monkeyp
     after = _find(store=store)
     assert "config.yaml discord.allow_from" in _locations(after)
     _assert_report_agrees(after, _verdict(_adapter_extra_from_loaded_config(), store))
-    # The YAML entry is not consulted while ANY env allowlist exists — reported, not hidden.
-    assert [s.authorizes_now for s in after if s.kind == "yaml"] == [False]
+    # With an AUTHORED env allowlist present the YAML row cannot be decided offline (F1: None, not
+    # False) — reported and never silently dropped, so the exit code stays 3 until it is removed.
+    yaml_rows = [s for s in after if s.kind == "yaml"]
+    assert [s.authorizes_now for s in yaml_rows] == [None]
+    assert "authored env allowlist" in yaml_rows[0].reason
 
     removed = _remove(after, store=store)
     assert "config.yaml discord.allow_from" in _locations(removed)
@@ -380,7 +416,12 @@ def test_wildcard_is_reported_but_never_removed(home):
 
 
 def test_allow_all_from_yaml_is_declared_not_consulted_in_a_secondary(home):
-    """F6: the YAML allow-all flag does not reach authz for a multiplexed secondary."""
+    """F6/F1: the YAML allow-all flag does not reach authz for a multiplexed secondary.
+
+    It is never reported ``False`` (F1): with the env flag unset in this process the row is
+    ``None`` — "a gateway bridges this to DISCORD_ALLOW_ALL_USERS; inert only for a multiplexed
+    secondary" — so the exit code is 3 rather than a silent 0.
+    """
     with _secondary_profile(home) as secondary:
         (secondary / "config.yaml").write_text(
             "discord:\n  enabled: true\n  allow_all_users: true\n", encoding="utf-8")
@@ -388,8 +429,8 @@ def test_allow_all_from_yaml_is_declared_not_consulted_in_a_secondary(home):
         grants = _find(store=store)
         allow_all = [s for s in grants if s.kind == "allow_all"]
         assert allow_all and allow_all[0].removable is False
-        assert allow_all[0].authorizes_now is False
-        assert "bridged" in allow_all[0].reason
+        assert allow_all[0].authorizes_now is None
+        assert "bridged" in allow_all[0].reason and "multiplexed secondary" in allow_all[0].reason
         _assert_report_agrees(grants, _verdict(_adapter_extra_from_loaded_config(), store, multiplex=True))
 
 
@@ -418,7 +459,12 @@ def test_group_allow_from_is_reported_with_group_scope(home):
 
 
 def test_mention_form_entry_is_matched_and_removable(home):
-    """A ``<@!1002>`` entry names the principal (matched/removed) but authz compares verbatim."""
+    """A ``<@!1002>`` entry names the principal (matched/removed) but authz compares verbatim.
+
+    ``authorizes_now`` is ``None``, not ``False`` (F1: a YAML row is never reported inert): the
+    Discord adapter resolves username-shaped entries at connect time, so an offline process cannot
+    rule out that this spelling resolves to the principal.
+    """
     with _secondary_profile(home) as secondary:
         (secondary / "config.yaml").write_text(
             'discord:\n  enabled: true\n  allow_from: ["1001", "<@!1002>"]\n', encoding="utf-8")
@@ -427,7 +473,7 @@ def test_mention_form_entry_is_matched_and_removable(home):
         located = [s for s in grants if s.kind == "yaml"]
         assert [s.entry for s in located] == ["<@!1002>"]
         assert located[0].removable is True
-        assert located[0].authorizes_now is False and "verbatim" in located[0].reason
+        assert located[0].authorizes_now is None and "verbatim" in located[0].reason
         _assert_report_agrees(grants, _verdict(_adapter_extra_from_loaded_config(), store, multiplex=True))
 
         _remove(grants, store=store)
@@ -551,17 +597,17 @@ def test_effective_refuses_a_managed_env_key(home, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _revoke_cli(store, *, effective: bool = False) -> int:
+def _revoke_cli(store, *, effective: bool = False, platform: str = PLATFORM, user: str = USER) -> int:
     """Run the real ``_cmd_revoke`` and return its exit code."""
     from hermes_cli.pairing import _cmd_revoke
 
     with pytest.raises(SystemExit) as exc:
-        _cmd_revoke(store, PLATFORM, USER, effective=effective)
+        _cmd_revoke(store, platform, user, effective=effective)
     return int(exc.value.code or 0)
 
 
 def test_revoke_plain_yaml_only_exits_3_and_names_the_source(home, capsys):
-    """The tars shape: YAML-only grant, no env allowlist → success is a lie, exit 3."""
+    """Single-profile-shaped secondary: YAML-only grant, no env allowlist → success is a lie, exit 3."""
     with _secondary_profile(home) as secondary:
         (secondary / "config.yaml").write_text(
             'discord:\n  enabled: true\n  allow_from: ["1001", "1002"]\n', encoding="utf-8")
@@ -720,3 +766,157 @@ def test_dashboard_revoke_requires_platform_and_user(home):
     assert client.post("/api/pairing/revoke", json={"platform": PLATFORM}).status_code == 422
     assert client.post(
         "/api/pairing/revoke", json={"platform": "", "user_id": ""}).status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# F1-F4 regression rows: the shape a GATEWAY loads, not this process's env
+# ---------------------------------------------------------------------------
+
+
+def test_revoke_cli_yaml_allow_all_is_never_a_silent_zero(home, capsys):
+    """F1a: ``config.yaml discord.allow_all_users: true`` + empty ``.env`` → exit 3, source named.
+
+    CLI-shaped on purpose: nothing calls ``load_gateway_config()`` first, so the YAML→env bridge
+    never runs and ``DISCORD_ALLOW_ALL_USERS`` is unset in this process. The gateway DOES bridge it,
+    so the flag authorizes there; the offline replica must report it as unknown, never as inert.
+    """
+    _write_home(home, "discord:\n  allow_all_users: true\n")
+    assert os.environ.get("DISCORD_ALLOW_ALL_USERS") is None, "precondition: no bridged flag here"
+    store = _store()
+
+    assert _revoke_cli(store) == 3
+    out = capsys.readouterr().out
+    assert "config.yaml discord.allow_all_users" in out
+    assert "cannot be evaluated offline" in out
+    assert "No other configured source names" not in out
+
+    # A flag cannot be removed: --effective must say so instead of claiming a removal it did not make.
+    assert _revoke_cli(store, effective=True) == 3
+    out = capsys.readouterr().out
+    assert "Removed" not in out
+    assert "config.yaml discord.allow_all_users" in out
+    assert "No other configured source names" not in out
+    assert (home / "config.yaml").read_text(encoding="utf-8") == "discord:\n  allow_all_users: true\n"
+
+
+def test_revoke_cli_yaml_allow_from_survives_a_group_env_list(home, monkeypatch, capsys):
+    """F1b: ``telegram.allow_from`` + ``TELEGRAM_GROUP_ALLOWED_USERS`` → exit 3, source named.
+
+    The bridge copies ``allow_from`` into ``TELEGRAM_ALLOWED_USERS``, which the union consults — so a
+    group-scoped env list must NOT make the YAML row disappear. CLI-shaped: the profile ``.env`` is
+    in the process env (as the CLI loads it) and no config load has happened.
+    """
+    _write_home(home, 'telegram:\n  allow_from:\n    - "1002"\n',
+                "TELEGRAM_GROUP_ALLOWED_USERS=5555\n")
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_USERS", "5555")
+    store = _store()
+
+    assert _revoke_cli(store, platform="telegram") == 3
+    out = capsys.readouterr().out
+    assert "config.yaml telegram.allow_from" in out and "authorizes now" in out
+    assert "No other configured source names" not in out
+    assert USER in (home / "config.yaml").read_text(encoding="utf-8")
+
+    # --effective DOES remove this one, and only then may it report a plain success.
+    assert _revoke_cli(store, platform="telegram", effective=True) == 0
+    out = capsys.readouterr().out
+    assert "Removed config.yaml telegram.allow_from" in out
+    assert "No other configured source names" in out
+    assert USER not in (home / "config.yaml").read_text(encoding="utf-8")
+
+
+_BUZZ_NPUB = "npub1nl2u0wnd8mezfknc74q7pl9ec58h9nrrakce4tnk434qgaxl4psqe5twr6"
+
+
+def test_plugin_platform_env_name_and_alias_match_without_a_live_registry(home, monkeypatch):
+    """F2: the allowlist env name comes from the registry entry, and matching uses authz's predicate.
+
+    Buzz stores npub or hex; inbound pubkeys are always hex (``_normalize_nostr_allow_entries``). A
+    second matcher implementation missed the npub entry, produced no row, and the command exited 0
+    while the principal was authorized.
+    """
+    from gateway.authz_mixin import _npub_to_hex
+    from gateway.platform_registry import platform_registry
+
+    hex_id = _npub_to_hex(_BUZZ_NPUB)
+    assert hex_id and len(hex_id) == 64, "precondition: the fixture npub decodes"
+    monkeypatch.setattr(
+        platform_registry, "get",
+        lambda name: SimpleNamespace(allowed_users_env="BUZZ_ALLOWED_USERS"))
+    _write_home(home, "", f"BUZZ_ALLOWED_USERS={_BUZZ_NPUB}\n")
+    monkeypatch.setenv("BUZZ_ALLOWED_USERS", _BUZZ_NPUB)
+
+    grants = _find(platform="buzz", user=hex_id)
+    env = [s for s in grants if s.kind == "env"]
+    assert [s.location for s in env] == [".env BUZZ_ALLOWED_USERS"]
+    assert env[0].entry == _BUZZ_NPUB  # labelled by its authored spelling
+    assert env[0].authorizes_now is True and env[0].removable is True
+
+
+def test_unresolvable_platform_allowlist_env_fails_closed(home, monkeypatch, capsys):
+    """F2: no registry entry and no known env name → an ``unresolved`` row (exit 3), never nothing."""
+    monkeypatch.delenv("BUZZ_ALLOWED_USERS", raising=False)
+    _write_home(home, "")
+
+    grants = _find(platform="buzz", user="deadbeef")
+    unresolved = [s for s in grants if s.kind == "unresolved"]
+    assert unresolved and unresolved[0].authorizes_now is None
+    assert unresolved[0].removable is False
+    assert "not resolvable" in unresolved[0].reason
+
+    assert _revoke_cli(_store(), platform="buzz", user="deadbeef") == 3
+    assert "No other configured source names" not in capsys.readouterr().out
+
+
+def test_env_entry_declared_but_not_consulted_is_unknown_not_inert(home):
+    """F3: a ``.env`` grant a live profile scope does not consult reads as unknown (restart re-reads)."""
+    with _secondary_profile(home) as secondary:
+        (secondary / "config.yaml").write_text("discord:\n  enabled: true\n", encoding="utf-8")
+        (secondary / ".env").write_text(f"DISCORD_ALLOWED_USERS={KEPT},{USER}\n", encoding="utf-8")
+        store = _store()
+
+        grants = _find(store=store)
+        declared = [s for s in grants if s.kind == "env"]
+        assert [s.location for s in declared] == [".env DISCORD_ALLOWED_USERS"]
+        assert declared[0].authorizes_now is None
+        assert "a restart re-reads it" in declared[0].reason
+        assert declared[0].removable is True
+
+        # The exit code follows the row: 3, not 0 while the file names the user.
+        assert _revoke_cli(store) == 3
+
+
+def test_group_allow_from_never_claims_a_dm_grant(home):
+    """F4: a group list is reported for GROUP traffic; the DM verdict denies the same principal."""
+    with _secondary_profile(home) as secondary:
+        (secondary / "config.yaml").write_text(
+            'discord:\n  enabled: true\n  group_allow_from: ["1002"]\n', encoding="utf-8")
+        store = _store()
+        grants = _find(store=store)
+        extra = _adapter_extra_from_loaded_config()
+        dm = _verdict(extra, store, multiplex=True, chat_type="dm")
+        group = _verdict(extra, store, multiplex=True, chat_type="group")
+        assert dm is False and group is True, "precondition: the two contexts disagree"
+
+        authorizing = [s for s in grants if s.authorizes_now is True]
+        assert [s.chat_scope for s in authorizing] == [GROUP]
+        assert not [s for s in grants if s.kind == "yaml" and s.chat_scope != GROUP]
+        _assert_report_agrees_per_context(grants, dm=dm, group=group)
+
+
+def test_platform_list_and_group_list_are_judged_in_their_own_context(home):
+    """F4: ``allow_from`` covers the platform's DM scope; ``group_allow_from`` covers group traffic."""
+    with _secondary_profile(home) as secondary:
+        (secondary / "config.yaml").write_text(
+            'discord:\n  enabled: true\n  allow_from: ["1002"]\n  group_allow_from: ["1001"]\n',
+            encoding="utf-8")
+        store = _store()
+        grants = _find(store=store)
+        extra = _adapter_extra_from_loaded_config()
+        dm = _verdict(extra, store, multiplex=True, chat_type="dm")
+        group = _verdict(extra, store, multiplex=True, chat_type="group")
+
+        platform_rows = [s for s in grants if s.kind == "yaml" and s.chat_scope != GROUP]
+        assert [s.entry for s in platform_rows] == [USER]
+        assert platform_rows[0].authorizes_now is True
+        _assert_report_agrees_per_context(grants, dm=dm, group=group)

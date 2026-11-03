@@ -7,20 +7,30 @@ same principal authorized long after the pairing record is gone, so a revocation
 names the user, says whether each one authorizes *now* in this deployment shape, and (for
 ``--effective``) removes the removable ones.
 
-Precedence replica — the source of truth is ``gateway/authz_mixin.py:645-696``:
+The property this module owes its callers: **exit 0 means no grant names the user in the shape a
+gateway would load this profile in.** The model is therefore what the RUNNING gateway consults,
+not what this one-shot process happens to see — the CLI never runs the YAML→env bridge, so the
+process env is only trusted where it is *authored*:
 
+* **authored** env allowlist = the profile ``.env`` sets it, or the process env sets it and the
+  YAML→env bridge did not write it (``bridged_env_var``). A bridged value never suppresses a YAML
+  row: the bridge copies ``allow_from`` into the platform list, which the union then consults.
 * YAML/``extra`` allow lists (``allow_from`` / ``group_allow_from`` / ``allowed_users``) authorize
-  only while the profile has NO env allowlist at all (platform, group sender, group chat, global)
-  — that branch is the only route to ``_adapter_extra_allowlist_authorizes``;
-* ``allow_all_users`` authorizes through its env flag only (the YAML key is bridged to
-  ``<PLATFORM>_ALLOW_ALL_USERS`` / ``GATEWAY_ALLOW_ALL_USERS`` outside a multiplexed secondary);
-* ``GATEWAY_ALLOWED_USERS`` and platform/group env entries always authorize when they name the
-  principal.
+  only while the profile has NO authored env allowlist at all — that is the only route to
+  ``_adapter_extra_allowlist_authorizes`` (``gateway/authz_mixin.py``). Group-sender, group-chat
+  and global lists do NOT suppress a YAML row through that gate; they are judged as their own
+  consulted lists, chat-scope aware.
+* ``allow_all_users`` authorizes through its bridged env flag only (``<PLATFORM>_ALLOW_ALL_USERS``
+  / ``GATEWAY_ALLOW_ALL_USERS``), which does not reach a multiplexed secondary profile.
+* ``GATEWAY_ALLOWED_USERS`` and platform/group env entries authorize when a consulted list names
+  the principal — matched through authz's own predicate (``_principal_matches_allowlist``), never
+  a second implementation.
 
-``authorizes_now`` is ``True`` (authorizes), ``False`` (declared but not consulted in this shape)
-or ``None`` (cannot be evaluated offline — a role list, an unresolved username entry, an
-unreadable config). Callers must never print an unqualified success while a source is ``True`` or
-``None``.
+``authorizes_now`` is ``True`` (authorizes in every context the row covers), ``False`` (evaluable,
+and authorizes in none) or ``None`` (cannot be decided offline — a role list, a username entry, an
+entry that some alias *might* match, an unreadable config, a value declared but not consulted in
+this process). Callers must never print an unqualified success while a source is ``True`` or
+``None``. Chat scope is part of the verdict: a group list never claims a DM grant (F4).
 
 Reads are side-effect free: the YAML view is a throwaway ``platforms_data`` filled by the loader's
 own ``bridge_platform_shared_keys``, so no process env is written and no plugin hook runs. Writes
@@ -44,10 +54,9 @@ GLOBAL = "global"
 # extending channel traffic to it), so its scope label must not claim "dm".
 _DISCORD_GLOBAL_SCOPE = "global(dm+channel)"
 
-# Platforms whose adapter resolves username-shaped allowlist entries to numeric IDs at connect time
-# (``adapter.resolved_allowlist_user_ids``): a non-numeric entry can authorize a numeric principal
-# and cannot be evaluated offline.
-_USERNAME_RESOLVING_PLATFORMS = frozenset({"discord"})
+# Platforms whose allow-list scope is one sender list covering DMs AND guild channels (upstream PR
+# #103743 keeps extending channel traffic to it), so the scope label must not claim "dm".
+_DISCORD_PLATFORMS = frozenset({"discord"})
 
 # (key, chat_scope) for the allow lists an operator can author. ``None`` scope = the platform's own
 # allow-list scope (global, or Discord's dm+channel).
@@ -71,13 +80,21 @@ _BLOCK_PREFIXES: tuple[tuple[str, ...], ...] = (
 
 _REPORTED_FIELDS = ("kind", "location", "chat_scope", "entry", "removable", "reason", "authorizes_now")
 
-_NOT_CONSULTED = "config.yaml allow list is consulted only while no env allowlist is configured"
-_USERNAME_REASON = ("cannot be evaluated offline: a username-shaped entry the adapter resolves to a "
-                    "numeric id at connect time")
-_MENTION_REASON = ("mention-form entry names the principal but authz compares entries verbatim, so it "
-                   "does not authorize; removed like a plain id")
+_NO_AUTHORED_ENV = "no authored env allowlist is configured, so this list is the one that authorizes"
+_ENV_SHAPE_REASON = (
+    "an authored env allowlist is configured for this platform; env beats YAML, and whether this "
+    "entry still reaches authz depends on the profile shape — cannot be decided offline")
+_USERNAME_REASON = ("cannot be evaluated offline: a non-numeric entry that an adapter may resolve to "
+                    "a numeric id at connect time")
+_MENTION_REASON = ("mention-form entry names the principal but authz compares entries verbatim, so "
+                   "this entry alone does not authorize; the adapter may resolve it at connect time")
+_DECLARED_NOT_CONSULTED = "declared in `.env`; a restart re-reads it"
 _GLOBAL_REASON = ("global allowlist is cross-platform: not removed per platform (it would revoke this "
                   "principal on every other platform too)")
+_UNRESOLVED_ENV = ("cannot be evaluated offline: this platform's allowlist env var is not resolvable "
+                   "in this process (no registry entry, no known name), so a gateway may consult one "
+                   "that names this user")
+_AUTHORITY_REASON = "command-authority list, not access: reported, never removed, never counted"
 
 
 class AccessGrantError(RuntimeError):
@@ -121,6 +138,36 @@ def _platform_obj(platform: str):
     return None
 
 
+class _PlatformShim:
+    """A ``.value``-carrying stand-in for a platform the enum has no member for.
+
+    Registry lookups and ``_principal_matches_allowlist`` key on ``platform.value``, so a plugin
+    platform whose enum member only exists after its plugin loads still gets the platform-specific
+    alias normalisation (Buzz ``npub1…`` ↔ hex) instead of silently missing a grant (F2).
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+
+def _platform_handle(platform: str):
+    return _platform_obj(platform) or _PlatformShim(str(platform or "").strip().lower())
+
+
+def _source(platform: str, user_id: str, chat_type: str = DM):
+    """A ``SessionSource`` for authz's own predicate, in the chat context being judged."""
+    from gateway.session import SessionSource
+
+    return SessionSource(
+        platform=_platform_handle(platform),  # type: ignore[arg-type]  # shim only when no enum member
+        chat_id="dm-1" if chat_type == DM else "group-1",
+        chat_type=chat_type,
+        user_id=user_id,
+    )
+
+
 def _ordered_entries(raw: Any) -> list[str]:
     """Allow-list entries in authored order (list, JSON literal string, or CSV string)."""
     if raw is None:
@@ -155,49 +202,69 @@ def _is_wildcard(entry: Any) -> bool:
 
 
 def _matches(platform: str, entry: Any, user_id: str) -> bool:
-    """Principal match for REPORTING/REMOVAL: the repo's alias rules plus Discord mention syntax."""
+    """Whether authz itself would admit ``user_id`` from this single entry.
+
+    Delegates to ``_principal_matches_allowlist`` on a singleton set — the SAME predicate authz
+    evaluates — so every platform alias rule (WhatsApp phone↔JID, Buzz ``npub1…``↔hex, SimpleX
+    contactId-only) is inherited instead of re-implemented (F2). A ``<@1002>`` mention is NOT a
+    verbatim allow-list entry, so it does not match here.
+    """
     text = str(entry or "").strip()
     if not text or _is_wildcard(text) or _is_wildcard(user_id):
         return False
-    from gateway.pairing import _user_ids_match
+    try:
+        from gateway.authz_mixin import _coerce_allow_set, _principal_matches_allowlist
 
-    if _user_ids_match(platform, text, user_id):
-        return True
-    mention = _mention_id(text)
+        return bool(_principal_matches_allowlist(_source(platform, user_id), user_id, _coerce_allow_set(text)))
+    except Exception:  # noqa: BLE001 - fall back to the pairing store's alias rules, never fail open
+        from gateway.pairing import _user_ids_match
+
+        return bool(_user_ids_match(platform, text, user_id))
+
+
+def _mention_matches(entry: Any, user_id: str) -> bool:
+    """``<@1002>`` / ``<@!1002>`` names the principal for REPORTING/REMOVAL only."""
+    mention = _mention_id(str(entry or ""))
     return mention is not None and mention == str(user_id)
 
 
-def _authorizes_entry(platform: str, entry: Any, user_id: str) -> bool:
-    """Whether authz itself would admit ``user_id`` from this entry.
+def _unresolved(platform: str, entry: Any, user_id: str) -> bool:
+    """An entry whose shape cannot be compared to this principal offline.
 
-    Authz compares allow-list entries VERBATIM (``_allows`` / ``_principal_matches_allowlist``), so a
-    ``<@!1002>`` entry is inert config for the verdict even though it names the principal: it is
-    matched for reporting/removal, never counted as an authorizing grant.
+    Discord resolves username entries through the API at connect time; any plugin platform may
+    normalise its own entry forms. So an entry that neither the predicate nor the mention rule could
+    decide, and whose shape differs from the principal's, is reported as cannot-be-evaluated on
+    EVERY platform (F2) — exit 3, never a silent 0.
     """
     text = str(entry or "").strip()
-    if _is_wildcard(text):
-        return True
-    if not text or _is_wildcard(user_id):
+    if not text or not str(user_id).isdigit():
         return False
-    from gateway.pairing import _user_ids_match
-
-    return _user_ids_match(platform, text, user_id)
+    return not (text.isdigit() or _is_wildcard(text) or _mention_id(text) is not None)
 
 
-def _unresolved(platform: str, entry: Any, user_id: str) -> bool:
-    """A non-numeric entry that could resolve to this numeric principal at connect time."""
-    text = str(entry or "").strip()
-    if platform not in _USERNAME_RESOLVING_PLATFORMS or not str(user_id).isdigit() or not text:
-        return False
-    if _is_wildcard(text) or text.isdigit() or _mention_id(text) is not None:
-        return False
-    return True
+def _platform_allow_env_resolution(platform: str) -> tuple[str, bool]:
+    """``(env var, resolved)`` for the platform's own allowlist (F2).
+
+    Order: the platform-registry entry's ``allowed_users_env`` (plugin platforms), then
+    ``pairing._PLATFORM_ALLOWLIST_ENV`` (built-ins). An unresolved name fails CLOSED: the caller
+    emits an ``unresolved`` row, because a gateway process may still consult a list here.
+    """
+    platform = str(platform or "").strip().lower()
+    if not platform:
+        return "", False
+    from gateway.authz_mixin import _registry_entry
+
+    entry = _registry_entry(_platform_handle(platform))
+    name = str(getattr(entry, "allowed_users_env", "") or "").strip() if entry is not None else ""
+    if not name:
+        from gateway.pairing import _PLATFORM_ALLOWLIST_ENV
+
+        name = str(_PLATFORM_ALLOWLIST_ENV.get(platform) or "").strip()
+    return name, bool(name)
 
 
 def _platform_allow_env(platform: str) -> str:
-    from gateway.pairing import _allowlist_env_for_platform
-
-    return _allowlist_env_for_platform(platform) or ""
+    return _platform_allow_env_resolution(platform)[0]
 
 
 def _allow_all_env(platform: str) -> str:
@@ -238,8 +305,37 @@ def _truthy(name: str) -> bool:
     return bool(name) and _gate_env(name).strip().lower() in {"true", "1", "yes"}
 
 
+def _authored_entries(home: Path, var: str) -> list[str]:
+    """Entries a gateway LOADS for ``var``: the profile ``.env``, plus process env it did not bridge.
+
+    This is the only value the YAML-suppressing test may use (F1). The CLI never runs the YAML→env
+    bridge, so a process value that ``bridged_env_var`` reports as this process's own bridge write is
+    a replica of ``config.yaml`` — trusting it would make a YAML row disappear precisely when the
+    gateway would still authorize it.
+    """
+    if not var:
+        return []
+    from agent.secret_scope import load_env_file
+    from gateway.platforms._shared import bridged_env_var
+
+    from_file = set(_entries(load_env_file(home / ".env").get(var)))
+    process = set() if bridged_env_var(var) else set(_entries(_gate_env(var)))
+    return sorted(from_file | process)
+
+
+def _consulted_or_authored(home: Path, var: str) -> bool:
+    """True when ``var`` names anything at all — now (consulted) or after a restart (authored)."""
+    if not var:
+        return False
+    if _entries(_gate_env(var)):
+        return True
+    from agent.secret_scope import load_env_file
+
+    return bool(_entries(load_env_file(home / ".env").get(var)))
+
+
 def _scope_for(platform: str) -> str:
-    return _DISCORD_GLOBAL_SCOPE if platform in _USERNAME_RESOLVING_PLATFORMS else GLOBAL
+    return _DISCORD_GLOBAL_SCOPE if platform in _DISCORD_PLATFORMS else GLOBAL
 
 
 # --------------------------------------------------------------------------- home / config
@@ -294,11 +390,17 @@ def _effective_extra(config: dict, platform: str) -> dict:
     return dict(block.get("extra") or {}) if isinstance(block, dict) else {}
 
 
-def _env_allowlist_configured(platform: str) -> bool:
-    """True when ANY env allowlist authz consults is non-empty (the YAML-reaches-extra gate)."""
-    platform_env = _platform_allow_env(platform)
+def _env_allowlist_configured(platform: str, home: Path) -> bool:
+    """True when ANY env allowlist authz consults names something — consulted now or authored.
+
+    Only ``GATEWAY_ALLOW_ALL_USERS``'s reachability uses this four-list superset (authz consults a
+    group list only in a group context, so the process cannot decide per-context offline).
+    """
     group_user, group_chat = _group_envs(platform)
-    return any(_gate_env(name) for name in (platform_env, group_user, group_chat, "GATEWAY_ALLOWED_USERS"))
+    return any(
+        _consulted_or_authored(home, name)
+        for name in (_platform_allow_env(platform), group_user, group_chat, "GATEWAY_ALLOWED_USERS")
+    )
 
 
 # --------------------------------------------------------------------------- enumeration
@@ -325,8 +427,12 @@ def find_user_grants(
             kind="pairing", location="pairing store", chat_scope=GLOBAL, entry=user_id,
             removable=True, authorizes_now=True, _platform=platform, _user_id=user_id))
 
-    yaml_only_env = not _env_allowlist_configured(platform)
-    sources.extend(_env_sources(platform, user_id, resolved_home, yaml_only_env))
+    platform_env, env_known = _platform_allow_env_resolution(platform)
+    # F1: the YAML-reaches-extra gate is the AUTHORED platform allowlist only. A bridged value, a
+    # group-sender list, a group-chat list and the global list never suppress a YAML row — the
+    # bridge copies ``allow_from`` into the platform list, which the union then consults.
+    yaml_only_env = not _authored_entries(resolved_home, platform_env)
+    sources.extend(_env_sources(platform, user_id, resolved_home, platform_env, env_known))
 
     config, refusal = _read_config(resolved_home)
     if refusal:
@@ -335,7 +441,7 @@ def find_user_grants(
             reason=f"config.yaml cannot be read, so its grants cannot be evaluated offline: {refusal}",
             authorizes_now=None, _platform=platform, _user_id=user_id))
         return sources
-    sources.extend(_yaml_sources(platform, user_id, config, yaml_only_env))
+    sources.extend(_yaml_sources(platform, user_id, config, yaml_only_env, env_known))
     return sources
 
 
@@ -353,8 +459,8 @@ def _env_allow_source(
     """One ``env`` source, with the provenance that decides removability and the reason text."""
     location = _env_location(var, from_env_file, bridged)
     removable = bool(from_env_file) and not global_scope
-    authorizes = _authorizes_entry(platform, entry, user_id)
-    if not authorizes:
+    authorizes: Optional[bool] = True if _matches(platform, entry, user_id) else None
+    if authorizes is None:
         reason = _MENTION_REASON
     elif removable:
         reason = ""
@@ -369,16 +475,24 @@ def _env_allow_source(
         reason=reason, authorizes_now=authorizes, _path=(var,), _platform=platform, _user_id=user_id)
 
 
-def _env_sources(platform: str, user_id: str, home: Path, yaml_only_env: bool) -> list[GrantSource]:
+def _env_sources(
+    platform: str, user_id: str, home: Path, platform_env: str, env_known: bool,
+) -> list[GrantSource]:
     """Env allowlists, provenance-aware: ``.env`` (authored), bridged, process-only."""
     from agent.secret_scope import load_env_file
     from gateway.platforms._shared import bridged_env_var
 
     authored = load_env_file(home / ".env")
-    platform_env = _platform_allow_env(platform)
     group_user, _group_chat = _group_envs(platform)
     allow_all = _allow_all_env(platform)
     sources: list[GrantSource] = []
+    if not env_known:
+        # F2: fail closed. A gateway process may load a plugin that names this platform's allowlist
+        # env var, so "I could not find one" is never "there is none".
+        sources.append(GrantSource(
+            kind="unresolved", location=f"env {platform.upper()} allowlist", chat_scope=GLOBAL,
+            entry="", removable=False, reason=_UNRESOLVED_ENV, authorizes_now=None,
+            _platform=platform, _user_id=user_id))
 
     for var, scope in (
         (platform_env, _scope_for(platform)),
@@ -390,22 +504,24 @@ def _env_sources(platform: str, user_id: str, home: Path, yaml_only_env: bool) -
         global_scope = var == "GATEWAY_ALLOWED_USERS"
         bridged = bridged_env_var(var)
         from_env_file = str(authored.get(var) or "").strip()
-        matched = [entry for entry in _entries(_gate_env(var)) if _matches(platform, entry, user_id)]
+        consulted = _entries(_gate_env(var))
+        matched = [entry for entry in consulted if _names_principal(platform, entry, user_id)]
         for entry in matched:
             sources.append(_env_allow_source(
                 platform, user_id, var, scope, entry, from_env_file,
                 bridged=bridged, global_scope=global_scope))
         if not matched:
-            # Declared in .env but not consulted by this process (no scope / another profile's value).
+            # F3: declared in the profile's .env but not consulted by THIS process (another profile's
+            # secret scope, a stale process env). A restart re-reads it, so it is unknown, never False.
             for entry in _entries(from_env_file):
-                if not _matches(platform, entry, user_id):
+                if not _names_principal(platform, entry, user_id):
                     continue
+                reason = _DECLARED_NOT_CONSULTED if not global_scope else f"{_DECLARED_NOT_CONSULTED} — {_GLOBAL_REASON}"
                 sources.append(GrantSource(
                     kind="env", location=f".env {var}", chat_scope=scope, entry=entry,
-                    removable=not global_scope,
-                    reason=("declared in .env but not consulted by this process (profile secret scope)"
-                            if not global_scope else _GLOBAL_REASON),
-                    authorizes_now=False, _path=(var,), _platform=platform, _user_id=user_id))
+                    removable=not global_scope, reason=reason,
+                    authorizes_now=None, _path=(var,), _platform=platform, _user_id=user_id))
+
 
     # Wildcards and username-shaped entries apply to the platform's own sender lists; the global list
     # is cross-platform and resolved per adapter, so it is reported above but not classified here.
@@ -432,13 +548,17 @@ def _env_sources(platform: str, user_id: str, home: Path, yaml_only_env: bool) -
             removable=False, reason="allow-all flag: admits every sender; never removed by revoke",
             authorizes_now=True, _path=(allow_all,), _platform=platform, _user_id=user_id))
     if _truthy("GATEWAY_ALLOW_ALL_USERS"):
+        # Consulted only in the no-env-allowlist branch, and only in a context that allowlist does
+        # not cover — so with any env allowlist configured the reachability is unknown, never False.
+        consulted = not _env_allowlist_configured(platform, home)
         sources.append(GrantSource(
             kind="allow_all", location="env GATEWAY_ALLOW_ALL_USERS", chat_scope=GLOBAL, entry="true",
             removable=False,
             reason=("allow-all flag: admits every sender on every platform (consulted only while no "
                     "env allowlist is configured); never removed by revoke"),
-            authorizes_now=yaml_only_env, _path=("GATEWAY_ALLOW_ALL_USERS",),
+            authorizes_now=True if consulted else None, _path=("GATEWAY_ALLOW_ALL_USERS",),
             _platform=platform, _user_id=user_id))
+
 
     roles_env = _roles_env(platform)
     roles = _gate_env(roles_env)
@@ -451,9 +571,14 @@ def _env_sources(platform: str, user_id: str, home: Path, yaml_only_env: bool) -
     return sources
 
 
-def _yaml_sources(platform: str, user_id: str, config: dict, yaml_only_env: bool) -> list[GrantSource]:
+def _yaml_sources(
+    platform: str, user_id: str, config: dict, yaml_only_env: bool, env_known: bool,
+) -> list[GrantSource]:
     """Authored ``config.yaml`` blocks, key by key, with the loader's own reachability."""
     effective = _effective_extra(config, platform)
+    # The loader needs a ``Platform`` to merge/bridge a block; without one the effective value is
+    # unknown, and an unknown effective value must never read as "does not authorize".
+    loader_known = _platform_obj(platform) is not None and env_known
     sources: list[GrantSource] = []
     for prefix in _BLOCK_PREFIXES:
         block: Any = config
@@ -468,13 +593,28 @@ def _yaml_sources(platform: str, user_id: str, config: dict, yaml_only_env: bool
             containers.append((extra, (*block_path, "extra")))
         for container, container_path in containers:
             sources.extend(_yaml_container_sources(
-                platform, user_id, container, container_path, effective, yaml_only_env))
+                platform, user_id, container, container_path, effective,
+                yaml_only_env=yaml_only_env, loader_known=loader_known))
     return sources
+
+
+def _yaml_authorizes(*, in_effective: bool, yaml_only_env: bool, loader_known: bool) -> Optional[bool]:
+    """``authorizes_now`` for one authored YAML allow row (F1/F4): True or None, NEVER False.
+
+    True only when the entry is in the loader's effective value AND no env allowlist is authored for
+    this platform — under that shape the entry authorizes in every context: single-profile/default
+    bridges it into the platform list the union consults, and a multiplexed secondary reaches
+    ``config.extra`` directly. With an authored env allowlist (or an unresolvable platform) the
+    shape decides, and the offline replica must not guess: None keeps the exit code at 3.
+    """
+    if not loader_known or not in_effective:
+        return None
+    return True if yaml_only_env else None
 
 
 def _yaml_container_sources(
     platform: str, user_id: str, container: dict, container_path: tuple[str, ...],
-    effective: dict, yaml_only_env: bool,
+    effective: dict, *, yaml_only_env: bool, loader_known: bool,
 ) -> list[GrantSource]:
     def effective_entries(key: str) -> set[str]:
         return {str(entry).strip() for entry in _entries(effective.get(key))}
@@ -488,20 +628,24 @@ def _yaml_container_sources(
         entries = _entries(container.get(key))
         effective_set = effective_entries(key)
         authority = key.endswith("admin_from")
+        # A group list speaks for GROUP traffic only; every other list covers the platform's own
+        # scope (F4). ``chat_scope`` is on the row, so a group grant never reads as a DM grant.
         scope_value = scope or _scope_for(platform)
         for entry in entries:
-            if not _matches(platform, entry, user_id):
+            if not _names_principal(platform, entry, user_id):
                 continue
-            verbatim = _authorizes_entry(platform, entry, user_id)
-            authorizes = bool(yaml_only_env and verbatim and str(entry).strip() in effective_set)
+            verbatim = _matches(platform, entry, user_id)
             if authority:
-                reason = "command-authority list, not access: reported, never removed"
-            elif not authorizes and not verbatim:
+                authorizes: Optional[bool] = None
+                reason = _AUTHORITY_REASON
+            elif not verbatim:
+                authorizes = None
                 reason = _MENTION_REASON
-            elif authorizes:
-                reason = ""
             else:
-                reason = _NOT_CONSULTED
+                authorizes = _yaml_authorizes(
+                    in_effective=str(entry).strip() in effective_set,
+                    yaml_only_env=yaml_only_env, loader_known=loader_known)
+                reason = _NO_AUTHORED_ENV if authorizes else _ENV_SHAPE_REASON
             out.append(GrantSource(
                 kind="yaml", location=location, chat_scope=scope_value, entry=entry,
                 removable=not authority, reason=reason, authorizes_now=authorizes,
@@ -512,7 +656,9 @@ def _yaml_container_sources(
             out.append(GrantSource(
                 kind="wildcard", location=location, chat_scope=scope_value, entry="*",
                 removable=False, reason="wildcard: admits every sender; never removed by revoke",
-                authorizes_now=bool(yaml_only_env and "*" in effective_set),
+                authorizes_now=_yaml_authorizes(
+                    in_effective="*" in effective_set, yaml_only_env=yaml_only_env,
+                    loader_known=loader_known),
                 _path=path, _platform=platform, _user_id=user_id))
         for entry in entries:
             if _unresolved(platform, entry, user_id):
@@ -524,12 +670,17 @@ def _yaml_container_sources(
     if container.get("allow_all_users") is True:
         path = (*container_path, "allow_all_users")
         allow_all_env = _allow_all_env(platform)
+        # F1: the YAML flag authorizes only through its bridged env flag. This process may never have
+        # run the bridge (the CLI does not), so "not set here" is UNKNOWN, not inert: a gateway loads
+        # this profile and sets it. None keeps the exit code at 3; False would silently drop the row.
+        flag_live = bool(allow_all_env and _truthy(allow_all_env))
         out.append(GrantSource(
             kind="allow_all", location="config.yaml " + ".".join(path), chat_scope=GLOBAL, entry="true",
             removable=False,
-            reason=("allow-all flag: admits every sender on this platform (authorizes only through the "
-                    f"bridged {allow_all_env or 'env flag'})"),
-            authorizes_now=bool(allow_all_env and _truthy(allow_all_env)),
+            reason=("allow-all flag: admits every sender on this platform (authorizes through the "
+                    f"bridged {allow_all_env or 'env flag'}; inert only for a multiplexed secondary "
+                    "profile, whose YAML→env bridge is skipped)"),
+            authorizes_now=True if flag_live else None,
             _path=path, _platform=platform, _user_id=user_id))
 
     roles = container.get("allowed_roles")
@@ -560,14 +711,20 @@ def _set_at(node: dict, path: tuple[str, ...], value: Any) -> None:
     node[path[-1]] = value
 
 
+def _names_principal(platform: str, entry: Any, user_id: str) -> bool:
+    """Names the principal at all — by authz's predicate or by mention spelling (removal/reporting)."""
+    return _matches(platform, entry, user_id) or _mention_matches(entry, user_id)
+
+
 def _strip(value: Any, platform: str, user_id: str) -> Any:
     """Drop the principal's entries, preserving the authored container type, order and ``*``."""
     if isinstance(value, str):
-        return ",".join(entry for entry in _ordered_entries(value) if not _matches(platform, entry, user_id))
+        return ",".join(entry for entry in _ordered_entries(value)
+                        if not _names_principal(platform, entry, user_id))
     if isinstance(value, (list, tuple)):
-        return [entry for entry in value if not _matches(platform, str(entry), user_id)]
+        return [entry for entry in value if not _names_principal(platform, entry, user_id)]
     if isinstance(value, (set, frozenset)):
-        return {entry for entry in value if not _matches(platform, str(entry), user_id)}
+        return {entry for entry in value if not _names_principal(platform, entry, user_id)}
     return value
 
 
@@ -654,7 +811,7 @@ def remove_user_grants(
         current = load_env_file(env_path)
         for var in sorted({source._path[0] for source in env_plan}):
             try:
-                require_env_writable(var, f"revoke {user_id} from {var}")
+                require_env_writable(var, f"revoke {user_id}")
             except ValueError as exc:
                 raise AccessGrantError(str(exc)) from exc
             before = str(current.get(var) or "")
