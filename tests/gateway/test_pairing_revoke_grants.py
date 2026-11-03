@@ -446,6 +446,18 @@ def test_allow_all_from_yaml_is_declared_not_consulted_in_a_secondary(home):
         _assert_report_agrees(grants, _verdict(_adapter_extra_from_loaded_config(), store, multiplex=True))
 
 
+@pytest.mark.parametrize('config', ['allow_all_users: "yes"\n', 'gateway:\n  allow_all_users: 1\n'])
+def test_global_allow_all_secondary_is_conservatively_reported(home, config):
+    with _secondary_profile(home) as secondary:
+        (secondary / 'config.yaml').write_text(config)
+        store = _store()
+        rows = [row for row in _find(store=store) if row.kind == 'allow_all']
+        assert len(rows) == 1 and rows[0].authorizes_now is None
+        assert not rows[0].removable
+        assert _revoke_cli(store, effective=True) == 3
+        assert (secondary / 'config.yaml').read_text() == config
+
+
 def test_allow_all_from_yaml_authorizes_in_single_profile(home):
     _write_home(home, "discord:\n  allow_all_users: true\n")
     extra = _adapter_extra_from_loaded_config()  # the bridge seeds DISCORD_ALLOW_ALL_USERS
@@ -1238,6 +1250,82 @@ def test_a_live_gateway_keeps_the_change_from_reading_as_enforced(home, monkeypa
         assert "Removed config.yaml discord.allow_from" in out
         assert "running gateway (pid 4242)" in out
         assert "cannot be evaluated offline" in out
+
+
+@pytest.mark.parametrize('config', [
+    'allow_all_users: true\n',
+    'allow_all_users: "true"\n',
+    'gateway:\n  allow_all_users: "yes"\n',
+    'discord:\n  allow_all_users: "true"\n',
+    'discord:\n  allow_all_users: 1\n',
+    'platforms:\n  discord:\n    extra:\n      allow_all_users: "true"\n',
+])
+@pytest.mark.parametrize('effective', [False, True])
+def test_allow_all_real_cli_and_gateway(home, config, effective):
+    import subprocess
+    import sys
+
+    _write_home(home, config, 'DISCORD_ALLOWED_USERS=1002\n' if effective else '')
+    env = os.environ.copy()
+    result = subprocess.run(
+        [sys.executable, '-m', 'hermes_cli.main', 'pairing', 'revoke',
+         *(['--effective'] if effective else []), PLATFORM, USER],
+        env=env, text=True, capture_output=True, timeout=60)
+    assert result.returncode == 3, (result.stdout, result.stderr)
+    assert 'allow_all_users' in result.stdout
+    assert (home / 'config.yaml').read_text() == config
+    extra = _adapter_extra_from_loaded_config()
+    assert all(_verdict(extra, _store(), chat_type=kind)
+               for kind in ('dm', 'group', 'channel', 'forum'))
+
+
+def test_authored_env_flags_without_process_env(home):
+    _write_home(home, '', 'DISCORD_ALLOW_ALL_USERS=yes\nDISCORD_ALLOWED_ROLES=admin\n')
+    rows = _find(store=_store())
+    assert {'allow_all', 'role'} <= {row.kind for row in rows}
+    assert all(row.authorizes_now is None for row in rows if row.kind in {'allow_all', 'role'})
+
+
+def test_malformed_mapping_is_one_clear_unresolved_row(home):
+    _write_home(home, 'discord:\n  allow_from: {"1001": true, "1002": true}\n')
+    rows = [r for r in _find(store=_store()) if r.location == 'config.yaml discord.allow_from']
+    assert len(rows) == 1 and rows[0].kind == 'unresolved'
+    assert 'mapping' in rows[0].reason and not rows[0].removable
+
+
+def test_block_level_groups_are_not_edited(home):
+    config = 'discord:\n  groups:\n    chan-1:\n      allow_from: ["1002"]\n'
+    _write_home(home, config)
+    assert _revoke_cli(_store(), effective=True) == 3
+    assert (home / 'config.yaml').read_text() == config
+
+
+def test_gateway_detection_failure_is_not_success(home, monkeypatch, capsys):
+    import gateway.status
+    def fail(_home):
+        raise PermissionError('synthetic failure')
+    monkeypatch.setattr(gateway.status, 'live_gateway_pid_for_home', fail)
+    _write_home(home, 'discord:\n  allow_from: ["1002"]\n')
+    assert _revoke_cli(_store(), effective=True) == 3
+    assert 'could not determine' in capsys.readouterr().out.lower()
+
+
+def test_gateway_detection_scopes_served_profiles_to_default_root(home, monkeypatch):
+    import gateway.status
+    import hermes_constants
+    import hermes_cli.gateway_multiplex_served as served
+    import hermes_cli.pairing as pairing_cli
+    root = home / 'root'
+    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda: root)
+    monkeypatch.setattr(gateway.status, 'live_gateway_pid_for_home', lambda _: None)
+    monkeypatch.setattr(served, 'live_default_gateway_pid', lambda: 4242)
+    monkeypatch.setattr(served, 'recorded_served_profiles', lambda: ['seat'])
+    monkeypatch.setenv('HERMES_HOME', str(home / 'other' / 'profiles' / 'seat'))
+    assert pairing_cli._live_gateway_pid(SimpleNamespace(profile=None)) == 0
+    monkeypatch.setenv('HERMES_HOME', str(root / 'profiles' / 'seat'))
+    assert pairing_cli._live_gateway_pid(SimpleNamespace(profile=None)) == 4242
+    monkeypatch.setattr(served, 'recorded_served_profiles', lambda: None)
+    assert pairing_cli._live_gateway_pid(SimpleNamespace(profile=None)) == -1
 
 
 def test_no_live_gateway_means_a_file_removal_is_a_denial(home, monkeypatch, capsys):

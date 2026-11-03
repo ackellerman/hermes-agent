@@ -696,17 +696,19 @@ def _env_sources(
                     removable=False, reason=_USERNAME_REASON, authorizes_now=None,
                     _path=(var,), _platform=platform, _user_id=user_id))
 
-    if _truthy(allow_all):
+    if _truthy(allow_all) or str(authored.get(allow_all) or "").strip().lower() in {"true", "1", "yes"}:
+        live = _truthy(allow_all)
         sources.append(GrantSource(
-            kind="allow_all", location=f"env {allow_all}", chat_scope=GLOBAL, entry="true",
+            kind="allow_all", location=f"{'env' if live else '.env'} {allow_all}", chat_scope=GLOBAL, entry="true",
             removable=False, reason="allow-all flag: admits every sender; never removed by revoke",
-            authorizes_now=True, _path=(allow_all,), _platform=platform, _user_id=user_id))
-    if _truthy("GATEWAY_ALLOW_ALL_USERS"):
+            authorizes_now=True if live else None, _path=(allow_all,), _platform=platform, _user_id=user_id))
+    if _truthy("GATEWAY_ALLOW_ALL_USERS") or str(authored.get("GATEWAY_ALLOW_ALL_USERS") or "").strip().lower() in {"true", "1", "yes"}:
         # Consulted only in the no-env-allowlist branch, and only in a context that allowlist does
         # not cover — so with any env allowlist configured the reachability is unknown, never False.
-        consulted = not _env_allowlist_configured(platform, home)
+        live = _truthy("GATEWAY_ALLOW_ALL_USERS")
+        consulted = live and not _env_allowlist_configured(platform, home)
         sources.append(GrantSource(
-            kind="allow_all", location="env GATEWAY_ALLOW_ALL_USERS", chat_scope=GLOBAL, entry="true",
+            kind="allow_all", location=f"{'env' if live else '.env'} GATEWAY_ALLOW_ALL_USERS", chat_scope=GLOBAL, entry="true",
             removable=False,
             reason=("allow-all flag: admits every sender on every platform (consulted only while no "
                     "env allowlist is configured); never removed by revoke"),
@@ -715,10 +717,10 @@ def _env_sources(
 
 
     roles_env = _roles_env(platform)
-    roles = _gate_env(roles_env)
+    roles = _gate_env(roles_env) or str(authored.get(roles_env) or "")
     if roles:
         sources.append(GrantSource(
-            kind="role", location=f"env {roles_env}", chat_scope=GLOBAL, entry=",".join(_entries(roles)),
+            kind="role", location=f"{'env' if _gate_env(roles_env) else '.env'} {roles_env}", chat_scope=GLOBAL, entry=",".join(_entries(roles)),
             removable=False,
             reason="role grant cannot be evaluated per user offline; a matching role admits this user",
             authorizes_now=None, _path=(roles_env,), _platform=platform, _user_id=user_id))
@@ -734,6 +736,15 @@ def _yaml_sources(
     # unknown, and an unknown effective value must never read as "does not authorize".
     loader_known = _platform_obj(platform) is not None and env_known
     sources: list[GrantSource] = []
+    # Inspect both authored locations even if precedence or profile scoping makes one inert.
+    for path, container in (((), config), (("gateway",), config.get("gateway"))):
+        if isinstance(container, dict) and str(container.get("allow_all_users")).strip().lower() in {"true", "1", "yes"}:
+            flag_path = (*path, "allow_all_users")
+            sources.append(GrantSource(
+                kind="allow_all", location="config.yaml " + ".".join(flag_path),
+                chat_scope=GLOBAL, entry="", removable=False, authorizes_now=None,
+                reason="allow-all flag may admit every sender on every platform; never removed by revoke",
+                _path=flag_path, _platform=platform, _user_id=user_id))
     for prefix in _BLOCK_PREFIXES:
         block: Any = config
         for key in (*prefix, platform):
@@ -779,7 +790,15 @@ def _yaml_container_sources(
             continue
         path = (*container_path, key)
         location = "config.yaml " + ".".join(path)
-        entries = _entries(container.get(key))
+        raw = container.get(key)
+        if isinstance(raw, dict):
+            out.append(GrantSource(
+                kind="unresolved", location=location, chat_scope=scope or _scope_for(platform),
+                entry="", removable=False, authorizes_now=None,
+                reason="allowlist is a mapping, not a list or CSV; cannot evaluate offline",
+                _path=path, _platform=platform, _user_id=user_id))
+            continue
+        entries = _entries(raw)
         effective_set = effective_entries(key)
         authority = key.endswith("admin_from")
         # A group list speaks for GROUP traffic only; every other list covers the platform's own
@@ -839,7 +858,7 @@ def _yaml_container_sources(
                     removable=False, reason=_USERNAME_REASON, authorizes_now=None,
                     _path=path, _platform=platform, _user_id=user_id))
 
-    if container.get("allow_all_users") is True:
+    if str(container.get("allow_all_users")).strip().lower() in {"true", "1", "yes"}:
         path = (*container_path, "allow_all_users")
         allow_all_env = _allow_all_env(platform)
         # F1: the YAML flag authorizes only through its bridged env flag. This process may never have
@@ -868,7 +887,15 @@ def _yaml_container_sources(
     out.extend(_per_group_sender_sources(
         platform, user_id, container, container_path, effective,
         yaml_only_env=yaml_only_env, loader_known=loader_known))
-    return out
+    seen_unresolved: set[str] = set()
+    deduped = []
+    for source in out:
+        if source.kind == "unresolved":
+            if source.location in seen_unresolved:
+                continue
+            seen_unresolved.add(source.location)
+        deduped.append(source)
+    return deduped
 
 
 def _chat_allow_sources(
@@ -931,7 +958,7 @@ def _per_group_sender_sources(
                     in_effective=str(entry).strip() in effective_entries,
                     yaml_only_env=yaml_only_env, loader_known=loader_known)
                 out.append(GrantSource(
-                    kind="yaml", location=location, chat_scope=GROUP, entry=entry, removable=True,
+                    kind="yaml", location=location, chat_scope=GROUP, entry=entry, removable=extra_container,
                     reason="" if authorizes else _PER_GROUP_REASON.format(chat=chat),
                     authorizes_now=authorizes, _path=path, _platform=platform, _user_id=user_id))
         if own_policy_like and not any(entries_by_key.values()):

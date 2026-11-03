@@ -125,12 +125,21 @@ def _live_gateway_pid(store) -> int:
             return pid
         from hermes_cli.gateway_multiplex_served import live_default_gateway_pid, recorded_served_profiles
 
+        from hermes_constants import get_default_hermes_root
+        if home.parent.resolve() != (get_default_hermes_root() / "profiles").resolve():
+            return 0
         default_pid = live_default_gateway_pid()
-        if default_pid and home.parent.name == "profiles" and home.name in (recorded_served_profiles() or []):
-            return default_pid
+        if default_pid:
+            served = recorded_served_profiles()
+            if served is None:
+                return -1
+            if home.name in served:
+                return default_pid
         return 0
     except Exception:
-        return 0
+        import logging
+        logging.getLogger(__name__).debug("Unable to detect live gateway", exc_info=True)
+        return -1  # Unknown is not evidence that no gateway is running.
 
 
 def _runtime_source(pid: int):
@@ -138,9 +147,10 @@ def _runtime_source(pid: int):
     from gateway.access_grants import GrantSource
 
     return GrantSource(
-        kind="runtime", location=f"running gateway (pid {pid})", chat_scope="global",
-        entry="", removable=False, authorizes_now=None,
-        reason="this gateway loaded the previous allowlist; restart it to enforce the change now")
+        kind="runtime", location=(f"running gateway (pid {pid})" if pid > 0 else "gateway status unknown"),
+        chat_scope="global", entry="", removable=False, authorizes_now=None,
+        reason=("this gateway loaded the previous allowlist; restart it to enforce the change now"
+                if pid > 0 else "could not determine whether a gateway is running; verify and restart it if needed"))
 
 
 def _cmd_revoke(store, platform: str, user_id: str, effective: bool = False):
