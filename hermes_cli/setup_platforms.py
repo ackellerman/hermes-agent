@@ -263,8 +263,9 @@ _HOME_CHANNEL_CHECKS = (
 )
 
 # Platform blocks the loader merges, in authored-precedence order (root block first:
-# `gateway/config_loader.py::platform_section` / `merge_platform_sections`).
-_HOME_CHANNEL_BLOCK_PREFIXES = ((), ("platforms",), ("gateway", "platforms"))
+# `gateway/config_loader.py::platform_section` / `merge_platform_sections`). A top-level `<plat>:`
+# block is NOT merged by the loader, so it is not a place routing reads a home channel from (F5).
+_HOME_CHANNEL_BLOCK_PREFIXES = (("platforms",), ("gateway", "platforms"))
 
 
 def _is_progress(status: str) -> bool:
@@ -276,8 +277,12 @@ def _is_progress(status: str) -> bool:
 def _yaml_home_channels() -> dict[str, str]:
     """``platform -> authored home channel`` from config.yaml (routing is NOT changed here).
 
-    The diagnostic used to read env only, so a home channel configured in YAML (the
-    documented surface for most platforms) was reported as missing.
+    The diagnostic used to read env only, so a home channel configured in YAML (the documented
+    surface for most platforms) was reported as missing. It must now accept exactly what routing
+    accepts, or it suppresses a warning routing would earn: ``platforms.<plat>.home_channel`` /
+    ``gateway.platforms.<plat>.home_channel`` as a mapping carrying ``platform`` and ``chat_id`` —
+    i.e. anything ``HomeChannel.from_dict`` parses. A scalar, a mapping without ``platform`` and a
+    top-level ``<plat>:`` block are not homes routing can deliver to (F5).
     """
     try:
         from hermes_cli.config import load_config_readonly
@@ -294,16 +299,29 @@ def _yaml_home_channels() -> dict[str, str]:
         for platform_key, _label, _token_var, _home_vars in _HOME_CHANNEL_CHECKS:
             if platform_key in found:
                 continue  # first authored block wins, mirroring the loader's precedence
-            plat_cfg = block.get(platform_key)
-            if not isinstance(plat_cfg, dict):
-                continue
-            home = plat_cfg.get("home_channel")
-            if isinstance(home, dict):
-                home = home.get("chat_id") or home.get("id")
-            if home is None or str(home).strip() == "":
-                continue
-            found[platform_key] = str(home).strip()
+            chat_id = _routed_home_chat_id(block.get(platform_key))
+            if chat_id:
+                found[platform_key] = chat_id
     return found
+
+
+def _routed_home_chat_id(platform_block) -> str:
+    """``chat_id`` when routing would build a ``HomeChannel`` here, else ``""``.
+
+    Parses through ``HomeChannel.from_dict`` itself so the diagnostic cannot drift from routing
+    (a missing ``platform``, a scalar or an unknown platform value is not a home).
+    """
+    if not isinstance(platform_block, dict):
+        return ""
+    home = platform_block.get("home_channel")
+    if not isinstance(home, dict) or not home.get("platform") or home.get("chat_id") in (None, ""):
+        return ""
+    try:
+        from gateway.config import HomeChannel
+
+        return str(HomeChannel.from_dict(home).chat_id or "").strip()
+    except Exception:  # invalid platform value / unparsable dict: routing would not deliver either
+        return ""
 
 
 def _warn_missing_home_channels() -> None:
