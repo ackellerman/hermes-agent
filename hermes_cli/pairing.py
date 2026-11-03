@@ -110,17 +110,21 @@ def _cmd_revoke(store, platform: str, user_id: str, effective: bool = False):
     from gateway.access_grants import AccessGrantError, find_user_grants, remove_user_grants
 
     platform = platform.lower().strip()
-    revoked = store.revoke(platform, user_id)
     removed = []
     try:
         grants = find_user_grants(platform, user_id, store=store)
         if effective:
-            removed = remove_user_grants(grants, store=store)
-            grants = find_user_grants(platform, user_id, store=store)
+            # Config/env removals validate BEFORE writing anything, and the pairing record is not
+            # touched until they succeed — a refusal must leave the whole state as it was.
+            removed = remove_user_grants(
+                [source for source in grants if source.kind != "pairing"], store=store)
     except AccessGrantError as exc:
         print(f"\n  Refused: {exc}\n")
-        print("  Nothing was removed; the pairing record (if any) was revoked before this check.\n")
+        print("  Nothing was changed: no config.yaml entry, no .env key, pairing record intact.\n")
         raise SystemExit(1)
+
+    revoked = store.revoke(platform, user_id)
+    grants = find_user_grants(platform, user_id, store=store)
 
     print()
     if revoked:

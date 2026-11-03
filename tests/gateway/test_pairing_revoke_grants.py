@@ -601,6 +601,25 @@ def test_revoke_plain_single_profile_yaml_grant_leaves_env_untouched(home, capsy
     assert _verdict(extra, store) is True
 
 
+def test_revoke_effective_refusal_keeps_pairing_record_and_env(home, capsys):
+    """F11: a refusal must not have revoked the pairing record or touched `.env` either."""
+    _write_home(home, f'discord:\n  allow_from: ["{USER}"]\n', f"DISCORD_ALLOWED_USERS={KEPT},{USER}\n")
+    os.environ["DISCORD_ALLOWED_USERS"] = f"{KEPT},{USER}"
+    store = _store()
+    store._approve_user(PLATFORM, USER, "")
+    before_env = (home / ".env").read_bytes()
+    (home / "config.yaml").chmod(0o000)
+    try:
+        assert _revoke_cli(store, effective=True) == 1
+        out = capsys.readouterr().out
+        assert "Refused" in out
+        assert store.is_approved(PLATFORM, USER) is True
+        assert (home / ".env").read_bytes() == before_env
+    finally:
+        (home / "config.yaml").chmod(0o600)
+        os.environ.pop("DISCORD_ALLOWED_USERS", None)
+
+
 def _live_adapter(extra: dict):
     return SimpleNamespace(
         platform=Platform.DISCORD, config=SimpleNamespace(extra=extra),
@@ -681,5 +700,3 @@ def test_dashboard_revoke_requires_platform_and_user(home):
     assert client.post("/api/pairing/revoke", json={"platform": PLATFORM}).status_code == 422
     assert client.post(
         "/api/pairing/revoke", json={"platform": "", "user_id": ""}).status_code == 400
-
-

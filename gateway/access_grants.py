@@ -339,13 +339,19 @@ def find_user_grants(
     return sources
 
 
+def _env_location(var: str, from_env_file: str, bridged: bool) -> str:
+    """Report the provenance of an env value: authored ``.env``, this process's bridge, or process env."""
+    if from_env_file:
+        return f".env {var}"
+    return f"env {var} (bridged from config.yaml)" if bridged else f"env {var} (process)"
+
+
 def _env_allow_source(
     platform: str, user_id: str, var: str, scope: str, entry: str, from_env_file: str,
     *, bridged: bool, global_scope: bool,
 ) -> GrantSource:
     """One ``env`` source, with the provenance that decides removability and the reason text."""
-    location = f".env {var}" if from_env_file else (
-        f"env {var} (bridged from config.yaml)" if bridged else f"env {var} (process)")
+    location = _env_location(var, from_env_file, bridged)
     removable = bool(from_env_file) and not global_scope
     authorizes = _authorizes_entry(platform, entry, user_id)
     if not authorizes:
@@ -407,15 +413,16 @@ def _env_sources(platform: str, user_id: str, home: Path, yaml_only_env: bool) -
         if not var:
             continue
         live_entries = _entries(_gate_env(var))
+        var_location = _env_location(var, str(authored.get(var) or "").strip(), bridged_env_var(var))
         if any(_is_wildcard(entry) for entry in live_entries):
             sources.append(GrantSource(
-                kind="wildcard", location=f"env {var}", chat_scope=scope, entry="*",
+                kind="wildcard", location=var_location, chat_scope=scope, entry="*",
                 removable=False, reason="wildcard: admits every sender; never removed by revoke",
                 authorizes_now=True, _path=(var,), _platform=platform, _user_id=user_id))
         for entry in live_entries:
             if _unresolved(platform, entry, user_id):
                 sources.append(GrantSource(
-                    kind="unresolved", location=f"env {var}", chat_scope=scope, entry=entry,
+                    kind="unresolved", location=var_location, chat_scope=scope, entry=entry,
                     removable=False, reason=_USERNAME_REASON, authorizes_now=None,
                     _path=(var,), _platform=platform, _user_id=user_id))
 
