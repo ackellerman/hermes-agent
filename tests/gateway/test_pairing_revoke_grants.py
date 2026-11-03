@@ -1387,6 +1387,54 @@ def test_failed_env_write_may_have_changed_target(home, monkeypatch, capsys):
     assert store.is_approved(PLATFORM, USER)
 
 
+@pytest.mark.xfail(strict=True, reason="effective revoke does not roll back a completed YAML write")
+def test_effective_env_failure_restores_completed_yaml(home, monkeypatch):
+    """A failed second write should not silently drop the first explicit grant."""
+    import hermes_cli.config as config
+
+    original = 'discord:\n  allow_from: ["1001", "1002"]\n'
+    _write_home(home, original, 'DISCORD_ALLOWED_USERS=1001,1002\n')
+    store = _store()
+    store._approve_user(PLATFORM, USER, "")
+    monkeypatch.setattr(config, "save_env_value", lambda *a, **kw: (_ for _ in ()).throw(OSError()))
+    assert _revoke_cli(store, effective=True) == 1
+    assert (home / "config.yaml").read_text() == original
+
+
+@pytest.mark.xfail(strict=True, reason="stale staged YAML overwrites concurrent edits to existing lists")
+def test_effective_preserves_concurrent_yaml_grant(home, monkeypatch):
+    """Inject an independent grant after staging, immediately before the real writer."""
+    import hermes_cli.config as config
+
+    _write_home(home, 'discord:\n  allow_from: ["1001", "1002"]\n')
+    real_write = config.atomic_config_write
+
+    def concurrent_write(path, data):
+        path.write_text('discord:\n  allow_from: ["1001", "1002", "1003"]\n')
+        return real_write(path, data)
+
+    monkeypatch.setattr(config, "atomic_config_write", concurrent_write)
+    _revoke_cli(_store(), effective=True)
+    assert '1003' in (home / "config.yaml").read_text()
+
+
+@pytest.mark.xfail(strict=True, reason="stale staged env value overwrites concurrent env updates")
+def test_effective_preserves_concurrent_env_grant(home, monkeypatch):
+    """A cooperating env writer can add a grant after revoke's unlocked read."""
+    import hermes_cli.config as config
+
+    _write_home(home, '', 'DISCORD_ALLOWED_USERS=1001,1002\n')
+    real_save = config.save_env_value
+
+    def concurrent_save(key, value):
+        real_save(key, '1001,1002,1003')
+        return real_save(key, value)
+
+    monkeypatch.setattr(config, "save_env_value", concurrent_save)
+    _revoke_cli(_store(), effective=True)
+    assert '1003' in (home / ".env").read_text()
+
+
 def test_group_mapping_key_is_redacted_from_reports(home, capsys):
     from gateway.access_grants import describe
     secret = "secret-group-key-123456"
