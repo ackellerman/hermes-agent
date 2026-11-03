@@ -148,6 +148,20 @@ def profile_scoped() -> bool:
 # (apply_yaml_config_fn, #25443)
 # ---------------------------------------------------------------------------
 
+# Names of env vars THIS process's YAML→env bridge wrote itself. Recorded on the write path only,
+# because the skip paths (explicit env already set, profile-scoped skip) mean the value belongs to
+# someone else. A revoke must not write a ``.env`` mirror for one of these: env beats YAML
+# first-writer-wins, so the mirror would shadow the operator's ``config.yaml`` and outlive the revoke.
+# The record is process-scoped because ``os.environ`` is: a fresh process re-derives the same names
+# from the YAML layer, and the CLI (where ``hermes pairing revoke`` runs) never runs the bridge at all.
+_BRIDGED_ENV_NAMES: set[str] = set()
+
+
+def bridged_env_var(name: str) -> bool:
+    """True when ``os.environ[name]`` is this process's own YAML→env bridge write (not authored)."""
+    return name in _BRIDGED_ENV_NAMES
+
+
 def yaml_env_setter() -> Callable[[str, Any], None]:
     """``set_env(name, value)`` for ``apply_yaml_config_fn`` hooks: writes ``os.environ[name]`` only
     when the var is unset (explicit env wins over YAML) and NEVER while a multiplexed secondary
@@ -163,6 +177,7 @@ def yaml_env_setter() -> Callable[[str, Any], None]:
         if value is None or skip or os.getenv(name):
             return
         os.environ[name] = ",".join(str(v) for v in value) if isinstance(value, list) else str(value)
+        _BRIDGED_ENV_NAMES.add(name)
 
     return set_env
 
