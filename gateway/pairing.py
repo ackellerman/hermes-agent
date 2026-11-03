@@ -231,7 +231,7 @@ def _sync_live_adapter_allowlist_remove(platform: str, user_id: str) -> None:
                         extra[key] = _purge_allowlist_entries(extra.get(key), platform_name, user_id)
 
 
-def _sync_allowlist_remove(platform: str, user_id: str, *, purge_live: Optional[bool] = None) -> bool:
+def _sync_allowlist_remove(platform: str, user_id: str) -> bool:
     """Remove ``user_id`` (and WhatsApp alias equivalents) from the allowlist MIRROR.
 
     Approve mirrors a normalized phone while revoke is often given a JID/device
@@ -244,9 +244,9 @@ def _sync_allowlist_remove(platform: str, user_id: str, *, purge_live: Optional[
       would outrank the operator's ``config.yaml`` (env beats YAML, first-writer-wins) and
       outlive the revoke, silently narrowing a grant the command never touched. The grant then
       still authorizes, and the caller reports it instead of claiming success.
-    * the in-process adapter purge runs only when a removal actually changed an authorizing
-      source (``purge_live``), so a plain revoke of a config-only grant cannot fake a denial
-      that the next restart reverses.
+    * the in-process adapter purge runs only when this call actually changed an authorizing
+      source, so a plain revoke of a config-only grant cannot fake a denial that the next
+      restart reverses.
 
     Returns True when this process removed the principal from the env mirror.
     """
@@ -264,7 +264,7 @@ def _sync_allowlist_remove(platform: str, user_id: str, *, purge_live: Optional[
             else:
                 _write_allowlist_env(env_var, remaining)
                 changed = True
-    if purge_live if purge_live is not None else changed:
+    if changed:
         _sync_live_adapter_allowlist_remove(platform, user_id)
     return changed
 

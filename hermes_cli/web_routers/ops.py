@@ -123,17 +123,14 @@ async def revoke_pairing(body: PairingRevoke):
     allow list keeps the user authorized. A 200 answers a well-formed request even when there
     was no pairing record: the surviving-grant report is the point, not the 404.
     """
-    from gateway.access_grants import AccessGrantError, describe, find_user_grants
+    from gateway.access_grants import describe, find_user_grants
 
     store = _pairing_store(body.profile)
     platform = (body.platform or "").lower().strip()
     if not platform or not body.user_id:
         raise HTTPException(status_code=400, detail="platform and user_id are required")
     revoked = store.revoke(platform, body.user_id)
-    try:
-        sources = find_user_grants(platform, body.user_id, store=store)
-    except AccessGrantError as exc:  # defensive: the scan itself does not write
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    sources = find_user_grants(platform, body.user_id, store=store)
     removed = [] if not revoked else [{
         "kind": "pairing", "location": "pairing store", "chat_scope": "global",
         "entry": str(body.user_id), "removable": True, "reason": "", "authorizes_now": True,
