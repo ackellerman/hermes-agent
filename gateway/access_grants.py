@@ -30,7 +30,19 @@ process env is only trusted where it is *authored*:
 and authorizes in none) or ``None`` (cannot be decided offline — a role list, a username entry, an
 entry that some alias *might* match, an unreadable config, a value declared but not consulted in
 this process). Callers must never print an unqualified success while a source is ``True`` or
-``None``. Chat scope is part of the verdict: a group list never claims a DM grant (F4).
+``None``.
+
+**Coverage is structural, not a list of known keys** (round 3): after the modelled sources are
+built, :func:`_name_scan_sources` walks every authored string in ``config.yaml`` (all keys, nested,
+plugin sections included) and every value in the profile ``.env``. Any value that names the
+principal at a path no modelled source already covers becomes an ``unresolved`` row. So a surface
+added tomorrow cannot silently produce exit 0: either it is modelled (and its row carries a verdict)
+or the net reports it. Alongside the net, grants that name a *chat* rather than a person
+(``group_allowed_chats``, ``TELEGRAM_GROUP_ALLOWED_CHATS``, ``QQ_GROUP_ALLOWED_USERS``,
+``allowed_chats``, an own-policy adapter's ``group_allow_from``) get a non-removable
+``chat_grant`` row: they admit every member of that chat and no pairing revoke can remove a person
+from a chat. Per-group *sender* lists (``groups.<chat>.allow_from`` / ``allowFrom``) are modelled
+as removable group-scoped rows.
 
 Reads are side-effect free: the YAML view is a throwaway ``platforms_data`` filled by the loader's
 own ``bridge_platform_shared_keys``, so no process env is written and no plugin hook runs. Writes
@@ -42,12 +54,18 @@ raises ``AccessGrantError`` before the first byte changes.
 from __future__ import annotations
 
 import contextlib
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 DM = "dm"
-GROUP = "group"
+# Group SENDER lists are consulted for group and forum traffic only — authz reads them under
+# ``is_group_or_forum`` — so the label must not claim channel traffic it does not cover (round-3 nit).
+GROUP = "group+forum"
+# Group CHAT allowlists admit every member of an allowlisted chat, channel broadcasts included
+# (``_chat_scoped_grant`` tests ``is_group``).
+CHAT = "group/channel"
 GLOBAL = "global"
 
 # Discord allow_from is one sender list covering DMs and guild channels (upstream PR #103743 keeps
@@ -69,6 +87,22 @@ _ALLOW_KEYS: tuple[tuple[str, Optional[str]], ...] = (
     ("allow_admin_from", None),
     ("group_allow_admin_from", GROUP),
 )
+
+# Chat allowlists (``allowed_chats`` is Telegram's DM/guest chat list): they name a CHAT, so they
+# admit every member of it. Reported, never removed — see the module docstring.
+_CHAT_ALLOW_KEYS: tuple[str, ...] = ("group_allowed_chats", "allowed_chats")
+
+# Per-chat sender lists (WeCom documents ``groups: {<chat>: {allow_from: [...]}}``).
+_PER_GROUP_KEYS: tuple[str, ...] = ("allow_from", "allowFrom")
+
+# Own-policy hosts (``OwnAccessPolicyMixin``'s host list): for these ``extra.group_allow_from`` is
+# read by ``OwnAccessPolicyMixin._is_group_allowed`` as a group CHAT allowlist, not a sender list.
+_OWN_POLICY_PLATFORMS = frozenset({"wecom", "weixin", "qqbot", "whatsapp", "whatsapp_cloud", "yuanbao"})
+
+# Audited platforms where ``extra.group_allow_from`` is a group SENDER list (authz gates them via
+# ``_adapter_extra_allowlist_authorizes``). Anything else is undecidable offline and reported
+# ``unresolved`` — the fail-closed direction.
+_SENDER_GROUP_ALLOW_FROM = frozenset({"discord", "telegram", "slack"})
 
 # Every place a platform block may live; the loader merges all three (``merge_platform_sections``
 # / ``platform_section`` in ``gateway/config_loader.py``).
@@ -95,6 +129,24 @@ _UNRESOLVED_ENV = ("cannot be evaluated offline: this platform's allowlist env v
                    "in this process (no registry entry, no known name), so a gateway may consult one "
                    "that names this user")
 _AUTHORITY_REASON = "command-authority list, not access: reported, never removed, never counted"
+# The structural net: a value naming the user that no modelled source covers.
+_UNMODELLED_REASON = ("this value names the user and this command does not model what reads it")
+_CHAT_GRANT_REASON = (
+    "chat allowlist: every sender in chat {chat} is admitted; a pairing revoke removes a person, "
+    "not a chat")
+_CHAT_GRANT_EXTRA = {
+    "allowed_chats": " (also a DM/guest chat list on Telegram)",
+}
+_OWN_GROUP_CHAT_REASON = (
+    "this adapter enforces its own access policy, so `group_allow_from` is a group CHAT allowlist: "
+    "chat {chat} admits every member; a pairing revoke cannot remove a person from a chat")
+_UNKNOWN_GROUP_SCOPE_REASON = (
+    "cannot be decided offline: `group_allow_from` is a group sender list for most adapters but a "
+    "group CHAT allowlist for own-policy adapters (WeCom, Weixin, QQBot, WhatsApp, Yuanbao), and "
+    "this platform is neither — either reading admits this entry")
+_PER_GROUP_REASON = (
+    "per-group sender list for chat {chat}: it names this user, but whether it reaches authz "
+    "depends on the platform env-allowlist shape and the loader's merge — cannot be decided offline")
 
 
 class AccessGrantError(RuntimeError):
@@ -110,9 +162,10 @@ class GrantSource:
     :func:`remove_user_grants`, never part of the reported surface (:func:`describe`).
     """
 
-    kind: str            # "pairing" | "env" | "yaml" | "wildcard" | "allow_all" | "role" | "unresolved"
+    kind: str            # "pairing" | "env" | "yaml" | "wildcard" | "allow_all" | "role"
+                         # | "unresolved" | "chat_grant"
     location: str        # "config.yaml platforms.discord.allow_from", ".env DISCORD_ALLOWED_USERS", ...
-    chat_scope: str      # "dm" | "group" | "global" | "global(dm+channel)"
+    chat_scope: str      # "dm" | "group+forum" | "group/channel" | "global" | "global(dm+channel)"
     entry: str           # matched entry, e.g. "1002" or "*"
     removable: bool
     reason: str = ""
@@ -228,18 +281,45 @@ def _mention_matches(entry: Any, user_id: str) -> bool:
     return mention is not None and mention == str(user_id)
 
 
+_HEX64 = re.compile(r"[0-9a-fA-F]{64}\Z")
+
+
+def _shape_class(entry: Any) -> str:
+    """The *form* of an allowlist entry: comparable shapes must agree to be judged offline.
+
+    ``<@1002>`` is a numeric id in a mention wrapper, and ``+1555…`` is a phone number, so both
+    classify as ``numeric`` — otherwise a mention or a WhatsApp phone spelling of a DIFFERENT
+    principal would read as "cannot be evaluated" and add exit-3 noise to decidable configs.
+    """
+    text = str(entry or "").strip()
+    if not text:
+        return ""
+    if _is_wildcard(text):
+        return "wildcard"
+    if _mention_id(text) is not None or text.lstrip("+").isdigit():
+        return "numeric"
+    if "@" in text:
+        return "email"
+    if text.lower().startswith("npub1"):
+        return "npub"
+    if _HEX64.match(text):
+        return "hex64"
+    return "opaque"
+
+
 def _unresolved(platform: str, entry: Any, user_id: str) -> bool:
-    """An entry whose shape cannot be compared to this principal offline.
+    """An entry whose *shape* cannot be compared to this principal offline.
 
     Discord resolves username entries through the API at connect time; any plugin platform may
     normalise its own entry forms. So an entry that neither the predicate nor the mention rule could
-    decide, and whose shape differs from the principal's, is reported as cannot-be-evaluated on
-    EVERY platform (F2) — exit 3, never a silent 0.
+    decide, and whose form differs from the principal's, is reported as cannot-be-evaluated on
+    EVERY platform — exit 3, never a silent 0. The rule is shape-based, not ``isdigit()``-gated, so
+    a non-numeric platform (Signal contact ids, Buzz hex, SimpleX, email) gets the same net (F5).
     """
-    text = str(entry or "").strip()
-    if not text or not str(user_id).isdigit():
-        return False
-    return not (text.isdigit() or _is_wildcard(text) or _mention_id(text) is not None)
+    entry_shape, user_shape = _shape_class(entry), _shape_class(user_id)
+    if entry_shape == "wildcard":
+        return False  # already reported as its own wildcard row
+    return bool(entry_shape) and bool(user_shape) and entry_shape != user_shape
 
 
 def _platform_allow_env_resolution(platform: str) -> tuple[str, bool]:
@@ -336,6 +416,33 @@ def _consulted_or_authored(home: Path, var: str) -> bool:
 
 def _scope_for(platform: str) -> str:
     return _DISCORD_GLOBAL_SCOPE if platform in _DISCORD_PLATFORMS else GLOBAL
+
+
+def _group_allow_from_reading(platform: str) -> str:
+    """What ``extra.group_allow_from`` means here: ``sender`` | ``chat`` | ``unknown``.
+
+    authz reads the same key twice: as a group SENDER list (``_adapter_extra_allowlist_authorizes``)
+    for ordinary adapters, and as a group CHAT allowlist (``OwnAccessPolicyMixin._is_group_allowed``
+    through ``_own_policy_authorizes``) for the hosts that gate access themselves. The CLI never
+    loads adapters, so the platform decides: an own-policy host is a chat list, an audited sender
+    host is a sender list, and anything else is undecidable — fail closed.
+    """
+    if platform in _OWN_POLICY_PLATFORMS:
+        return "chat"
+    if platform in _SENDER_GROUP_ALLOW_FROM:
+        return "sender"
+    return "unknown"
+
+
+def _chat_grant(
+    platform: str, user_id: str, location: str, path: tuple[str, ...], chat: str, key: str,
+    *, reason: str = "",
+) -> GrantSource:
+    """A grant that names a CHAT: every member is admitted, and no revoke can remove one person."""
+    return GrantSource(
+        kind="chat_grant", location=location, chat_scope=CHAT, entry=str(chat), removable=False,
+        reason=reason or _CHAT_GRANT_REASON.format(chat=chat) + _CHAT_GRANT_EXTRA.get(key, ""),
+        authorizes_now=None, _path=path, _platform=platform, _user_id=user_id)
 
 
 # --------------------------------------------------------------------------- home / config
@@ -442,6 +549,10 @@ def find_user_grants(
             authorizes_now=None, _platform=platform, _user_id=user_id))
         return sources
     sources.extend(_yaml_sources(platform, user_id, config, yaml_only_env, env_known))
+    # The structural net: whatever the modelled sources did not account for, the authored values
+    # themselves are walked. This is what makes exit 0 a promise about the FILE, not about the set
+    # of keys this module happens to know today.
+    sources.extend(_name_scan_sources(platform, user_id, config, resolved_home, sources))
     return sources
 
 
@@ -522,6 +633,16 @@ def _env_sources(
                     removable=not global_scope, reason=reason,
                     authorizes_now=None, _path=(var,), _platform=platform, _user_id=user_id))
 
+    # Grants that name a CHAT: an allowlisted chat admits every sender in it, which no pairing
+    # revoke can undo for one person (F2). Reported, never removed.
+    group_chat = _group_envs(platform)[1]
+    if group_chat:
+        from_env_file = str(authored.get(group_chat) or "").strip()
+        location = _env_location(group_chat, from_env_file, bridged_env_var(group_chat))
+        chats = sorted(set(_entries(_gate_env(group_chat))) | set(_entries(from_env_file)))
+        sources.extend(
+            _chat_grant(platform, user_id, location, (group_chat,), chat, group_chat)
+            for chat in chats)
 
     # Wildcards and username-shaped entries apply to the platform's own sender lists; the global list
     # is cross-platform and resolved per adapter, so it is reported above but not classified here.
@@ -535,7 +656,10 @@ def _env_sources(
                 kind="wildcard", location=var_location, chat_scope=scope, entry="*",
                 removable=False, reason="wildcard: admits every sender; never removed by revoke",
                 authorizes_now=True, _path=(var,), _platform=platform, _user_id=user_id))
-        for entry in live_entries:
+        # Authored entries count here too: an entry the profile declares but this process does not
+        # consult is still a shape a restart will read (F5 — a foreign-shaped entry must not vanish
+        # just because it is not in this process's env).
+        for entry in sorted(set(live_entries) | set(_entries(str(authored.get(var) or "")))):
             if _unresolved(platform, entry, user_id):
                 sources.append(GrantSource(
                     kind="unresolved", location=var_location, chat_scope=scope, entry=entry,
@@ -631,6 +755,24 @@ def _yaml_container_sources(
         # A group list speaks for GROUP traffic only; every other list covers the platform's own
         # scope (F4). ``chat_scope`` is on the row, so a group grant never reads as a DM grant.
         scope_value = scope or _scope_for(platform)
+        if key == "group_allow_from":
+            reading = _group_allow_from_reading(platform)
+            if reading == "chat":
+                # For own-policy hosts the same key is a CHAT list: each entry admits every member
+                # of that chat, so it is reported as a chat grant, never as a sender list.
+                out.extend(
+                    _chat_grant(platform, user_id, location, path, entry, key,
+                                reason=_OWN_GROUP_CHAT_REASON.format(chat=entry))
+                    for entry in entries)
+                continue
+            if reading == "unknown":
+                out.extend(
+                    GrantSource(
+                        kind="unresolved", location=location, chat_scope=CHAT, entry=entry,
+                        removable=False, reason=_UNKNOWN_GROUP_SCOPE_REASON, authorizes_now=None,
+                        _path=path, _platform=platform, _user_id=user_id)
+                    for entry in entries)
+                continue
         for entry in entries:
             if not _names_principal(platform, entry, user_id):
                 continue
@@ -691,7 +833,177 @@ def _yaml_container_sources(
             entry=",".join(_entries(roles)), removable=False,
             reason="role grant cannot be evaluated per user offline; a matching role admits this user",
             authorizes_now=None, _path=path, _platform=platform, _user_id=user_id))
+
+    out.extend(_chat_allow_sources(platform, user_id, container, container_path))
+    out.extend(_per_group_sender_sources(
+        platform, user_id, container, container_path, effective,
+        yaml_only_env=yaml_only_env, loader_known=loader_known))
     return out
+
+
+def _chat_allow_sources(
+    platform: str, user_id: str, container: dict, container_path: tuple[str, ...],
+) -> list[GrantSource]:
+    """``group_allowed_chats`` / ``allowed_chats``: a chat id admits every member of that chat."""
+    out: list[GrantSource] = []
+    for key in _CHAT_ALLOW_KEYS:
+        if key not in container:
+            continue
+        path = (*container_path, key)
+        location = "config.yaml " + ".".join(path)
+        out.extend(_chat_grant(platform, user_id, location, path, chat, key)
+                   for chat in _entries(container.get(key)))
+    return out
+
+
+def _per_group_sender_sources(
+    platform: str, user_id: str, container: dict, container_path: tuple[str, ...], effective: dict,
+    *, yaml_only_env: bool, loader_known: bool,
+) -> list[GrantSource]:
+    """``groups.<chat>.allow_from`` / ``allowFrom``: a per-chat SENDER list (WeCom, any platform).
+
+    One row per chat, group-scoped and REMOVABLE: ``--effective`` drops this principal from that
+    chat's list and leaves the operator's other entries and file comments intact. A list that does
+    not name the principal yields no row — the structural name scan is what covers an unmodelled
+    value.
+    """
+    groups = container.get("groups")
+    if not isinstance(groups, dict):
+        return []
+    # ``_adapter_group_has_sender_allowlist`` reads ``config.extra["groups"]``, so only the extra
+    # block is consulted; a block-level ``groups`` is authored but reaches nothing (None, not False).
+    extra_container = bool(container_path) and container_path[-1] == "extra"
+    out: list[GrantSource] = []
+    for chat, group_cfg in groups.items():
+        if not isinstance(group_cfg, dict):
+            continue
+        for key in _PER_GROUP_KEYS:
+            if key not in group_cfg:
+                continue
+            path = (*container_path, "groups", str(chat), key)
+            location = "config.yaml " + ".".join(path)
+            suffix = path[len(container_path):]
+            effective_entries = (
+                {str(entry).strip() for entry in _entries(_value_at(effective, suffix))}
+                if extra_container else set())
+            for entry in _entries(group_cfg.get(key)):
+                if not _names_principal(platform, entry, user_id):
+                    continue
+                authorizes = _yaml_authorizes(
+                    in_effective=str(entry).strip() in effective_entries,
+                    yaml_only_env=yaml_only_env, loader_known=loader_known)
+                out.append(GrantSource(
+                    kind="yaml", location=location, chat_scope=GROUP, entry=entry, removable=True,
+                    reason="" if authorizes else _PER_GROUP_REASON.format(chat=chat),
+                    authorizes_now=authorizes, _path=path, _platform=platform, _user_id=user_id))
+    return out
+
+
+# --------------------------------------------------------------------------- the structural net
+
+
+def _iter_authored_strings(
+    node: Any, path: tuple[str, ...] = (),
+) -> Iterable[tuple[tuple[str, ...], str]]:
+    """Every authored string in a config mapping, with the dotted path that holds it.
+
+    A list yields its members at the LIST's path — an allowlist is one grant at one location, which
+    is also how the modelled sources address it. A mapping nested inside a list is walked with its
+    index, so a plugin section that happens to be a list still reports a usable location.
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            sub = (*path, str(key))
+            if isinstance(value, str):
+                yield sub, value
+            elif isinstance(value, (dict, list, tuple)):
+                yield from _iter_authored_strings(value, sub)
+    elif isinstance(node, (list, tuple)):
+        for index, item in enumerate(node):
+            if isinstance(item, str):
+                yield path, item
+            elif isinstance(item, (dict, list, tuple)):
+                yield from _iter_authored_strings(item, (*path, str(index)))
+
+
+def _accounted_for(path: tuple[str, ...], modelled: Iterable[tuple[str, ...]]) -> bool:
+    """Whether a modelled source already covers this authored path (its path is a prefix)."""
+    return any(
+        bool(model) and len(model) <= len(path) and path[:len(model)] == model for model in modelled)
+
+
+def _env_var_owner(var: str) -> str:
+    """The platform a known per-platform allowlist env var belongs to (``""`` when unknown).
+
+    Only used to WORD a name-scan row: a value in another platform's env var still names the
+    principal (so it is still reported), but the operator should be told which command removes it.
+    """
+    if not var:
+        return ""
+    from gateway.authz_mixin import _GROUP_CHAT_ENV, _GROUP_USER_ENV
+    from gateway.pairing import _PLATFORM_ALLOWLIST_ENV
+
+    owners: dict[str, str] = {}
+    for plat, name in _PLATFORM_ALLOWLIST_ENV.items():
+        if not name:
+            continue
+        owners[name] = plat
+        if name.endswith("_ALLOWED_USERS"):
+            stem = name[: -len("_ALLOWED_USERS")]
+            owners[f"{stem}_ALLOW_ALL_USERS"] = plat
+            owners[f"{stem}_ALLOWED_ROLES"] = plat
+    for mapping in (_GROUP_USER_ENV, _GROUP_CHAT_ENV):
+        for plat, name in mapping.items():
+            if name:
+                owners[name] = getattr(plat, "value", str(plat))
+    return owners.get(var, "")
+
+
+def _name_scan_sources(
+    platform: str, user_id: str, config: dict, home: Path, sources: Iterable[GrantSource],
+) -> list[GrantSource]:
+    """The net: every authored value that names the principal, at a path nothing models.
+
+    This is the round-3 inversion. Enumerating surfaces is a losing game — each new key (a plugin
+    section, a channel override, a per-group list) reopens the same false exit 0 — so the promise is
+    turned around: ``exit 0`` now means no authored value in ``config.yaml`` or the profile ``.env``
+    names this principal unless a modelled row already reported it. One pass, deterministic order,
+    text only (``config.yaml`` and ``.env`` are text; nothing is executed or imported).
+    """
+    modelled = [source._path for source in sources if source._path]
+    rows: list[GrantSource] = []
+
+    def named(entry: Any) -> bool:
+        return _is_wildcard(entry) or _names_principal(platform, entry, user_id)
+
+    for path, value in _iter_authored_strings(config):
+        if not named(value) or _accounted_for(path, modelled):
+            continue
+        rows.append(GrantSource(
+            kind="unresolved", location="config.yaml " + ".".join(path), chat_scope=GLOBAL,
+            entry=str(value).strip(), removable=False, reason=_UNMODELLED_REASON,
+            authorizes_now=None, _platform=platform, _user_id=user_id))
+
+    from agent.secret_scope import load_env_file
+
+    for var, raw in load_env_file(home / ".env").items():
+        if _accounted_for((var,), modelled):
+            continue
+        owner = _env_var_owner(var)
+        reason = _UNMODELLED_REASON
+        if owner and owner != platform:
+            reason = (f"this value names the user in {owner}'s env var and this command does not "
+                      f"model what reads it; `pairing revoke {owner} …` reports and removes it")
+        for entry in _entries(raw):
+            if not named(entry):
+                continue
+            rows.append(GrantSource(
+                kind="unresolved", location=f".env {var}", chat_scope=GLOBAL, entry=entry,
+                removable=False, reason=reason, authorizes_now=None,
+                _platform=platform, _user_id=user_id))
+
+    rows.sort(key=lambda row: (row.location, row.entry))
+    return rows
 
 
 # --------------------------------------------------------------------------- removal

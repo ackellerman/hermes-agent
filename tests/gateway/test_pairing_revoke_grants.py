@@ -36,7 +36,10 @@ from gateway.session import SessionSource
 PLATFORM = "discord"
 USER = "1002"
 KEPT = "1001"
-GROUP = "group"  # chat_scope label of a group-scoped grant row
+# Group SENDER lists are consulted for group/forum traffic only (authz reads them under
+# ``is_group_or_forum``); group CHAT allowlists admit every member, channel traffic included.
+GROUP = "group+forum"
+CHAT = "group/channel"
 
 _LEAKY_ENV = (
     "DISCORD_ALLOWED_USERS",
@@ -235,7 +238,7 @@ def _assert_report_agrees_per_context(sources, *, dm: bool, group: bool) -> None
     """
     authorizing = [s for s in sources if s.authorizes_now is True]
     for source in authorizing:
-        if source.chat_scope == GROUP:
+        if source.chat_scope.startswith("group"):
             assert group is True, f"{source.location} claims a group grant; group verdict denied"
         else:
             assert dm is True, f"{source.location} claims a dm/platform grant; dm verdict denied"
@@ -458,7 +461,7 @@ def test_group_allow_from_is_reported_with_group_scope(home):
             'discord:\n  enabled: true\n  group_allow_from: ["1002"]\n', encoding="utf-8")
         store = _store()
         grants = _find(store=store)
-        group = [s for s in grants if s.chat_scope == "group"]
+        group = [s for s in grants if s.chat_scope == GROUP]
         assert [s.location for s in group] == ["config.yaml discord.group_allow_from"]
         assert group[0].authorizes_now is True
         assert not [s for s in grants if s.kind == "yaml" and s.chat_scope.startswith("global")]
@@ -928,3 +931,225 @@ def test_platform_list_and_group_list_are_judged_in_their_own_context(home):
         assert [s.entry for s in platform_rows] == [USER]
         assert platform_rows[0].authorizes_now is True
         _assert_report_agrees_per_context(grants, dm=dm, group=group)
+
+
+# ---------------------------------------------------------------------------
+# Round 3 — structural coverage: the recursive name scan, chat grants, per-group
+# sender lists. These are the shapes that used to exit 0 while the gateway said "yes".
+# ---------------------------------------------------------------------------
+
+_WECOM_CHAT = "wrABC123"
+_WECOM_GROUP_CONFIG = (
+    "platforms:\n"
+    "  wecom:\n"
+    "    extra:\n"
+    "      # operator note\n"
+    "      groups:\n"
+    f"        {_WECOM_CHAT}:\n"
+    f"          allow_from: [\"{KEPT}\", \"{USER}\"]\n"
+    "      other_setting: true\n"
+)
+
+
+def test_wecom_per_group_sender_list_is_reported_and_removable(home, capsys):
+    """F1 (round 3): ``extra.groups.<chat>.allow_from`` names the user — report it, remove it.
+
+    Before this round the key was not in any modelled list, so ``revoke`` exited 0 with
+    "No other configured source names user" while ``_adapter_group_has_sender_allowlist`` handed the
+    gateway a True verdict for that chat, and ``--effective`` reported a success having written
+    nothing.
+    """
+    _write_home(home, _WECOM_GROUP_CONFIG)
+    store = _store()
+    grants = _find(store=store, platform="wecom")
+    located = [s for s in grants
+               if s.location == f"config.yaml platforms.wecom.extra.groups.{_WECOM_CHAT}.allow_from"]
+    assert [s.entry for s in located] == [USER]
+    assert located[0].kind == "yaml"
+    assert located[0].chat_scope == GROUP  # a sender list: group/forum, never channel
+    assert located[0].removable is True and located[0].authorizes_now is True
+
+    assert _revoke_cli(store, platform="wecom") == 3
+    out = capsys.readouterr().out
+    assert f"platforms.wecom.extra.groups.{_WECOM_CHAT}.allow_from" in out
+    assert "No other configured source names" not in out
+    assert USER in (home / "config.yaml").read_text(encoding="utf-8")
+
+    # --effective drops only this principal from that chat's list.
+    assert _revoke_cli(store, platform="wecom", effective=True) == 0
+    out = capsys.readouterr().out
+    assert f"Removed config.yaml platforms.wecom.extra.groups.{_WECOM_CHAT}.allow_from" in out
+    assert "No other configured source names" in out
+    text = (home / "config.yaml").read_text(encoding="utf-8")
+    assert USER not in text and KEPT in text
+    assert "# operator note" in text and "other_setting: true" in text, (
+        "comments and unrelated keys survive the rewrite")
+
+
+def test_wecom_group_allow_from_is_a_chat_grant_not_a_sender_list(home, capsys):
+    """F3 (round 3): on an own-policy host ``group_allow_from`` is a CHAT list — non-removable.
+
+    ``_own_policy_authorizes`` matches that list against the chat id, so it admits every member of
+    the chat; reporting it as a sender list (the pre-round model) let a numeric chat id drop out of
+    the report entirely.
+    """
+    _write_home(home, "platforms:\n  wecom:\n    extra:\n      group_allow_from: [\"1234567890\"]\n")
+    store = _store()
+    grants = _find(store=store, platform="wecom")
+    chat_rows = [s for s in grants if s.kind == "chat_grant"]
+    assert [s.location for s in chat_rows] == ["config.yaml platforms.wecom.extra.group_allow_from"]
+    assert [s.entry for s in chat_rows] == ["1234567890"]
+    assert chat_rows[0].chat_scope == CHAT
+    assert chat_rows[0].removable is False and chat_rows[0].authorizes_now is None
+    assert "1234567890" in chat_rows[0].reason
+
+    assert _revoke_cli(store, platform="wecom") == 3
+    assert "No other configured source names" not in capsys.readouterr().out
+    # A chat grant is not removable: --effective must not claim a removal it did not make.
+    assert _revoke_cli(store, platform="wecom", effective=True) == 3
+    out = capsys.readouterr().out
+    assert "Removed" not in out
+    assert "1234567890" in (home / "config.yaml").read_text(encoding="utf-8")
+
+
+def test_telegram_group_allowed_chats_is_a_chat_grant(home, capsys):
+    """F2 (round 3): ``TELEGRAM_GROUP_ALLOWED_CHATS`` admits every sender in the chat → rc 3."""
+    _write_home(home, "", "TELEGRAM_GROUP_ALLOWED_CHATS=-1001234567890\n")
+    store = _store()
+    grants = _find(store=store, platform="telegram")
+    chat_rows = [s for s in grants if s.kind == "chat_grant"]
+    assert [s.location for s in chat_rows] == [".env TELEGRAM_GROUP_ALLOWED_CHATS"]
+    assert chat_rows[0].entry == "-1001234567890" and chat_rows[0].removable is False
+    assert chat_rows[0].authorizes_now is None and chat_rows[0].chat_scope == CHAT
+    assert "-1001234567890" in chat_rows[0].reason
+
+    assert _revoke_cli(store, platform="telegram") == 3
+    out = capsys.readouterr().out
+    assert "Still named by .env TELEGRAM_GROUP_ALLOWED_CHATS" in out
+    assert "No other configured source names" not in out
+
+    assert _revoke_cli(store, platform="telegram", effective=True) == 3
+    assert "TELEGRAM_GROUP_ALLOWED_CHATS=-1001234567890" in (home / ".env").read_text(encoding="utf-8")
+
+
+def test_yaml_group_allowed_chats_and_allowed_chats_are_chat_grants(home):
+    """Both YAML chat allowlists are reported, in every block the loader merges."""
+    with _secondary_profile(home) as secondary:
+        (secondary / "config.yaml").write_text(
+            "platforms:\n  telegram:\n    extra:\n      group_allowed_chats: [-100555]\n"
+            "      allowed_chats: [-100999]\n",
+            encoding="utf-8")
+        grants = _find(store=_store(), platform="telegram")
+        chat_rows = [s for s in grants if s.kind == "chat_grant"]
+        assert [s.location for s in chat_rows] == [
+            "config.yaml platforms.telegram.extra.group_allowed_chats",
+            "config.yaml platforms.telegram.extra.allowed_chats",
+        ]
+        assert [s.entry for s in chat_rows] == ["-100555", "-100999"]
+        assert all(s.removable is False and s.authorizes_now is None for s in chat_rows)
+
+
+def test_unmodelled_config_key_naming_the_user_is_a_name_scan_hit(home, capsys):
+    """The structural net: a plugin key nobody modelled still cannot exit 0."""
+    _write_home(home,
+                "platforms:\n  discord:\n    extra:\n      owner_ids:\n        - \"1001\"\n"
+                "        - \"1002\"\n")
+    store = _store()
+    grants = _find(store=store)
+    scan = [s for s in grants if s.kind == "unresolved"]
+    assert [(s.location, s.entry) for s in scan] == [
+        ("config.yaml platforms.discord.extra.owner_ids", USER)]
+    assert scan[0].authorizes_now is None and scan[0].removable is False
+    assert "does not model what reads it" in scan[0].reason
+
+    assert _revoke_cli(store) == 3
+    out = capsys.readouterr().out
+    assert "config.yaml platforms.discord.extra.owner_ids" in out
+    assert "No other configured source names" not in out
+    # Nothing removable: --effective must not invent a success either.
+    assert _revoke_cli(store, effective=True) == 3
+    assert "Removed" not in capsys.readouterr().out
+
+
+def test_unmodelled_env_var_naming_the_user_is_a_name_scan_hit(home, capsys):
+    """The net covers the profile ``.env`` too, not only ``config.yaml``."""
+    _write_home(home, "", "SOME_PLUGIN_OPERATORS=1001,1002\n")
+    grants = _find(store=_store())
+    scan = [s for s in grants if s.kind == "unresolved"]
+    assert [(s.location, s.entry) for s in scan] == [(".env SOME_PLUGIN_OPERATORS", USER)]
+    assert _revoke_cli(_store()) == 3
+
+
+def test_name_scan_ignores_a_value_naming_a_different_principal(home, capsys):
+    """The control: no unresolved row, no exit-3 noise, when the value names somebody else."""
+    _write_home(home,
+                "platforms:\n  discord:\n    extra:\n      owner_ids: [\"1001\"]\n",
+                "SOME_PLUGIN_OPERATORS=1001\n")
+    store = _store()
+    assert _find(store=store) == []
+
+    assert _revoke_cli(store) == 0
+    out = capsys.readouterr().out
+    assert "No other configured source names" in out and "cannot be evaluated" not in out
+    assert _revoke_cli(store, effective=True) == 0
+
+
+def test_per_group_camelcase_spelling_is_modelled_and_removable(home):
+    """``groups.<chat>.allowFrom`` is the other documented spelling (WeCom reads both)."""
+    _write_home(home,
+                "platforms:\n  wecom:\n    extra:\n      groups:\n        g-2:\n"
+                f"          allowFrom: [\"{KEPT}\", \"{USER}\"]\n")
+    store = _store()
+    grants = _find(store=store, platform="wecom")
+    located = [s for s in grants
+               if s.location == "config.yaml platforms.wecom.extra.groups.g-2.allowFrom"]
+    assert [s.entry for s in located] == [USER]
+    assert located[0].removable is True and located[0].chat_scope == GROUP
+
+    assert _remove(grants, store=store)
+    text = (home / "config.yaml").read_text(encoding="utf-8")
+    assert USER not in text and KEPT in text
+
+
+def test_name_scan_names_the_owner_of_a_foreign_env_var(home):
+    """A value in another platform's env var is still reported, and the row says which command."""
+    _write_home(home, "", f"DISCORD_ALLOWED_USERS={USER}\n")
+    grants = _find(store=_store(), platform="telegram")
+    scan = [s for s in grants if s.kind == "unresolved"]
+    assert [s.location for s in scan] == [".env DISCORD_ALLOWED_USERS"]
+    assert "discord's env var" in scan[0].reason
+    assert "pairing revoke discord" in scan[0].reason
+
+
+def test_name_scan_is_quiet_on_a_home_that_never_names_the_user(home, capsys):
+    """No noise control: a realistic home with paths, tokens and other users stays exit 0."""
+    _write_home(
+        home,
+        "discord:\n"
+        "  enabled: true\n"
+        "  token: \"abc\"\n"
+        "  extra:\n"
+        "    require_mention: true\n"
+        "    allow_from: [\"1001\", \"1003\"]\n"
+        "  home_channel: {platform: discord, chat_id: \"555\"}\n",
+        "DISCORD_BOT_TOKEN=abc\nHERMES_HOME=/tmp/example\nTZ=UTC\n")
+    store = _store()
+    assert _find(store=store) == []
+    assert _revoke_cli(store) == 0
+    out = capsys.readouterr().out
+    assert "No other configured source names" in out and "cannot be evaluated" not in out
+
+
+def test_non_numeric_principal_gets_the_same_unresolved_net(home):
+    """Nit (round 3): ``_unresolved`` is shape-based, not ``isdigit()``-gated."""
+    _write_home(home, "", "SIGNAL_ALLOWED_USERS=+15550001111,+15550009999,some_user\n")
+    grants = _find(store=_store(), platform="signal", user="+15550001111")
+    unresolved = [s for s in grants
+                  if s.kind == "unresolved" and s.location == ".env SIGNAL_ALLOWED_USERS"]
+    assert [s.entry for s in unresolved] == ["some_user"]
+    assert unresolved[0].authorizes_now is None
+    # A sibling phone number is decidable: same shape, different principal — no row, no noise.
+    assert not [s for s in grants if s.entry == "+15550009999"]
+    own = [s for s in grants if s.entry == "+15550001111"]
+    assert own and own[0].kind == "env", "the principal's own entry is reported as an env grant"
+    assert own[0].authorizes_now is None, "declared in .env but not consulted here: a restart re-reads it"
