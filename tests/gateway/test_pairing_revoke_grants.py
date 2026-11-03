@@ -986,6 +986,26 @@ def test_wecom_per_group_sender_list_is_reported_and_removable(home, capsys):
         "comments and unrelated keys survive the rewrite")
 
 
+def test_wecom_sole_entry_removal_leaves_a_chat_grant_not_a_false_success(home, capsys):
+    """Removing the only entry empties the list, and an empty list admits EVERY sender in the chat.
+
+    WeCom's ``_is_group_allowed`` returns True when ``allow_from`` holds nothing, so ``--effective``
+    must not print "No other configured source names user" after leaving the chat wide open.
+    """
+    _write_home(home, "platforms:\n  wecom:\n    extra:\n      groups:\n"
+                      f"        wrABC123:\n          allow_from: [\"{USER}\"]\n")
+    store = _store()
+    assert _revoke_cli(store, platform="wecom") == 3
+
+    assert _revoke_cli(store, platform="wecom", effective=True) == 3
+    out = capsys.readouterr().out
+    assert "Removed config.yaml platforms.wecom.extra.groups.wrABC123.allow_from" in out
+    assert "No other configured source names" not in out
+    assert "no sender entries left" in out and "every sender in that chat is admitted" in out
+    text = (home / "config.yaml").read_text(encoding="utf-8")
+    assert USER not in text
+
+
 def test_wecom_group_allow_from_is_a_chat_grant_not_a_sender_list(home, capsys):
     """F3 (round 3): on an own-policy host ``group_allow_from`` is a CHAT list — non-removable.
 

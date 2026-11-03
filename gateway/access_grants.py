@@ -147,6 +147,10 @@ _UNKNOWN_GROUP_SCOPE_REASON = (
 _PER_GROUP_REASON = (
     "per-group sender list for chat {chat}: it names this user, but whether it reaches authz "
     "depends on the platform env-allowlist shape and the loader's merge — cannot be decided offline")
+_EMPTY_GROUP_REASON = (
+    "chat {chat} has no sender entries left in `groups` — the adapter treats an empty allow_from as "
+    "no restriction, so every sender in that chat is admitted; removing a person from an empty list "
+    "denies nobody")
 
 
 class AccessGrantError(RuntimeError):
@@ -863,9 +867,14 @@ def _per_group_sender_sources(
     """``groups.<chat>.allow_from`` / ``allowFrom``: a per-chat SENDER list (WeCom, any platform).
 
     One row per chat, group-scoped and REMOVABLE: ``--effective`` drops this principal from that
-    chat's list and leaves the operator's other entries and file comments intact. A list that does
-    not name the principal yields no row — the structural name scan is what covers an unmodelled
-    value.
+    chat's list and leaves the operator's other entries and file comments intact. A list that names
+    another sender yields no row — that list DENIES this principal, which is the direction we want.
+
+    An empty list is the opposite: ``_is_group_allowed`` treats ``allow_from`` as absent when it
+    holds no entries, so an empty (or keyless) group config admits every sender in that chat. That
+    is a chat grant, not a denial — and it is exactly the state ``--effective`` leaves behind when
+    the principal was the list's only entry, so it must be reported or the removal would read as a
+    success that the gateway contradicts.
     """
     groups = container.get("groups")
     if not isinstance(groups, dict):
@@ -873,20 +882,23 @@ def _per_group_sender_sources(
     # ``_adapter_group_has_sender_allowlist`` reads ``config.extra["groups"]``, so only the extra
     # block is consulted; a block-level ``groups`` is authored but reaches nothing (None, not False).
     extra_container = bool(container_path) and container_path[-1] == "extra"
+    # ``groups`` is an own-policy concept (WeCom); on an audited sender-list platform it is not
+    # consulted, so an empty config there is not a grant and must not add noise.
+    own_policy_like = _group_allow_from_reading(platform) != "sender"
     out: list[GrantSource] = []
     for chat, group_cfg in groups.items():
         if not isinstance(group_cfg, dict):
             continue
-        for key in _PER_GROUP_KEYS:
-            if key not in group_cfg:
-                continue
+        entries_by_key = {
+            key: _entries(group_cfg.get(key)) for key in _PER_GROUP_KEYS if key in group_cfg}
+        for key, entries in entries_by_key.items():
             path = (*container_path, "groups", str(chat), key)
             location = "config.yaml " + ".".join(path)
             suffix = path[len(container_path):]
             effective_entries = (
                 {str(entry).strip() for entry in _entries(_value_at(effective, suffix))}
                 if extra_container else set())
-            for entry in _entries(group_cfg.get(key)):
+            for entry in entries:
                 if not _names_principal(platform, entry, user_id):
                     continue
                 authorizes = _yaml_authorizes(
@@ -896,6 +908,11 @@ def _per_group_sender_sources(
                     kind="yaml", location=location, chat_scope=GROUP, entry=entry, removable=True,
                     reason="" if authorizes else _PER_GROUP_REASON.format(chat=chat),
                     authorizes_now=authorizes, _path=path, _platform=platform, _user_id=user_id))
+        if own_policy_like and not any(entries_by_key.values()):
+            path = (*container_path, "groups", str(chat))
+            out.append(_chat_grant(
+                platform, user_id, "config.yaml " + ".".join(path), path, str(chat), "groups",
+                reason=_EMPTY_GROUP_REASON.format(chat=chat)))
     return out
 
 
