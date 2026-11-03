@@ -115,13 +115,35 @@ async def approve_pairing(body: PairingApprove):
 
 @router.post("/api/pairing/revoke")
 async def revoke_pairing(body: PairingRevoke):
+    """Revoke the pairing record and report every grant that still names the user.
+
+    The CLI's plain/``--effective`` split is deliberate: this endpoint removes the pairing
+    record only (never the operator's config.yaml). It therefore reports
+    ``still_authorized_by`` — the dashboard must not toast a bare success while a config.yaml
+    allow list keeps the user authorized. A 200 answers a well-formed request even when there
+    was no pairing record: the surviving-grant report is the point, not the 404.
+    """
+    from gateway.access_grants import AccessGrantError, describe, find_user_grants
+
     store = _pairing_store(body.profile)
     platform = (body.platform or "").lower().strip()
     if not platform or not body.user_id:
         raise HTTPException(status_code=400, detail="platform and user_id are required")
-    if store.revoke(platform, body.user_id):
-        return {"ok": True}
-    raise HTTPException(status_code=404, detail=f"User {body.user_id} not found in approved list for {platform}.")
+    revoked = store.revoke(platform, body.user_id)
+    try:
+        sources = find_user_grants(platform, body.user_id, store=store)
+    except AccessGrantError as exc:  # defensive: the scan itself does not write
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    removed = [] if not revoked else [{
+        "kind": "pairing", "location": "pairing store", "chat_scope": "global",
+        "entry": str(body.user_id), "removable": True, "reason": "", "authorizes_now": True,
+    }]
+    return {
+        "ok": True,
+        "revoked": revoked,
+        "removed": removed,
+        "still_authorized_by": describe(s for s in sources if s.authorizes_now is not False),
+    }
 
 
 @router.post("/api/pairing/clear-pending")

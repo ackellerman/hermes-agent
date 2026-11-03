@@ -23,6 +23,13 @@ from pathlib import Path
 
 import pytest
 
+try:  # Collection-time fastapi import: pydantic's plugin loader scans distribution entry points
+    # (the venv's editable install lives under the real ~/.hermes tree), and doing that inside a
+    # test would trip tests/home_io_guard.py for a reason unrelated to the code under test.
+    import hermes_cli.web_server_files  # noqa: F401
+except ImportError:  # pragma: no cover - fastapi/starlette absent
+    pass
+
 from gateway.config import GatewayConfig, Platform, load_gateway_config
 from gateway.session import SessionSource
 
@@ -507,7 +514,7 @@ def test_effective_refuses_a_managed_env_key(home, monkeypatch):
     from gateway.access_grants import AccessGrantError
 
     _write_home(home, "", f"DISCORD_ALLOWED_USERS={KEPT},{USER}\n")
-    os.environ["DISCORD_ALLOWED_USERS"] = f"{KEPT},{USER}"
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", f"{KEPT},{USER}")
     monkeypatch.setattr(config_mod, "is_managed", lambda: True)
     before = (home / ".env").read_bytes()
     try:
@@ -517,4 +524,162 @@ def test_effective_refuses_a_managed_env_key(home, monkeypatch):
         assert (home / ".env").read_bytes() == before
     finally:
         os.environ.pop("DISCORD_ALLOWED_USERS", None)
+
+
+# ---------------------------------------------------------------------------
+# P3 — CLI surface, live-adapter purge, dashboard endpoint
+# ---------------------------------------------------------------------------
+
+
+def _revoke_cli(store, *, effective: bool = False) -> int:
+    """Run the real ``_cmd_revoke`` and return its exit code."""
+    from hermes_cli.pairing import _cmd_revoke
+
+    with pytest.raises(SystemExit) as exc:
+        _cmd_revoke(store, PLATFORM, USER, effective=effective)
+    return int(exc.value.code or 0)
+
+
+def test_revoke_plain_yaml_only_exits_3_and_names_the_source(home, capsys):
+    """The tars shape: YAML-only grant, no env allowlist → success is a lie, exit 3."""
+    with _secondary_profile(home) as secondary:
+        (secondary / "config.yaml").write_text(
+            'discord:\n  enabled: true\n  allow_from: ["1001", "1002"]\n', encoding="utf-8")
+        store = _store()
+        store._approve_user(PLATFORM, USER, "")
+
+        assert _revoke_cli(store) == 3
+        out = capsys.readouterr().out
+        assert "Revoked pairing access" in out
+        assert "config.yaml discord.allow_from" in out
+        assert "authorizes now" in out
+        assert "--effective" in out
+        assert store.is_approved(PLATFORM, USER) is False
+        assert USER in (secondary / "config.yaml").read_text(encoding="utf-8")
+
+
+def test_revoke_effective_exits_0_and_denies(home, capsys):
+    with _secondary_profile(home) as secondary:
+        (secondary / "config.yaml").write_text(
+            'discord:\n  enabled: true\n  allow_from: ["1001", "1002"]\n', encoding="utf-8")
+        store = _store()
+        store._approve_user(PLATFORM, USER, "")
+
+        assert _revoke_cli(store, effective=True) == 0
+        out = capsys.readouterr().out
+        assert "Removed config.yaml discord.allow_from" in out
+        assert "No other configured source names" in out
+        assert USER not in (secondary / "config.yaml").read_text(encoding="utf-8")
+        assert _verdict(_adapter_extra_from_loaded_config(), store, multiplex=True) is False
+
+
+def test_revoke_plain_env_only_exits_0(home, monkeypatch, capsys):
+    """Control row: an authored .env allowlist entry is what plain revoke removes."""
+    _write_home(home, "", f"DISCORD_ALLOWED_USERS={KEPT},{USER}\n")
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", f"{KEPT},{USER}")
+    store = _store()
+    store._approve_user(PLATFORM, USER, "")
+
+    assert _revoke_cli(store) == 0
+    out = capsys.readouterr().out
+    assert "No other configured source names" in out
+    assert (home / ".env").read_text(encoding="utf-8").strip() == f"DISCORD_ALLOWED_USERS={KEPT}"
+    assert _verdict(_adapter_extra_from_loaded_config(), store) is False
+
+
+def test_revoke_plain_single_profile_yaml_grant_leaves_env_untouched(home, capsys):
+    """F12: the single-profile shape is report-only too, and ``.env`` stays byte-identical."""
+    _write_home(home, 'discord:\n  allow_from: ["1001", "1002"]\n')
+    extra = _adapter_extra_from_loaded_config()  # the bridge seeds the env mirror in-process
+    store = _store()
+    store._approve_user(PLATFORM, USER, "")
+
+    assert _revoke_cli(store) == 3
+    out = capsys.readouterr().out
+    assert "env DISCORD_ALLOWED_USERS (bridged from config.yaml)" in out
+    assert (home / ".env").read_text(encoding="utf-8") == ""
+    assert _verdict(extra, store) is True
+
+
+def _live_adapter(extra: dict):
+    return SimpleNamespace(
+        platform=Platform.DISCORD, config=SimpleNamespace(extra=extra),
+        send=AsyncMock(), _dm_allow_from=list(extra.get("allow_from") or []),
+    )
+
+
+def test_effective_purges_live_adapter_snapshot_but_plain_revoke_does_not(home, monkeypatch, capsys):
+    """F1: only a removal that changed an authorizing source may purge the in-process snapshot."""
+    import gateway.pairing as pairing_mod
+
+    with _secondary_profile(home) as secondary:
+        (secondary / "config.yaml").write_text(
+            'discord:\n  enabled: true\n  allow_from: ["1001", "1002"]\n', encoding="utf-8")
+        store = _store()
+        store._approve_user(PLATFORM, USER, "")
+
+        # Plain revoke of a YAML-only grant: nothing removed, nothing to purge.
+        live = _live_adapter({"allow_from": [KEPT, USER]})
+        monkeypatch.setattr(pairing_mod, "_iter_live_gateway_adapters", lambda: iter([live]))
+        assert _revoke_cli(store) == 3
+        assert live.config.extra["allow_from"] == [KEPT, USER]
+
+        # --effective removed the YAML entry, so the in-process snapshot must not keep it.
+        assert _revoke_cli(store, effective=True) == 0
+        assert live.config.extra["allow_from"] == [KEPT]
+        capsys.readouterr()
+
+
+def _router_client():
+    try:
+        from starlette.testclient import TestClient
+    except ImportError:  # pragma: no cover - fastapi/starlette absent
+        pytest.skip("fastapi/starlette not installed")
+    import hermes_state
+    from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN, app
+
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    from hermes_constants import get_hermes_home
+
+    hermes_state.DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+    return client
+
+
+def test_dashboard_revoke_reports_a_surviving_yaml_grant(home):
+    """F10: the endpoint must not answer a bare ``ok`` (or 404) while config.yaml still grants."""
+    _write_home(home, 'discord:\n  allow_from: ["1001", "1002"]\n')
+    store = _store()
+    store._approve_user(PLATFORM, USER, "")
+
+    response = _router_client().post(
+        "/api/pairing/revoke", json={"platform": PLATFORM, "user_id": USER})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["revoked"] is True
+    assert body["removed"] and body["removed"][0]["kind"] == "pairing"
+    assert [row["location"] for row in body["still_authorized_by"]] == ["config.yaml discord.allow_from"]
+    assert body["still_authorized_by"][0]["authorizes_now"] is True
+
+
+def test_dashboard_revoke_without_a_pairing_record_still_reports_grants(home):
+    """A 404 here would tell an operator "nothing to revoke" while the YAML grant stands."""
+    _write_home(home, 'discord:\n  allow_from: ["1002"]\n')
+
+    response = _router_client().post(
+        "/api/pairing/revoke", json={"platform": PLATFORM, "user_id": USER})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["revoked"] is False and body["removed"] == []
+    assert [row["location"] for row in body["still_authorized_by"]] == ["config.yaml discord.allow_from"]
+
+
+def test_dashboard_revoke_requires_platform_and_user(home):
+    _write_home(home, "")
+    client = _router_client()
+    # A missing field is rejected by the request model (422); empty values reach the handler (400).
+    assert client.post("/api/pairing/revoke", json={"platform": PLATFORM}).status_code == 422
+    assert client.post(
+        "/api/pairing/revoke", json={"platform": "", "user_id": ""}).status_code == 400
+
 

@@ -90,11 +90,21 @@ export default function PairingPage() {
         const { platform, user_id } = splitUserKey(key);
         const user = approved.find((u) => getUserKey(u) === key);
         try {
-          await api.revokePairing(platform, user_id);
-          showToast(
-            `Revoked: "${user ? getUserLabel(user) : user_id}"`,
-            "success",
-          );
+          const res = await api.revokePairing(platform, user_id);
+          // The endpoint removes the pairing record only. A config.yaml allow list is an
+          // independent grant, so a bare "Revoked" here would be a lie: name the survivor.
+          const survivor = res.still_authorized_by?.[0];
+          if (survivor) {
+            showToast(
+              `Pairing record revoked, but ${survivor.location} still authorizes this user`,
+              "warning",
+            );
+          } else {
+            showToast(
+              `Revoked: "${user ? getUserLabel(user) : user_id}"`,
+              "success",
+            );
+          }
           loadPairing();
         } catch (e) {
           showToast(`Could not revoke access: ${errorMessage(e)}`, "error");

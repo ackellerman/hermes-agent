@@ -1,4 +1,20 @@
-"""CLI commands for the DM pairing system."""
+"""CLI commands for the DM pairing system.
+
+``revoke`` has two documented modes. It ALWAYS removes the pairing record; a ``config.yaml``
+allow list is an independent grant the command must not edit silently:
+
+* plain ``revoke`` — pairing record only. Every other source that still names the user is
+  reported, and the exit code says whether one still authorizes.
+* ``revoke --effective`` — also removes the removable sources (``config.yaml`` entries, the
+  profile ``.env`` allowlist) so the user is denied without a restart. Wildcards, allow-all
+  flags, role lists, the cross-platform global allowlist and anything that cannot be evaluated
+  offline are reported and left alone.
+
+Exit codes: ``0`` no known grant names the user; ``3`` completed, but a named grant survives or
+cannot be evaluated offline; ``1`` refused (unreadable/pinned config.yaml, managed ``.env``) —
+nothing was written.
+"""
+
 
 def pairing_command(args):
     """Handle hermes pairing subcommands."""
@@ -8,7 +24,8 @@ def pairing_command(args):
     handlers = {
         "list": lambda: _cmd_list(store),
         "approve": lambda: _cmd_approve(store, args.platform, args.code),
-        "revoke": lambda: _cmd_revoke(store, args.platform, args.user_id),
+        "revoke": lambda: _cmd_revoke(
+            store, args.platform, args.user_id, effective=bool(getattr(args, "effective", False))),
         "clear-pending": lambda: _cmd_clear_pending(store),
     }
     handler = handlers.get(getattr(args, "pairing_action", None))
@@ -17,7 +34,6 @@ def pairing_command(args):
         print("Run 'hermes pairing --help' for details.")
     else:
         handler()
-
 
 def _cmd_list(store):
     """List all pending and approved users."""
@@ -81,13 +97,53 @@ def _cmd_approve(store, platform: str, code: str):
         print("  Run 'hermes pairing list' to see pending requests.\n")
 
 
-def _cmd_revoke(store, platform: str, user_id: str):
-    """Revoke a user's access."""
+def _print_surviving(sources) -> None:
+    """One line per source that still names the user (or cannot be evaluated offline)."""
+    for source in sources:
+        state = "authorizes now" if source.authorizes_now is True else "cannot be evaluated offline"
+        detail = f" — {source.reason}" if source.reason else ""
+        print(f"  Still named by {source.location} [{source.chat_scope}] ({state}){detail}")
+
+
+def _cmd_revoke(store, platform: str, user_id: str, effective: bool = False):
+    """Revoke a user's access. See the module docstring for the two modes and the exit codes."""
+    from gateway.access_grants import AccessGrantError, find_user_grants, remove_user_grants
+
     platform = platform.lower().strip()
-    if store.revoke(platform, user_id):
-        print(f"\n  Revoked access for user {user_id} on {platform}.\n")
+    revoked = store.revoke(platform, user_id)
+    removed = []
+    try:
+        grants = find_user_grants(platform, user_id, store=store)
+        if effective:
+            removed = remove_user_grants(grants, store=store)
+            grants = find_user_grants(platform, user_id, store=store)
+    except AccessGrantError as exc:
+        print(f"\n  Refused: {exc}\n")
+        print("  Nothing was removed; the pairing record (if any) was revoked before this check.\n")
+        raise SystemExit(1)
+
+    print()
+    if revoked:
+        print(f"  Revoked pairing access for user {user_id} on {platform}.")
     else:
-        print(f"\n  User {user_id} not found in approved list for {platform}.\n")
+        print(f"  No pairing record for user {user_id} on {platform}.")
+
+    for source in removed:
+        print(f"  Removed {source.location} [{source.chat_scope}]")
+
+    surviving = [source for source in grants if source.authorizes_now is not False]
+    if surviving:
+        _print_surviving(surviving)
+        print()
+        if not effective:
+            print("  Revoking the pairing record does not edit your config.yaml.")
+            print(f"  To deny this user across every configured source: "
+                  f"hermes pairing revoke --effective {platform} {user_id}")
+    else:
+        print(f"  No other configured source names user {user_id} on {platform}.")
+    print()
+
+    raise SystemExit(3 if surviving else 0)
 
 
 def _cmd_clear_pending(store):

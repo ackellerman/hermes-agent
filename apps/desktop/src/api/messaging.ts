@@ -3,6 +3,7 @@ import type {
   MessagingPlatformTestResponse,
   MessagingPlatformUpdate,
   PairingResponse,
+  PairingRevokeResult,
   PairingUser,
   TelegramOnboardingApplyResponse,
   TelegramOnboardingStartResponse,
@@ -135,10 +136,10 @@ export function approvePairing(
   })
 }
 
-export function revokePairing(platform: string, userId: string, profile?: null | string): Promise<{ ok: boolean }> {
+export function revokePairing(platform: string, userId: string, profile?: null | string): Promise<PairingRevokeResult> {
   const scope = profileScoped(profile)
 
-  return hermesApi<{ ok: boolean }>({
+  return hermesApi<PairingRevokeResult>({
     ...scope,
     path: '/api/pairing/revoke',
     method: 'POST',
