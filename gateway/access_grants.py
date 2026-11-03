@@ -42,7 +42,8 @@ or the net reports it. Alongside the net, grants that name a *chat* rather than 
 ``allowed_chats``, an own-policy adapter's ``group_allow_from``) get a non-removable
 ``chat_grant`` row: they admit every member of that chat and no pairing revoke can remove a person
 from a chat. Per-group *sender* lists (``groups.<chat>.allow_from`` / ``allowFrom``) are modelled
-as removable group-scoped rows.
+as removable group-scoped rows — and a list emptied of its last entry is reported as a chat grant,
+because the adapter reads an empty list as "no sender restriction", not as "deny everyone".
 
 Reads are side-effect free: the YAML view is a throwaway ``platforms_data`` filled by the loader's
 own ``bridge_platform_shared_keys``, so no process env is written and no plugin hook runs. Writes
