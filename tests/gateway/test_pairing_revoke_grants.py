@@ -18,6 +18,7 @@ by ASSERTION, never by import:
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 import contextlib
+import json
 import os
 from pathlib import Path
 
@@ -1077,8 +1078,9 @@ def test_unmodelled_config_key_naming_the_user_is_a_name_scan_hit(home, capsys):
     store = _store()
     grants = _find(store=store)
     scan = [s for s in grants if s.kind == "unresolved"]
+    # ``entry`` is blanked on net rows: the same walk sees credentials that contain the principal.
     assert [(s.location, s.entry) for s in scan] == [
-        ("config.yaml platforms.discord.extra.owner_ids", USER)]
+        ("config.yaml platforms.discord.extra.owner_ids", "")]
     assert scan[0].authorizes_now is None and scan[0].removable is False
     assert "does not model what reads it" in scan[0].reason
 
@@ -1096,7 +1098,7 @@ def test_unmodelled_env_var_naming_the_user_is_a_name_scan_hit(home, capsys):
     _write_home(home, "", "SOME_PLUGIN_OPERATORS=1001,1002\n")
     grants = _find(store=_store())
     scan = [s for s in grants if s.kind == "unresolved"]
-    assert [(s.location, s.entry) for s in scan] == [(".env SOME_PLUGIN_OPERATORS", USER)]
+    assert [(s.location, s.entry) for s in scan] == [(".env SOME_PLUGIN_OPERATORS", "")]
     assert _revoke_cli(_store()) == 3
 
 
@@ -1173,3 +1175,77 @@ def test_non_numeric_principal_gets_the_same_unresolved_net(home):
     own = [s for s in grants if s.entry == "+15550001111"]
     assert own and own[0].kind == "env", "the principal's own entry is reported as an env grant"
     assert own[0].authorizes_now is None, "declared in .env but not consulted here: a restart re-reads it"
+
+
+# ---------------------------------------------------------------------------
+# P4 — the net is structural: every authored spelling names the user (review round 4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("config_yaml, expected_path", [
+    ('plugin:\n  ids: [1002]\n', "config.yaml plugin.ids"),                     # a list of ints
+    ('plugin:\n  ids: "1002,1003"\n', "config.yaml plugin.ids"),                # one CSV string
+    ('plugin:\n  users:\n    "1002": true\n', "config.yaml plugin.users"),      # a mapping KEY
+    ('plugin:\n  ids: "*,1003"\n', "config.yaml plugin.ids"),                   # wildcard in CSV
+])
+def test_the_net_catches_non_string_and_composite_spellings(home, config_yaml, expected_path):
+    """The net must not depend on a value being a bare string.
+
+    Review round 4: ``ids: [1002]`` (int), ``ids: "1002,1003"`` (CSV), ``users: {"1002": true}``
+    (key) and ``"*,1003"`` all exited 0 with "No other configured source names user 1002" — the walk
+    skipped non-strings and compared the raw CSV instead of its entries.
+    """
+    _write_home(home, config_yaml)
+    grants = _find(store=_store())
+    rows = [s for s in grants if s.kind == "unresolved" and s.location == expected_path]
+    assert rows, f"{expected_path} must be reported; got {[s.location for s in grants]}"
+    assert rows[0].authorizes_now is None and rows[0].removable is False
+    assert _revoke_cli(_store()) == 3
+
+
+def test_whatsapp_jid_entry_aliases_a_bare_phone_principal(home):
+    """A JID is a phone number in a suffix wrapper — not an email shape to be screened out."""
+    _write_home(home, 'plugin:\n  ids: ["15551234567@s.whatsapp.net"]\n')
+    grants = _find(store=_store(), platform="whatsapp", user="15551234567")
+    rows = [s for s in grants if s.location == "config.yaml plugin.ids"]
+    assert rows and rows[0].kind == "unresolved"
+
+
+def test_reports_never_echo_an_unrelated_secret(home):
+    """A value that merely CONTAINS the principal can be a credential; the report must not carry it."""
+    from gateway.access_grants import describe
+
+    secret = "synthetic-secret-token-abc123"
+    _write_home(home, f'plugin:\n  credential: "alice,{secret}"\n')
+    grants = _find(store=_store(), user="alice")
+    assert [s.location for s in grants if s.kind == "unresolved"] == ["config.yaml plugin.credential"]
+    blob = json.dumps(describe(grants))
+    assert secret not in blob and "alice," not in blob
+    assert all(row["entry"] == "" for row in describe(grants) if row["kind"] == "unresolved")
+
+
+def test_a_live_gateway_keeps_the_change_from_reading_as_enforced(home, monkeypatch, capsys):
+    """Files can be clean while the running process still enforces the old list — say so, exit 3."""
+    import hermes_cli.pairing as pairing_cli
+
+    with _secondary_profile(home) as secondary:
+        (secondary / "config.yaml").write_text(
+            'discord:\n  enabled: true\n  allow_from: ["1001", "1002"]\n', encoding="utf-8")
+        monkeypatch.setattr(pairing_cli, "_live_gateway_pid", lambda store: 4242)
+
+        assert _revoke_cli(_store(), effective=True) == 3
+        out = capsys.readouterr().out
+        assert "Removed config.yaml discord.allow_from" in out
+        assert "running gateway (pid 4242)" in out
+        assert "cannot be evaluated offline" in out
+
+
+def test_no_live_gateway_means_a_file_removal_is_a_denial(home, monkeypatch, capsys):
+    """Control: no live process for this home ⇒ the effective removal exits 0."""
+    import hermes_cli.pairing as pairing_cli
+
+    with _secondary_profile(home) as secondary:
+        (secondary / "config.yaml").write_text(
+            'discord:\n  enabled: true\n  allow_from: ["1001", "1002"]\n', encoding="utf-8")
+        monkeypatch.setattr(pairing_cli, "_live_gateway_pid", lambda store: 0)
+        assert _revoke_cli(_store(), effective=True) == 0

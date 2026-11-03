@@ -115,6 +115,15 @@ _BLOCK_PREFIXES: tuple[tuple[str, ...], ...] = (
 
 _REPORTED_FIELDS = ("kind", "location", "chat_scope", "entry", "removable", "reason", "authorizes_now")
 
+# Kinds whose ``entry`` is a value matched from an allowlist (safe to show). Everything else blanks
+# it: the name-scan walk sees every authored scalar, including credentials that happen to contain the
+# principal's string, and a report (or the dashboard JSON) must not echo an unrelated secret.
+_ENTRY_KINDS = frozenset({"pairing", "env", "yaml"})
+
+# Phone-in-suffix spellings a WhatsApp principal is stored as. Treated as ``numeric`` so a JID entry
+# is compared to a bare phone id instead of being screened out as an email shape.
+_WHATSAPP_JID_SUFFIXES = ("@s.whatsapp.net", "@c.us", "@g.us")
+
 _NO_AUTHORED_ENV = "no authored env allowlist is configured, so this list is the one that authorizes"
 _ENV_SHAPE_REASON = (
     "an authored env allowlist is configured for this platform; env beats YAML, and whether this "
@@ -181,8 +190,19 @@ class GrantSource:
 
 
 def describe(sources: Iterable[GrantSource]) -> list[dict]:
-    """JSON-ready rows for a CLI/dashboard surface."""
-    return [{name: getattr(source, name) for name in _REPORTED_FIELDS} for source in sources]
+    """JSON-ready rows for a CLI/dashboard surface.
+
+    ``entry`` is blanked for every kind whose entry was not matched from an allowlist: the name-scan
+    rows walk all authored scalars, so an unrelated credential can contain the principal's string.
+    A report must never hand a caller a value it did not ask for.
+    """
+    rows = []
+    for source in sources:
+        row = {name: getattr(source, name) for name in _REPORTED_FIELDS}
+        if source.kind not in _ENTRY_KINDS:
+            row["entry"] = ""
+        rows.append(row)
+    return rows
 
 
 # --------------------------------------------------------------------------- readers / matching
@@ -302,6 +322,11 @@ def _shape_class(entry: Any) -> str:
     if _is_wildcard(text):
         return "wildcard"
     if _mention_id(text) is not None or text.lstrip("+").isdigit():
+        return "numeric"
+    lowered = text.lower()
+    # A Baileys/Cloud WhatsApp JID is a phone number in a suffix wrapper, and the phone is the same
+    # principal a bare-id revoke carries — classifying it as ``email`` hid the alias entirely.
+    if any(lowered.endswith(suffix) for suffix in _WHATSAPP_JID_SUFFIXES):
         return "numeric"
     if "@" in text:
         return "email"
@@ -923,23 +948,34 @@ def _per_group_sender_sources(
 def _iter_authored_strings(
     node: Any, path: tuple[str, ...] = (),
 ) -> Iterable[tuple[tuple[str, ...], str]]:
-    """Every authored string in a config mapping, with the dotted path that holds it.
+    """Every authored scalar in a config mapping, with the dotted path that holds it.
 
     A list yields its members at the LIST's path — an allowlist is one grant at one location, which
     is also how the modelled sources address it. A mapping nested inside a list is walked with its
     index, so a plugin section that happens to be a list still reports a usable location.
+
+    Scalars are yielded as ``str(value)`` and mapping KEYS are yielded at their parent's path: a
+    grant is often written as ``ids: [1002]`` (an int), ``ids: "1002,1003"`` (CSV, split by the
+    caller) or ``users: {"1002": true}`` (a key, not a value). Skipping any of those is how the net
+    developed holes, and the shape screen (``_scan_match``) is what keeps the wider walk quiet.
     """
     if isinstance(node, dict):
         for key, value in node.items():
             sub = (*path, str(key))
-            if isinstance(value, str):
-                yield sub, value
+            if isinstance(key, (str, int)) and not isinstance(key, bool):
+                yield path, str(key)  # a mapping key can itself name the principal
+            if isinstance(value, bool) or value is None:
+                continue
+            if isinstance(value, (str, int, float)):
+                yield sub, str(value)
             elif isinstance(value, (dict, list, tuple)):
                 yield from _iter_authored_strings(value, sub)
     elif isinstance(node, (list, tuple)):
         for index, item in enumerate(node):
-            if isinstance(item, str):
-                yield path, item
+            if isinstance(item, bool) or item is None:
+                continue
+            if isinstance(item, (str, int, float)):
+                yield path, str(item)
             elif isinstance(item, (dict, list, tuple)):
                 yield from _iter_authored_strings(item, (*path, str(index)))
 
@@ -1017,38 +1053,45 @@ def _name_scan_sources(
     """
     modelled = [source._path for source in sources if source._path]
     rows: list[GrantSource] = []
+    seen: set[tuple[str, str]] = set()
     user_shape = _shape_class(user_id)
 
     def named(entry: Any) -> bool:
         return _scan_match(platform, entry, user_id, user_shape)
 
-    for path, value in _iter_authored_strings(config):
-        if not named(value) or _accounted_for(path, modelled):
-            continue
+    def add(kind: str, location: str, reason: str) -> None:
+        # ``entry`` stays EMPTY on the net's rows: the walk sees every authored scalar, including
+        # credentials and tokens, so carrying the raw value into a report (and the dashboard JSON)
+        # would leak unrelated secrets. The path is the actionable part.
+        if (kind, location) in seen:
+            return
+        seen.add((kind, location))
         rows.append(GrantSource(
-            kind="unresolved", location="config.yaml " + ".".join(path), chat_scope=GLOBAL,
-            entry=str(value).strip(), removable=False, reason=_UNMODELLED_REASON,
-            authorizes_now=None, _platform=platform, _user_id=user_id))
+            kind=kind, location=location, chat_scope=GLOBAL, entry="", removable=False,
+            reason=reason, authorizes_now=None, _platform=platform, _user_id=user_id))
+
+    for path, value in _iter_authored_strings(config):
+        if _accounted_for(path, modelled):
+            continue
+        if not any(named(entry) for entry in _entries(value)):
+            continue
+        add("unresolved", "config.yaml " + ".".join(path), _UNMODELLED_REASON)
 
     from agent.secret_scope import load_env_file
 
     for var, raw in load_env_file(home / ".env").items():
         if _accounted_for((var,), modelled):
             continue
+        if not any(named(entry) for entry in _entries(raw)):
+            continue
         owner = _env_var_owner(var)
         reason = _UNMODELLED_REASON
         if owner and owner != platform:
             reason = (f"this value names the user in {owner}'s env var and this command does not "
                       f"model what reads it; `pairing revoke {owner} …` reports and removes it")
-        for entry in _entries(raw):
-            if not named(entry):
-                continue
-            rows.append(GrantSource(
-                kind="unresolved", location=f".env {var}", chat_scope=GLOBAL, entry=entry,
-                removable=False, reason=reason, authorizes_now=None,
-                _platform=platform, _user_id=user_id))
+        add("unresolved", f".env {var}", reason)
 
-    rows.sort(key=lambda row: (row.location, row.entry))
+    rows.sort(key=lambda row: row.location)
     return rows
 
 

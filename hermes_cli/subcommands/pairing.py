@@ -29,7 +29,8 @@ def build_pairing_parser(subparsers, *, cmd_pairing: Callable) -> None:
             "plain revoke reports it and exits 3 while it still authorizes. --effective also "
             "removes removable config.yaml/.env entries, so the files stop granting the user (a "
             "separately running gateway applies the change when it next loads its config). "
-            "Exit codes: 0 nothing names the user, 3 a named grant survives or cannot be evaluated, "
+            "Exit codes: 0 nothing names the user and no live gateway still enforces the old list, "
+            "3 a named grant survives, cannot be evaluated, or a running gateway has not reloaded, "
             "1 refused (config.yaml unreadable/pinned, managed .env) — nothing written."))
     pairing_revoke_parser.add_argument("platform", help="Platform name")
     pairing_revoke_parser.add_argument("user_id", help="User ID to revoke")

@@ -12,9 +12,10 @@ allow list is an independent grant the command must not edit silently:
   flags, role lists, the cross-platform global allowlist and anything that cannot be evaluated
   offline are reported and left alone.
 
-Exit codes: ``0`` no known grant names the user; ``3`` completed, but a named grant survives or
-cannot be evaluated offline; ``1`` refused (unreadable/pinned config.yaml, managed ``.env``) —
-nothing was written.
+Exit codes: ``0`` no known grant names the user AND no live gateway for the profile still enforces
+the old list; ``3`` completed, but a named grant survives, cannot be evaluated offline, or a running
+gateway (including a multiplexer that serves the profile) has not loaded the change yet; ``1``
+refused (unreadable/pinned config.yaml, managed ``.env``) — nothing was written.
 """
 
 
@@ -107,6 +108,41 @@ def _print_surviving(sources) -> None:
         print(f"  Still named by {source.location} [{source.chat_scope}] ({state}){detail}")
 
 
+def _live_gateway_pid(store) -> int:
+    """PID of a live gateway that enforces this profile, or 0.
+
+    Two shapes: a gateway dedicated to the profile's own home, or the default multiplexer, which
+    loads every served secondary's config into its own process (so a seat's allowlist is stale there
+    until it reloads). The multiplex record is the authority for who it serves.
+    """
+    try:
+        from gateway.access_grants import resolve_home
+        from gateway.status import live_gateway_pid_for_home
+
+        home = resolve_home(store=store)
+        pid = live_gateway_pid_for_home(home)
+        if pid:
+            return pid
+        from hermes_cli.gateway_multiplex_served import live_default_gateway_pid, recorded_served_profiles
+
+        default_pid = live_default_gateway_pid()
+        if default_pid and home.parent.name == "profiles" and home.name in (recorded_served_profiles() or []):
+            return default_pid
+        return 0
+    except Exception:
+        return 0
+
+
+def _runtime_source(pid: int):
+    """The row that keeps a file-only removal from reading as an enforced denial."""
+    from gateway.access_grants import GrantSource
+
+    return GrantSource(
+        kind="runtime", location=f"running gateway (pid {pid})", chat_scope="global",
+        entry="", removable=False, authorizes_now=None,
+        reason="this gateway loaded the previous allowlist; restart it to enforce the change now")
+
+
 def _cmd_revoke(store, platform: str, user_id: str, effective: bool = False):
     """Revoke a user's access. See the module docstring for the two modes and the exit codes."""
     from gateway.access_grants import AccessGrantError, find_user_grants, remove_user_grants
@@ -142,6 +178,13 @@ def _cmd_revoke(store, platform: str, user_id: str, effective: bool = False):
         print(f"  Removed {source.location} [{source.chat_scope}]")
 
     surviving = [source for source in grants if source.authorizes_now is not False]
+    if removed:
+        # A gateway already running for this profile bridged the old allowlist into its process env
+        # at load; the files are correct now, but that process still enforces the old list until it
+        # reloads. Exit 3 says so instead of reporting a denial the enforcement point contradicts.
+        pid = _live_gateway_pid(store)
+        if pid:
+            surviving.append(_runtime_source(pid))
     if surviving:
         _print_surviving(surviving)
         print()
