@@ -151,8 +151,8 @@ def test_model_request_describes_understanding_and_next_action_without_confirmat
     messages = endpoint.await_args.kwargs["messages"]
     assert messages == [
         {"role": "system", "content": (
-            "In one brief, natural sentence, tell the requester what you understood and what you are "
-            "going to do now. Address them directly in your own words. Avoid answering the request "
+            "In one brief, natural sentence, tell the requester what you understood, then what you'll "
+            "do now. Address them directly in your own words. Avoid answering the request "
             "itself. Keep it under 200 characters."
         )},
         {"role": "user", "content": f'The user said this by voice:\n"""\n{spoken}\n"""'},
