@@ -45,14 +45,11 @@ UNSUPPORTED_ROUTE_TEXT = (
 )
 
 _INSTRUCTIONS = (
-    "In ONE short, natural sentence, state your understanding of the user's request and what "
-    "you will do next. Address the requester directly in the second person ('you'), not in "
-    "the third person ('the user' or 'they'), and state your own imminent action in the "
-    "first person ('I'll'). Preserve the request's intent and speak naturally, not by a template. "
-    "Make it declarative and forward-looking; do not ask permission or "
-    "confirmation. Do not answer the request, invent details or add work, and do not use a "
-    "fixed or canned phrase. "
-    f"Reply with the sentence only, at most {MAX_BRIEF_CHARS} characters."
+    "Address the requester directly and state your understanding of their request and what "
+    "you will do next in your own words. Reply with one short sentence, "
+    f"at most {MAX_BRIEF_CHARS} characters. "
+    "Avoid asking for confirmation, answering the request, inventing details, adding work, "
+    "or using a canned phrase."
 )
 
 
@@ -110,9 +107,7 @@ def brief_messages(message: str) -> list[dict[str, str]]:
         {"role": "system", "content": _INSTRUCTIONS},
         {
             "role": "user",
-            "content": (f'The user said this by voice:\n"""\n{message}\n"""\n\n'
-                        "Restate your understanding and what you will do next in one sentence, "
-                        "without asking for confirmation."),
+            "content": f'The user said this by voice:\n"""\n{message}\n"""',
         },
     ]
 

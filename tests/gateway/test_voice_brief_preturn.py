@@ -109,7 +109,7 @@ def edge(monkeypatch):
 
     async def fake_ask(route, messages):
         ORDER.append(("model", route.get("provider"), route.get("model")))
-        assert messages and "Restate" in messages[-1]["content"]
+        assert messages and "The user said this by voice:" in messages[-1]["content"]
         if getattr(monkeypatch, "model_raises", False):
             raise RuntimeError("model exploded")
         return MODEL_OUTPUT
@@ -132,28 +132,33 @@ def edge(monkeypatch):
     return adapter
 
 
-def test_model_request_describes_understanding_and_next_action_without_confirmation(monkeypatch):
+@pytest.mark.parametrize("spoken,route", [
+    ("Please check the deployment logs", {"provider": "provider-a", "model": "ops-agent"}),
+    ("Summarize the main point of this poem.", {"provider": "provider-b", "model": "literary-agent"}),
+    ("What is the weather like in Paris?", {"provider": "provider-a", "model": "general-agent"}),
+    ("Help me plan a vegetarian dinner for four.", {"provider": "provider-c", "model": "meal-agent"}),
+])
+def test_model_request_describes_understanding_and_next_action_without_confirmation(monkeypatch, spoken, route):
     from agent import auxiliary_client
 
     endpoint = AsyncMock(return_value=SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="I'll check the logs."))]
     ))
     monkeypatch.setattr(auxiliary_client, "async_call_llm", endpoint)
-    spoken = "Please check the deployment logs"
-    asyncio.run(voice_brief._ask_model({}, voice_brief.brief_messages(spoken)))
+    asyncio.run(voice_brief._ask_model(route, voice_brief.brief_messages(spoken)))
+    assert endpoint.await_args.kwargs["provider"] == route["provider"]
+    assert endpoint.await_args.kwargs["model"] == route["model"]
     messages = endpoint.await_args.kwargs["messages"]
-    assert [message["role"] for message in messages] == ["system", "user"]
-    system, user = (message["content"].lower() for message in messages)
-    assert spoken.lower() in user
-    assert 'second person' in system
-    assert 'first person' in system
-    assert 'third person' in system
-    assert 'imminent' in system
-    for prompt in (system, user):
-        assert "understand" in prompt
-        assert "do next" in prompt
-        assert "confirmation" in prompt
-        assert "do not" in prompt or "without" in prompt
+    assert messages == [
+        {"role": "system", "content": (
+            "Address the requester directly and state your understanding of their request and what "
+            "you will do next in your own words. Reply with one short sentence, at most 200 characters. "
+            "Avoid asking for confirmation, answering the request, inventing details, adding work, "
+            "or using a canned phrase."
+        )},
+        {"role": "user", "content": f'The user said this by voice:\n"""\n{spoken}\n"""'},
+    ]
+    assert "tools" not in endpoint.await_args.kwargs
 
 
 def _source() -> SessionSource:
