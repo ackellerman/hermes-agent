@@ -132,6 +132,26 @@ def edge(monkeypatch):
     return adapter
 
 
+def test_model_request_describes_understanding_and_next_action_without_confirmation(monkeypatch):
+    from agent import auxiliary_client
+
+    endpoint = AsyncMock(return_value=SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="I'll check the logs."))]
+    ))
+    monkeypatch.setattr(auxiliary_client, "async_call_llm", endpoint)
+    spoken = "Please check the deployment logs"
+    asyncio.run(voice_brief._ask_model({}, voice_brief.brief_messages(spoken)))
+    messages = endpoint.await_args.kwargs["messages"]
+    assert [message["role"] for message in messages] == ["system", "user"]
+    system, user = (message["content"].lower() for message in messages)
+    assert spoken.lower() in user
+    for prompt in (system, user):
+        assert "understand" in prompt
+        assert "do next" in prompt
+        assert "confirmation" in prompt
+        assert "do not" in prompt or "without" in prompt
+
+
 def _source() -> SessionSource:
     return SessionSource(
         platform=Platform.DISCORD, chat_id=CHAT_ID, chat_type="group", user_id="u1",
