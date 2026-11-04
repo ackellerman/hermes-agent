@@ -145,6 +145,10 @@ def test_model_request_describes_understanding_and_next_action_without_confirmat
     assert [message["role"] for message in messages] == ["system", "user"]
     system, user = (message["content"].lower() for message in messages)
     assert spoken.lower() in user
+    assert 'second person' in system
+    assert 'first person' in system
+    assert 'third person' in system
+    assert 'imminent' in system
     for prompt in (system, user):
         assert "understand" in prompt
         assert "do next" in prompt

@@ -46,7 +46,10 @@ UNSUPPORTED_ROUTE_TEXT = (
 
 _INSTRUCTIONS = (
     "In ONE short, natural sentence, state your understanding of the user's request and what "
-    "you will do next. Make it declarative and forward-looking; do not ask permission or "
+    "you will do next. Address the requester directly in the second person ('you'), not in "
+    "the third person ('the user' or 'they'), and state your own imminent action in the "
+    "first person ('I'll'). Preserve the request's intent and speak naturally, not by a template. "
+    "Make it declarative and forward-looking; do not ask permission or "
     "confirmation. Do not answer the request, invent details or add work, and do not use a "
     "fixed or canned phrase. "
     f"Reply with the sentence only, at most {MAX_BRIEF_CHARS} characters."
