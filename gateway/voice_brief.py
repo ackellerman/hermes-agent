@@ -2,7 +2,7 @@
 
 Opt-in per profile (``discord.voice_brief.enabled``, default off). Before a voice turn runs,
 one bounded auxiliary call to the turn's OWN routed provider/model asks for one short sentence,
-in the model's own words, restating what it understood the user to be asking. That sentence is
+in the model's own words, stating its understanding and what it will do next. That sentence is
 synthesized with the profile's configured TTS provider, played in the turn's bound voice
 channel (awaited), and posted to the bound text channel. Only then does the turn run — exactly
 as it does without this feature: no gated tools, no muted streaming, no rewritten history.
@@ -45,8 +45,10 @@ UNSUPPORTED_ROUTE_TEXT = (
 )
 
 _INSTRUCTIONS = (
-    "You restate a request back to its author in ONE short sentence, in your own words. "
-    "Do not answer it, do not add work, do not use a fixed or canned phrase. "
+    "In ONE short, natural sentence, state your understanding of the user's request and what "
+    "you will do next. Make it declarative and forward-looking; do not ask permission or "
+    "confirmation. Do not answer the request, invent details or add work, and do not use a "
+    "fixed or canned phrase. "
     f"Reply with the sentence only, at most {MAX_BRIEF_CHARS} characters."
 )
 
@@ -100,12 +102,14 @@ def voice_binding(source: Any, adapter: Any) -> Optional[tuple[int, str]]:
 
 
 def brief_messages(message: str) -> list[dict[str, str]]:
-    """Provider-edge request: the user's spoken words and the one-sentence restatement rule."""
+    """Provider-edge request: spoken words and the one-sentence understanding and next action."""
     return [
         {"role": "system", "content": _INSTRUCTIONS},
         {
             "role": "user",
-            "content": f'The user said this by voice:\n"""\n{message}\n"""\n\nRestate what they asked in one sentence.',
+            "content": (f'The user said this by voice:\n"""\n{message}\n"""\n\n'
+                        "Restate your understanding and what you will do next in one sentence, "
+                        "without asking for confirmation."),
         },
     ]
 
