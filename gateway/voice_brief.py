@@ -31,6 +31,9 @@ CONFIG_SECTION = "voice_brief"
 MAX_BRIEF_CHARS = 200
 # Hard bounds. The model call is the one that can hang a voice turn forever.
 MODEL_TIMEOUT_S = 15.0
+# Thinking off for this call (the same mechanism title generation uses); routes that refuse the
+# disable are stepped up to their lowest effort by the auxiliary client's reasoning-floor ladder.
+MODEL_REASONING = {"enabled": False}
 TTS_TIMEOUT_S = 60.0
 
 # Routes that execute work themselves; the normal loop (and so this seam) never runs there.
@@ -45,11 +48,9 @@ UNSUPPORTED_ROUTE_TEXT = (
 )
 
 _INSTRUCTIONS = (
-    "Address the requester directly and state your understanding of their request and what "
-    "you will do next in your own words. Reply with one short sentence, "
-    f"at most {MAX_BRIEF_CHARS} characters. "
-    "Avoid asking for confirmation, answering the request, inventing details, adding work, "
-    "or using a canned phrase."
+    "In one brief, natural sentence, tell the requester what you understood and what you are going "
+    "to do now. Address them directly in your own words. Avoid answering the request itself. "
+    f"Keep it under {MAX_BRIEF_CHARS} characters."
 )
 
 
@@ -130,7 +131,12 @@ def _response_text(response: Any) -> str:
 
 
 async def _ask_model(route: dict[str, Any], messages: list[dict[str, str]]) -> str:
-    """One auxiliary call on the turn's routed provider/model. No tools are offered at all."""
+    """One auxiliary call on the turn's routed provider/model. No tools are offered at all.
+
+    No ``max_tokens``: reasoning models (DeepSeek V4 on Ollama Cloud) bill thinking against it, and a
+    small cap returned an empty sentence with finish_reason=length. ``MODEL_TIMEOUT_S`` is the only
+    bound on the call; ``MAX_BRIEF_CHARS`` still rejects an over-long sentence.
+    """
     from agent.auxiliary_client import async_call_llm
 
     response = await async_call_llm(
@@ -141,8 +147,8 @@ async def _ask_model(route: dict[str, Any], messages: list[dict[str, str]]) -> s
         api_key=route.get("api_key") or None,
         messages=messages,
         temperature=0.2,
-        max_tokens=120,
         timeout=MODEL_TIMEOUT_S,
+        reasoning_config=dict(MODEL_REASONING),
     )
     return _response_text(response)
 

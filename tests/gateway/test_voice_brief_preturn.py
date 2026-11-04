@@ -151,14 +151,17 @@ def test_model_request_describes_understanding_and_next_action_without_confirmat
     messages = endpoint.await_args.kwargs["messages"]
     assert messages == [
         {"role": "system", "content": (
-            "Address the requester directly and state your understanding of their request and what "
-            "you will do next in your own words. Reply with one short sentence, at most 200 characters. "
-            "Avoid asking for confirmation, answering the request, inventing details, adding work, "
-            "or using a canned phrase."
+            "In one brief, natural sentence, tell the requester what you understood and what you are "
+            "going to do now. Address them directly in your own words. Avoid answering the request "
+            "itself. Keep it under 200 characters."
         )},
         {"role": "user", "content": f'The user said this by voice:\n"""\n{spoken}\n"""'},
     ]
     assert "tools" not in endpoint.await_args.kwargs
+    # No token cap: reasoning models bill thinking against max_tokens and starved the sentence.
+    assert "max_tokens" not in endpoint.await_args.kwargs
+    assert endpoint.await_args.kwargs["reasoning_config"] == {"enabled": False}
+    assert endpoint.await_args.kwargs["timeout"] == voice_brief.MODEL_TIMEOUT_S
 
 
 def _source() -> SessionSource:
