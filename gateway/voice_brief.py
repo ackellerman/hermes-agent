@@ -48,8 +48,8 @@ UNSUPPORTED_ROUTE_TEXT = (
 )
 
 _INSTRUCTIONS = (
-    "In one brief, natural sentence, tell the requester what you understood and what you are going "
-    "to do now. Address them directly in your own words. Avoid answering the request itself. "
+    "In one brief, natural sentence, tell the requester what you understood, then what you'll do "
+    "now. Address them directly in your own words. Avoid answering the request itself. "
     f"Keep it under {MAX_BRIEF_CHARS} characters."
 )
 
