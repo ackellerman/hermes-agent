@@ -4564,9 +4564,17 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                     logger.warning("Voice mixer failed to start: %s", e)
             return True
 
-    async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
+    async def play_in_voice_channel(
+        self, guild_id: int, audio_path: str, strict: bool = False,
+    ) -> bool:
         """Play audio in the VC: via the mixer (layered over the ambient bed, ducking it)
-        when installed, else the legacy one-shot FFmpegPCMAudio path."""
+        when installed, else the legacy one-shot FFmpegPCMAudio path.
+
+        ``strict`` (opt-in, used by the pre-turn voice brief) reports a playback that timed out
+        or errored as ``False``. The default keeps the historical contract — callers such as
+        ``play_tts`` and ``run_voice`` receive ``True`` even when the clip was cut off — so this
+        parameter cannot change any existing caller's behaviour.
+        """
         vc = self._voice_clients.get(guild_id)
         if not vc or not vc.is_connected():
             return False
@@ -4584,13 +4592,15 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                     mixer.play_speech(self._lead_silence_bytes() + pcm, gain=speech_gain)
                     # Block until speech drains so callers serialise replies; ambient keeps playing.
                     wait_start = time.monotonic()
+                    timed_out = False
                     while mixer.speech_active:
                         if time.monotonic() - wait_start > playback_timeout:
                             logger.warning("Mixer speech playback timed out after %.1fs", playback_timeout)
                             mixer.stop_speech()
+                            timed_out = True
                             break
                         await asyncio.sleep(0.05)
-                    return True
+                    return False if (strict and timed_out) else True
                 logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
             # Legacy one-shot path: pause receiver while playing (echo prevention).
             receiver = self._voice_receivers.get(guild_id)
@@ -4606,10 +4616,12 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                     await asyncio.sleep(0.1)
                 done = asyncio.Event()
                 loop = asyncio.get_running_loop()
+                playback_error: list[Any] = []
 
                 def _after(error):
                     if error:
                         logger.error("Voice playback error: %s", error)
+                        playback_error.append(error)
                     loop.call_soon_threadsafe(done.set)
                 # Lead silence so socket warm-up doesn't clip the first word (mirrors mixer path).
                 ffmpeg_opts: dict[str, Any] = {}
@@ -4630,7 +4642,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 except TimeoutError:
                     logger.warning("Voice playback timed out after %.1fs", playback_timeout)
                     vc.stop()
-                return True
+                    return not strict
+                return not (strict and playback_error)
             finally:
                 if receiver:
                     receiver.resume()

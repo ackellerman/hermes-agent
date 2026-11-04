@@ -2715,6 +2715,72 @@ class GatewayTurnMixin:
     def _proxy_error_result(text: str) -> dict[str, Any]:
         return {"final_response": text, "messages": [], "api_calls": 0, "tools": []}
 
+    def _voice_brief_route_refusal(
+        self, source: SessionSource, session_key: Optional[str], *, proxy: bool,
+    ) -> Optional[dict[str, Any]]:
+        """Visible refusal BEFORE any work when the brief is enabled on a route that owns execution.
+
+        The pre-turn seam lives in the normal conversation loop; the proxy and the codex app server
+        run work themselves, so the brief could never be spoken first. Refuse rather than silently
+        skipping it.
+        """
+        from gateway.run import _load_gateway_config
+        from gateway.voice_brief import brief_enabled, route_owns_execution, unsupported_route_text
+
+        config = _load_gateway_config()
+        if not brief_enabled(config):
+            return None
+        api_mode = ""
+        if not proxy:
+            _model, runtime = self._resolve_session_agent_runtime(
+                source=source, session_key=session_key, user_config=config,
+            )
+            api_mode = str((runtime or {}).get("api_mode") or "")
+        if not (proxy or route_owns_execution(api_mode)):
+            return None
+        logger.warning("Voice brief refused: route owns execution (proxy=%s api_mode=%s)", proxy, api_mode)
+        return self._proxy_error_result(unsupported_route_text())
+
+    async def _voice_brief_before_turn(
+        self, *, source: SessionSource, message: str, session_key: Optional[str],
+        user_config: dict[str, Any], turn_ctx: TurnContext,
+    ) -> Optional[dict[str, Any]]:
+        """Speak+post the pre-turn brief. ``None`` means the turn may run; a dict refuses visibly.
+
+        Runs before any turn task is started. On success the canned ack slot is cleared (the brief
+        already spoke). The turn itself is not modified in any other way.
+        """
+        from gateway.voice_brief import VoiceBriefError, brief_enabled, deliver_preturn_brief, failure_text, voice_binding
+
+        if not brief_enabled(user_config):
+            return None
+        adapter = self._delivery_adapter_for(source)
+        binding = voice_binding(source, adapter)
+        if binding is None:
+            logger.warning("Voice brief enabled but no voice channel is bound to chat=%s", source.chat_id)
+            return self._proxy_error_result(failure_text("no bound voice channel"))
+        guild_id, chat_id = binding
+        model, runtime = self._resolve_session_agent_runtime(
+            source=source, session_key=session_key, user_config=user_config,
+        )
+        runtime = runtime or {}
+        route = {
+            "provider": runtime.get("provider"), "model": model,
+            "base_url": runtime.get("base_url"), "api_key": runtime.get("api_key"),
+        }
+        if not (route["provider"] and route["model"]):
+            return self._proxy_error_result(failure_text("no routed model"))
+        try:
+            brief = await deliver_preturn_brief(
+                adapter=adapter, guild_id=guild_id, chat_id=chat_id, message=message, route=route,
+            )
+        except VoiceBriefError as exc:
+            return self._proxy_error_result(str(exc))
+        logger.info("Voice brief delivered before the turn: %s", brief)
+        # The brief already spoke: silence the canned ack for THIS turn only (existing mechanism).
+        turn_ctx._voice_ack_guild[0] = None
+        return None
+
     def _proxy_stream_consumer(self, source: SessionSource, event_message_id, _thread_metadata, _run_still_current):
         """Platform stream consumer for the proxy path when streaming is enabled, else ``None``."""
         from gateway.run import _load_gateway_config, _platform_config_key
@@ -4278,6 +4344,14 @@ class GatewayTurnMixin:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
+        _is_voice_input = str(getattr(message_type, "value", message_type) or "").lower() == "voice"
+        if _is_voice_input and source.platform == Platform.DISCORD:
+            # Refuse before any work: these routes never reach the in-loop pre-turn seam.
+            _brief_refusal = self._voice_brief_route_refusal(
+                source, session_key, proxy=bool(self._get_proxy_url()),
+            )
+            if _brief_refusal is not None:
+                return _brief_refusal
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
@@ -4317,6 +4391,15 @@ class GatewayTurnMixin:
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
+        # Pre-turn spoken brief (Discord voice input, opt-in): speak+post the model's one-sentence
+        # understanding BEFORE the worker starts. A failure refuses the turn with visible text.
+        if _is_voice_input and source.platform == Platform.DISCORD:
+            _brief_refusal = await self._voice_brief_before_turn(
+                source=source, message=message, session_key=session_key,
+                user_config=disp.user_config, turn_ctx=turn_ctx,
+            )
+            if _brief_refusal is not None:
+                return _brief_refusal
         # Two independent quiet reasons: a muted diagnostic wake (ours) and a scheduled heartbeat.
         if not (scheduled_heartbeat or turn_ctx.mute_notification_reply):
             self._run_agent_start_streaming_tts(
