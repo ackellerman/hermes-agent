@@ -20,9 +20,9 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import tempfile
-import uuid
-from contextlib import suppress
+import threading
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -111,21 +111,20 @@ def brief_messages(message: str) -> list[dict[str, str]]:
 
 
 def clean_brief(raw: Any) -> str:
-    """Collapse to one line, unquote, and enforce ``MAX_BRIEF_CHARS`` at a word boundary."""
+    """Collapse to one line and unquote without changing the sentence's meaning."""
     text = " ".join(str(raw or "").split())
     for left, right in (('"', '"'), ("'", "'"), ("\u201c", "\u201d"), ("\u2018", "\u2019")):
         if len(text) >= 2 and text.startswith(left) and text.endswith(right):
             text = text[1:-1].strip()
-    if len(text) > MAX_BRIEF_CHARS:
-        cut = text.rfind(" ", 0, MAX_BRIEF_CHARS - 1)
-        text = (text[:cut] if cut > 0 else text[: MAX_BRIEF_CHARS - 1]).rstrip() + "\u2026"
     return text
 
 
 def _response_text(response: Any) -> str:
-    from agent.auxiliary_client import extract_content_or_reasoning
-
-    return extract_content_or_reasoning(response)
+    try:
+        content = response.choices[0].message.content
+    except (AttributeError, IndexError, TypeError):
+        return ""
+    return content if isinstance(content, str) else ""
 
 
 async def _ask_model(route: dict[str, Any], messages: list[dict[str, str]]) -> str:
@@ -182,16 +181,35 @@ async def deliver_preturn_brief(
         logger.warning("Voice brief model returned no sentence")
         raise VoiceBriefError(failure_text("no sentence returned"))
 
-    audio_path = os.path.join(
-        tempfile.gettempdir(), "hermes_voice", f"brief_{uuid.uuid4().hex[:12]}.mp3",
-    )
-    os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+    if len(text) > MAX_BRIEF_CHARS:
+        raise VoiceBriefError(failure_text("sentence too long"))
+
+    workdir = tempfile.mkdtemp(prefix="hermes-voice-brief-")
+    audio_path = os.path.join(workdir, "brief.mp3")
+    lock = threading.Lock()
+    state = {"finished": False, "abandoned": False}
+
+    def synthesize_owned() -> str:
+        try:
+            path = _synthesize(text, audio_path)
+            if os.path.commonpath((os.path.realpath(workdir), os.path.realpath(path))) != os.path.realpath(workdir):
+                raise VoiceBriefError(failure_text("synthesis returned an unowned path"))
+            return path
+        finally:
+            with lock:
+                state["finished"] = True
+                if state["abandoned"]:
+                    shutil.rmtree(workdir, ignore_errors=True)
+
     actual: Optional[str] = None
+    submitted = False
     try:
         try:
-            actual = await asyncio.wait_for(
-                asyncio.to_thread(_synthesize, text, audio_path), timeout=TTS_TIMEOUT_S,
-            )
+            future = asyncio.get_running_loop().run_in_executor(None, synthesize_owned)
+            submitted = True
+            # Consume a late exception even when the waiter has timed out or been cancelled.
+            future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+            actual = await asyncio.wait_for(asyncio.shield(future), timeout=TTS_TIMEOUT_S)
         except VoiceBriefError:
             raise
         except Exception as exc:
@@ -217,7 +235,7 @@ async def deliver_preturn_brief(
             raise VoiceBriefError(failure_text("text post failed"))
         return text
     finally:
-        for path in {audio_path, actual}:
-            if path and os.path.isfile(path):
-                with suppress(OSError):
-                    os.unlink(path)
+        with lock:
+            state["abandoned"] = True
+            if state["finished"] or not submitted:
+                shutil.rmtree(workdir, ignore_errors=True)

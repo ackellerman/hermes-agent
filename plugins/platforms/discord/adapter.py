@@ -4589,7 +4589,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 pcm = await asyncio.to_thread(decode_to_pcm, audio_path)
                 if pcm:
                     speech_gain = float(self._voice_fx_cfg.get("speech_gain", 1.0))
-                    mixer.play_speech(self._lead_silence_bytes() + pcm, gain=speech_gain)
+                    child = mixer.play_speech(self._lead_silence_bytes() + pcm, gain=speech_gain)
                     # Block until speech drains so callers serialise replies; ambient keeps playing.
                     wait_start = time.monotonic()
                     timed_out = False
@@ -4600,7 +4600,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                             timed_out = True
                             break
                         await asyncio.sleep(0.05)
-                    return False if (strict and timed_out) else True
+                    return not strict or (not timed_out and child is not None and child._finished)
                 logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
             # Legacy one-shot path: pause receiver while playing (echo prevention).
             receiver = self._voice_receivers.get(guild_id)
@@ -4636,6 +4636,28 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                     audio_path, executable=resolve_ffmpeg_executable(), **ffmpeg_opts,
                 )
                 source = discord.PCMVolumeTransformer(source, volume=1.0)
+                if strict:
+                    class _TrackedSource(discord.AudioSource):
+                        def __init__(self, wrapped):
+                            self.wrapped = wrapped
+                            self.exhausted = False
+                            self.had_audio = False
+
+                        def read(self):
+                            data = self.wrapped.read()
+                            if data:
+                                self.had_audio = True
+                            else:
+                                self.exhausted = self.had_audio
+                            return data
+
+                        def is_opus(self):
+                            return self.wrapped.is_opus()
+
+                        def cleanup(self):
+                            self.wrapped.cleanup()
+
+                    source = _TrackedSource(source)
                 vc.play(source, after=_after)
                 try:
                     await asyncio.wait_for(done.wait(), timeout=playback_timeout)
@@ -4643,7 +4665,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                     logger.warning("Voice playback timed out after %.1fs", playback_timeout)
                     vc.stop()
                     return not strict
-                return not (strict and playback_error)
+                return not strict or (not playback_error and source.exhausted)
             finally:
                 if receiver:
                     receiver.resume()
