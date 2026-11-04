@@ -1617,6 +1617,13 @@ DEFAULT_CONFIG = {
                 "On it.",
             ],
         },
+        # Speak a short pre-turn brief on Discord VOICE-INPUT turns: before the turn runs, the
+        # routed model restates the request in one sentence in its own words, which is spoken in
+        # the bound voice channel and posted to the bound text channel. Any failure stops the turn
+        # visibly. Off by default; opt in per profile.
+        "voice_brief": {
+            "enabled": False,
+        },
         # Opt-in Discord voice auto-join (issue #33683).  OFF by default for
         # safety — auto-joining a voice channel means transcribing everyone who
         # speaks.  Both CHANNEL allowlist (channel_ids) and USER allowlist
