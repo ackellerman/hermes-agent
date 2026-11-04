@@ -27,6 +27,7 @@ from gateway.config import Platform
 from gateway.platforms.event import MessageType
 from gateway.session import SessionSource
 import gateway.voice_brief as voice_brief
+_REAL_ASK_MODEL = voice_brief._ask_model
 
 ORDER: list = []
 EDGE: list = []
@@ -244,10 +245,9 @@ def test_long_model_output_is_capped(edge, monkeypatch, tmp_path):
         _run(_make_runner(), MessageType.VOICE)
     finally:
         MODEL_OUTPUT = "You want me to check the deployment logs and report the error."
-    posted = edge.posted[0]
-    assert len(posted) <= 200
-    assert posted.endswith("\u2026")
-    assert ORDER[1][1] == posted  # spoken text is the same capped sentence
+    assert edge.posted == [] and edge.played == []
+    assert ("turn",) not in ORDER
+    assert not any(step[0] == "synth" for step in ORDER)
 
 
 def test_empty_model_output_refuses_instead_of_inventing_a_phrase(edge, monkeypatch, tmp_path):
@@ -459,6 +459,125 @@ def _bare_adapter():
 
     adapter._playback_timeout_for_audio = _timeout
     return adapter
+
+
+def test_reasoning_only_response_is_not_spoken(edge, monkeypatch, tmp_path):
+    from agent import auxiliary_client
+    async def response(**kwargs):
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, reasoning="secret reasoning"))])
+    monkeypatch.setattr(auxiliary_client, "async_call_llm", response)
+    monkeypatch.setattr(voice_brief, "_ask_model", _REAL_ASK_MODEL)
+    _wire(monkeypatch, tmp_path)
+    result = _run(_make_runner(), MessageType.VOICE)
+    assert "no sentence returned" in result["final_response"]
+    assert not edge.played and not edge.posted and ("turn",) not in ORDER
+
+
+def test_tts_timeout_cleans_late_file(edge, monkeypatch, tmp_path):
+    import tools.tts_tool as tts_tool
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    paths = []
+    def slow_tts(text, output_path=None, **kwargs):
+        paths.append(output_path)
+        started.set()
+        assert release.wait(5)
+        with open(output_path, "wb") as f:
+            f.write(b"late")
+        finished.set()
+        return json.dumps({"success": True, "file_path": output_path})
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", slow_tts)
+    monkeypatch.setattr(voice_brief, "TTS_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(voice_brief.tempfile, "tempdir", str(tmp_path))
+    async def go():
+        try:
+            with pytest.raises(voice_brief.VoiceBriefError):
+                await voice_brief.deliver_preturn_brief(adapter=edge, guild_id=GUILD_ID, chat_id=CHAT_ID, message="hi", route={})
+            assert started.is_set() and not finished.is_set()
+            release.set()
+            assert await asyncio.to_thread(finished.wait, 5)
+            for _ in range(100):
+                if not os.path.exists(paths[0]):
+                    break
+                await asyncio.sleep(.01)
+            assert not os.path.exists(paths[0])
+        finally:
+            release.set()
+    asyncio.run(go())
+
+
+def test_strict_legacy_stop_callback_is_not_completion(monkeypatch):
+    adapter = _bare_adapter()
+    vc = adapter._voice_clients[GUILD_ID]
+    vc.is_playing.return_value = False
+    async def timeout(path): return 1
+    adapter._playback_timeout_for_audio = timeout
+    def play(source, after):
+        after(None)  # Discord also invokes this on stop, without reading the source.
+    vc.play.side_effect = play
+    assert asyncio.run(adapter.play_in_voice_channel(GUILD_ID, "/tmp/nope.mp3", strict=True)) is False
+
+
+def test_strict_mixer_stop_is_not_completion(monkeypatch):
+    from plugins.platforms.discord.voice_mixer import VoiceMixer
+    from plugins.platforms.discord import adapter as module
+    mixer = VoiceMixer()
+    adapter = _bare_adapter()
+    adapter._voice_mixers[GUILD_ID] = mixer
+    async def timeout(audio_path): return 2
+    adapter._playback_timeout_for_audio = timeout
+    monkeypatch.setattr(module._voice_mixer_module(), "decode_to_pcm", lambda path: b"1234")
+    async def go():
+        task = asyncio.create_task(adapter.play_in_voice_channel(GUILD_ID, "unused", strict=True))
+        while not mixer.speech_active:
+            await asyncio.sleep(.001)
+        mixer.stop_speech()
+        return await task
+    assert asyncio.run(go()) is False
+
+
+def test_strict_legacy_natural_eof_completes(monkeypatch):
+    from plugins.platforms.discord import adapter as module
+    adapter = _bare_adapter()
+    vc = adapter._voice_clients[GUILD_ID]
+    vc.is_playing.return_value = False
+    async def timeout(audio_path): return 1
+    adapter._playback_timeout_for_audio = timeout
+    class PCM:
+        def __init__(self, *args, **kwargs): self.frames = iter([b"\x00" * 3840, b""])
+        def read(self): return next(self.frames)
+        def is_opus(self): return False
+        def cleanup(self): pass
+    class AudioSource:
+        pass
+    monkeypatch.setattr(module, "discord", SimpleNamespace(
+        AudioSource=AudioSource, FFmpegPCMAudio=PCM,
+        PCMVolumeTransformer=lambda source, volume: source,
+    ))
+    def play(source, after):
+        assert source.read()
+        assert not source.read()
+        after(None)
+    vc.play.side_effect = play
+    assert asyncio.run(adapter.play_in_voice_channel(GUILD_ID, "unused", strict=True)) is True
+
+
+def test_strict_mixer_natural_eof_completes(monkeypatch):
+    from plugins.platforms.discord.voice_mixer import VoiceMixer
+    from plugins.platforms.discord import adapter as module
+    mixer = VoiceMixer()
+    adapter = _bare_adapter()
+    adapter._voice_mixers[GUILD_ID] = mixer
+    async def timeout(audio_path): return 2
+    adapter._playback_timeout_for_audio = timeout
+    monkeypatch.setattr(module._voice_mixer_module(), "decode_to_pcm", lambda path: b"1234")
+    async def go():
+        task = asyncio.create_task(adapter.play_in_voice_channel(GUILD_ID, "unused", strict=True))
+        while not mixer.speech_active:
+            await asyncio.sleep(.001)
+        mixer.read()
+        mixer.read()
+        return await task
+    assert asyncio.run(go()) is True
 
 
 def test_playback_timeout_returns_true_by_default_and_false_when_strict(monkeypatch):

@@ -105,18 +105,20 @@ class VoiceMixer(discord.AudioSource):
             gain_now = self._duck_gain if self._speech_active else self._ambient_gain
             self._ambient = MixerChild(pcm, loop=True, gain=gain_now, fade_in_ms=200)
 
-    def play_speech(self, pcm: bytes, *, gain: Optional[float] = None, fade_in_ms: int = 40) -> None:
+    def play_speech(self, pcm: bytes, *, gain: Optional[float] = None, fade_in_ms: int = 40) -> Optional[MixerChild]:
         """Layer a one-shot speech clip over the ambient bed (ducks ambient)."""
         if not pcm:
             return
         with self._lock:
-            self._speech.append(MixerChild(
+            child = MixerChild(
                 pcm, gain=self._speech_gain if gain is None else float(gain), fade_in_ms=fade_in_ms,
-            ))
+            )
+            self._speech.append(child)
             self._speech_active = True
             self._duck_release_left = 0
             if self._ambient is not None:
                 self._ambient.gain = self._duck_gain
+            return child
 
     @property
     def speech_active(self) -> bool:
