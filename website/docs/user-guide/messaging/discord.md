@@ -319,6 +319,7 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `DISCORD_AUTO_THREAD` | No | `true` | When `true`, automatically creates a new thread for every `@mention` in a text channel, so each conversation is isolated (similar to Slack behavior). Messages already inside threads or DMs are unaffected. |
 | `DISCORD_FREE_RESPONSE_AUTO_THREAD` | No | `false` | When `true`, free-response channels (listed in `DISCORD_FREE_RESPONSE_CHANNELS`) also auto-create a thread for each top-level message, while staying mention-free. Default `false` preserves the lightweight inline-chat behavior. Requires `DISCORD_AUTO_THREAD=true`; `DISCORD_NO_THREAD_CHANNELS` still wins, and voice-linked channels always ignore it. |
 | `DISCORD_ALLOW_BOTS` | No | `"none"` | Controls how the bot handles messages from other Discord bots. `"none"` — ignore all other bots. `"mentions"` — only accept bot messages that `@mention` Hermes. `"all"` — accept all bot messages. By default, either enabled mode still requires a literal inline mention; see the next setting. |
+| `DISCORD_ALLOWED_BOTS` | No | — | Comma-separated bot **user IDs**. When set, `DISCORD_ALLOW_BOTS=mentions`/`all` admits only these bots; every other bot is dropped (`reason=bot-not-in-allowlist`). Empty = no list (`DISCORD_ALLOW_BOTS` alone decides). YAML: `discord.bot_allow_from`. See [`discord.bot_allow_from`](#discordbot_allow_from). |
 | `DISCORD_BOTS_REQUIRE_INLINE_MENTION` | No | `true` | Require a literal `<@BOT_ID>` / `<@!BOT_ID>` token to start a bot handoff. Reply metadata alone does not start one. Brief same-sender/channel continuations are admitted as described below. Set to `false` only for trusted relays needing legacy admission. Human messages are unaffected. |
 | `DISCORD_REACTIONS` | No | `true` | When `true`, the bot adds emoji reactions to messages during processing (👀 when starting, ✅ on success, ❌ on error). Set to `false` to disable reactions entirely. |
 | `DISCORD_IGNORED_CHANNELS` | No | — | Comma-separated channel IDs where the bot **never** responds, even when `@mentioned`. Takes priority over all other channel settings. |
@@ -460,6 +461,24 @@ discord:
 Prefer IDs: a name only matches while the category is cached, and it can collide across servers or change on rename. A thread whose parent channel is not cached cannot be resolved to a category, so it needs an `@mention`, as before.
 
 The key is applied live: an edit to `config.yaml` (or `DISCORD_FREE_RESPONSE_CATEGORIES` in `.env`) takes effect on the next message, without a gateway restart, and the profile's `gateway.log` records `free_response_categories now [...] (applied live)`. A non-empty `.env` value wins over `config.yaml`; an empty one (`DISCORD_FREE_RESPONSE_CATEGORIES=`) is ignored and `config.yaml` decides. To turn the feature off, clear it in `config.yaml` — an empty string, an empty list, or removing the key — which also applies on the next message. The same holds for `free_response_channels` and `allow_bots`.
+
+#### `discord.bot_allow_from`
+
+Narrows `allow_bots` to named bots. With `allow_bots: mentions` (or `all`), only the bot user IDs listed here can trigger this profile; any other bot is dropped at ingress and refused by gateway authorization, including while a session is busy.
+
+```yaml
+discord:
+  allow_bots: mentions
+  bot_allow_from: ["123456789012345678", "234567890123456789"]
+```
+
+- **IDs only.** Match a bot by its numeric user ID (`<@123…>` pasted from Discord is accepted). A name never matches: a non-numeric entry is ignored with one WARNING, and a list with no usable ID admits **no** bot (fail closed).
+- **Empty means no list.** An absent key, `[]` or `""` leaves `allow_bots` to decide alone. `allow_bots: none` still refuses every bot whatever the list says.
+- **Every bot you still need must be listed.** A list cuts off every bot not on it, including an admin or ops bot that talks to this profile.
+- **Per profile.** Under `gateway.multiplex_profiles` each profile reads its own `config.yaml` / `.env`; one profile's list never applies to another. The key is accepted in all three placements: `discord:`, `platforms.discord:` and `platforms.discord.extra:`. The `.env` form is `DISCORD_ALLOWED_BOTS`; a non-empty `.env` value wins over `config.yaml`.
+- **Applied live.** Edits apply on the next message, with no gateway restart, for ingress and for gateway authorization alike (the same holds for `allow_bots`). The connect line `bot allowlist: … (home=<profile>, applied live)` in `gateway.log` shows what each profile resolved; the config-drift check reports later edits as informational.
+- **History is tagged, not filtered.** When history backfill runs, messages from a bot outside the list stay in the context block, tagged `[unverified]`, the same treatment as a human outside the allowlist, so a seat still sees its peers' turns. This is an instruction to the model to treat the text as background, **not a hard block**: the text still reaches the model.
+- **Relay bypass.** A trusted relay (`authorization_is_upstream`) decides authorization upstream, and its `allowOtherBots` policy is derived from `DISCORD_ALLOW_BOTS` alone; `bot_allow_from` is not sent to the connector. Do not rely on the list on a relay-fronted Discord.
 
 #### `discord.free_response_auto_thread`
 
