@@ -697,7 +697,9 @@ def _read_policy_file_values(home) -> dict:
             if str(env_values.get(name) or "").strip()
         }
     except Exception:
-        values["env_readable"] = False
+        # ``load_env_file`` returns ``{}`` for a missing or unreadable file and does not raise, so an
+        # unreadable ``.env`` reads as an empty one: ``config.yaml`` then decides, exactly as it would
+        # after a restart. This handler only covers an import failure.
         logger.debug("[Discord] live policy: .env read failed", exc_info=True)
     raw_cfg = _read_config_yaml(cfg_path)
     values["yaml"] = _policy_keys_from_yaml(raw_cfg)
@@ -5818,10 +5820,12 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         its files before and it is gone now (removing the key clears it too). An empty ``.env`` line is
         ignored, as it always was, so ``config.yaml`` decides.
 
-        ``None`` when the adapter has no profile home yet (never connected), the read failed, or the
-        files have never named the key — the caller then keeps the connect-time snapshot. That is
-        the fail-closed path for an unreadable file, and it keeps a value that only ever came from
-        process env (no file to remove it from) in force.
+        ``None`` when the adapter has no profile home yet (never connected), the read failed, an
+        unparseable ``config.yaml`` (a hand-edit typo) would otherwise read as "key removed", or the
+        files have never named the key — the caller then keeps the connect-time snapshot. That keeps
+        a typo from silently dropping a profile's policy, and keeps a value that only ever came from
+        process env (no file to remove it from) in force. An unreadable ``.env`` is NOT detectable
+        (``load_env_file`` returns ``{}``): it reads as empty, so ``config.yaml`` decides, as at a restart.
         """
         home = getattr(self, "_live_policy_home", None)
         if home is None:
@@ -5843,7 +5847,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         if extra_key in yaml_values and yaml_values[extra_key] is not None:
             seen.add(extra_key)
             return yaml_values[extra_key]
-        if extra_key in seen and values.get("yaml_readable", True) and values.get("env_readable", True):
+        if extra_key in seen and values.get("yaml_readable", True):
             return ""
         return None
 

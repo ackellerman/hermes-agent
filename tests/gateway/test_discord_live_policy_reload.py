@@ -416,3 +416,59 @@ def test_process_env_only_value_is_not_cleared_by_absent_files(tmp_path):
     for _ in range(2):
         assert adapter._get_allow_bots() == "all"
         assert adapter._discord_free_response_categories() == {"500"}
+
+
+
+# ── the two read-failure cases, pinned (impl review 2026-11-04, blockers 1 and 2) ─────────────────
+
+def test_config_yaml_typo_after_connect_keeps_all_three_live_keys(tmp_path):
+    # Since a removed key clears live, the yaml_readable guard is the only thing between a hand-edit
+    # typo and a profile silently losing its policy. All three live keys must survive it.
+    _write_yaml(tmp_path, (
+        "discord:\n  allow_bots: all\n  free_response_channels: \"111\"\n"
+        "  free_response_categories: [\"500\"]\n"), 1)
+    adapter = _adapter(tmp_path, extra={
+        "allow_bots": "all", "free_response_channels": "111", "free_response_categories": "500"})
+    assert adapter._get_allow_bots() == "all"
+    assert adapter._discord_free_response_channels() == {"111"}
+    assert adapter._discord_free_response_categories() == {"500"}
+
+    _write_yaml(tmp_path, "discord: [unclosed\n", 2)
+    for _ in range(2):
+        assert adapter._get_allow_bots() == "all"
+        assert adapter._discord_free_response_channels() == {"111"}
+        assert adapter._discord_free_response_categories() == {"500"}
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_unreadable_env_reads_as_empty_and_config_yaml_decides(tmp_path):
+    # load_env_file returns {} for an unreadable file, so it cannot be told from an emptied one.
+    # Pinned behaviour: the .env value drops out and config.yaml decides, as after a restart.
+    _write_yaml(tmp_path, "discord:\n  free_response_categories: [\"600\"]\n", 1)
+    _write_env(tmp_path, DISCORD_FREE_RESPONSE_CATEGORIES="500")
+    adapter = _adapter(tmp_path)
+    assert adapter._discord_free_response_categories() == {"500"}
+
+    env = tmp_path / ".env"
+    env.chmod(0)
+    os.utime(env, (time.time() + 5, time.time() + 5))
+    try:
+        assert adapter._discord_free_response_categories() == {"600"}
+    finally:
+        env.chmod(0o600)
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_unreadable_env_with_no_yaml_key_clears_a_seen_env_value(tmp_path):
+    # Same root cause, no config.yaml value to fall back to: the seen key resolves empty (fails
+    # closed: a mention is required again), which is also what a restart would give.
+    _write_env(tmp_path, DISCORD_FREE_RESPONSE_CATEGORIES="500")
+    adapter = _adapter(tmp_path, extra={"free_response_categories": "500"})   # snapshot holds 500 too
+    assert adapter._discord_free_response_categories() == {"500"}
+    env = tmp_path / ".env"
+    env.chmod(0)
+    os.utime(env, (time.time() + 5, time.time() + 5))
+    try:
+        assert adapter._discord_free_response_categories() == set()
+    finally:
+        env.chmod(0o600)
