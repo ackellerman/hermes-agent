@@ -761,10 +761,27 @@ def _voice_fx_signature(fx: Optional[dict]) -> str:
 _DRIFT_ADAPTERS: "weakref.WeakSet" = weakref.WeakSet()
 
 
+def _drift_owner_label(adapter) -> str:
+    """The profile directory name that owns ``adapter``'s policy files (``name`` is not per-profile)."""
+    home = getattr(adapter, "_live_policy_home", None)
+    return getattr(home, "name", None) or getattr(adapter, "name", "discord")
+
+
 def _config_drift_keys_for_adapters() -> list:
-    """Drift rows for every connected adapter; keys are prefixed only when more than one is live."""
+    """Drift rows for every connected adapter in THIS module copy.
+
+    Rows are prefixed with the owning profile's directory name whenever more than one adapter can
+    feed the monitor: several in this module, or other module copies (one per profile scope under
+    a multiplexed gateway) registered with it.
+    """
     adapters = [a for a in list(_DRIFT_ADAPTERS) if getattr(a, "_policy_snapshot", None)]
-    prefix_for = (lambda a: f"{getattr(a, 'name', 'discord')}: ") if len(adapters) > 1 else (lambda a: "")
+    try:
+        from gateway.config_drift import registered_provider_count
+        shared = registered_provider_count() > 1
+    except Exception:
+        shared = False
+    prefixed = shared or len(adapters) > 1
+    prefix_for = (lambda a: f"{_drift_owner_label(a)}: ") if prefixed else (lambda a: "")
     rows: list = []
     for adapter in adapters:
         try:
