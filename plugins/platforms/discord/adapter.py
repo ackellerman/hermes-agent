@@ -603,6 +603,7 @@ _GATE_ENV_KEYS = (
     "DISCORD_ALLOWED_USERS", "DISCORD_ALLOWED_ROLES", "DISCORD_ALLOWED_CHANNELS",
     "DISCORD_IGNORED_CHANNELS", "DISCORD_NO_THREAD_CHANNELS", "DISCORD_FREE_RESPONSE_CHANNELS",
     "DISCORD_FREE_RESPONSE_CATEGORIES", "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOW_BOTS",
+    "DISCORD_ALLOWED_BOTS",
     "GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS",
 )
 
@@ -613,7 +614,8 @@ _GATE_ENV_KEYS = (
 # restart. Everything that owns a socket (plugins, voice) stays load-once — a reload there would mean
 # tearing down live connections, and the drift check reports it instead.
 _LIVE_POLICY_ENV_KEYS = (
-    "DISCORD_ALLOW_BOTS", "DISCORD_FREE_RESPONSE_CHANNELS", "DISCORD_FREE_RESPONSE_CATEGORIES",
+    "DISCORD_ALLOW_BOTS", "DISCORD_ALLOWED_BOTS", "DISCORD_FREE_RESPONSE_CHANNELS",
+    "DISCORD_FREE_RESPONSE_CATEGORIES",
 )
 _ALLOW_BOTS_MODES = frozenset({"none", "mentions", "all"})
 
@@ -671,7 +673,7 @@ def _policy_keys_from_yaml(cfg: Optional[dict]) -> dict:
         return {}
     return {
         key: seeded[key]
-        for key in ("allow_bots", "free_response_channels", "free_response_categories")
+        for key in ("allow_bots", "bot_allow_from", "free_response_channels", "free_response_categories")
         if key in seeded
     }
 
@@ -734,6 +736,11 @@ def _normalize_allow_bots(raw) -> str:
     """
     mode = str(raw or "none").strip().lower() or "none"
     return mode if mode in _ALLOW_BOTS_MODES else "none"
+
+
+def _bot_allowlist_signature(allowed: Optional[frozenset]) -> str:
+    """Stable string for the resolved bot allowlist: ``any`` (no list) or the sorted IDs."""
+    return "any" if allowed is None else (" ".join(sorted(allowed)) or "(empty: no bot passes)")
 
 
 def _enabled_plugins_signature(cfg: Optional[dict]) -> str:
@@ -2126,6 +2133,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             bot_tag_continuation = self._is_bot_tag_debounce_continuation(message)
             if allow_bots == "none":
                 return _drop("bot-not-allowed")
+            if not self.bot_sender_allowed(author_id):
+                return _drop("bot-not-in-allowlist")
             if (
                 allow_bots == "mentions"
                 and not self._self_is_explicitly_mentioned(message)
@@ -5745,6 +5754,14 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         self._live_policy_home = _resolve_profile_home()
         self._capture_policy_snapshot()
         try:
+            logger.info(
+                "[Discord] bot allowlist: %s (home=%s, applied live)",
+                _bot_allowlist_signature(self._bot_allowlist()),
+                self._live_policy_home.name if self._live_policy_home is not None else "none",
+            )
+        except Exception:
+            logger.debug("[Discord] could not resolve the bot allowlist at connect", exc_info=True)
+        try:
             categories = sorted(self._discord_free_response_categories())
             home = self._live_policy_home
             logger.info(
@@ -5930,6 +5947,62 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             raw = self._gate_raw("allow_bots", "DISCORD_ALLOW_BOTS")
         return self._parse_allow_bots(raw)
 
+    def _bot_allowlist(self) -> Optional[frozenset]:
+        """This profile's ``bot_allow_from`` (``DISCORD_ALLOWED_BOTS``), re-read per message.
+
+        ``None``: no list configured (an absent or blank key), so ``allow_bots`` alone decides.
+        A set: only these bot user IDs pass. Entries that are not numeric IDs are dropped with one
+        WARNING; a list with no usable entry (or malformed JSON) is an EMPTY set, i.e. no bot passes,
+        never "no list".
+        """
+        raw = self._live_gate_value("bot_allow_from", "DISCORD_ALLOWED_BOTS")
+        if raw is None:
+            raw = self._gate_raw("bot_allow_from", "DISCORD_ALLOWED_BOTS")
+        if raw is None:
+            return None
+        if isinstance(raw, (list, tuple, set, frozenset)):
+            if not raw:
+                return None
+        elif not str(raw).strip() or str(raw).strip() == "[]":
+            return None
+        ids: set = set()
+        rejected: list = []
+        for entry in self._policy_csv_set(raw, key="bot_allow_from"):
+            cleaned = _clean_discord_id(str(entry))
+            if cleaned.isdigit():
+                ids.add(cleaned)
+            else:
+                rejected.append(str(entry))
+        if rejected and self._policy_typo_once("bot_allow_from", ",".join(sorted(rejected))):
+            logger.warning(
+                "[%s] bot_allow_from entries %s are not Discord user IDs and were ignored; a bot is "
+                "matched only by its numeric user ID.", getattr(self, "name", "discord"), sorted(rejected),
+            )
+        return frozenset(ids)
+
+    @staticmethod
+    def _bot_id_allowed(allowed: Optional[frozenset], author_id: Any) -> bool:
+        """``author_id`` against a resolved ``_bot_allowlist()`` (``None`` = no list = pass)."""
+        if allowed is None:
+            return True
+        return author_id is not None and str(author_id).strip() in allowed
+
+    def bot_sender_allowed(self, author_id: Any) -> bool:
+        """Whether a bot author passes ``bot_allow_from`` (True when no list is configured).
+
+        Gateway authz calls this on the routed adapter, so ingress, recovery, the busy path and
+        authz share one live, per-profile decision.
+        """
+        return self._bot_id_allowed(self._bot_allowlist(), author_id)
+
+    def bot_admission_mode(self) -> str:
+        """This profile's live ``allow_bots`` mode (none|mentions|all), for gateway authz.
+
+        The same per-message read ingress uses (``_get_allow_bots``): without it, authz would keep
+        the connect-time ``config.extra`` value and refuse a bot that a live edit just admitted.
+        """
+        return self._get_allow_bots()
+
     @staticmethod
     def _bot_tag_debounce_key(message: Any) -> str:
         return (
@@ -6028,6 +6101,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             cfg = _read_config_yaml(home / "config.yaml") if home is not None else None
             self._policy_snapshot = {
                 "allow_bots": self._get_allow_bots(),
+                "bot_allow_from": _bot_allowlist_signature(self._bot_allowlist()),
                 "free_response_channels": " ".join(sorted(self._discord_free_response_channels())),
                 "free_response_categories": " ".join(sorted(self._discord_free_response_categories())),
                 "plugins.enabled": _enabled_plugins_signature(cfg),
@@ -6063,6 +6137,9 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         _add("allow_bots", snapshot.get("allow_bots"),
              _normalize_allow_bots(live_allow_bots) if live_allow_bots is not None
              else snapshot.get("allow_bots"), reloadable=True)
+        if self._live_gate_value("bot_allow_from", "DISCORD_ALLOWED_BOTS") is not None:
+            _add("bot_allow_from", snapshot.get("bot_allow_from"),
+                 _bot_allowlist_signature(self._bot_allowlist()), reloadable=True)
         live_free = self._live_gate_value("free_response_channels", "DISCORD_FREE_RESPONSE_CHANNELS")
         _add("free_response_channels", snapshot.get("free_response_channels"),
              " ".join(sorted(self._policy_csv_set(live_free, key="free_response_channels")))
@@ -6257,6 +6334,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             return ""
         allow_bots_raw = self._get_allow_bots()
         include_other_bots = allow_bots_raw != "none"
+        # Resolved once per fetch, not per history message (it re-reads the profile's files).
+        bot_allowlist = self._bot_allowlist() if include_other_bots else None
         # Narrow via cached last-self-message id (`after`) only if it predates the trigger; miss => full scan.
         channel_id = str(getattr(channel, "id", ""))
         _cached_id = self._last_self_message_id.get(channel_id)
@@ -6298,6 +6377,16 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                     name = f"{name} [bot]"
                 # Tag non-allowlisted senders [unverified] so the LLM treats them as background; bots bypass.
                 trust_tag = ""
+                if (
+                    is_bot_author
+                    and msg.author != self._client.user
+                    and not self._bot_id_allowed(bot_allowlist, getattr(msg.author, "id", None))
+                ):
+                    # Context, not a trigger: a bot outside bot_allow_from is kept but tagged as
+                    # background, like a human outside the allowlist. A prompt instruction, not a
+                    # hard block: the model still sees the text.
+                    trust_tag = "[unverified] "
+                    has_unverified = True
                 if not is_bot_author:
                     author_id = str(getattr(msg.author, "id", ""))
                     is_authorized = self._is_sender_authorized(
@@ -8347,6 +8436,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict, *, set_env=None) -> di
     _gate("allowed_roles", "DISCORD_ALLOWED_ROLES", from_platform_extra=True)
     _gate("allow_all_users", "DISCORD_ALLOW_ALL_USERS", from_platform_extra=True, lower=True)
     _gate("allow_bots", "DISCORD_ALLOW_BOTS", from_platform_extra=True, lower=True)
+    _gate("bot_allow_from", "DISCORD_ALLOWED_BOTS", from_platform_extra=True)
     approval_mentions_cfg = (
         discord_cfg["approval_mentions"] if "approval_mentions" in discord_cfg
         else platform_extra_cfg.get("approval_mentions")
