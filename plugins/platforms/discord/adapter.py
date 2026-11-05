@@ -2143,12 +2143,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 # the same message with no mention at all is admitted. ``thread_require_mention``
                 # still gates multi-bot threads, inside _in_bot_thread().
                 if not self._in_bot_thread(message):
-                    parent_id = None
-                    if hasattr(message.channel, "parent_id") and message.channel.parent_id:
-                        parent_id = str(message.channel.parent_id)
-                    free_channels = self._discord_free_response_channels()
-                    channel_keys = self._discord_channel_keys(message, parent_id)
-                    if "*" not in free_channels and not (channel_keys & free_channels):
+                    if not self._no_mention_free_gate_admits(message):
                         # The reason string carries what the old prose comment said: this is the drop
                         # an operator cannot guess from the outside (mentions someone else, the bot is
                         # not a participant, the channel is not free-response).
@@ -5935,6 +5930,13 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             raw = self._gate_env("DISCORD_FREE_RESPONSE_CHANNELS")
         return self._policy_csv_set(raw, key="free_response_channels")
 
+    def _discord_free_response_categories(self) -> set:
+        """Return Discord category IDs/names where no bot mention is required."""
+        raw = self.config.extra.get("free_response_categories")
+        if raw is None:
+            raw = self._gate_env("DISCORD_FREE_RESPONSE_CATEGORIES")
+        return self._policy_csv_set(raw, key="free_response_categories")
+
     # ── config drift: what this process loaded vs. what the files say now ─────────────────────────
 
     def _capture_policy_snapshot(self) -> None:
@@ -6071,6 +6073,75 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             keys.add(parent_name)
             keys.add(f"#{parent_name}")
         return keys
+
+    def _discord_category_keys(self, message: Any) -> set[str]:
+        """Return category identifiers accepted by Discord category config gates."""
+        return self._discord_category_keys_from_channel(getattr(message, "channel", None))
+
+    def _discord_category_keys_from_channel(self, channel: Any) -> set[str]:
+        """Build Discord category config keys from a channel object.
+
+        Categories are intentionally separate from channel keys so operators can
+        configure an explicit ``free_response_categories`` gate without
+        overloading the channel lists with category snowflakes.
+
+        A thread has no category of its own — it inherits the parent channel's.
+        Resolve through ``channel.parent`` when present, mirroring the parent
+        scope ``_discord_channel_keys_from_channel`` already preserves for
+        thread policies. discord.py's ``Thread.category`` / ``Thread.category_id``
+        raise ``ClientException`` when the parent is not cached (``getattr``
+        only swallows ``AttributeError``), so both reads are suppressed: an
+        unresolvable category yields no keys instead of raising through the
+        message and slash gates.
+        """
+        keys: set[str] = set()
+
+        parent = getattr(channel, "parent", None)
+        source = parent if parent is not None else channel
+
+        category_id = None
+        with suppress(Exception):
+            category_id = getattr(source, "category_id", None)
+        if category_id is not None:
+            keys.add(str(category_id))
+
+        category_channel = None
+        with suppress(Exception):
+            category_channel = getattr(source, "category", None)
+        category_name = str(getattr(category_channel, "name", "")).strip() if category_channel else ""
+        if category_name:
+            keys.add(category_name)
+            keys.add(f"#{category_name}")
+
+        return keys
+
+    def _no_mention_free_gate_admits(self, message: Any) -> bool:
+        """Whether a no-mention message survives the mention-others admission gate.
+
+        That gate drops messages which @mention other users but not this bot
+        (``DISCORD_IGNORE_NO_MENTION``). Free-response scopes are the exception:
+        the bot answers regardless of who was mentioned. Resolve the channel
+        scope (channel / thread-parent keys vs ``free_response_channels``) and
+        the category scope (vs ``free_response_categories``) so category-level
+        free-response applies at this earlier gate too, matching the
+        ``is_free_channel`` decision in ``_handle_message``.
+        """
+        channel = getattr(message, "channel", None)
+        parent_id = None
+        if getattr(channel, "parent_id", None):
+            parent_id = str(channel.parent_id)
+
+        free_channels = self._discord_free_response_channels()
+        channel_keys = self._discord_channel_keys(message, parent_id)
+        if "*" in free_channels or (channel_keys & free_channels):
+            return True
+
+        free_categories = self._discord_free_response_categories()
+        category_keys = self._discord_category_keys(message)
+        if "*" in free_categories or (category_keys & free_categories):
+            return True
+
+        return False
 
     def _discord_thread_require_mention(self) -> bool:
         """Whether threads still require @mention after the bot has participated (default False).
@@ -6973,6 +7044,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         # Config (discord.* in config.yaml or DISCORD_* env vars):
         #   discord.require_mention: Require @mention in server channels (default: true)
         #   discord.free_response_channels: Channel IDs where bot responds without mention
+        #   discord.free_response_categories: Category IDs/names where bot responds without mention
         #   discord.ignored_channels: Channel IDs where bot NEVER responds (even when mentioned)
         #   discord.allowed_channels: If set, bot ONLY responds in these channels (whitelist)
         #   discord.no_thread_channels: Channel IDs where bot responds directly without creating thread
@@ -7010,6 +7082,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             if parent_channel_id:
                 channel_ids.add(parent_channel_id)
             channel_keys = self._discord_channel_keys(message, parent_channel_id)
+            category_keys = self._discord_category_keys(message)
             allowed_channels = self._get_allowed_channels()
             if allowed_channels:
                 if "*" not in allowed_channels and not (channel_keys & allowed_channels):
@@ -7020,6 +7093,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 logger.debug("[%s] Ignoring message in ignored channel: %s", self.name, channel_keys)
                 return False
             free_channels = self._discord_free_response_channels()
+            free_categories = self._discord_free_response_categories()
             require_mention = self._discord_require_mention()
             # Voice-linked text channel is free-response while voice is active (exact channel only).
             voice_linked_ids = {str(ch_id) for ch_id in self._voice_text_channels.values()}
@@ -7028,6 +7102,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             is_free_channel = (
                 "*" in free_channels
                 or bool(channel_keys & free_channels)
+                or "*" in free_categories
+                or bool(category_keys & free_categories)
                 or is_voice_linked_channel
             )
             in_bot_thread = self._in_bot_thread(message)
@@ -8199,6 +8275,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict, *, set_env=None) -> di
         seeded_extra["approval_mentions"] = approval_mentions_cfg
         _env_default("DISCORD_APPROVAL_MENTIONS", str(approval_mentions_cfg).lower())
     _gate("free_response_channels", "DISCORD_FREE_RESPONSE_CHANNELS", from_platform_extra=False)
+    _gate("free_response_categories", "DISCORD_FREE_RESPONSE_CATEGORIES", from_platform_extra=False)
     for key, env_key in (
         ("auto_thread", "DISCORD_AUTO_THREAD"),
         ("free_response_auto_thread", "DISCORD_FREE_RESPONSE_AUTO_THREAD"),
