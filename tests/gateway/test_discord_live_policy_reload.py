@@ -337,3 +337,82 @@ def test_connect_logs_the_resolved_free_response_categories(tmp_path, monkeypatc
     # The connect line is the baseline: an unchanged read afterwards logs nothing more.
     adapter._discord_free_response_categories()
     assert not [r for r in caplog.records if "free_response_categories now" in r.getMessage()]
+
+
+# ── clearing a live key applies live too (C3) ─────────────────────────────────────────────────────
+# Clearing used to be inert: an empty YAML value counted as "not mentioned", so the getter fell back to
+# the connect-time config.extra and kept the OLD list (and the drift row agreed, so nothing warned).
+# Contract now: a key present in config.yaml is authoritative even when empty; a key that THIS adapter
+# has seen in its files and that is now gone resolves empty as well; an empty .env line is ignored
+# (config.yaml decides); a value that only ever came from process env is untouched.
+
+def _write_yaml(home, body, bump):
+    (home / "config.yaml").write_text(body, encoding="utf-8")
+    os.utime(home / "config.yaml", (time.time() + bump, time.time() + bump))
+
+
+@pytest.mark.parametrize("key,getter", [
+    ("free_response_channels", "_discord_free_response_channels"),
+    ("free_response_categories", "_discord_free_response_categories"),
+])
+@pytest.mark.parametrize("cleared", ['""', "[]", None])
+def test_cleared_list_key_applies_live(tmp_path, key, getter, cleared):
+    _write_yaml(tmp_path, f"discord:\n  {key}: \"111\"\n", 1)
+    adapter = _adapter(tmp_path, extra={key: "111"})      # startup bridge seeded extra from the file
+    assert getattr(adapter, getter)() == {"111"}
+
+    _write_yaml(tmp_path, f"discord:\n  {key}: \"111,222\"\n", 2)
+    assert getattr(adapter, getter)() == {"111", "222"}   # widening was already live
+
+    body = f"discord:\n  {key}: {cleared}\n" if cleared is not None else "discord:\n  require_mention: true\n"
+    _write_yaml(tmp_path, body, 3)
+    assert getattr(adapter, getter)() == set()
+
+
+@pytest.mark.parametrize("cleared", ['""', None])
+def test_cleared_allow_bots_applies_live(tmp_path, cleared):
+    _write_yaml(tmp_path, "discord:\n  allow_bots: all\n", 1)
+    adapter = _adapter(tmp_path, extra={"allow_bots": "all"})
+    assert adapter._get_allow_bots() == "all"
+    assert adapter._discord_message_admission(_bot_message(msg_id=9001), claim=True)[0] is True
+
+    body = f"discord:\n  allow_bots: {cleared}\n" if cleared is not None else "discord:\n  require_mention: true\n"
+    _write_yaml(tmp_path, body, 2)
+    assert adapter._get_allow_bots() == "none"
+    assert adapter._discord_message_admission(_bot_message(msg_id=9002), claim=True)[0] is False
+
+
+def test_cleared_key_is_reported_by_the_drift_row(tmp_path):
+    _write_yaml(tmp_path, "discord:\n  free_response_categories: [\"500\"]\n", 1)
+    adapter = _adapter(tmp_path, extra={"free_response_categories": "500"})
+    adapter._voice_fx_cfg = {}
+    adapter._capture_policy_snapshot()
+    _write_yaml(tmp_path, "discord:\n  free_response_categories: []\n", 2)
+    rows = {row.name: row for row in adapter._config_drift_keys()}
+    assert rows["free_response_categories"].snapshot == "500"
+    assert rows["free_response_categories"].disk == ""
+    assert rows["free_response_categories"].drifted()
+
+
+def test_empty_env_line_falls_through_to_config_yaml(tmp_path):
+    # W3b: an empty .env value is ignored, not a clear: config.yaml decides.
+    _write_yaml(tmp_path, "discord:\n  free_response_categories: [\"500\"]\n", 1)
+    _write_env(tmp_path, DISCORD_FREE_RESPONSE_CATEGORIES="")
+    adapter = _adapter(tmp_path)
+    assert adapter._discord_free_response_categories() == {"500"}
+    _write_env(tmp_path, DISCORD_FREE_RESPONSE_CATEGORIES="600")
+    assert adapter._discord_free_response_categories() == {"600"}     # non-empty .env wins
+    _write_env(tmp_path, DISCORD_FREE_RESPONSE_CATEGORIES="")
+    assert adapter._discord_free_response_categories() == {"500"}     # emptied .env: YAML again
+
+
+def test_process_env_only_value_is_not_cleared_by_absent_files(tmp_path):
+    # A value that never came from this profile's files (container env, unit-file Environment=) has
+    # nothing on disk to "remove": the absent key keeps the connect-time snapshot.
+    adapter = _adapter(tmp_path)
+    adapter._gate_env_snapshot["DISCORD_ALLOW_BOTS"] = "all"
+    adapter._gate_env_snapshot["DISCORD_FREE_RESPONSE_CATEGORIES"] = "500"
+    _write_yaml(tmp_path, "discord:\n  require_mention: true\n", 1)
+    for _ in range(2):
+        assert adapter._get_allow_bots() == "all"
+        assert adapter._discord_free_response_categories() == {"500"}
