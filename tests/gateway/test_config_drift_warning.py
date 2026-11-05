@@ -192,3 +192,131 @@ def test_unconnected_adapter_offers_no_drift_rows(tmp_path):
     adapter._gate_env_snapshot = {key: "" for key in adapter_mod._GATE_ENV_KEYS}
     # Neither the profile home nor the snapshot was captured: nothing to compare, nothing to read.
     assert adapter._config_drift_keys() == []
+
+
+def test_free_response_categories_drift_is_reported_as_applied_live(tmp_path, caplog):
+    _write_config(tmp_path, "discord:\n  require_mention: true\n")
+    adapter = _adapter(tmp_path)
+    assert adapter._policy_snapshot.get("free_response_categories") == ""
+    monitor = ConfigDriftMonitor(adapter._config_drift_keys, scope="discord")
+    caplog.set_level(logging.INFO, logger="gateway.config_drift")
+
+    assert monitor.check_once() is None                # disk agrees with the snapshot
+    _write_config(tmp_path, "discord:\n  free_response_categories: [\"500\"]\n")
+    message = monitor.check_once()
+    assert message and "free_response_categories changed on disk (applied live)" in message
+    assert "restart" not in message
+
+
+# ── one monitor serves every profile's plugin module (C4) ─────────────────────────────────────────
+# A multiplexed gateway imports the Discord plugin once per profile scope (bare
+# ``hermes_plugins.platforms__discord`` for the first, ``…__home_<digest>`` for the others). Each copy
+# has its own adapter registry and provider. The process-wide monitor used to keep only the FIRST
+# provider, so every other profile's edits were never reported.
+
+def _provider(module_name, rows):
+    def provider():
+        return list(rows())
+    provider.__module__ = module_name
+    provider.__qualname__ = "_config_drift_keys_for_adapters"
+    return provider
+
+
+def test_two_module_providers_both_reach_the_one_monitor(caplog):
+    import gateway.config_drift as config_drift_mod
+
+    rows_a = [DriftKey(name="a: allow_bots", snapshot="none", disk="none", reloadable=True)]
+    rows_b = [DriftKey(name="b: allow_bots", snapshot="none", disk="none", reloadable=True)]
+    try:
+        first = config_drift_mod.start_monitor(_provider("mod_a", lambda: rows_a), interval=3600, scope="discord")
+        second = config_drift_mod.start_monitor(_provider("mod_b", lambda: rows_b), interval=3600, scope="discord")
+        assert first is second
+        caplog.set_level(logging.INFO, logger="gateway.config_drift")
+        assert first.check_once() is None
+        rows_b[0] = DriftKey(name="b: allow_bots", snapshot="none", disk="all", reloadable=True)
+        message = first.check_once()
+        assert message and "b: allow_bots changed on disk (applied live)" in message
+    finally:
+        config_drift_mod.reset_monitor()
+
+
+def test_reregistered_module_replaces_its_stale_provider():
+    # A plugin reload re-imports the module under the same name with a new function object: the
+    # old provider (and the adapters it pins) must be dropped, not kept beside the new one.
+    import gateway.config_drift as config_drift_mod
+
+    calls = []
+    try:
+        monitor = config_drift_mod.start_monitor(
+            _provider("mod_a", lambda: calls.append("old") or []), interval=3600, scope="discord")
+        config_drift_mod.start_monitor(
+            _provider("mod_a", lambda: calls.append("new") or []), interval=3600, scope="discord")
+        monitor.check_once()
+        assert calls == ["new"]
+    finally:
+        config_drift_mod.reset_monitor()
+
+
+def _load_plugin_copy(monkeypatch, name):
+    """Import the Discord plugin package under ``name``, the way the plugin loader scopes it."""
+    import importlib.util
+    import pathlib
+    import sys
+    import types
+
+    if "hermes_plugins" not in sys.modules:
+        namespace = types.ModuleType("hermes_plugins")
+        namespace.__path__ = []
+        monkeypatch.setitem(sys.modules, "hermes_plugins", namespace)
+    package_dir = pathlib.Path(adapter_mod.__file__).parent
+    spec = importlib.util.spec_from_file_location(
+        name, package_dir / "__init__.py", submodule_search_locations=[str(package_dir)])
+    package = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, package)
+    spec.loader.exec_module(package)
+    module = sys.modules[name + ".adapter"]
+    monkeypatch.setitem(sys.modules, name + ".adapter", module)
+    return module
+
+
+def test_second_profile_module_edit_is_reported(tmp_path, monkeypatch, caplog):
+    import gateway.config_drift as config_drift_mod
+    from gateway.config import PlatformConfig
+
+    module_a = _load_plugin_copy(monkeypatch, "hermes_plugins.platforms__discord")
+    module_b = _load_plugin_copy(monkeypatch, "hermes_plugins.platforms__discord__home_b")
+    assert module_a is not module_b and module_a._DRIFT_ADAPTERS is not module_b._DRIFT_ADAPTERS
+
+    def connect(module, home):
+        home.mkdir()
+        _write_config(home, "discord:\n  free_response_categories: [\"500\"]\n")
+        adapter = module.DiscordAdapter(PlatformConfig(
+            enabled=True, token="x", extra={"free_response_categories": "500"}))
+        adapter._gate_env_snapshot = {key: "" for key in module._GATE_ENV_KEYS}
+        adapter._live_policy_home = home
+        adapter._capture_policy_snapshot()
+        module._start_config_drift_monitor(adapter)
+        return adapter
+
+    home_a, home_b = tmp_path / "alpha", tmp_path / "beta"
+    try:
+        adapters = (connect(module_a, home_a), connect(module_b, home_b))  # noqa: F841 (keep alive)
+        monitor = config_drift_mod._MONITOR
+        caplog.set_level(logging.INFO, logger="gateway.config_drift")
+        assert monitor.check_once() is None                     # both homes agree with disk
+
+        _write_config(home_b, "discord:\n  free_response_categories: [\"500\", \"600\"]\n")
+        module_a._LIVE_POLICY_CACHE.clear()
+        module_b._LIVE_POLICY_CACHE.clear()
+        message = monitor.check_once()
+        assert message and "beta: free_response_categories changed on disk (applied live)" in message
+        assert "alpha:" not in message
+
+        _write_config(home_a, "discord:\n  free_response_categories: [\"700\"]\n")
+        module_a._LIVE_POLICY_CACHE.clear()
+        message = monitor.check_once()
+        # Both now drifted; the one line names each owner's key.
+        assert message and "alpha: free_response_categories" in message
+        assert "beta: free_response_categories" in message and "(applied live)" in message
+    finally:
+        config_drift_mod.reset_monitor()

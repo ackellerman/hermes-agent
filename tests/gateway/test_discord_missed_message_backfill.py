@@ -570,3 +570,25 @@ async def test_stored_cursor_cannot_widen_scan_window_or_leak_into_threads(adapt
         pass
     assert not isinstance(channel.seen_after[-1], dt.datetime)  # newer cursor narrows (discord.Object)
     assert thread.seen_after[-1] == window_floor
+
+
+@pytest.mark.asyncio
+async def test_recovered_message_in_free_response_category_is_admitted(adapter, monkeypatch):
+    """A recovered no-mention post in a free-response category passes the recovery pre-gate.
+
+    The live path admits it (``_no_mention_free_gate_admits``); recovery must agree, or a post made
+    while the gateway was down is dropped in a scope the operator configured as mention-free.
+    """
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CATEGORIES", "500")
+    adapter._gate_env_snapshot = None  # read the scoped env this test sets, not a connect snapshot
+    in_category = FakeChannel(channel_id=321, parent_id=None)
+    in_category.category_id = 500
+    elsewhere = FakeChannel(channel_id=654, parent_id=None)
+    elsewhere.category_id = 999
+
+    assert await adapter._dispatch_recovered_message(
+        make_message(message_id=11, content="no mention, free category", channel=in_category)) is True
+    assert await adapter._dispatch_recovered_message(
+        make_message(message_id=12, content="no mention, other category", channel=elsewhere)) is False
+    assert adapter._handle_message.await_count == 1

@@ -122,3 +122,26 @@ def test_admitted_messages_stay_out_of_the_info_log(caplog):
     admitted, _ = _adapter()._discord_message_admission(_message(), claim=True)
     assert admitted is True
     assert _drop_records(caplog) == []
+
+
+def _category_post(msg_id, category_id):
+    """A post in a category channel that @mentions someone else (not the bot)."""
+    message = _message(content=f"<@{HUMAN_AUTHOR_ID + 1}> see this", msg_id=msg_id,
+                       mentions=[SimpleNamespace(id=HUMAN_AUTHOR_ID + 1, bot=False)])
+    message.channel = SimpleNamespace(id=CHANNEL_ID, name="general", parent_id=None,
+                                      category_id=category_id, category=None)
+    return message
+
+
+def test_mention_others_in_free_category_is_admitted_and_outside_keeps_its_reason(caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    adapter = _adapter(extra={"free_response_categories": "500"})
+
+    admitted, _ = adapter._discord_message_admission(_category_post(8001, 500), claim=True)
+    assert admitted is True
+    assert _drop_records(caplog) == []
+
+    admitted, _ = adapter._discord_message_admission(_category_post(8002, 999), claim=True)
+    assert admitted is False
+    reasons = [r.getMessage().rsplit("reason=", 1)[-1].rstrip(")") for r in _drop_records(caplog)]
+    assert reasons == ["mentions-others-not-free-channel"]

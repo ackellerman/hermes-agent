@@ -41,3 +41,32 @@ def test_routed_no_agent_script_env_keeps_operator_allowlist_and_drops_platform_
     assert env.get("DEMO_ALLOWED_SENDER") == "someone@example.com"
     assert "DISCORD_ALLOWED_CHANNELS" not in env
     assert os.environ["DISCORD_ALLOWED_CHANNELS"] == "111"  # the strip never mutates the process env
+
+
+def test_discord_free_response_categories_is_a_profile_gate():
+    assert is_profile_gate_env("DISCORD_FREE_RESPONSE_CATEGORIES")
+
+
+def test_routed_child_env_drops_the_launch_profiles_category_gate(tmp_path, monkeypatch):
+    """A child built for profile B must not inherit profile A's free-response categories (the YAML
+    bridge writes the first profile's value into process env), same as the channel list."""
+    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    launch = tmp_path / ".hermes"
+    other = launch / "profiles" / "other"
+    other.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "111")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CATEGORIES", "500")
+
+    ht = set_hermes_home_override(str(other))
+    st = set_secret_scope(build_profile_secret_scope(other), profile_home=str(other))
+    try:
+        env = build_subprocess_env(strip_launch_profile=True)
+    finally:
+        reset_secret_scope(st)
+        reset_hermes_home_override(ht)
+    assert "DISCORD_FREE_RESPONSE_CHANNELS" not in env           # control: the channel gate is stripped
+    assert "DISCORD_FREE_RESPONSE_CATEGORIES" not in env
+    assert os.environ["DISCORD_FREE_RESPONSE_CATEGORIES"] == "500"
