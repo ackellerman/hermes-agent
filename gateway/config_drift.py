@@ -16,6 +16,9 @@ Design notes:
   drifted file does not repeat every minute, and a file that converges resets the latch so a later
   re-drift is reported again.
 * The loop is a daemon thread: a config comparison must never keep a gateway alive or block its loop.
+* One monitor, many providers: a multiplexed gateway loads a plugin once per profile scope, and every
+  copy registers its own row provider. All of them are compared (keyed by defining module, so a reload
+  replaces its stale provider), and each adapter prefixes its rows with its profile directory name.
 """
 
 from __future__ import annotations
@@ -151,6 +154,38 @@ class ConfigDriftMonitor:
 _MONITOR: Optional[ConfigDriftMonitor] = None
 _MONITOR_LOCK = threading.Lock()
 
+# Every registered row provider, keyed by the module that defines it. A multiplexed gateway imports a
+# plugin once per profile scope (``hermes_plugins.platforms__discord`` and ``…__home_<digest>``), and
+# each copy has its own provider; keeping only the first one meant no other profile's edit was ever
+# reported. Keyed by module name, not object identity, so a plugin reload (same module name, new
+# function object) REPLACES its stale provider instead of running beside it.
+_PROVIDERS: dict[str, Callable[[], Iterable[DriftKey]]] = {}
+
+
+def _provider_key(key_provider: Callable[[], Iterable[DriftKey]]) -> str:
+    module = getattr(key_provider, "__module__", None) or ""
+    name = getattr(key_provider, "__qualname__", None) or repr(key_provider)
+    return f"{module}:{name}"
+
+
+def registered_provider_count() -> int:
+    """How many distinct providers feed the monitor (more than one => rows need an owner prefix)."""
+    with _MONITOR_LOCK:
+        return len(_PROVIDERS)
+
+
+def _all_rows() -> list[DriftKey]:
+    """Rows from every registered provider; one failing provider does not hide the others."""
+    with _MONITOR_LOCK:
+        providers = list(_PROVIDERS.values())
+    rows: list[DriftKey] = []
+    for provider in providers:
+        try:
+            rows.extend(provider())
+        except Exception:
+            logger.debug("config drift: a key provider failed", exc_info=True)
+    return rows
+
 
 def start_monitor(
     key_provider: Callable[[], Iterable[DriftKey]],
@@ -158,24 +193,27 @@ def start_monitor(
     interval: float = DEFAULT_INTERVAL_SECONDS,
     scope: str = "config",
 ) -> ConfigDriftMonitor:
-    """Start the process-wide monitor for ``scope`` once; later calls return the running one.
+    """Register ``key_provider`` and start the process-wide monitor once; later calls return it.
 
     One monitor per process (not per adapter): a multiplexed gateway would otherwise emit the same
-    warning once per profile for a change they all share.
+    warning once per profile for a change they all share. It compares the rows of EVERY registered
+    provider, so each profile's plugin module copy is watched, not only the first to connect.
     """
     global _MONITOR
     with _MONITOR_LOCK:
+        _PROVIDERS[_provider_key(key_provider)] = key_provider
         if _MONITOR is None:
-            _MONITOR = ConfigDriftMonitor(key_provider, interval=interval, scope=scope)
+            _MONITOR = ConfigDriftMonitor(_all_rows, interval=interval, scope=scope)
         if not _MONITOR.running:
             _MONITOR.start()
         return _MONITOR
 
 
 def reset_monitor() -> None:
-    """Stop and drop the process-wide monitor (tests; also a clean shutdown hook)."""
+    """Stop and drop the process-wide monitor and its providers (tests; also a clean shutdown hook)."""
     global _MONITOR
     with _MONITOR_LOCK:
         if _MONITOR is not None:
             _MONITOR.stop()
         _MONITOR = None
+        _PROVIDERS.clear()
