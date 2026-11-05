@@ -602,16 +602,19 @@ def _clean_discord_id(entry: str) -> str:
 _GATE_ENV_KEYS = (
     "DISCORD_ALLOWED_USERS", "DISCORD_ALLOWED_ROLES", "DISCORD_ALLOWED_CHANNELS",
     "DISCORD_IGNORED_CHANNELS", "DISCORD_NO_THREAD_CHANNELS", "DISCORD_FREE_RESPONSE_CHANNELS",
-    "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOW_BOTS",
+    "DISCORD_FREE_RESPONSE_CATEGORIES", "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOW_BOTS",
     "GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS",
 )
 
 # ── reloadable policy keys ──────────────────────────────────────────────── Owner ruling (2026-11-02):
-# gates live, plugins restart-only. ``allow_bots`` and ``free_response_channels`` are re-read per
+# gates live, plugins restart-only. ``allow_bots``, ``free_response_channels`` and
+# ``free_response_categories`` are re-read per
 # message off this profile's own ``.env``/``config.yaml``, so a policy edit stops needing a gateway
 # restart. Everything that owns a socket (plugins, voice) stays load-once — a reload there would mean
 # tearing down live connections, and the drift check reports it instead.
-_LIVE_POLICY_ENV_KEYS = ("DISCORD_ALLOW_BOTS", "DISCORD_FREE_RESPONSE_CHANNELS")
+_LIVE_POLICY_ENV_KEYS = (
+    "DISCORD_ALLOW_BOTS", "DISCORD_FREE_RESPONSE_CHANNELS", "DISCORD_FREE_RESPONSE_CATEGORIES",
+)
 _ALLOW_BOTS_MODES = frozenset({"none", "mentions", "all"})
 
 # home -> (file signature, {"env": {...}, "yaml": {...}}). Cache key is the two files' stat identity,
@@ -651,7 +654,7 @@ def _read_config_yaml(path) -> Optional[dict]:
 
 
 def _policy_keys_from_yaml(cfg: Optional[dict]) -> dict:
-    """``allow_bots``/``free_response_channels`` as the startup bridge resolves them, from a raw config."""
+    """The live policy keys as the startup bridge resolves them, from a raw config."""
     if not isinstance(cfg, dict):
         return {}
     section = cfg.get("discord") if isinstance(cfg.get("discord"), dict) else None
@@ -666,7 +669,11 @@ def _policy_keys_from_yaml(cfg: Optional[dict]) -> dict:
     except Exception:
         logger.debug("[Discord] live policy: YAML policy extraction failed", exc_info=True)
         return {}
-    return {key: seeded[key] for key in ("allow_bots", "free_response_channels") if key in seeded}
+    return {
+        key: seeded[key]
+        for key in ("allow_bots", "free_response_channels", "free_response_categories")
+        if key in seeded
+    }
 
 
 def _read_policy_file_values(home) -> dict:
@@ -2968,13 +2975,10 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
     async def _dispatch_recovered_message(self, message: Any) -> bool:
         """Run one recovered message through the live Discord ingress gates."""
         if not isinstance(message.channel, discord.DMChannel):
-            parent_id = self._get_parent_channel_id(message.channel)
-            channel_keys = self._discord_channel_keys(message, parent_id)
-            free_channels = self._discord_free_response_channels()
+            # Same free-response scope as the live path (channels, thread parents, categories).
             if (
                 self._discord_require_mention()
-                and "*" not in free_channels
-                and not (channel_keys & free_channels)
+                and not self._no_mention_free_gate_admits(message)
                 and not self._in_bot_thread(message)
                 and not self._self_is_explicitly_mentioned(message)
             ):
@@ -5717,6 +5721,15 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         # what keeps the live read inert for an adapter that was never connected.
         self._live_policy_home = _resolve_profile_home()
         self._capture_policy_snapshot()
+        try:
+            categories = sorted(self._discord_free_response_categories())
+            home = self._live_policy_home
+            logger.info(
+                "[Discord] free-response categories: %s (home=%s, applied live)",
+                categories or "none", home.name if home is not None else "none",
+            )
+        except Exception:
+            logger.debug("[Discord] could not resolve free-response categories at connect", exc_info=True)
 
     def _gate_env(self, name: str, default: str = "") -> str:
         """Read a gate env var from this adapter's snapshot (scope fallback)."""
@@ -5931,11 +5944,33 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         return self._policy_csv_set(raw, key="free_response_channels")
 
     def _discord_free_response_categories(self) -> set:
-        """Return Discord category IDs/names where no bot mention is required."""
-        raw = self.config.extra.get("free_response_categories")
+        """Return Discord category IDs/names where no bot mention is required.
+
+        Re-read from this profile's ``.env``/``config.yaml`` per message, like
+        ``free_response_channels``: live first, then this adapter's ``config.extra``, then the
+        connect-time gate-env snapshot (never raw process env, which may hold another profile's).
+        """
+        raw = self._live_gate_value("free_response_categories", "DISCORD_FREE_RESPONSE_CATEGORIES")
+        if raw is None:
+            raw = self.config.extra.get("free_response_categories")
         if raw is None:
             raw = self._gate_env("DISCORD_FREE_RESPONSE_CATEGORIES")
-        return self._policy_csv_set(raw, key="free_response_categories")
+        categories = self._policy_csv_set(raw, key="free_response_categories")
+        self._note_free_response_categories(categories)
+        return categories
+
+    def _note_free_response_categories(self, categories: set) -> None:
+        """INFO once per change of the resolved category set (the first resolution is silent: the
+        connect line reports it). Runs on the message/connect path, so the record carries the owning
+        profile's home and lands in that profile's log; the drift thread never calls this."""
+        current = tuple(sorted(categories))
+        last = getattr(self, "_free_categories_logged", None)
+        self._free_categories_logged = current
+        if last is not None and last != current:
+            logger.info(
+                "[%s] free_response_categories now %s (applied live)",
+                getattr(self, "name", "discord"), list(current),
+            )
 
     # ── config drift: what this process loaded vs. what the files say now ─────────────────────────
 
@@ -5955,6 +5990,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             self._policy_snapshot = {
                 "allow_bots": self._get_allow_bots(),
                 "free_response_channels": " ".join(sorted(self._discord_free_response_channels())),
+                "free_response_categories": " ".join(sorted(self._discord_free_response_categories())),
                 "plugins.enabled": _enabled_plugins_signature(cfg),
                 "discord.voice_fx": _voice_fx_signature(getattr(self, "_voice_fx_cfg", None)),
             }
@@ -5992,6 +6028,11 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         _add("free_response_channels", snapshot.get("free_response_channels"),
              " ".join(sorted(self._policy_csv_set(live_free, key="free_response_channels")))
              if live_free is not None else snapshot.get("free_response_channels"), reloadable=True)
+        # Built from _live_gate_value (not the getter) so the drift thread never moves the INFO latch.
+        live_categories = self._live_gate_value("free_response_categories", "DISCORD_FREE_RESPONSE_CATEGORIES")
+        _add("free_response_categories", snapshot.get("free_response_categories"),
+             " ".join(sorted(self._policy_csv_set(live_categories, key="free_response_categories")))
+             if live_categories is not None else snapshot.get("free_response_categories"), reloadable=True)
 
         # Restart-only: the process loaded these once (plugin manager, voice mixer at __init__).
         cfg = _read_config_yaml(home / "config.yaml")

@@ -1,8 +1,8 @@
 """Startup config-drift warnings: the process holds one snapshot, the disk may say something else.
 
-Owner ruling (2026-11-02): **gates live, plugins restart-only.** ``allow_bots`` and
-``free_response_channels`` are re-read per message (see the Discord adapter), so a change there shows
-up without a restart. Everything else — plugin enablement, voice, and anything that owns a socket —
+Owner ruling (2026-11-02): **gates live, plugins restart-only.** ``allow_bots``,
+``free_response_channels`` and ``free_response_categories`` are re-read per message (see the Discord
+adapter), so a change there shows up without a restart. Everything else — plugin enablement, voice, and anything that owns a socket —
 is loaded once at startup, so an edit on disk is silently inert until the gateway restarts. That
 silence is what this module fixes: once a minute it compares the values the running process actually
 loaded against the values on disk now, and says one WARNING naming the keys.
