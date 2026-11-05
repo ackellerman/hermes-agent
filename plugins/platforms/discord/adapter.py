@@ -697,8 +697,12 @@ def _read_policy_file_values(home) -> dict:
             if str(env_values.get(name) or "").strip()
         }
     except Exception:
+        values["env_readable"] = False
         logger.debug("[Discord] live policy: .env read failed", exc_info=True)
-    values["yaml"] = _policy_keys_from_yaml(_read_config_yaml(cfg_path))
+    raw_cfg = _read_config_yaml(cfg_path)
+    values["yaml"] = _policy_keys_from_yaml(raw_cfg)
+    # An unreadable (half-written) config.yaml must not read as "key removed": keep the snapshot.
+    values["yaml_readable"] = raw_cfg is not None
     with _LIVE_POLICY_LOCK:
         _LIVE_POLICY_CACHE[key] = (signature, values)
     return values
@@ -5792,9 +5796,15 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
     def _live_gate_value(self, extra_key: str, env_key: str):
         """This profile's value for a reloadable policy key, re-read from disk right now.
 
-        ``None`` when the adapter has no profile home yet (never connected) or neither file mentions
-        the key — the caller then keeps the connect-time snapshot, which is also the fail-closed path
-        for an unreadable/typoed file.
+        Precedence: a non-empty ``.env`` value; else the ``config.yaml`` key when PRESENT, even empty
+        (``""``/``[]`` is a clear and applies live); else ``""`` when this adapter has seen the key in
+        its files before and it is gone now (removing the key clears it too). An empty ``.env`` line is
+        ignored, as it always was, so ``config.yaml`` decides.
+
+        ``None`` when the adapter has no profile home yet (never connected), the read failed, or the
+        files have never named the key — the caller then keeps the connect-time snapshot. That is
+        the fail-closed path for an unreadable file, and it keeps a value that only ever came from
+        process env (no file to remove it from) in force.
         """
         home = getattr(self, "_live_policy_home", None)
         if home is None:
@@ -5804,12 +5814,20 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         except Exception:
             logger.debug("[%s] live policy re-read failed", getattr(self, "name", "discord"), exc_info=True)
             return None
+        seen = getattr(self, "_live_policy_seen", None)
+        if seen is None:
+            seen = set()
+            self._live_policy_seen = seen
         env_value = values.get("env", {}).get(env_key)
         if env_value:
+            seen.add(extra_key)
             return env_value
-        yaml_value = values.get("yaml", {}).get(extra_key)
-        if yaml_value is not None and str(yaml_value).strip():
-            return yaml_value
+        yaml_values = values.get("yaml", {})
+        if extra_key in yaml_values and yaml_values[extra_key] is not None:
+            seen.add(extra_key)
+            return yaml_values[extra_key]
+        if extra_key in seen and values.get("yaml_readable", True) and values.get("env_readable", True):
+            return ""
         return None
 
     @staticmethod
