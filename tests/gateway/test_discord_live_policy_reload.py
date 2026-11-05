@@ -202,3 +202,138 @@ def test_unconnected_adapter_keeps_the_snapshot_and_reads_nothing(tmp_path, monk
     adapter = _adapter(None)
     assert adapter._get_allow_bots() == "none"
     assert adapter._discord_free_response_channels() == set()
+
+
+# ── free_response_categories: the same live, profile-scoped read (category carry) ─────────────────
+
+CATEGORY_ID = 500
+
+
+def _forum_post(msg_id=7001, *, category_id=CATEGORY_ID):
+    """A post in a forum (thread) whose parent forum sits in a category; mentions someone else."""
+    forum = SimpleNamespace(id=700, name="app-forum", category_id=category_id,
+                            category=SimpleNamespace(name="Projects") if category_id else None)
+    thread = SimpleNamespace(id=7100 + msg_id % 100, name="post", parent_id=700, parent=forum)
+    return SimpleNamespace(
+        id=msg_id,
+        author=SimpleNamespace(id=OTHER_USER_ID, bot=False, display_name="someone"),
+        channel=thread,
+        content=f"<@{OTHER_USER_ID}> look at this",
+        mentions=[SimpleNamespace(id=OTHER_USER_ID, bot=False)],
+        type=discord.MessageType.default,
+        guild=SimpleNamespace(id=1),
+        attachments=[],
+    )
+
+
+def _category_adapter(home, *, extra=None):
+    adapter = _adapter(home, extra=extra)
+    # Real channel keys for the forum post (the base helper pins them to the test channel).
+    adapter._discord_channel_keys = Mock(return_value={"7100", "700"})
+    return adapter
+
+
+def test_free_response_categories_env_edit_admits_in_the_same_process(tmp_path):
+    _write_env(tmp_path, DISCORD_FREE_RESPONSE_CATEGORIES="")
+    adapter = _category_adapter(tmp_path)
+    assert adapter._discord_free_response_categories() == set()
+    assert adapter._discord_message_admission(_forum_post(), claim=True)[0] is False
+
+    _write_env(tmp_path, DISCORD_FREE_RESPONSE_CATEGORIES=str(CATEGORY_ID))
+    assert adapter._discord_free_response_categories() == {str(CATEGORY_ID)}
+    assert adapter._discord_message_admission(_forum_post(msg_id=7002), claim=True)[0] is True
+
+
+def test_free_response_categories_from_config_yaml_applies_live(tmp_path):
+    (tmp_path / "config.yaml").write_text("discord:\n  allow_bots: none\n", encoding="utf-8")
+    adapter = _category_adapter(tmp_path)
+    assert adapter._discord_free_response_categories() == set()
+
+    (tmp_path / "config.yaml").write_text(
+        f"discord:\n  free_response_categories: [{CATEGORY_ID}]\n", encoding="utf-8")
+    os.utime(tmp_path / "config.yaml", (time.time() + 2, time.time() + 2))
+    assert adapter._discord_free_response_categories() == {str(CATEGORY_ID)}
+    assert adapter._discord_message_admission(_forum_post(msg_id=7003), claim=True)[0] is True
+
+
+def test_unparseable_free_response_categories_fails_closed_and_logs_once(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    _write_env(tmp_path, DISCORD_FREE_RESPONSE_CATEGORIES='["500",')
+    adapter = _category_adapter(tmp_path)
+    for index in range(3):
+        assert adapter._discord_free_response_categories() == set()
+        assert adapter._discord_message_admission(_forum_post(msg_id=7010 + index), claim=True)[0] is False
+    warnings = [r for r in caplog.records if "Unparseable free_response_categories" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+def test_free_response_categories_two_homes_resolve_independently(tmp_path):
+    home_a, home_b = tmp_path / "a", tmp_path / "b"
+    home_a.mkdir()
+    home_b.mkdir()
+    (home_a / "config.yaml").write_text(
+        f"discord:\n  free_response_categories: [{CATEGORY_ID}]\n", encoding="utf-8")
+    (home_b / "config.yaml").write_text("discord:\n  require_mention: true\n", encoding="utf-8")
+    adapter_a, adapter_b = _category_adapter(home_a), _category_adapter(home_b)
+    assert adapter_a._discord_message_admission(_forum_post(msg_id=7020), claim=True)[0] is True
+    assert adapter_b._discord_message_admission(_forum_post(msg_id=7021), claim=True)[0] is False
+
+    # An edit to B's own file changes B only.
+    (home_b / "config.yaml").write_text(
+        "discord:\n  free_response_categories: [\"999\"]\n", encoding="utf-8")
+    os.utime(home_b / "config.yaml", (time.time() + 2, time.time() + 2))
+    assert adapter_b._discord_free_response_categories() == {"999"}
+    assert adapter_a._discord_free_response_categories() == {str(CATEGORY_ID)}
+
+
+def test_free_response_categories_snapshot_is_profile_scoped(tmp_path, monkeypatch):
+    # Another profile's value in process env must not become this adapter's policy: the connect-time
+    # snapshot (taken inside this profile's scope) owns the env fallback, as for the channel key.
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CATEGORIES", str(CATEGORY_ID))
+    assert "DISCORD_FREE_RESPONSE_CATEGORIES" in adapter_mod._GATE_ENV_KEYS
+    adapter = _category_adapter(None)
+    assert adapter._discord_free_response_categories() == set()
+
+
+def test_free_response_categories_change_logs_info_once_per_change(tmp_path, caplog):
+    import hermes_logging  # noqa: F401  (installs the record factory that stamps ``hermes_home``)
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    adapter = _category_adapter(tmp_path)
+    token = set_hermes_home_override(str(tmp_path))
+    try:
+        assert adapter._discord_free_response_categories() == set()
+        (tmp_path / "config.yaml").write_text(
+            f"discord:\n  free_response_categories: [{CATEGORY_ID}]\n", encoding="utf-8")
+        os.utime(tmp_path / "config.yaml", (time.time() + 2, time.time() + 2))
+        for _ in range(3):
+            assert adapter._discord_free_response_categories() == {str(CATEGORY_ID)}
+        (tmp_path / "config.yaml").write_text(
+            "discord:\n  free_response_categories: [\"999\"]\n", encoding="utf-8")
+        os.utime(tmp_path / "config.yaml", (time.time() + 4, time.time() + 4))
+        for _ in range(2):
+            assert adapter._discord_free_response_categories() == {"999"}
+    finally:
+        reset_hermes_home_override(token)
+    changes = [r for r in caplog.records if "free_response_categories now" in r.getMessage()]
+    assert [r.getMessage().split("now ", 1)[1] for r in changes] == [
+        "['500'] (applied live)", "['999'] (applied live)"]
+    assert all(r.levelno == logging.INFO for r in changes)
+    # Emitted on the calling (profile-scoped) path, so hermes_logging routes it to that profile's log.
+    assert {getattr(r, "hermes_home", None) for r in changes} == {str(tmp_path.resolve())}
+
+
+def test_connect_logs_the_resolved_free_response_categories(tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    (tmp_path / "config.yaml").write_text(
+        f"discord:\n  free_response_categories: [{CATEGORY_ID}]\n", encoding="utf-8")
+    adapter = _category_adapter(None)
+    adapter._voice_fx_cfg = {}
+    monkeypatch.setattr(adapter_mod, "_resolve_profile_home", lambda: tmp_path)
+    adapter._snapshot_gate_env()          # what connect() does, inside the profile scope
+    lines = [r.getMessage() for r in caplog.records if "free-response categories:" in r.getMessage()]
+    assert lines == [f"[Discord] free-response categories: ['500'] (home={tmp_path.name}, applied live)"]
+    # The connect line is the baseline: an unchanged read afterwards logs nothing more.
+    adapter._discord_free_response_categories()
+    assert not [r for r in caplog.records if "free_response_categories now" in r.getMessage()]

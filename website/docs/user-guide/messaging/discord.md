@@ -459,6 +459,8 @@ discord:
 
 Prefer IDs: a name only matches while the category is cached, and it can collide across servers or change on rename. A thread whose parent channel is not cached cannot be resolved to a category, so it needs an `@mention`, as before.
 
+The key is applied live: an edit to `config.yaml` (or `DISCORD_FREE_RESPONSE_CATEGORIES` in `.env`) takes effect on the next message, without a gateway restart, and the profile's `gateway.log` records `free_response_categories now [...] (applied live)`. A non-empty `.env` value wins over `config.yaml`; an empty one (`DISCORD_FREE_RESPONSE_CATEGORIES=`) is ignored and `config.yaml` decides.
+
 #### `discord.free_response_auto_thread`
 
 **Type:** boolean — **Default:** `false`

@@ -192,3 +192,17 @@ def test_unconnected_adapter_offers_no_drift_rows(tmp_path):
     adapter._gate_env_snapshot = {key: "" for key in adapter_mod._GATE_ENV_KEYS}
     # Neither the profile home nor the snapshot was captured: nothing to compare, nothing to read.
     assert adapter._config_drift_keys() == []
+
+
+def test_free_response_categories_drift_is_reported_as_applied_live(tmp_path, caplog):
+    _write_config(tmp_path, "discord:\n  require_mention: true\n")
+    adapter = _adapter(tmp_path)
+    assert adapter._policy_snapshot.get("free_response_categories") == ""
+    monitor = ConfigDriftMonitor(adapter._config_drift_keys, scope="discord")
+    caplog.set_level(logging.INFO, logger="gateway.config_drift")
+
+    assert monitor.check_once() is None                # disk agrees with the snapshot
+    _write_config(tmp_path, "discord:\n  free_response_categories: [\"500\"]\n")
+    message = monitor.check_once()
+    assert message and "free_response_categories changed on disk (applied live)" in message
+    assert "restart" not in message
