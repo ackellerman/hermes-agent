@@ -35,6 +35,11 @@ _ALLOWED_USERS_ENV = {Platform(k): v for k, v in _PLATFORM_ALLOWLIST_ENV.items()
 _ALLOW_ALL_ENV = {p: v.replace("_ALLOWED_USERS", "_ALLOW_ALL_USERS") for p, v in _ALLOWED_USERS_ENV.items()}
 _GROUP_USER_ENV = {Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS"}
 _GROUP_CHAT_ENV = {Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS", Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS"}
+# Platform -> env var narrowing {PLATFORM}_ALLOW_BOTS to named bot user IDs (YAML ``bot_allow_from``).
+_BOT_ALLOWLIST_ENV = {Platform.DISCORD: "DISCORD_ALLOWED_BOTS"}
+# Returned by _chat_scoped_grant when a bot is refused outright (it must not fall through to the human
+# allowlist): allow_bots admits bots, but this one is not in the platform's bot allowlist.
+_BOT_REFUSED = object()
 _ALLOW_BOTS_ENV = {
     # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466). Checked before the
     # no-user-id guard below: some platforms deliver bot/automation traffic with no user_id at all -- e.g.
@@ -526,8 +531,12 @@ class GatewayAuthorizationMixin:
             return set()
         return {s for e in resolved_ids if isinstance(e, (str, int)) and (s := str(e).strip())}
 
-    def _chat_scoped_grant(self, source, adapter_profile, is_group: bool, allow_adapter_delegation: bool) -> bool:
-        """Grants that need no ``user_id`` (checked before the no-user-id guard)."""
+    def _chat_scoped_grant(self, source, adapter_profile, is_group: bool, allow_adapter_delegation: bool) -> object:
+        """Grants that need no ``user_id`` (checked before the no-user-id guard).
+
+        Truthy = granted; falsy = no grant here (the human ladder decides); ``_BOT_REFUSED`` = a bot
+        refused outright, which must NOT fall through to the human allowlist.
+        """
         # Trusted-upstream delegation (relay): the connector authenticates this gateway's WS and
         # resolves owner bindings BEFORE delivering, so there is no local RELAY_ALLOWED_USERS. Not a
         # fail-open: fires only for events actually delivered over the relay WS
@@ -551,19 +560,66 @@ class GatewayAuthorizationMixin:
                 adapter_group_allowed = self._adapter_extra_for_source(source).get("group_allowed_chats")
                 if adapter_group_allowed and _allows(_coerce_allow_set(adapter_group_allowed), source.chat_id):
                     return True
-        # Bots admitted by {PLATFORM}_ALLOW_BOTS (scoped env → the routed adapter's YAML ``allow_bots`` →
-        # none) bypass the human allowlist (Slack Workflow Builder posts arrive with user=None). The YAML
+        # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (Slack Workflow Builder posts
+        # arrive with user=None). The routed adapter's LIVE mode decides when it exposes one (Discord
+        # re-reads its profile's files per message, so a live edit reaches authz as it reaches
+        # ingress); otherwise scoped env → the routed adapter's YAML ``allow_bots`` → none. The YAML
         # rung is what a secondary profile has: its config is never bridged into the process env.
         if getattr(source, "is_bot", False):
             allow_bots_var = _ALLOW_BOTS_ENV.get(source.platform)
             if allow_bots_var:
-                extra = {}
+                adapter = None
                 with contextlib.suppress(Exception):
-                    extra = self._adapter_extra_for_source(source)
-                mode = str(_extra_or_secret(extra, "allow_bots", allow_bots_var, "none")).lower().strip()
+                    adapter = self._delivery_adapter_for(source)
+                mode = self._adapter_bot_admission_mode(adapter)
+                if mode is None:
+                    extra = {}
+                    with contextlib.suppress(Exception):
+                        extra = self._adapter_extra_for_source(source)
+                    mode = str(_extra_or_secret(extra, "allow_bots", allow_bots_var, "none")).lower().strip()
                 if mode in {"mentions", "all"}:
+                    if self._bot_allowlist_refuses(source, adapter):
+                        return _BOT_REFUSED
                     return True
         return False
+
+    @staticmethod
+    def _adapter_bot_admission_mode(adapter) -> Optional[str]:
+        """The adapter's live ``allow_bots`` mode, or None when it exposes none.
+
+        ``isinstance(str)``: a MagicMock stand-in (or any non-string) must not decide authz; it
+        falls back to the connect-time config instead.
+        """
+        getter = getattr(adapter, "bot_admission_mode", None)
+        if not callable(getter):
+            return None
+        mode = None
+        with contextlib.suppress(Exception):
+            mode = getter()
+        return mode.lower().strip() if isinstance(mode, str) else None
+
+    def _bot_allowlist_refuses(self, source, adapter) -> bool:
+        """True when the platform's bot allowlist is configured and this bot is not on it.
+
+        The routed adapter's live verdict (``bot_sender_allowed``) is authoritative: it re-reads the
+        owning profile's files per message, as its own ingress gate does. Without one, only the
+        scoped env decides (a bare runner with no adapter has no YAML to read).
+        """
+        env_key = _BOT_ALLOWLIST_ENV.get(source.platform)
+        if env_key is None:
+            return False
+        user_id = str(source.user_id or "").strip()
+        checker = getattr(adapter, "bot_sender_allowed", None)
+        if callable(checker):
+            verdict = None
+            with contextlib.suppress(Exception):
+                verdict = checker(user_id or None)
+            if verdict is True or verdict is False:  # ``is``: a MagicMock stand-in must not decide
+                return not verdict
+        allowed = _coerce_allow_set(_auth_env(env_key))
+        if not allowed:
+            return False
+        return not user_id or user_id not in allowed
 
     def _legacy_telegram_chat_grant(self, source, group_user_allowlist: str) -> bool:
         """TELEGRAM_GROUP_ALLOWED_USERS was once (mis)used as a chat-ID allowlist; "-"-prefixed
@@ -614,8 +670,8 @@ class GatewayAuthorizationMixin:
     def _is_user_authorized(self, source: SessionSource, *, allow_adapter_delegation: bool = True) -> bool:
         """Whether a user may use the bot.
 
-        Order: trusted-upstream delegation, chat-scoped group allowlists, ``{PLATFORM}_ALLOW_BOTS``,
-        per-platform allow-all, adapter role auth, pairing store, env/config allowlists,
+        Order: trusted-upstream delegation, chat-scoped group allowlists, ``{PLATFORM}_ALLOW_BOTS``
+        (narrowed by the platform's bot allowlist, e.g. Discord ``bot_allow_from``), per-platform allow-all, adapter role auth, pairing store, env/config allowlists,
         ``GATEWAY_ALLOW_ALL_USERS``, default deny. A bot-authored message that any of these admits
         is still refused while its chat's loop guard is cooling down.
         """
@@ -636,7 +692,10 @@ class GatewayAuthorizationMixin:
         adapter_profile = self._adapter_profile_for_source(source)
         is_group = source.chat_type in _GROUP_CHAT_TYPES
         is_group_or_forum = source.chat_type in _GROUP_FORUM_TYPES
-        if self._chat_scoped_grant(source, adapter_profile, is_group, allow_adapter_delegation):
+        grant = self._chat_scoped_grant(source, adapter_profile, is_group, allow_adapter_delegation)
+        if grant is _BOT_REFUSED:
+            return False
+        if grant:
             return True
         user_id = source.user_id
         if not user_id:
