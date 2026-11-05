@@ -1763,3 +1763,23 @@ class TestTopLevelBlockVsAuthoredExtra:
             adapter.config = config.platforms[Platform.TELEGRAM]
             assert adapter._telegram_require_mention() is True
             assert os.environ["TELEGRAM_REQUIRE_MENTION"] == "true"
+
+
+@pytest.mark.parametrize("key", ["free_response_channels", "free_response_categories"])
+def test_nested_platforms_discord_free_response_key_reaches_extra(key, tmp_path, monkeypatch):
+    """A YAML-only value in a nested ``platforms.discord`` block is bridged into the adapter's extra
+    (the channel key is the control; the category key must take the same path)."""
+    import json
+    from gateway.config_loader import load_yaml_layer
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(json.dumps(
+        {"platforms": {"discord": {"enabled": True, key: ["500"]}}}), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for name in list(os.environ):
+        if name.startswith("DISCORD_"):
+            monkeypatch.delenv(name)
+    data = {}
+    load_yaml_layer(home, data)
+    assert data["platforms"]["discord"]["extra"].get(key) in ("500", ["500"])

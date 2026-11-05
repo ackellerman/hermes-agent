@@ -602,16 +602,19 @@ def _clean_discord_id(entry: str) -> str:
 _GATE_ENV_KEYS = (
     "DISCORD_ALLOWED_USERS", "DISCORD_ALLOWED_ROLES", "DISCORD_ALLOWED_CHANNELS",
     "DISCORD_IGNORED_CHANNELS", "DISCORD_NO_THREAD_CHANNELS", "DISCORD_FREE_RESPONSE_CHANNELS",
-    "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOW_BOTS",
+    "DISCORD_FREE_RESPONSE_CATEGORIES", "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOW_BOTS",
     "GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS",
 )
 
 # ── reloadable policy keys ──────────────────────────────────────────────── Owner ruling (2026-11-02):
-# gates live, plugins restart-only. ``allow_bots`` and ``free_response_channels`` are re-read per
+# gates live, plugins restart-only. ``allow_bots``, ``free_response_channels`` and
+# ``free_response_categories`` are re-read per
 # message off this profile's own ``.env``/``config.yaml``, so a policy edit stops needing a gateway
 # restart. Everything that owns a socket (plugins, voice) stays load-once — a reload there would mean
 # tearing down live connections, and the drift check reports it instead.
-_LIVE_POLICY_ENV_KEYS = ("DISCORD_ALLOW_BOTS", "DISCORD_FREE_RESPONSE_CHANNELS")
+_LIVE_POLICY_ENV_KEYS = (
+    "DISCORD_ALLOW_BOTS", "DISCORD_FREE_RESPONSE_CHANNELS", "DISCORD_FREE_RESPONSE_CATEGORIES",
+)
 _ALLOW_BOTS_MODES = frozenset({"none", "mentions", "all"})
 
 # home -> (file signature, {"env": {...}, "yaml": {...}}). Cache key is the two files' stat identity,
@@ -651,7 +654,7 @@ def _read_config_yaml(path) -> Optional[dict]:
 
 
 def _policy_keys_from_yaml(cfg: Optional[dict]) -> dict:
-    """``allow_bots``/``free_response_channels`` as the startup bridge resolves them, from a raw config."""
+    """The live policy keys as the startup bridge resolves them, from a raw config."""
     if not isinstance(cfg, dict):
         return {}
     section = cfg.get("discord") if isinstance(cfg.get("discord"), dict) else None
@@ -666,7 +669,11 @@ def _policy_keys_from_yaml(cfg: Optional[dict]) -> dict:
     except Exception:
         logger.debug("[Discord] live policy: YAML policy extraction failed", exc_info=True)
         return {}
-    return {key: seeded[key] for key in ("allow_bots", "free_response_channels") if key in seeded}
+    return {
+        key: seeded[key]
+        for key in ("allow_bots", "free_response_channels", "free_response_categories")
+        if key in seeded
+    }
 
 
 def _read_policy_file_values(home) -> dict:
@@ -690,8 +697,14 @@ def _read_policy_file_values(home) -> dict:
             if str(env_values.get(name) or "").strip()
         }
     except Exception:
+        # ``load_env_file`` returns ``{}`` for a missing or unreadable file and does not raise, so an
+        # unreadable ``.env`` reads as an empty one: ``config.yaml`` then decides, exactly as it would
+        # after a restart. This handler only covers an import failure.
         logger.debug("[Discord] live policy: .env read failed", exc_info=True)
-    values["yaml"] = _policy_keys_from_yaml(_read_config_yaml(cfg_path))
+    raw_cfg = _read_config_yaml(cfg_path)
+    values["yaml"] = _policy_keys_from_yaml(raw_cfg)
+    # An unreadable (half-written) config.yaml must not read as "key removed": keep the snapshot.
+    values["yaml_readable"] = raw_cfg is not None
     with _LIVE_POLICY_LOCK:
         _LIVE_POLICY_CACHE[key] = (signature, values)
     return values
@@ -750,10 +763,27 @@ def _voice_fx_signature(fx: Optional[dict]) -> str:
 _DRIFT_ADAPTERS: "weakref.WeakSet" = weakref.WeakSet()
 
 
+def _drift_owner_label(adapter) -> str:
+    """The profile directory name that owns ``adapter``'s policy files (``name`` is not per-profile)."""
+    home = getattr(adapter, "_live_policy_home", None)
+    return getattr(home, "name", None) or getattr(adapter, "name", "discord")
+
+
 def _config_drift_keys_for_adapters() -> list:
-    """Drift rows for every connected adapter; keys are prefixed only when more than one is live."""
+    """Drift rows for every connected adapter in THIS module copy.
+
+    Rows are prefixed with the owning profile's directory name whenever more than one adapter can
+    feed the monitor: several in this module, or other module copies (one per profile scope under
+    a multiplexed gateway) registered with it.
+    """
     adapters = [a for a in list(_DRIFT_ADAPTERS) if getattr(a, "_policy_snapshot", None)]
-    prefix_for = (lambda a: f"{getattr(a, 'name', 'discord')}: ") if len(adapters) > 1 else (lambda a: "")
+    try:
+        from gateway.config_drift import registered_provider_count
+        shared = registered_provider_count() > 1
+    except Exception:
+        shared = False
+    prefixed = shared or len(adapters) > 1
+    prefix_for = (lambda a: f"{_drift_owner_label(a)}: ") if prefixed else (lambda a: "")
     rows: list = []
     for adapter in adapters:
         try:
@@ -2143,12 +2173,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 # the same message with no mention at all is admitted. ``thread_require_mention``
                 # still gates multi-bot threads, inside _in_bot_thread().
                 if not self._in_bot_thread(message):
-                    parent_id = None
-                    if hasattr(message.channel, "parent_id") and message.channel.parent_id:
-                        parent_id = str(message.channel.parent_id)
-                    free_channels = self._discord_free_response_channels()
-                    channel_keys = self._discord_channel_keys(message, parent_id)
-                    if "*" not in free_channels and not (channel_keys & free_channels):
+                    if not self._no_mention_free_gate_admits(message):
                         # The reason string carries what the old prose comment said: this is the drop
                         # an operator cannot guess from the outside (mentions someone else, the bot is
                         # not a participant, the channel is not free-response).
@@ -2973,13 +2998,10 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
     async def _dispatch_recovered_message(self, message: Any) -> bool:
         """Run one recovered message through the live Discord ingress gates."""
         if not isinstance(message.channel, discord.DMChannel):
-            parent_id = self._get_parent_channel_id(message.channel)
-            channel_keys = self._discord_channel_keys(message, parent_id)
-            free_channels = self._discord_free_response_channels()
+            # Same free-response scope as the live path (channels, thread parents, categories).
             if (
                 self._discord_require_mention()
-                and "*" not in free_channels
-                and not (channel_keys & free_channels)
+                and not self._no_mention_free_gate_admits(message)
                 and not self._in_bot_thread(message)
                 and not self._self_is_explicitly_mentioned(message)
             ):
@@ -5722,6 +5744,15 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         # what keeps the live read inert for an adapter that was never connected.
         self._live_policy_home = _resolve_profile_home()
         self._capture_policy_snapshot()
+        try:
+            categories = sorted(self._discord_free_response_categories())
+            home = self._live_policy_home
+            logger.info(
+                "[Discord] free-response categories: %s (home=%s, applied live)",
+                categories or "none", home.name if home is not None else "none",
+            )
+        except Exception:
+            logger.debug("[Discord] could not resolve free-response categories at connect", exc_info=True)
 
     def _gate_env(self, name: str, default: str = "") -> str:
         """Read a gate env var from this adapter's snapshot (scope fallback)."""
@@ -5784,9 +5815,17 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
     def _live_gate_value(self, extra_key: str, env_key: str):
         """This profile's value for a reloadable policy key, re-read from disk right now.
 
-        ``None`` when the adapter has no profile home yet (never connected) or neither file mentions
-        the key — the caller then keeps the connect-time snapshot, which is also the fail-closed path
-        for an unreadable/typoed file.
+        Precedence: a non-empty ``.env`` value; else the ``config.yaml`` key when PRESENT, even empty
+        (``""``/``[]`` is a clear and applies live); else ``""`` when this adapter has seen the key in
+        its files before and it is gone now (removing the key clears it too). An empty ``.env`` line is
+        ignored, as it always was, so ``config.yaml`` decides.
+
+        ``None`` when the adapter has no profile home yet (never connected), the read failed, an
+        unparseable ``config.yaml`` (a hand-edit typo) would otherwise read as "key removed", or the
+        files have never named the key — the caller then keeps the connect-time snapshot. That keeps
+        a typo from silently dropping a profile's policy, and keeps a value that only ever came from
+        process env (no file to remove it from) in force. An unreadable ``.env`` is NOT detectable
+        (``load_env_file`` returns ``{}``): it reads as empty, so ``config.yaml`` decides, as at a restart.
         """
         home = getattr(self, "_live_policy_home", None)
         if home is None:
@@ -5796,12 +5835,20 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         except Exception:
             logger.debug("[%s] live policy re-read failed", getattr(self, "name", "discord"), exc_info=True)
             return None
+        seen = getattr(self, "_live_policy_seen", None)
+        if seen is None:
+            seen = set()
+            self._live_policy_seen = seen
         env_value = values.get("env", {}).get(env_key)
         if env_value:
+            seen.add(extra_key)
             return env_value
-        yaml_value = values.get("yaml", {}).get(extra_key)
-        if yaml_value is not None and str(yaml_value).strip():
-            return yaml_value
+        yaml_values = values.get("yaml", {})
+        if extra_key in yaml_values and yaml_values[extra_key] is not None:
+            seen.add(extra_key)
+            return yaml_values[extra_key]
+        if extra_key in seen and values.get("yaml_readable", True):
+            return ""
         return None
 
     @staticmethod
@@ -5935,6 +5982,35 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             raw = self._gate_env("DISCORD_FREE_RESPONSE_CHANNELS")
         return self._policy_csv_set(raw, key="free_response_channels")
 
+    def _discord_free_response_categories(self) -> set:
+        """Return Discord category IDs/names where no bot mention is required.
+
+        Re-read from this profile's ``.env``/``config.yaml`` per message, like
+        ``free_response_channels``: live first, then this adapter's ``config.extra``, then the
+        connect-time gate-env snapshot (never raw process env, which may hold another profile's).
+        """
+        raw = self._live_gate_value("free_response_categories", "DISCORD_FREE_RESPONSE_CATEGORIES")
+        if raw is None:
+            raw = self.config.extra.get("free_response_categories")
+        if raw is None:
+            raw = self._gate_env("DISCORD_FREE_RESPONSE_CATEGORIES")
+        categories = self._policy_csv_set(raw, key="free_response_categories")
+        self._note_free_response_categories(categories)
+        return categories
+
+    def _note_free_response_categories(self, categories: set) -> None:
+        """INFO once per change of the resolved category set (the first resolution is silent: the
+        connect line reports it). Runs on the message/connect path, so the record carries the owning
+        profile's home and lands in that profile's log; the drift thread never calls this."""
+        current = tuple(sorted(categories))
+        last = getattr(self, "_free_categories_logged", None)
+        self._free_categories_logged = current
+        if last is not None and last != current:
+            logger.info(
+                "[%s] free_response_categories now %s (applied live)",
+                getattr(self, "name", "discord"), list(current),
+            )
+
     # ── config drift: what this process loaded vs. what the files say now ─────────────────────────
 
     def _capture_policy_snapshot(self) -> None:
@@ -5953,6 +6029,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             self._policy_snapshot = {
                 "allow_bots": self._get_allow_bots(),
                 "free_response_channels": " ".join(sorted(self._discord_free_response_channels())),
+                "free_response_categories": " ".join(sorted(self._discord_free_response_categories())),
                 "plugins.enabled": _enabled_plugins_signature(cfg),
                 "discord.voice_fx": _voice_fx_signature(getattr(self, "_voice_fx_cfg", None)),
             }
@@ -5990,6 +6067,11 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         _add("free_response_channels", snapshot.get("free_response_channels"),
              " ".join(sorted(self._policy_csv_set(live_free, key="free_response_channels")))
              if live_free is not None else snapshot.get("free_response_channels"), reloadable=True)
+        # Built from _live_gate_value (not the getter) so the drift thread never moves the INFO latch.
+        live_categories = self._live_gate_value("free_response_categories", "DISCORD_FREE_RESPONSE_CATEGORIES")
+        _add("free_response_categories", snapshot.get("free_response_categories"),
+             " ".join(sorted(self._policy_csv_set(live_categories, key="free_response_categories")))
+             if live_categories is not None else snapshot.get("free_response_categories"), reloadable=True)
 
         # Restart-only: the process loaded these once (plugin manager, voice mixer at __init__).
         cfg = _read_config_yaml(home / "config.yaml")
@@ -6071,6 +6153,75 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             keys.add(parent_name)
             keys.add(f"#{parent_name}")
         return keys
+
+    def _discord_category_keys(self, message: Any) -> set[str]:
+        """Return category identifiers accepted by Discord category config gates."""
+        return self._discord_category_keys_from_channel(getattr(message, "channel", None))
+
+    def _discord_category_keys_from_channel(self, channel: Any) -> set[str]:
+        """Build Discord category config keys from a channel object.
+
+        Categories are intentionally separate from channel keys so operators can
+        configure an explicit ``free_response_categories`` gate without
+        overloading the channel lists with category snowflakes.
+
+        A thread has no category of its own — it inherits the parent channel's.
+        Resolve through ``channel.parent`` when present, mirroring the parent
+        scope ``_discord_channel_keys_from_channel`` already preserves for
+        thread policies. discord.py's ``Thread.category`` / ``Thread.category_id``
+        raise ``ClientException`` when the parent is not cached (``getattr``
+        only swallows ``AttributeError``), so both reads are suppressed: an
+        unresolvable category yields no keys instead of raising through the
+        message and slash gates.
+        """
+        keys: set[str] = set()
+
+        parent = getattr(channel, "parent", None)
+        source = parent if parent is not None else channel
+
+        category_id = None
+        with suppress(Exception):
+            category_id = getattr(source, "category_id", None)
+        if category_id is not None:
+            keys.add(str(category_id))
+
+        category_channel = None
+        with suppress(Exception):
+            category_channel = getattr(source, "category", None)
+        category_name = str(getattr(category_channel, "name", "")).strip() if category_channel else ""
+        if category_name:
+            keys.add(category_name)
+            keys.add(f"#{category_name}")
+
+        return keys
+
+    def _no_mention_free_gate_admits(self, message: Any) -> bool:
+        """Whether a no-mention message survives the mention-others admission gate.
+
+        That gate drops messages which @mention other users but not this bot
+        (``DISCORD_IGNORE_NO_MENTION``). Free-response scopes are the exception:
+        the bot answers regardless of who was mentioned. Resolve the channel
+        scope (channel / thread-parent keys vs ``free_response_channels``) and
+        the category scope (vs ``free_response_categories``) so category-level
+        free-response applies at this earlier gate too, matching the
+        ``is_free_channel`` decision in ``_handle_message``.
+        """
+        channel = getattr(message, "channel", None)
+        parent_id = None
+        if getattr(channel, "parent_id", None):
+            parent_id = str(channel.parent_id)
+
+        free_channels = self._discord_free_response_channels()
+        channel_keys = self._discord_channel_keys(message, parent_id)
+        if "*" in free_channels or (channel_keys & free_channels):
+            return True
+
+        free_categories = self._discord_free_response_categories()
+        category_keys = self._discord_category_keys(message)
+        if "*" in free_categories or (category_keys & free_categories):
+            return True
+
+        return False
 
     def _discord_thread_require_mention(self) -> bool:
         """Whether threads still require @mention after the bot has participated (default False).
@@ -6973,6 +7124,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         # Config (discord.* in config.yaml or DISCORD_* env vars):
         #   discord.require_mention: Require @mention in server channels (default: true)
         #   discord.free_response_channels: Channel IDs where bot responds without mention
+        #   discord.free_response_categories: Category IDs/names where bot responds without mention
         #   discord.ignored_channels: Channel IDs where bot NEVER responds (even when mentioned)
         #   discord.allowed_channels: If set, bot ONLY responds in these channels (whitelist)
         #   discord.no_thread_channels: Channel IDs where bot responds directly without creating thread
@@ -7010,6 +7162,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             if parent_channel_id:
                 channel_ids.add(parent_channel_id)
             channel_keys = self._discord_channel_keys(message, parent_channel_id)
+            category_keys = self._discord_category_keys(message)
             allowed_channels = self._get_allowed_channels()
             if allowed_channels:
                 if "*" not in allowed_channels and not (channel_keys & allowed_channels):
@@ -7020,6 +7173,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 logger.debug("[%s] Ignoring message in ignored channel: %s", self.name, channel_keys)
                 return False
             free_channels = self._discord_free_response_channels()
+            free_categories = self._discord_free_response_categories()
             require_mention = self._discord_require_mention()
             # Voice-linked text channel is free-response while voice is active (exact channel only).
             voice_linked_ids = {str(ch_id) for ch_id in self._voice_text_channels.values()}
@@ -7028,6 +7182,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             is_free_channel = (
                 "*" in free_channels
                 or bool(channel_keys & free_channels)
+                or "*" in free_categories
+                or bool(category_keys & free_categories)
                 or is_voice_linked_channel
             )
             in_bot_thread = self._in_bot_thread(message)
@@ -8199,6 +8355,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict, *, set_env=None) -> di
         seeded_extra["approval_mentions"] = approval_mentions_cfg
         _env_default("DISCORD_APPROVAL_MENTIONS", str(approval_mentions_cfg).lower())
     _gate("free_response_channels", "DISCORD_FREE_RESPONSE_CHANNELS", from_platform_extra=False)
+    _gate("free_response_categories", "DISCORD_FREE_RESPONSE_CATEGORIES", from_platform_extra=False)
     for key, env_key in (
         ("auto_thread", "DISCORD_AUTO_THREAD"),
         ("free_response_auto_thread", "DISCORD_FREE_RESPONSE_AUTO_THREAD"),

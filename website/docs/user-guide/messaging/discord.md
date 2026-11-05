@@ -314,7 +314,8 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `DISCORD_REQUIRE_MENTION` | No | `true` | When `true`, the bot only responds in server channels when `@mentioned`. Set to `false` to respond to all messages in every channel. |
 | `DISCORD_THREAD_REQUIRE_MENTION` | No | `false` | When `true`, the in-thread mention shortcut is disabled — threads are gated the same as channels, requiring `@mention` even after the bot has already participated. Use this when multiple bots share a thread and you want each to fire only on explicit `@mention`. |
 | `DISCORD_FREE_RESPONSE_CHANNELS` | No | — | Comma-separated channel IDs where the bot responds without requiring an `@mention`, even when `DISCORD_REQUIRE_MENTION` is `true`. |
-| `DISCORD_IGNORE_NO_MENTION` | No | `true` | When `true`, the bot stays silent if a message `@mentions` other users but does **not** mention the bot. Prevents the bot from jumping into conversations directed at other people. Only applies in server channels, not DMs. |
+| `DISCORD_FREE_RESPONSE_CATEGORIES` | No | — | Comma-separated category IDs or names. Every channel and thread under these categories is treated as free-response — the bot answers without an `@mention`, even when `DISCORD_REQUIRE_MENTION` is `true`. Threads inherit their parent channel's category. Kept separate from `DISCORD_FREE_RESPONSE_CHANNELS` so channel and category scopes don't overload one list. |
+| `DISCORD_IGNORE_NO_MENTION` | No | `true` | When `true`, the bot stays silent if a message `@mentions` other users but does **not** mention the bot. Prevents the bot from jumping into conversations directed at other people. Only applies in server channels, not DMs. Free-response channels and categories are exempt — the bot still answers there. |
 | `DISCORD_AUTO_THREAD` | No | `true` | When `true`, automatically creates a new thread for every `@mention` in a text channel, so each conversation is isolated (similar to Slack behavior). Messages already inside threads or DMs are unaffected. |
 | `DISCORD_FREE_RESPONSE_AUTO_THREAD` | No | `false` | When `true`, free-response channels (listed in `DISCORD_FREE_RESPONSE_CHANNELS`) also auto-create a thread for each top-level message, while staying mention-free. Default `false` preserves the lightweight inline-chat behavior. Requires `DISCORD_AUTO_THREAD=true`; `DISCORD_NO_THREAD_CHANNELS` still wins, and voice-linked channels always ignore it. |
 | `DISCORD_ALLOW_BOTS` | No | `"none"` | Controls how the bot handles messages from other Discord bots. `"none"` — ignore all other bots. `"mentions"` — only accept bot messages that `@mention` Hermes. `"all"` — accept all bot messages. By default, either enabled mode still requires a literal inline mention; see the next setting. |
@@ -372,6 +373,7 @@ discord:
   thread_require_mention: false   # If true, require @mention in threads too (multi-bot threads)
   bots_require_inline_mention: true  # Bot authors must type a literal @mention (default: true)
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
+  free_response_categories: []    # Category IDs/names where no @mention is needed
   auto_thread: true               # Auto-create threads on @mention
   free_response_auto_thread: false # If true, free_response_channels also auto-thread (default: inline)
   reactions: true                 # Add emoji reactions during processing
@@ -442,6 +444,22 @@ If a thread's parent channel is in this list, the thread also becomes mention-fr
 Free-response channels also **skip auto-threading** by default — the bot replies inline rather than spinning off a new thread per message. This keeps the channel usable as a lightweight chat surface.
 
 To opt in to threading for free-response channels, set `discord.free_response_auto_thread: true` (or `DISCORD_FREE_RESPONSE_AUTO_THREAD=true`). In that mode each new top-level message in a free channel still gets its own thread, but the channel remains @mention-free. Requires `discord.auto_thread: true`.
+
+#### `discord.free_response_categories`
+
+**Type:** string or list — **Default:** `""`
+
+Category IDs (or names) where the bot answers without an `@mention`, like `free_response_channels` but for every channel under the category. Threads and forum posts inherit their parent channel's category, so a forum inside a listed category is free-response for every post in it. Text chats of voice and stage channels in the category are included too; use `ignored_channels` to silence an individual channel.
+
+```yaml
+discord:
+  free_response_categories:
+    - 1234567890
+```
+
+Prefer IDs: a name only matches while the category is cached, and it can collide across servers or change on rename. A thread whose parent channel is not cached cannot be resolved to a category, so it needs an `@mention`, as before.
+
+The key is applied live: an edit to `config.yaml` (or `DISCORD_FREE_RESPONSE_CATEGORIES` in `.env`) takes effect on the next message, without a gateway restart, and the profile's `gateway.log` records `free_response_categories now [...] (applied live)`. A non-empty `.env` value wins over `config.yaml`; an empty one (`DISCORD_FREE_RESPONSE_CATEGORIES=`) is ignored and `config.yaml` decides. To turn the feature off, clear it in `config.yaml` — an empty string, an empty list, or removing the key — which also applies on the next message. The same holds for `free_response_channels` and `allow_bots`.
 
 #### `discord.free_response_auto_thread`
 
