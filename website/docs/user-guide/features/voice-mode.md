@@ -512,6 +512,8 @@ Speech from another bot account follows the same bot policy as its typed message
 
 Unless that policy admits bot speech, a seat never transcribes another bot's audio: an SSRC that belongs to a bot member (or to another seat's bot) is dropped before decryption, and bot utterances are dropped before STT. An unattributed audio stream is mapped to a speaker only when exactly one other member is in the channel and that member is allowlisted.
 
+Known limitation (accepted, plan review M1): Discord maps each audio stream to its user with a speaking event, and it can skip that event (for example after the bot rejoins). With another bot in the channel too (a second seat, a music bot), the seat does not guess: an unmapped stream is not attributed to the operator, its audio is dropped, and the operator may go unheard while it stays unmapped. Guessing would risk transcribing the other bot as the operator.
+
 ```bash
 # ~/.hermes/.env
 DISCORD_ALLOWED_USERS=284102345871466496
