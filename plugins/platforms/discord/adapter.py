@@ -4471,10 +4471,22 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             "Auto-joining voice channel %s (guild %d), text channel %s",
             voice_channel.id, guild_id, text_ch_id,
         )
-        succeeded = await self.join_voice_channel(
-            voice_channel,
-            text_channel_id=text_ch_id,
-        )
+        # Occupancy (V-Q1): an auto-join into a VC another seat or bot holds is skipped, never an
+        # eviction. The runner's check holds its per-(guild, VC) lock around the connect (that lock
+        # is outermost: this adapter's voice lock is taken inside join_voice_channel).
+        runner = getattr(self, "gateway_runner", None)
+        guarded = getattr(type(runner), "_voice_join_unless_occupied", None) if runner is not None else None
+        join = lambda: self.join_voice_channel(voice_channel, text_channel_id=text_ch_id)  # noqa: E731
+        if guarded is not None:
+            succeeded = await guarded(runner, self, guild_id, voice_channel, getattr(self, "_owner_profile", None), join)
+        else:
+            from gateway.voice_channel_policy import voice_channel_occupant
+            own = getattr(getattr(self._client, "user", None), "id", None) if self._client else None
+            occupant = voice_channel_occupant(voice_channel, own, {})
+            succeeded = f"{occupant} is in the VC" if occupant is not None else await join()
+        if isinstance(succeeded, str):
+            logger.info("Auto-join of VC %s (guild %d) skipped: %s", voice_channel.id, guild_id, succeeded)
+            return
         # An auto-join is the user's opt-in to voice, so the bound chat must SPEAK: ``/voice
         # channel`` does exactly this through the runner (``_apply_voice_mode(..., "all")``), and
         # without it the reply is text-only — the bot sits in the room saying nothing.

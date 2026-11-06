@@ -198,7 +198,10 @@ class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
             adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
                 self._voice_key(Platform.DISCORD, str(chat_id), profile=voice_profile), "off")
         try:
-            success = await adapter.join_voice_channel(voice_channel)
+            success = await self._voice_join_unless_occupied(
+                adapter, guild_id, voice_channel, voice_profile, lambda: adapter.join_voice_channel(voice_channel))
+            if isinstance(success, str):
+                return success  # another seat (or bot) is in that VC: refused, never handed over
         except Exception as e:
             # ``asyncio.TimeoutError`` stringifies to '' — the join then reports
             # "Failed to join voice channel:" with no reason at all, which is indistinguishable
@@ -233,6 +236,58 @@ class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
         self._apply_voice_mode(adapter, self._voice_key(Platform.DISCORD, str(text_channel_id), profile=voice_profile),
                                str(text_channel_id), "all")
         return t("gateway.voice.channel_joined", name=voice_channel.name)
+
+    def _voice_occupant(self, adapter, guild_id: int, voice_channel, seat: str) -> Optional[str]:
+        """Who else holds *voice_channel*: a bot member (or a fleet bot id) other than this seat's
+        bot, a seat mid-connect to it in this process, or an in-process seat already connected
+        there that the member cache has not caught up with."""
+        from gateway.voice_channel_policy import voice_channel_occupant
+        fleet = self._fleet_discord_bots()
+        own = getattr(getattr(getattr(adapter, "_client", None), "user", None), "id", None)
+        if (label := voice_channel_occupant(voice_channel, own, fleet)) is not None:
+            return label
+        vc_id = getattr(voice_channel, "id", None)
+        pending = (getattr(self, "_voice_pending_connects", None) or {}).get((guild_id, vc_id))
+        if pending is not None and pending != seat:
+            return pending
+        maps = [("default", getattr(self, "adapters", None) or {})]
+        maps += list((getattr(self, "_profile_adapters", None) or {}).items())
+        for profile, adapters in maps:
+            other = (adapters or {}).get(Platform.DISCORD)
+            if other is None or other is adapter:
+                continue
+            clients = getattr(other, "_voice_clients", None)
+            live = clients.get(guild_id) if isinstance(clients, dict) else None
+            if live is not None and getattr(getattr(live, "channel", None), "id", None) == vc_id \
+                    and callable(getattr(live, "is_connected", None)) and live.is_connected() is True:
+                owner = getattr(other, "_owner_profile", None)
+                return owner if isinstance(owner, str) and owner else profile
+        return None
+
+    async def _voice_join_unless_occupied(self, adapter, guild_id: int, voice_channel, voice_profile, join):
+        """Run *join* (a coroutine factory) unless another seat or bot occupies the VC; then return
+        the refusal reply instead. The runner's per-(guild, VC) lock is the OUTERMOST lock (the
+        adapter's own voice lock is taken inside *join*), and the seat is recorded as pending
+        under it for the whole connect. Used by ``/voice join`` and by the adapter's auto-join."""
+        from gateway.voice_channel_policy import REPLY_OCCUPIED
+        seat = voice_profile if isinstance(voice_profile, str) and voice_profile else "default"
+        vc_id = getattr(voice_channel, "id", None)
+        locks = self.__dict__.setdefault("_voice_join_locks", {})
+        pending = self.__dict__.setdefault("_voice_pending_connects", {})
+        key = (guild_id, vc_id)
+        async with locks.setdefault(key, asyncio.Lock()):
+            occupant = self._voice_occupant(adapter, guild_id, voice_channel, seat)
+            if occupant is not None:
+                vc_name = getattr(voice_channel, "name", None)
+                vc_name = vc_name if isinstance(vc_name, str) and vc_name else "that voice channel"
+                logger.info("Voice join by seat %s refused: VC %s is occupied by %s", seat, vc_id, occupant)
+                return REPLY_OCCUPIED.format(seat=occupant, vc=vc_name)
+            pending[key] = seat
+            try:
+                return await join()
+            finally:
+                if pending.get(key) == seat:
+                    pending.pop(key, None)
 
     def _voice_join_policy_decision(self, adapter, guild_id: int, voice_channel, source, voice_profile):
         """Apply the fleet voice-channel policy to a ``/voice join``. Returns the reply (a refusal
