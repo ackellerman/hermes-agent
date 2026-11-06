@@ -204,6 +204,31 @@ def test_an_unreadable_served_profile_config_refuses_every_join(fleet):
     assert p.auto_join_channels() == frozenset()
 
 
+def test_the_loader_parses_through_the_shared_fast_reader(fleet, monkeypatch):
+    """Every /voice join and seat connect parses every served profile's config on the event loop:
+    for the live fleet (33 configs) the pure-Python PyYAML reader measured ~233 ms, the shared
+    C-backed reader ~60 ms. Pin the mechanism: each config file goes through ``utils.fast_safe_load``."""
+    import utils
+    calls = []
+    real = utils.fast_safe_load
+
+    def spy(stream):
+        calls.append(getattr(stream, "name", stream))
+        return real(stream)
+
+    monkeypatch.setattr(utils, "fast_safe_load", spy)
+    p = load_voice_policy("alpha")
+    assert sorted(Path(c).relative_to(fleet).as_posix() for c in calls) == [
+        "config.yaml", "profiles/alpha/config.yaml", "profiles/beta/config.yaml"]
+    assert p.rule(_MANUAL_VC).allow_thread_move is False and p.is_auto_vc(_LEGACY_VC) and not p.problems
+
+
+def test_a_config_with_a_utf8_bom_still_parses(fleet):
+    (fleet / "config.yaml").write_bytes(b"\xef\xbb\xbf" + yaml.safe_dump(_ROOT).encode())
+    p = load_voice_policy("alpha")
+    assert not p.problems and p.rule(_AUTO_VC).join == "auto"
+
+
 def test_the_summary_names_the_seat_and_its_resolved_policy(fleet):
     text = load_voice_policy("alpha").summary()
     assert text.startswith("seat=alpha unlisted=allow")

@@ -343,9 +343,11 @@ def voice_channel_occupant(voice_channel: Any, own_bot_id: Any, fleet_bots: Mapp
 def _read_config_strict(path: Path) -> tuple[dict, Optional[str]]:
     """``({}, None)`` for a missing file; ``({}, reason)`` for one that cannot be read or parsed."""
     try:
-        import yaml
+        # The shared C-backed reader (the one config loading uses, same YAML 1.1 rules): this runs on
+        # the event loop for every served profile; PyYAML's pure-Python parser cost ~4x as much there.
+        from utils import fast_safe_load
         with open(path, encoding="utf-8-sig") as f:
-            data = yaml.safe_load(f)
+            data = fast_safe_load(f)
     except FileNotFoundError:
         return {}, None
     except Exception as exc:  # unreadable or unparseable: fail closed
