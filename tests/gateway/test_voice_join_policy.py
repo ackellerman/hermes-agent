@@ -355,3 +355,18 @@ async def test_the_fresh_read_at_auto_join_logs_at_debug_unless_it_fails_closed(
         await seat._do_auto_join(seat._fake_vc(vf.OTHER_VC), vf.HOME_TEXT, vf.GUILD)
         assert levels() == ["ERROR"]
         assert vf.GUILD not in seat._voice_clients
+
+
+@pytest.mark.asyncio
+async def test_a_vc_made_auto_after_connect_refuses_voice_join_at_once_but_triggers_next_connect(root, fleet):
+    """Documented split: ``/voice join`` re-reads the policy on every join, so R1 applies at once;
+    the auto-join trigger set is the one resolved at connect."""
+    seat = fleet.seat("alpha")
+    seat._auto_join_cfg = {"enabled": True, "channel_ids": []}
+    seat._resolve_voice_channel_policy()
+    vf.write_fleet(root, {**_MAP, str(vf.OTHER_VC): {"join": "auto", "seats": ["alpha"]}})
+    assert str(vf.OTHER_VC) not in seat._effective_auto_join_channel_ids()
+    fleet.operator_in(vf.OTHER_VC)
+    assert await fleet.voice_join("alpha", vf.ALPHA_TEXT) == REPLY_R1
+    seat._resolve_voice_channel_policy()  # the next connect
+    assert str(vf.OTHER_VC) in seat._effective_auto_join_channel_ids()
