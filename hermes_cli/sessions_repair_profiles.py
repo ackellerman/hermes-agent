@@ -11,8 +11,9 @@ and settles what an earlier release left crossed. This does, for six kinds of cr
 4. ``gateway_routing`` rows in a named profile's store (the routing index lives in the gateway's
    home; #66887 copied every profile's rows into whichever store was scoped) — moved to the routing
    store when absent there, dropped otherwise — and root rows for a namespace no profile claims;
-5. profile-less Telegram topic bindings and ``gateway_voice_mode.json`` entries owned by a
-   non-default bot — relabelled from the evidence of the rows themselves;
+5. profile-less Telegram topic bindings and ``gateway_voice_mode.json`` entries (with their
+   ``gateway_voice_mode.join.json`` records) owned by a non-default bot — relabelled from the
+   evidence of the rows themselves;
 6. ``sessions.json`` mirror entries whose key namespace no served profile claims — dropped, since
    the legacy import re-injects any key the routing DB lacks on every boot.
 
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 _LEGACY_MAIN_CHOICES = ("report", "rekey", "move")
 _VOICE_MODE_FILE = "gateway_voice_mode.json"
+_VOICE_JOIN_FILE = "gateway_voice_mode.join.json"  # the /voice join records beside it
 
 
 @dataclass(frozen=True)
@@ -448,6 +450,17 @@ def _rekey_voice_mode_entry(path: Path, key: str, owner: str) -> dict[str, int]:
     data = json.loads(path.read_text(encoding="utf-8-sig"))
     if key not in data:
         return {}
+    # The /voice join record (``gateway_voice_mode.join.json``, the chat's mode before the join)
+    # is keyed the same way: it moves with the key, first, or the leave and the next start miss it.
+    join_path = path.with_name(_VOICE_JOIN_FILE)
+    try:
+        joins = json.loads(join_path.read_text(encoding="utf-8-sig"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        joins = None
+    if isinstance(joins, dict) and key in joins:
+        joins.setdefault(f"{owner}:{key}", joins.pop(key))
+        joins.pop(key, None)
+        atomic_json_write(join_path, joins)
     data.setdefault(f"{owner}:{key}", data.pop(key))
     data.pop(key, None)
     atomic_json_write(path, data)
