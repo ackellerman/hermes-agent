@@ -80,6 +80,10 @@ def _seed_crossings(homes):
         "telegram:200": "all",        # acme's chat, unprefixed
         "telegram:100": "voice_only",  # the default bot's chat — legitimately unprefixed
     }))
+    #    …and the /voice join records beside it, keyed the same way (a join's prior mode)
+    (homes["default"] / "gateway_voice_mode.join.json").write_text(json.dumps({
+        "telegram:200": "voice_only", "telegram:100": None,
+    }))
     # 6. sessions.json mirror entry for the ghost namespace
     (homes["default"] / "sessions").mkdir(exist_ok=True)
     (homes["default"] / "sessions" / "sessions.json").write_text(json.dumps({
@@ -123,6 +127,7 @@ def test_dry_run_names_every_crossing_and_changes_nothing(homes, capsys):
     _seed_crossings(homes)
     before = {name: _dump(home / "state.db") for name, home in homes.items()}
     files_before = {p.name: p.read_text() for p in (homes["default"] / "gateway_voice_mode.json",
+                                                    homes["default"] / "gateway_voice_mode.join.json",
                                                     homes["default"] / "sessions" / "sessions.json")}
 
     report = _report()
@@ -151,6 +156,7 @@ def test_dry_run_names_every_crossing_and_changes_nothing(homes, capsys):
 
     assert {name: _dump(home / "state.db") for name, home in homes.items()} == before
     assert {p.name: p.read_text() for p in (homes["default"] / "gateway_voice_mode.json",
+                                            homes["default"] / "gateway_voice_mode.join.json",
                                             homes["default"] / "sessions" / "sessions.json")} == files_before
 
 
@@ -191,6 +197,9 @@ def test_apply_settles_every_repairable_crossing_and_is_idempotent(homes, monkey
         assert acme.get_telegram_topic_binding(chat_id="200", thread_id="7", profile_name="default") is None
         voice = json.loads((homes["default"] / "gateway_voice_mode.json").read_text())
         assert voice == {"acme:telegram:200": "all", "telegram:100": "voice_only"}
+        #    the join record moves with its key, or the leave (or the next start) misses it
+        joins = json.loads((homes["default"] / "gateway_voice_mode.join.json").read_text())
+        assert joins == {"acme:telegram:200": "voice_only", "telegram:100": None}
         # 6. ghost mirror entry dropped, the default's kept
         mirror = json.loads((homes["default"] / "sessions" / "sessions.json").read_text())
         assert set(mirror) == {"_README", ROOT_KEY}
