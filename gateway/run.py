@@ -3690,6 +3690,8 @@ class GatewayRunner(
         self.hooks = ProfileHookRegistries()
         # Per-chat voice reply mode: "off" | "voice_only" | "all"
         self._voice_mode: dict[str, str] = self._load_voice_modes()
+        # The mode each chat had before a /voice join set it to "all" (handed back on the leave).
+        self._voice_join_prior: dict[str, Optional[str]] = self._load_voice_join_modes()
         # Per-(bot, guild, text channel, user) transcript dedup: voice/STT can emit one utterance twice.
         self._recent_voice_transcripts: dict[tuple, list[tuple[float, str]]] = {}
         # Background tasks kept referenced so they are not garbage-collected mid-execution.

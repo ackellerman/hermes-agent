@@ -92,9 +92,10 @@ def _persisted(rig) -> dict:
 
 
 def _speaks_text_replies(rig, chat: int = C) -> bool:
-    """Would a plain text reply in *chat* carry a TTS attachment (runner gate or adapter auto-TTS)?"""
-    runner_tts = rig.runner._should_send_voice_reply(_event("what's next?", chat), "Here is the plan.", [])
-    return runner_tts or rig.adapter._should_auto_tts_for_chat(str(chat))
+    """Would a plain text reply in *chat* carry a TTS attachment? The runner's gate decides for text
+    input (it consults the adapter's auto-TTS set when the chat has no mode); the adapter's own
+    auto-TTS (``_wants_auto_tts``) fires on voice input only."""
+    return rig.runner._should_send_voice_reply(_event("what's next?", chat), "Here is the plan.", [])
 
 
 @pytest.mark.asyncio
