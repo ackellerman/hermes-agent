@@ -37,9 +37,24 @@ _GROUP_USER_ENV = {Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS"}
 _GROUP_CHAT_ENV = {Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS", Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS"}
 # Platform -> env var narrowing {PLATFORM}_ALLOW_BOTS to named bot user IDs (YAML ``bot_allow_from``).
 _BOT_ALLOWLIST_ENV = {Platform.DISCORD: "DISCORD_ALLOWED_BOTS"}
-# Returned by _chat_scoped_grant when a bot is refused outright (it must not fall through to the human
-# allowlist): allow_bots admits bots, but this one is not in the platform's bot allowlist.
-_BOT_REFUSED = object()
+class _BotRefused:
+    """Returned by _chat_scoped_grant when a bot is refused outright (it must not fall through to the
+    human allowlist): allow_bots admits bots, but this one is not in the platform's bot allowlist.
+
+    Falsy, so a caller that only tests ``if grant:`` refuses too; callers that must stop the human
+    ladder compare ``grant is _BOT_REFUSED``.
+    """
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return "_BOT_REFUSED"
+
+
+_BOT_REFUSED = _BotRefused()
 _ALLOW_BOTS_ENV = {
     # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466). Checked before the
     # no-user-id guard below: some platforms deliver bot/automation traffic with no user_id at all -- e.g.
@@ -602,8 +617,9 @@ class GatewayAuthorizationMixin:
         """True when the platform's bot allowlist is configured and this bot is not on it.
 
         The routed adapter's live verdict (``bot_sender_allowed``) is authoritative: it re-reads the
-        owning profile's files per message, as its own ingress gate does. Without one, only the
-        scoped env decides (a bare runner with no adapter has no YAML to read).
+        owning profile's files per message, as its own ingress gate does; a checker that raises
+        refuses. Without one (or on a non-bool verdict), only the scoped env decides (a bare runner
+        with no adapter has no YAML to read).
         """
         env_key = _BOT_ALLOWLIST_ENV.get(source.platform)
         if env_key is None:
@@ -611,9 +627,13 @@ class GatewayAuthorizationMixin:
         user_id = str(source.user_id or "").strip()
         checker = getattr(adapter, "bot_sender_allowed", None)
         if callable(checker):
-            verdict = None
-            with contextlib.suppress(Exception):
+            try:
                 verdict = checker(user_id or None)
+            except Exception as exc:
+                # Fail closed: the adapter's list may live only in its profile's YAML, which the
+                # env fallback below cannot see (a secondary's config is never bridged to env).
+                logger.warning("bot allowlist check raised (%s); refusing bot %s", type(exc).__name__, user_id or "?")
+                return True
             if verdict is True or verdict is False:  # ``is``: a MagicMock stand-in must not decide
                 return not verdict
         allowed = _coerce_allow_set(_auth_env(env_key))
