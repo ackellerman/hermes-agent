@@ -259,8 +259,8 @@ class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
 
     def _voice_occupant(self, adapter, guild_id: int, voice_channel, seat: str) -> Optional[str]:
         """Who else holds *voice_channel*: a bot member (or a fleet bot id) other than this seat's
-        bot, a seat mid-connect to it in this process, or an in-process seat already connected
-        there that the member cache has not caught up with."""
+        bot, a seat mid-connect to it in this process, or an in-process seat whose client is tracked
+        there (connected, or mid-reconnect) that the member cache does not show."""
         from gateway.voice_channel_policy import voice_channel_occupant
         fleet = self._fleet_discord_bots()
         own = getattr(getattr(getattr(adapter, "_client", None), "user", None), "id", None)
@@ -278,8 +278,12 @@ class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
                 continue
             clients = getattr(other, "_voice_clients", None)
             live = clients.get(guild_id) if isinstance(clients, dict) else None
-            if live is not None and getattr(getattr(live, "channel", None), "id", None) == vc_id \
-                    and callable(getattr(live, "is_connected", None)) and live.is_connected() is True:
+            # Tracked = the holder, whatever ``is_connected()`` says: mid-reconnect it is False and
+            # Discord drops the bot's voice state, yet it comes back in this VC. A final disconnect
+            # seen through ``cleanup()`` removes it (a task under that seat's voice lock); a close
+            # discord.py never reported leaves it tracked until that seat's next join or
+            # `/voice leave`, so until then the VC reads as held by that seat, the seat the reply names.
+            if live is not None and getattr(getattr(live, "channel", None), "id", None) == vc_id:
                 owner = getattr(other, "_owner_profile", None)
                 return owner if isinstance(owner, str) and owner else profile
         return None
