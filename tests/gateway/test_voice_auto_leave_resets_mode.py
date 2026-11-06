@@ -239,6 +239,40 @@ async def test_both_voice_mode_files_are_written_atomically_join_file_first(rig,
 
 
 @pytest.mark.asyncio
+async def test_a_rebind_hands_the_old_chat_back_its_own_prior_mode(rig):
+    """C held ``voice_only`` before the join; a rebind C→D hands C that mode back (not text) and
+    D's own record goes with the next leave."""
+    await _voice(rig, "on")
+    await _join(rig)
+    await _join(rig, D)  # the rebind: /voice join typed in D while the bot sits in the VC
+    assert rig.adapter._voice_text_channels.get(fx.GUILD) == D, "the rebind itself must happen"
+
+    assert rig.runner._voice_mode.get(_key(C)) == "voice_only"
+    assert _persisted(rig).get(_key(C)) == "voice_only"
+    assert str(C) in rig.adapter._auto_tts_enabled_chats
+    assert rig.runner._voice_join_modes() == {_key(D): None}
+
+    await _owner_walks_out(rig)
+    assert _key(D) not in rig.runner._voice_mode and rig.runner._voice_join_modes() == {}
+    assert rig.runner._voice_mode.get(_key(C)) == "voice_only"
+
+
+@pytest.mark.asyncio
+async def test_a_mode_changed_without_slash_voice_during_the_session_survives_the_leave(rig):
+    """The leave hands a chat back only while its mode is still the join's ``all``: a mode some
+    other path wrote (not ``/voice``, so the record was never disowned) is left as it is."""
+    await _join(rig)
+    rig.runner._apply_voice_mode(rig.adapter, _key(C), str(C), "voice_only")
+    assert _key(C) in rig.runner._voice_join_modes(), "the record is still held"
+
+    await _owner_walks_out(rig)
+
+    assert rig.runner._voice_mode.get(_key(C)) == "voice_only"
+    assert _persisted(rig).get(_key(C)) == "voice_only"
+    assert rig.runner._voice_join_modes() == {}
+
+
+@pytest.mark.asyncio
 async def test_control_while_joined_text_replies_are_spoken(rig):
     """Positive control for the harness: the join's ``all`` does speak text replies in C."""
     await _join(rig)
