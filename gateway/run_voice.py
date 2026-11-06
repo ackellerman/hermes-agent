@@ -225,17 +225,37 @@ class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
         # Moving to another text channel drops speech buffered for the old one (a same-channel rejoin
         # keeps it); nothing awaits between this and the binding write, so no poll sees the gap.
         previous = adapter._voice_text_channels.get(guild_id)
-        if previous is not None and previous != text_channel_id and hasattr(adapter, "discard_pending_voice_input"):
-            adapter.discard_pending_voice_input(guild_id)
-        adapter._voice_text_channels[guild_id] = text_channel_id
-        if hasattr(adapter, "_voice_sources"):
-            if bound_source is not None:
+        if callable(getattr(type(adapter), "_bind_voice_text_channel", None)):
+            # The adapter's binding API: drops the old chat's buffered speech and, when no new
+            # source is given (bind: home), its stored source, which a raw write kept routing to.
+            adapter._bind_voice_text_channel(guild_id, text_channel_id, bound_source)
+        else:  # adapters without the binding API (other platforms' doubles): the previous writes
+            if previous is not None and previous != text_channel_id and hasattr(adapter, "discard_pending_voice_input"):
+                adapter.discard_pending_voice_input(guild_id)
+            adapter._voice_text_channels[guild_id] = text_channel_id
+            if hasattr(adapter, "_voice_sources") and bound_source is not None:
                 adapter._voice_sources[guild_id] = bound_source
-            else:  # bind: home: a typed message there carries its own source, rebuilt per turn
-                adapter._voice_sources.pop(guild_id, None)
+        if previous is not None and previous != text_channel_id:
+            self._hand_back_voice_reply_mode(adapter, previous, voice_profile)
         self._apply_voice_mode(adapter, self._voice_key(Platform.DISCORD, str(text_channel_id), profile=voice_profile),
                                str(text_channel_id), "all")
         return t("gateway.voice.channel_joined", name=voice_channel.name)
+
+    def _hand_back_voice_reply_mode(self, adapter, old_chat, voice_profile) -> None:
+        """A rebind moves spoken replies with the binding: the old chat's ``all`` (set by the join)
+        and an auto-join's speak enable there are dropped, so the old chat goes back to text."""
+        old = str(old_chat)
+        key = self._voice_key(Platform.DISCORD, old, profile=voice_profile)
+        if self._voice_mode.get(key) == "all":
+            del self._voice_mode[key]
+            self._save_voice_modes()
+            if isinstance(enabled := getattr(adapter, _ON_SET, None), set):
+                enabled.discard(old)
+        tracker = getattr(adapter, "_auto_join_tts_chats", None)
+        if isinstance(tracker, set) and old in tracker:
+            tracker.discard(old)
+            if isinstance(enabled := getattr(adapter, _ON_SET, None), set):
+                enabled.discard(old)
 
     def _voice_occupant(self, adapter, guild_id: int, voice_channel, seat: str) -> Optional[str]:
         """Who else holds *voice_channel*: a bot member (or a fleet bot id) other than this seat's
@@ -297,8 +317,8 @@ class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
         VC is told so (F16); R1 (an auto VC needs ``allow_attach_from_text``) comes before the
         per-seat ``never``/``seats``/``unlisted`` refusals, so a caller in an auto VC always hears
         "join a manual voice channel first"."""
-        from gateway.voice_channel_policy import (REPLY_ALREADY_BOUND, REPLY_INVALID, REPLY_NO_HOME, REPLY_R1,
-                                                  load_voice_policy)
+        from gateway.voice_channel_policy import (REPLY_ALREADY_BOUND, REPLY_INVALID, REPLY_NO_HOME, REPLY_NO_MOVE,
+                                                  REPLY_R1, load_voice_policy)
         seat = voice_profile if isinstance(voice_profile, str) and voice_profile else "default"
         vc_id = getattr(voice_channel, "id", None)
         vc_name = getattr(voice_channel, "name", None)
@@ -337,6 +357,12 @@ class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
             return refusal
         if text_channel_id is None:
             return REPLY_NO_HOME.format(vc=vc_name)
+        if connected and vc_id is not None and live_vc_id == vc_id and bound is not None \
+                and bound != text_channel_id:
+            if not rule.allow_thread_move:
+                logger.info("Voice rebind refused for seat %s in VC %s: allow_thread_move is off", seat, vc_id)
+                return REPLY_NO_MOVE.format(vc=vc_name)
+            logger.info("Voice binding of seat %s in VC %s moves %s -> %s", seat, vc_id, bound, text_channel_id)
         return text_channel_id, bound_source
 
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
