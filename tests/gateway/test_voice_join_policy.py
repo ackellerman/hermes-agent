@@ -204,6 +204,19 @@ async def test_a_root_auto_entry_drives_the_named_seats_auto_join(root, fleet, m
 
 
 @pytest.mark.asyncio
+async def test_a_root_manual_entry_stops_a_seats_legacy_auto_join(root, fleet, monkeypatch):
+    """V-Q2 on the adapter side: the seat's in-memory ``voice_auto_join.channel_ids`` must not
+    auto-join a VC the root lists as manual (the policy object alone is not the mechanism)."""
+    vf.write_fleet(root, _MAP, alpha_legacy=[vf.MANUAL_VC])
+    seat = fleet.seat("alpha")
+    try:
+        assert await _drive_auto_join(seat, fleet, monkeypatch, vf.MANUAL_VC, legacy=[vf.MANUAL_VC]) is False
+        assert str(vf.MANUAL_VC) not in seat._effective_auto_join_channel_ids()
+    finally:
+        await seat.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_an_approved_prompt_rechecks_the_policy_before_joining(root, fleet, monkeypatch):
     """``user_prompt`` mode joins when the reaction arrives, possibly after the policy changed."""
     vf.write_fleet(root, {**_MAP, str(vf.OTHER_VC): {"join": "never"}}, alpha_legacy=[vf.OTHER_VC])

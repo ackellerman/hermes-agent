@@ -4227,10 +4227,10 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         return policy
 
     def _effective_auto_join_channel_ids(self) -> frozenset:
-        """The VCs this seat auto-joins: its ``voice_auto_join.channel_ids`` (legacy, counts as auto)
-        plus the root map's ``join: auto`` entries naming this seat, minus any the fleet map refuses
-        (``never``, ``seats``, ``unlisted: refuse``, a broken policy). Before connect resolves the
-        policy, the legacy list alone (the previous behaviour)."""
+        """The VCs this seat auto-joins: its ``voice_auto_join.channel_ids`` (legacy, auto only for VCs
+        the root map does not list) plus the root map's ``join: auto`` entries naming this seat, minus
+        any the fleet map refuses (``never``, ``seats``, ``unlisted: refuse``, a broken policy). Before
+        connect resolves the policy, the legacy list alone (the previous behaviour)."""
         legacy = frozenset(str(c) for c in (self._auto_join_cfg.get("channel_ids") or []) if c)
         policy = getattr(self, "_voice_channel_policy", None)
         if policy is None:
@@ -4238,7 +4238,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         out = set()
         for vc in legacy | policy.auto_join_channels():
             rule = policy.rule(vc)
-            if rule.joinable and (vc in legacy or rule.join == "auto"):
+            if rule.joinable and (rule.join == "auto" or (vc in legacy and not rule.listed)):
                 out.add(vc)
         return frozenset(out)
 
