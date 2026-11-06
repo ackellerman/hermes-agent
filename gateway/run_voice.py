@@ -180,9 +180,15 @@ class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
         voice_channel = await adapter.get_user_voice_channel(guild_id, event.source.user_id)
         if not voice_channel:
             return t("gateway.voice.channel_not_in_voice")
+        voice_profile = self._adapter_profile_for_source(event.source)
+        # Fleet voice-channel policy (fork-local, gateway/voice_channel_policy.py): read from config
+        # on every join, never from which seats happen to be connected.
+        decision = self._voice_join_policy_decision(adapter, guild_id, voice_channel, event.source, voice_profile)
+        if isinstance(decision, str):
+            return decision
+        text_channel_id, bound_source = decision
         # Wire callbacks BEFORE join so voice input arriving right after connection is not lost.
         self._bind_voice_input_callback(adapter)
-        voice_profile = self._adapter_profile_for_source(event.source)
         if hasattr(adapter, "_on_voice_disconnect"):
             adapter._on_voice_disconnect = functools.partial(
                 self._handle_voice_timeout_cleanup, adapter=adapter)
@@ -213,7 +219,6 @@ class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
             return t("gateway.voice.channel_deps_missing", hint=install_hint("discord"))
         if not success:
             return t("gateway.voice.channel_join_permissions")
-        text_channel_id = int(event.source.chat_id)
         # Moving to another text channel drops speech buffered for the old one (a same-channel rejoin
         # keeps it); nothing awaits between this and the binding write, so no poll sees the gap.
         previous = adapter._voice_text_channels.get(guild_id)
@@ -221,10 +226,63 @@ class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
             adapter.discard_pending_voice_input(guild_id)
         adapter._voice_text_channels[guild_id] = text_channel_id
         if hasattr(adapter, "_voice_sources"):
-            adapter._voice_sources[guild_id] = event.source.to_dict()
-        self._apply_voice_mode(adapter, self._voice_key_for_source(event.source),
-                               event.source.chat_id, "all")
+            if bound_source is not None:
+                adapter._voice_sources[guild_id] = bound_source
+            else:  # bind: home: a typed message there carries its own source, rebuilt per turn
+                adapter._voice_sources.pop(guild_id, None)
+        self._apply_voice_mode(adapter, self._voice_key(Platform.DISCORD, str(text_channel_id), profile=voice_profile),
+                               str(text_channel_id), "all")
         return t("gateway.voice.channel_joined", name=voice_channel.name)
+
+    def _voice_join_policy_decision(self, adapter, guild_id: int, voice_channel, source, voice_profile):
+        """Apply the fleet voice-channel policy to a ``/voice join``. Returns the reply (a refusal
+        or the already-bound answer) as a string, else ``(text_channel_id, source_dict_or_None)``.
+
+        Order: an invalid or unreadable policy refuses; the chat already bound to this seat in this
+        VC is told so (F16); R1 (an auto VC needs ``allow_attach_from_text``) comes before the
+        per-seat ``never``/``seats``/``unlisted`` refusals, so a caller in an auto VC always hears
+        "join a manual voice channel first"."""
+        from gateway.voice_channel_policy import (REPLY_ALREADY_BOUND, REPLY_INVALID, REPLY_NO_HOME, REPLY_R1,
+                                                  load_voice_policy)
+        seat = voice_profile if isinstance(voice_profile, str) and voice_profile else "default"
+        vc_id = getattr(voice_channel, "id", None)
+        vc_name = getattr(voice_channel, "name", None)
+        vc_name = vc_name if isinstance(vc_name, str) and vc_name else "that voice channel"
+        try:
+            policy = load_voice_policy(seat)
+        except Exception:
+            logger.error("Voice channel policy failed to load; refusing /voice join", exc_info=True)
+            return REPLY_INVALID
+        rule = policy.rule(vc_id)
+        if rule.refusal == "invalid":
+            logger.error("Voice join refused for seat %s in VC %s: voice channel policy fails closed (%s)",
+                         seat, vc_id, "; ".join(policy.problems))
+            return REPLY_INVALID
+        text_channel_id, bound_source = int(source.chat_id), source.to_dict()
+        if rule.bind == "home":
+            home_lookup = getattr(adapter, "_auto_join_home_text_channel", None)
+            client = getattr(adapter, "_client", None)
+            guild = client.get_guild(guild_id) if client is not None else None
+            home = home_lookup(guild) if callable(home_lookup) else None
+            text_channel_id, bound_source = (home, None) if isinstance(home, int) else (None, None)
+        clients, bindings = getattr(adapter, "_voice_clients", None), getattr(adapter, "_voice_text_channels", None)
+        live = clients.get(guild_id) if isinstance(clients, dict) else None
+        live_vc_id = getattr(getattr(live, "channel", None), "id", None) if live is not None else None
+        connected = live is not None and callable(getattr(live, "is_connected", None)) and live.is_connected() is True
+        bound = bindings.get(guild_id) if isinstance(bindings, dict) else None
+        if connected and vc_id is not None and live_vc_id == vc_id and text_channel_id is not None \
+                and bound == text_channel_id:
+            return REPLY_ALREADY_BOUND.format(vc=vc_name)  # F16: nothing to change
+        if policy.is_auto_vc(vc_id) and not rule.allow_attach_from_text:
+            logger.info("Voice join refused for seat %s: VC %s is an auto-join channel (R1)", seat, vc_id)
+            return REPLY_R1
+        if (refusal := rule.refusal_reply(vc_name)) is not None:
+            logger.info("Voice join refused for seat %s in VC %s: %s", seat, vc_id,
+                        rule.refusal or ("never" if rule.join == "never" else "seats"))
+            return refusal
+        if text_channel_id is None:
+            return REPLY_NO_HOME.format(vc=vc_name)
+        return text_channel_id, bound_source
 
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
         adapter = self._delivery_adapter_for(event.source)

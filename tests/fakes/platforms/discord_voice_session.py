@@ -112,6 +112,9 @@ class FakeReceiver:
         pending, self.pending = self.pending, []
         return pending
 
+    def discard_pending(self) -> None:
+        self.pending = []
+
     def check_silence(self) -> list:
         return []
 
