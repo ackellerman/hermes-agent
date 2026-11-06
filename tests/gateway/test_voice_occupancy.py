@@ -103,6 +103,29 @@ async def test_the_own_bot_is_not_an_occupant(fleet):
     assert (await fleet.voice_join("beta", vf.THREAD, thread=True)).startswith("Joined voice channel **Voice (manual)**")
 
 
+@pytest.mark.asyncio
+async def test_a_rebind_is_not_refused_by_a_bot_that_arrived_after_the_seat(fleet):
+    """The seat is already connected in the VC, so a rebind connects nothing: another bot that joined
+    since is not an occupant of THIS seat's session. A second seat is still refused (control)."""
+    assert (await fleet.voice_join("beta", vf.BETA_TEXT)).startswith("Joined voice channel **Voice (manual)**")
+    fleet.members[vf.MANUAL_VC].append(SimpleNamespace(id=7777, bot=True, display_name="music-bot"))
+    beta, client = fleet.seat("beta"), fleet.seat("beta")._voice_clients[vf.GUILD]
+    assert (await fleet.voice_join("beta", vf.THREAD, thread=True)).startswith("Joined voice channel **Voice (manual)**")
+    assert beta._voice_text_channels[vf.GUILD] == vf.THREAD and beta._voice_clients[vf.GUILD] is client
+    assert await fleet.voice_join("alpha", vf.ALPHA_TEXT) == _OCCUPIED_BY_BETA
+
+
+@pytest.mark.asyncio
+async def test_a_seat_connected_elsewhere_is_still_checked_for_occupancy(fleet):
+    """Only a client connected in THIS VC skips the check: a seat in another VC moving here is a new
+    presence in this VC and must not walk past its occupant."""
+    beta = fleet.seat("beta")
+    assert await beta.join_voice_channel(beta._fake_vc(vf.OTHER_VC), text_channel_id=vf.BETA_TEXT)
+    fleet.members[vf.MANUAL_VC].append(SimpleNamespace(id=7777, bot=True, display_name="music-bot"))
+    assert await fleet.voice_join("beta", vf.BETA_TEXT) == REPLY_OCCUPIED.format(seat="music-bot", vc="Voice (manual)")
+    assert beta._voice_clients[vf.GUILD].channel.id == vf.OTHER_VC
+
+
 # --- auto-join never evicts ----------------------------------------------------------------------
 
 @pytest.mark.asyncio

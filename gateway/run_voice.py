@@ -296,7 +296,13 @@ class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
         pending = self.__dict__.setdefault("_voice_pending_connects", {})
         key = (guild_id, vc_id)
         async with locks.setdefault(key, asyncio.Lock()):
-            occupant = self._voice_occupant(adapter, guild_id, voice_channel, seat)
+            # This seat's own client already connected in this VC: the join is a rebind, it connects
+            # nothing, so a bot that arrived since is not an occupant of it (a seat elsewhere is checked).
+            own = getattr(adapter, "_voice_clients", None)
+            own = own.get(guild_id) if isinstance(own, dict) else None
+            rebind = own is not None and getattr(getattr(own, "channel", None), "id", None) == vc_id \
+                and callable(getattr(own, "is_connected", None)) and own.is_connected() is True
+            occupant = None if rebind else self._voice_occupant(adapter, guild_id, voice_channel, seat)
             if occupant is not None:
                 vc_name = getattr(voice_channel, "name", None)
                 vc_name = vc_name if isinstance(vc_name, str) and vc_name else "that voice channel"
