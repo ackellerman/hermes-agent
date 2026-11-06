@@ -206,6 +206,39 @@ async def test_the_start_leaves_an_all_with_no_join_record_alone(rig, monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prior", [None, "on"])
+async def test_a_torn_join_file_cannot_strand_the_joins_all(rig, monkeypatch, tmp_path, prior):
+    """The join's ``all`` lives in memory and in the join file only: the mode file keeps the
+    mode the chat had before, so losing the join file (torn, truncated) loses only the ``all``."""
+    if prior:
+        await _voice(rig, prior)
+    await _join(rig)
+    expected = {None: None, "on": "voice_only"}[prior]
+    assert _persisted(rig).get(_key(C)) == expected, "the mode file holds the prior, not the join's all"
+
+    join_file = rig.runner._voice_join_mode_path()
+    join_file.write_text(join_file.read_text(encoding="utf-8")[:7], encoding="utf-8")  # torn mid-write
+    fresh = await _start_a_fresh_gateway(rig, monkeypatch, tmp_path)
+
+    assert fresh._voice_mode.get(_key(C)) == expected
+    assert _persisted(rig).get(_key(C)) == expected
+
+
+@pytest.mark.asyncio
+async def test_both_voice_mode_files_are_written_atomically_join_file_first(rig, monkeypatch):
+    import utils
+    writes = []
+
+    def recording(path, content, **kw):
+        writes.append(path.name)
+        return utils.atomic_write_text(path, content, **kw)
+
+    monkeypatch.setattr("gateway.run_voice.atomic_write_text", recording, raising=False)
+    await _join(rig)
+    assert writes and writes[-2:] == ["gateway_voice_mode.join.json", "gateway_voice_mode.json"], writes
+
+
+@pytest.mark.asyncio
 async def test_control_while_joined_text_replies_are_spoken(rig):
     """Positive control for the harness: the join's ``all`` does speak text replies in C."""
     await _join(rig)

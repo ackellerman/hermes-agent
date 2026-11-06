@@ -25,6 +25,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.response_filters import voice_reply_suppressed
 from gateway.run_voice_session_end import GatewayVoiceSessionEndMixin
 from gateway.session import SessionSource
+from utils import atomic_write_text
 
 logger = logging.getLogger("gateway.run")  # log-record parity with the origin module
 
@@ -90,12 +91,30 @@ class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
         return {k: m for k, m in items.items() if ":" in k}
 
     def _save_voice_modes(self) -> None:
+        """Persist both files atomically, the join file first. The mode file never holds a join's
+        ``all``: a chat the join owns is written with the mode it had before (no key when it had
+        none). So a crash between the two writes, or a lost or torn join file, can only lose the
+        join's ``all``; it can never leave a chat speaking every reply with nothing to undo it."""
+        held = self.__dict__.get("_voice_join_prior")  # None: never loaded, unchanged on disk
         try:
             self._VOICE_MODE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            payload = json.dumps(self._voice_mode, indent=2)
-            self._VOICE_MODE_PATH.write_text(payload, encoding="utf-8")
-            if (held := self.__dict__.get("_voice_join_prior")) is not None:  # never loaded: unchanged on disk
-                self._voice_join_mode_path().write_text(json.dumps(held, indent=2), encoding="utf-8")
+        except OSError as e:
+            logger.warning("Failed to save voice modes: %s", e)
+            return
+        if held is not None:
+            try:
+                atomic_write_text(self._voice_join_mode_path(), json.dumps(held, indent=2))
+            except OSError as e:
+                logger.warning("Failed to save voice-join modes: %s", e)
+        on_disk = dict(self._voice_mode)
+        for key, prior in (held or {}).items():
+            if on_disk.get(key) == "all":  # still the join's: the user's own mode goes to disk
+                if prior is None:
+                    del on_disk[key]
+                else:
+                    on_disk[key] = prior
+        try:
+            atomic_write_text(self._VOICE_MODE_PATH, json.dumps(on_disk, indent=2))
         except OSError as e:
             logger.warning("Failed to save voice modes: %s", e)
 
