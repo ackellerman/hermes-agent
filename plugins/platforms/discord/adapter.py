@@ -2078,6 +2078,9 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 # Registration walks the skill catalog on disk (#110707); keep the loop free.
                 await asyncio.to_thread(self._register_slash_commands)
             self._disconnecting = False
+            # Resolve the voice policy before the client starts: discord.py can dispatch a voice-state
+            # event before on_ready, and that auto-join must already follow the fleet map.
+            self._resolve_voice_channel_policy()
             self._bot_task = asyncio.create_task(self._client.start(self.config.token))
             self._bot_task.add_done_callback(self._handle_bot_task_done)
             ready_timeout = _discord_ready_timeout_seconds()
@@ -2089,7 +2092,6 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             # _mark_connected() clears a prior fatal stamp; a bare ``_running = True`` left a transient
             # startup failure reported as ``fatal`` for the life of the process (#102554).
             self._mark_connected()
-            self._resolve_voice_channel_policy()
             self._start_liveness_probe()
             # Once a minute, compare this process's loaded policy to the files on disk (one WARNING):
             # gates apply live now, but plugins/voice still need a restart and that must not be silent.
@@ -4213,10 +4215,11 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
     # ------------------------------------------------------------------
 
     def _resolve_voice_channel_policy(self, *, store: bool = True):
-        """Resolve this seat's view of the fleet voice-channel map from disk and log it once (INFO, or
-        ERROR when it fails closed). ``store=False`` (the auto-join's fresh check) returns it without
-        replacing the copy resolved at connect, which drives the auto-join trigger. Never raises: an
-        unexpected failure resolves to a fail-closed policy."""
+        """Resolve this seat's view of the fleet voice-channel map from disk and log it (INFO once per
+        connect, or ERROR when it fails closed). ``store=False`` (the auto-join's fresh check) returns
+        it without replacing the copy resolved at connect, which drives the auto-join trigger, and logs
+        at DEBUG unless it fails closed. Never raises: an unexpected failure resolves to a fail-closed
+        policy."""
         seat = getattr(self, "_owner_profile", None) or "default"
         try:
             from gateway.voice_channel_policy import load_voice_policy
@@ -4227,7 +4230,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                                           errors=[f"policy load failed ({type(exc).__name__})"])
         if store:
             self._voice_channel_policy = policy
-        log = logger.error if policy.problems else logger.info
+        log = logger.error if policy.problems else (logger.info if store else logger.debug)
         log("[%s] Voice channel policy: %s", self.name, policy.summary())
         return policy
 
@@ -4235,13 +4238,13 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         """The VCs this seat auto-joins: its ``voice_auto_join.channel_ids`` (legacy, auto only for VCs
         the root map does not list) plus the root map's ``join: auto`` entries naming this seat, minus
         any the fleet map refuses (``never``, ``seats``, ``unlisted: refuse``, a broken policy). Before
-        connect resolves the policy, the legacy list alone (the previous behaviour). ``policy``
+        connect resolves the policy, nothing: legacy ids alone never drive an auto-join. ``policy``
         overrides the copy resolved at connect."""
         legacy = frozenset(str(c) for c in (self._auto_join_cfg.get("channel_ids") or []) if c)
         if policy is None:
             policy = getattr(self, "_voice_channel_policy", None)
         if policy is None:
-            return legacy
+            return frozenset()
         out = set()
         for vc in legacy | policy.auto_join_channels():
             rule = policy.rule(vc)
