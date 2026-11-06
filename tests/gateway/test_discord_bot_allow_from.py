@@ -21,6 +21,9 @@ Probe map:
   P12     a bot in the HUMAN allowlist but not the bot list is refused
   P13     snapshot + drift rows; P14 connect INFO line + one typo WARNING
   P15     ``DISCORD_ALLOWED_BOTS`` is a profile gate (scrubbed from children); P16 primary bridge
+  P17     authz env fallback (no adapter, or a non-bool verdict) honours the scoped list
+  P18     a checker that RAISES refuses the bot (fail closed)
+  P19     the refusal marker is falsy, and the caller still refuses
 """
 import asyncio
 import contextlib
@@ -106,7 +109,7 @@ def _bot_message(adapter, author_id, msg_id):
     return SimpleNamespace(
         id=msg_id,
         author=SimpleNamespace(id=int(author_id), bot=True, display_name=f"bot{author_id}"),
-        channel=SimpleNamespace(id=CHANNEL, name="conference", parent_id=None),
+        channel=SimpleNamespace(id=CHANNEL, name="general", parent_id=None),
         content=f"<@{me.id}> handoff",
         mentions=[me],
         type=discord.MessageType.default,
@@ -128,7 +131,7 @@ def _admit_under(adapter, author_id, msg_id, *, under=None):
 
 
 @pytest.fixture
-def office(tmp_path, monkeypatch):
+def multi(tmp_path, monkeypatch):
     root = tmp_path / "hh"
     # Production: the primary (unscoped) profile's home IS the root. Without this the default
     # adapter binds conftest's home and its rows pass through the env snapshot, untested.
@@ -201,15 +204,15 @@ def _bot_author(bot_id, name):
 
 
 # ── P1: per-profile isolation of the allowlist at ingress ────────────────────────────────────────
-def test_p1_each_profile_enforces_its_own_list(office):
-    assert _admit(office["alpha"], BOT_BETA, 1) is True
-    assert _admit(office["alpha"], BOT_OUTSIDER, 2) is False
-    assert _admit(office["beta"], BOT_ALPHA, 3) is True, "beta must admit alpha (its own list)"
-    assert _admit(office["beta"], BOT_GAMMA, 4) is False
-    assert _admit(office["default"], BOT_OUTSIDER, 5) is True, "default has no list: allow_bots alone decides"
+def test_p1_each_profile_enforces_its_own_list(multi):
+    assert _admit(multi["alpha"], BOT_BETA, 1) is True
+    assert _admit(multi["alpha"], BOT_OUTSIDER, 2) is False
+    assert _admit(multi["beta"], BOT_ALPHA, 3) is True, "beta must admit alpha (its own list)"
+    assert _admit(multi["beta"], BOT_GAMMA, 4) is False
+    assert _admit(multi["default"], BOT_OUTSIDER, 5) is True, "default has no list: allow_bots alone decides"
 
 
-def test_p1b_no_process_env_written_by_a_scoped_profile(office):
+def test_p1b_no_process_env_written_by_a_scoped_profile(multi):
     assert "DISCORD_ALLOWED_BOTS" not in os.environ
 
 
@@ -219,13 +222,13 @@ def test_p1b_no_process_env_written_by_a_scoped_profile(office):
     ("alpha", BOT_DELTA, True), ("alpha", BOT_ALPHA, False),
     ("default", BOT_OUTSIDER, True),
 ])
-def test_p2_authz_verdict_per_profile(office, who, bot, expected):
-    assert _authz(office[who], bot) is expected
+def test_p2_authz_verdict_per_profile(multi, who, bot, expected):
+    assert _authz(multi[who], bot) is expected
 
 
 # ── P3: live policy — narrowing/widening applies on the next message, like allow_bots ───────────
-def test_p3_bot_allow_from_edit_applies_live(office):
-    beta = office["beta"]
+def test_p3_bot_allow_from_edit_applies_live(multi):
+    beta = multi["beta"]
     assert _admit(beta, BOT_OUTSIDER, 10) is False
     _write_cfg(beta._probe_home, f"discord:\n  allow_bots: mentions\n  bot_allow_from: [{BOT_ALPHA}, {BOT_OUTSIDER}]\n")
     assert _admit(beta, BOT_OUTSIDER, 11) is True
@@ -252,8 +255,8 @@ def test_p4_id_shapes(tmp_path, value, author, expected):
 
 
 # ── P5: history backfill keeps a peer's turn (as background) for a narrowed seat ─────────────────
-def test_p5_history_keeps_unlisted_bot_as_unverified(office, monkeypatch):
-    beta = office["beta"]
+def test_p5_history_keeps_unlisted_bot_as_unverified(multi, monkeypatch):
+    beta = multi["beta"]
     monkeypatch.setattr(discord, "Thread", type("T", (), {}), raising=False)
     calls = []
     real = getattr(beta, "_bot_allowlist", None)  # absent on a tree without the feature: the tag asserts decide
@@ -288,9 +291,9 @@ def test_p5b_single_profile_history_semantics(tmp_path, monkeypatch):
 # ── P6: the busy path (run_busy._handle_active_session_busy_message) refuses an unlisted bot ────
 # In production ingress drops the unlisted bot first; this is the second layer, for events that
 # reach the busy path some other way (recovery, a routed source).
-def test_p6_busy_path_drops_unlisted_bot(office, caplog):
+def test_p6_busy_path_drops_unlisted_bot(multi, caplog):
     from gateway.platforms.base import MessageEvent, MessageType
-    beta = office["beta"]
+    beta = multi["beta"]
     runner = _runner_for(beta)
     runner._authorization_home_for_source = lambda _s: None
     runner._draining = False
@@ -305,9 +308,9 @@ def test_p6_busy_path_drops_unlisted_bot(office, caplog):
 
 
 # ── P7: missed-message recovery path (claim=False) uses the same gate ────────────────────────────
-def test_p7_recovered_message_path(office):
-    assert _admit(office["beta"], BOT_GAMMA, 77, claim=False) is False
-    assert _admit(office["beta"], BOT_ALPHA, 78, claim=False) is True
+def test_p7_recovered_message_path(multi):
+    assert _admit(multi["beta"], BOT_GAMMA, 77, claim=False) is False
+    assert _admit(multi["beta"], BOT_ALPHA, 78, claim=False) is True
 
 
 # ── P8: real load_gateway_config for a secondary profile, every YAML placement the fleet uses ───
@@ -343,18 +346,18 @@ def test_p8_real_loader(tmp_path, monkeypatch, body):
 
 
 # ── P9 / P9b: the verdict is bound to the adapter's own profile, not the caller's ambient scope ──
-def test_p9_ingress_scope_independent(office):
-    alpha_home = office["alpha"]._probe_home
-    beta = office["beta"]
+def test_p9_ingress_scope_independent(multi):
+    alpha_home = multi["alpha"]._probe_home
+    beta = multi["beta"]
     assert _admit_under(beta, BOT_ALPHA, 101) is True
     assert _admit_under(beta, BOT_GAMMA, 102) is False
     assert _admit_under(beta, BOT_ALPHA, 103, under=alpha_home) is True
     assert _admit_under(beta, BOT_GAMMA, 104, under=alpha_home) is False
 
 
-def test_p9b_authz_scope_independent(office):
-    beta = office["beta"]
-    alpha_home = office["alpha"]._probe_home
+def test_p9b_authz_scope_independent(multi):
+    beta = multi["beta"]
+    alpha_home = multi["alpha"]._probe_home
     assert _authz(beta, BOT_ALPHA, home=alpha_home) is True  # a sibling's scope
     assert _authz(beta, BOT_GAMMA, home=alpha_home) is False
     assert _authz(beta, BOT_ALPHA, scoped=False) is True     # no scope at all
@@ -442,8 +445,8 @@ def test_p12_bot_in_human_allowlist_is_refused(tmp_path):
 
 
 # ── P13: snapshot row + drift row (a matched pair) ───────────────────────────────────────────────
-def test_p13_snapshot_and_drift_rows(office):
-    beta = office["beta"]
+def test_p13_snapshot_and_drift_rows(multi):
+    beta = multi["beta"]
     assert beta._policy_snapshot["bot_allow_from"] == BOT_ALPHA
     _write_cfg(beta._probe_home, f"discord:\n  allow_bots: mentions\n  bot_allow_from: [{BOT_OUTSIDER}, {BOT_ALPHA}]\n")
     rows = {row.name: row for row in beta._config_drift_keys()}
@@ -451,7 +454,7 @@ def test_p13_snapshot_and_drift_rows(office):
     assert row.snapshot == BOT_ALPHA
     assert row.disk == f"{BOT_ALPHA} {BOT_OUTSIDER}"
     assert row.reloadable is True
-    assert "bot_allow_from" not in {r.name for r in office["default"]._config_drift_keys()}, \
+    assert "bot_allow_from" not in {r.name for r in multi["default"]._config_drift_keys()}, \
         "a profile that never named the key has no row"
 
 
@@ -485,3 +488,80 @@ def test_p16_primary_bridge_writes_csv(tmp_path, monkeypatch):
     seeded = adapter_mod._apply_yaml_config(cfg, cfg["discord"]) or {}
     assert seeded["bot_allow_from"] == f"{BOT_ALPHA},{BOT_GAMMA}"
     assert os.environ.get("DISCORD_ALLOWED_BOTS") == f"{BOT_ALPHA},{BOT_GAMMA}"
+
+
+# ── P17: authz env fallback — no adapter (bare runner) or a non-bool verdict ────────────────────
+def _bare_runner():
+    """A runner with no adapters at all: authz can only read the scoped env."""
+    runner = _runner_for(None)
+    runner.adapters = {}
+    # The real resolvers, not the fixture's stand-ins: with no adapters they must find none.
+    del runner._delivery_adapter_for, runner._authorization_adapter
+    return runner
+
+
+@pytest.mark.parametrize("env,bot,expected", [
+    (f"DISCORD_ALLOW_BOTS=mentions\nDISCORD_ALLOWED_BOTS={BOT_ALPHA}\n", BOT_ALPHA, True),
+    (f"DISCORD_ALLOW_BOTS=mentions\nDISCORD_ALLOWED_BOTS={BOT_ALPHA}\n", BOT_GAMMA, False),
+    ("DISCORD_ALLOW_BOTS=mentions\n", BOT_GAMMA, True),           # no list: the mode alone decides
+    (f"DISCORD_ALLOW_BOTS=none\nDISCORD_ALLOWED_BOTS={BOT_GAMMA}\n", BOT_GAMMA, False),
+], ids=["listed", "unlisted", "no-list", "mode-none"])
+def test_p17_env_fallback_without_adapter(tmp_path, env, bot, expected):
+    home = tmp_path / "hh" / "profiles" / "beta"
+    _write_cfg(home, "{}\n", env=env)
+    runner = _bare_runner()
+    assert runner._delivery_adapter_for(_bot_source(bot)) is None, "fixture control: no adapter"
+    assert "DISCORD_ALLOWED_BOTS" not in os.environ, "fixture control: the list is in scoped env only"
+    with _scope(home):
+        assert runner._principal_authorized(_bot_source(bot), allow_adapter_delegation=True) is expected
+
+
+@pytest.mark.parametrize("bot,expected", [(BOT_ALPHA, True), (BOT_GAMMA, False)])
+def test_p17b_env_fallback_on_non_bool_verdict(tmp_path, bot, expected):
+    home = tmp_path / "hh" / "profiles" / "beta"
+    _write_cfg(home, "{}\n", env=f"DISCORD_ALLOW_BOTS=mentions\nDISCORD_ALLOWED_BOTS={BOT_ALPHA}\n")
+    adapter = SimpleNamespace(
+        config=SimpleNamespace(extra={}),
+        bot_admission_mode=lambda: "mentions",
+        bot_sender_allowed=lambda _uid: MagicMock(),  # not a bool: must not decide
+    )
+    runner = _runner_for(adapter)
+    with _scope(home):
+        assert runner._principal_authorized(_bot_source(bot), allow_adapter_delegation=True) is expected
+
+
+# ── P18: the adapter has a checker but it raises: refuse (its list may be YAML-only) ─────────────
+def test_p18_checker_raising_refuses(tmp_path):
+    home = tmp_path / "hh" / "profiles" / "beta"
+    _write_cfg(home, "{}\n")  # no env list: before the fix the bot fell through to "no list" = admit
+
+    def _boom(_uid):
+        raise RuntimeError("config unreadable")
+
+    adapter = SimpleNamespace(
+        config=SimpleNamespace(extra={"allow_bots": "mentions"}),
+        bot_admission_mode=lambda: "mentions",
+        bot_sender_allowed=_boom,
+    )
+    runner = _runner_for(adapter)
+    with _scope(home):
+        assert runner._principal_authorized(_bot_source(BOT_GAMMA), allow_adapter_delegation=True) is False
+        assert runner._principal_authorized(_bot_source(BOT_ALPHA), allow_adapter_delegation=True) is False
+
+
+# ── P19: the refusal marker is falsy, so a caller testing ``if grant:`` cannot grant ─────────────
+def test_p19_refusal_marker_is_falsy_and_still_refuses(tmp_path):
+    from gateway import authz_mixin
+    marker = authz_mixin._BOT_REFUSED
+    assert bool(marker) is False
+    home = tmp_path / "hh" / "profiles" / "beta"
+    _write_cfg(home, f"discord:\n  allow_bots: mentions\n  bot_allow_from: [{BOT_ALPHA}]\n",
+               env=f"DISCORD_ALLOWED_USERS={BOT_GAMMA}\n")
+    beta = _load(home, self_id=BOT_BETA)
+    runner = _runner_for(beta)
+    with _scope(home):
+        grant = runner._chat_scoped_grant(_bot_source(BOT_GAMMA), None, True, True)
+        assert grant is marker, grant
+        # GAMMA is in the HUMAN allowlist: only the marker check keeps the ladder from granting.
+        assert runner._principal_authorized(_bot_source(BOT_GAMMA), allow_adapter_delegation=True) is False
+        assert runner._principal_authorized(_bot_source(BOT_ALPHA), allow_adapter_delegation=True) is True

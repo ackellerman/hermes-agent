@@ -464,7 +464,7 @@ The key is applied live: an edit to `config.yaml` (or `DISCORD_FREE_RESPONSE_CAT
 
 #### `discord.bot_allow_from`
 
-Narrows `allow_bots` to named bots. With `allow_bots: mentions` (or `all`), only the bot user IDs listed here can trigger this profile; any other bot is dropped at ingress and refused by gateway authorization, including while a session is busy.
+Narrows `allow_bots` to named bots. With `allow_bots: mentions` (or `all`), only the bot user IDs listed here can trigger this profile; any other bot is dropped at ingress and refused by gateway authorization, including while a session is busy (except for the relay and `group_allowed_chats` bypasses below).
 
 ```yaml
 discord:
@@ -479,6 +479,7 @@ discord:
 - **Applied live.** Edits apply on the next message, with no gateway restart, for ingress and for gateway authorization alike (the same holds for `allow_bots`). The connect line `bot allowlist: … (home=<profile>, applied live)` in `gateway.log` shows what each profile resolved; the config-drift check reports later edits as informational.
 - **History is tagged, not filtered.** When history backfill runs, messages from a bot outside the list stay in the context block, tagged `[unverified]`, the same treatment as a human outside the allowlist, so a seat still sees its peers' turns. This is an instruction to the model to treat the text as background, **not a hard block**: the text still reaches the model.
 - **Relay bypass.** A trusted relay (`authorization_is_upstream`) decides authorization upstream, and its `allowOtherBots` policy is derived from `DISCORD_ALLOW_BOTS` alone; `bot_allow_from` is not sent to the connector. Do not rely on the list on a relay-fronted Discord.
+- **`group_allowed_chats` bypass at authorization.** A channel listed in the Discord `group_allowed_chats` key (any placement: `discord:`, `platforms.discord:` or `platforms.discord.extra:`) is granted by gateway authorization before the bot check runs, so in that channel authorization admits an unlisted bot. Ingress (and missed-message recovery) still drops it (`reason=bot-not-in-allowlist`), but the second layer, gateway authorization on the busy path, does not refuse it there. Do not list a channel in `group_allowed_chats` if you rely on `bot_allow_from` in it.
 
 #### `discord.free_response_auto_thread`
 
