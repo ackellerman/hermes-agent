@@ -105,6 +105,45 @@ def test_root_never_beats_a_legacy_auto_join():
     assert _LEGACY_VC not in p.auto_join_channels() and not p.is_auto_vc(_LEGACY_VC)
 
 
+def test_a_root_manual_entry_beats_a_seats_legacy_auto_join():
+    """V-Q2: only the root marks auto. A seat's legacy ``voice_auto_join.channel_ids`` count as auto
+    only for VCs the root map does not list; a root entry wins, with a WARNING."""
+    alpha = _cfg(legacy=[_MANUAL_VC])
+    profiles = {"default": _ROOT, "alpha": alpha, "beta": {}}
+    p_alpha = resolve_voice_policy("alpha", _ROOT, alpha, profiles, seat_is_root=False)
+    assert p_alpha.rule(_MANUAL_VC).join == "manual" and p_alpha.rule(_MANUAL_VC).joinable
+    assert _MANUAL_VC not in p_alpha.auto_join_channels()
+    assert any(_MANUAL_VC in w and "root" in w for w in p_alpha.seat_layer.warnings)
+
+
+def test_r1_does_not_count_a_legacy_id_the_root_lists_as_manual():
+    """The fleet R1 set: alpha's legacy id on a root-manual VC must not make /voice join refuse there
+    for every seat (beta here). An unlisted legacy VC still counts (control)."""
+    alpha = _cfg(legacy=[_MANUAL_VC, _LEGACY_VC])
+    profiles = {"default": _ROOT, "alpha": alpha, "beta": {}}
+    p_beta = resolve_voice_policy("beta", _ROOT, {}, profiles, seat_is_root=False)
+    assert not p_beta.is_auto_vc(_MANUAL_VC)
+    assert p_beta.is_auto_vc(_LEGACY_VC)
+
+
+def test_a_root_auto_entry_for_other_seats_is_not_widened_by_a_legacy_id():
+    """The root entry's ``seats`` decide who auto-joins it; a seat outside them listing it in its
+    legacy ids does not auto-join (and it stays auto for R1 through the root entry)."""
+    alpha = _cfg(legacy=[_AUTO_VC])
+    profiles = {"default": _ROOT, "alpha": alpha}
+    p_alpha = resolve_voice_policy("alpha", _ROOT, alpha, profiles, seat_is_root=False)
+    assert _AUTO_VC not in p_alpha.auto_join_channels() and not p_alpha.rule(_AUTO_VC).seat_allowed
+    assert p_alpha.is_auto_vc(_AUTO_VC)
+
+
+def test_the_loader_warns_when_a_root_entry_overrides_a_legacy_id(fleet, caplog):
+    _write(fleet / "profiles" / "alpha" / "config.yaml", _cfg(legacy=[_MANUAL_VC]))
+    with caplog.at_level(logging.WARNING, logger="gateway.voice_channel_policy"):
+        p = load_voice_policy("alpha")
+    assert p.rule(_MANUAL_VC).join == "manual"
+    assert any(r.levelno == logging.WARNING and _MANUAL_VC in r.getMessage() for r in caplog.records)
+
+
 def test_root_auto_entries_drive_the_named_seats_auto_join():
     p = resolve_voice_policy("default", _ROOT, _ROOT, {"default": _ROOT}, seat_is_root=True)
     assert p.auto_join_channels() == frozenset({_AUTO_VC})

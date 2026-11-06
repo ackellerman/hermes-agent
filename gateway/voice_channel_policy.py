@@ -15,7 +15,8 @@ One map, in the ROOT ``config.yaml`` (``get_default_hermes_root()``), under ``di
 Only the root may mark a VC ``auto``. A seat's own ``config.yaml`` may carry the same block, and it can
 only NARROW: lower ``join`` (auto > manual > never), drop itself from ``seats``, turn an opt-in off, set
 ``unlisted: refuse`` or ``bind: home``. Anything wider is ignored with a warning. A seat's legacy
-``discord.voice_auto_join.channel_ids`` (with ``enabled: true``) still counts as ``auto`` for that seat.
+``discord.voice_auto_join.channel_ids`` (with ``enabled: true``) count as ``auto`` for that seat only
+for VCs the root map does not list; a root entry wins over them, with a warning.
 
 Unknown keys and values fail CLOSED: a bad entry refuses that VC; a bad ``unlisted`` value refuses
 unlisted VCs; an unknown top-level key, an unreadable root config or an unreadable served profile
@@ -218,14 +219,13 @@ class VoicePolicy:
         if base is None:
             if self.unlisted == "refuse":
                 return VoiceChannelRule(vc, False, "never", "caller", False, False, False, refusal="unlisted")
+            # A legacy voice_auto_join id counts as auto for this seat only where the root is silent.
             base = {"join": "auto" if legacy else "manual", "bind": "caller",
                     "seats": "*", "allow_attach_from_text": False, "allow_thread_move": True}
             listed = False
         else:
-            base = dict(base)
+            base = dict(base)  # a root entry wins over the seat's legacy ids (V-Q2: only the root marks auto)
             listed = True
-            if legacy and base["join"] == "manual":
-                base["join"] = "auto"  # legacy voice_auto_join counts as auto for this seat
         seats = base["seats"]
         seat_allowed = seats == "*" or self.seat in seats
         join, bind = base["join"], base["bind"]
@@ -297,14 +297,18 @@ def resolve_voice_policy(seat: str, root_cfg: Mapping, seat_cfg: Optional[Mappin
                     seat_layer.warnings.append(f"profile {seat}: VC {vc} {key}=true ignored (seats may only narrow)")
         if seat_layer.unlisted == "allow" and root.unlisted == "refuse":
             seat_layer.warnings.append(f"profile {seat}: unlisted=allow ignored (root refuses unlisted VCs)")
+    seat_legacy = legacy_auto_join_ids(root_cfg if seat_is_root else (seat_cfg or {}))
+    for vc in sorted(seat_legacy):
+        base = root.entries.get(vc)
+        if base is not None and (base["join"] != "auto" or (base["seats"] != "*" and seat not in base["seats"])):
+            seat_layer.warnings.append(
+                f"profile {seat}: voice_auto_join.channel_ids VC {vc} ignored (the root map lists it: "
+                f"join={base['join']}, seats={'*' if base['seats'] == '*' else sorted(base['seats'])})")
+    # R1's fleet auto set: root auto entries, plus legacy ids only for VCs the root does not list.
     fleet_auto = {vc for vc, e in root.entries.items() if e["join"] == "auto"}
     for cfg in profile_cfgs.values():
-        for vc in legacy_auto_join_ids(cfg):
-            if root.entries.get(vc, {}).get("join") != "never":
-                fleet_auto.add(vc)
-    return VoicePolicy(seat=seat, root=root, seat_layer=seat_layer,
-                       legacy_auto=legacy_auto_join_ids(seat_cfg or {}) if not seat_is_root
-                       else legacy_auto_join_ids(root_cfg),
+        fleet_auto.update(vc for vc in legacy_auto_join_ids(cfg) if vc not in root.entries)
+    return VoicePolicy(seat=seat, root=root, seat_layer=seat_layer, legacy_auto=seat_legacy,
                        fleet_auto=frozenset(fleet_auto), errors=tuple(errors))
 
 
