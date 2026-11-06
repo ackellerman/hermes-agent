@@ -169,6 +169,53 @@ class TestVoiceModeProfileIsolation:
         assert "123" not in default_ad._auto_tts_enabled_chats
         assert "123" not in default_ad._auto_tts_disabled_chats
 
+    @pytest.mark.asyncio
+    async def test_a_join_hand_back_lands_only_on_the_bot_that_joined(self, tmp_path):
+        """The default bot's hand-set ``all`` and bot2's join ``all`` share chat 123. bot2 had no
+        mode there before its join, so its leave removes bot2's key, and only bot2's: the default
+        bot's ``all`` and enabled set are untouched."""
+        from types import SimpleNamespace
+
+        from gateway.platforms.base import SessionSource
+        from gateway.platforms.event import MessageEvent, MessageType
+
+        runner = _make_runner()
+        runner._VOICE_MODE_PATH = tmp_path / "voice.json"
+        runner._is_user_authorized = lambda source: True
+        default_ad = self._discord_adapter()
+        bot2_ad = self._discord_adapter(owner="bot2")
+        runner.adapters = {Platform.DISCORD: default_ad}
+        runner._profile_adapters = {"bot2": {Platform.DISCORD: bot2_ad}}
+
+        def source(profile, adapter):
+            src = SessionSource(platform=Platform.DISCORD, chat_id="123", user_id="u1",
+                                chat_type="channel", profile=profile)
+            src._transport_adapter_ref = lambda: adapter
+            return src
+
+        await runner._handle_voice_command(
+            MessageEvent(text="/voice tts", message_type=MessageType.TEXT, source=source(None, default_ad)))
+        assert runner._voice_mode == {"discord:123": "all"}
+
+        join = MessageEvent(text="/voice channel", message_type=MessageType.TEXT, source=source("bot2", bot2_ad))
+        join.raw_message = SimpleNamespace(guild_id=111, guild=None)
+        bot2_ad.join_voice_channel = AsyncMock(return_value=True)
+        ch = MagicMock(); ch.name = "General"
+        bot2_ad.get_user_voice_channel = AsyncMock(return_value=ch)
+        await runner._handle_voice_channel_join(join)
+        assert runner._voice_mode == {"discord:123": "all", "bot2:discord:123": "all"}
+        assert runner._voice_join_modes() == {"bot2:discord:123": None}
+        assert bot2_ad._auto_tts_enabled_chats == {"123"}
+
+        bot2_ad._on_voice_disconnect("123")
+
+        assert runner._voice_mode == {"discord:123": "all"}
+        assert json.loads(runner._VOICE_MODE_PATH.read_text()) == {"discord:123": "all"}
+        assert runner._voice_join_modes() == {}
+        assert bot2_ad._auto_tts_enabled_chats == set()
+        assert default_ad._auto_tts_enabled_chats == {"123"}
+        assert default_ad._auto_tts_disabled_chats == set()
+
     def test_sync_restores_only_the_owning_profiles_chats(self):
         runner = _make_runner()
         runner._voice_mode = {"discord:1": "all", "bot2:discord:2": "all"}
