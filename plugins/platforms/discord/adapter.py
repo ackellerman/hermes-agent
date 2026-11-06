@@ -1920,7 +1920,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                             else:
                                 policy = AutoJoinPolicy(
                                     enabled=policy_cfg.get("enabled", False),
-                                    channel_ids=frozenset(policy_cfg.get("channel_ids", [])),
+                                    channel_ids=adapter_self._effective_auto_join_channel_ids(),
                                     user_ids=frozenset(policy_cfg.get("user_ids", [])),
                                     join_mode=policy_cfg.get("join_mode", "user_prompt"),
                                     require_text_opt_in=policy_cfg.get("require_text_opt_in", True),
@@ -4226,6 +4226,22 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         log("[%s] Voice channel policy: %s", self.name, policy.summary())
         return policy
 
+    def _effective_auto_join_channel_ids(self) -> frozenset:
+        """The VCs this seat auto-joins: its ``voice_auto_join.channel_ids`` (legacy, counts as auto)
+        plus the root map's ``join: auto`` entries naming this seat, minus any the fleet map refuses
+        (``never``, ``seats``, ``unlisted: refuse``, a broken policy). Before connect resolves the
+        policy, the legacy list alone (the previous behaviour)."""
+        legacy = frozenset(str(c) for c in (self._auto_join_cfg.get("channel_ids") or []) if c)
+        policy = getattr(self, "_voice_channel_policy", None)
+        if policy is None:
+            return legacy
+        out = set()
+        for vc in legacy | policy.auto_join_channels():
+            rule = policy.rule(vc)
+            if rule.joinable and (vc in legacy or rule.join == "auto"):
+                out.add(vc)
+        return frozenset(out)
+
     def _auto_join_debounced(self, key: str, seconds: float = 30.0) -> bool:
         """Returns True when key is inside its debounce window (the
         triggering event should be ignored); returns False otherwise
@@ -4446,6 +4462,11 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
 
     async def _do_auto_join(self, voice_channel, text_ch_id, guild_id):
         """Execute the auto-join: call ``join_voice_channel`` then announce."""
+        # Re-checked here too: an approval prompt can be answered long after the policy was read.
+        vc_key = str(getattr(voice_channel, "id", ""))
+        if getattr(self, "_voice_channel_policy", None) is not None and vc_key not in self._effective_auto_join_channel_ids():
+            logger.info("Auto-join of VC %s skipped: the voice channel policy no longer allows it", vc_key)
+            return
         logger.info(
             "Auto-joining voice channel %s (guild %d), text channel %s",
             voice_channel.id, guild_id, text_ch_id,
