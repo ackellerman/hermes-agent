@@ -391,6 +391,7 @@ discord:
     max_attempts: 3               # Lifetime re-dispatch cap per message
   channel_prompts: {}             # Per-channel ephemeral system prompts
   voice_channel_inactivity_timeout_seconds: 300  # Set 0 to stay in VC until explicit /voice leave
+  voice_channels: {}              # Fleet voice-channel policy (root config.yaml; profiles only narrow) — see Voice Mode › Voice channel policy
   voice_playback_timeout_seconds: 120             # Minimum playback watchdog; long clips get duration+padding
   allow_mentions:                 # What the bot is allowed to ping (safe defaults)
     everyone: false               # @everyone / @here pings (default: false)

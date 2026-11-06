@@ -1483,6 +1483,15 @@ platform_toolsets:
 #   reactions: true                  # Show processing reactions (default: true)
 #   history_backfill: true           # Recover missed channel messages on mention (default: true)
 #   history_backfill_limit: 50       # Max messages to scan backwards (default: 50)
+#   voice_channels:                  # Fleet voice-channel policy: ROOT config.yaml only; a profile
+#                                    # config may only narrow it. Unknown keys/values refuse joins.
+#     unlisted: allow                # allow (default) | refuse: VCs with no entry
+#     "111111111111111111":          # voice channel id
+#       join: manual                 # auto | manual (default) | never
+#       bind: caller                 # caller (default) | home: where /voice join binds speech
+#       seats: "*"                   # "*" (default) or a list of profile names
+#       allow_attach_from_text: false  # R1 opt-in: /voice join may attach to an auto VC
+#       allow_thread_move: false     # /voice join elsewhere may move the binding (unlisted VCs: true)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Available toolsets (use these names in platform_toolsets or the toolsets list)
