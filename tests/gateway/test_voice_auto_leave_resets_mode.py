@@ -159,23 +159,50 @@ async def test_a_mode_set_by_hand_during_the_session_survives_the_leave(rig, set
     assert str(C) in rig.adapter._auto_tts_enabled_chats
 
 
-@pytest.mark.asyncio
-async def test_the_join_record_survives_a_restart(rig):
-    """The prior mode is persisted with the mode file: a runner that reloads it still restores it."""
+async def _start_a_fresh_gateway(rig, monkeypatch, tmp_path):
+    """A new process: the real ``GatewayRunner.__init__`` over the same mode files."""
+    from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
-    await _voice(rig, "on")
-    await _join(rig)
-    reloaded = object.__new__(GatewayRunner)
-    reloaded.adapters, reloaded._profile_adapters = {Platform.DISCORD: rig.adapter}, {}
-    reloaded._VOICE_MODE_PATH = rig.mode_path
-    reloaded._voice_mode = reloaded._load_voice_modes()
-    reloaded._session_db, reloaded.session_store = None, MagicMock()
-    rig.adapter._on_voice_disconnect = lambda chat_id: reloaded._handle_voice_timeout_cleanup(chat_id, adapter=rig.adapter)
+    monkeypatch.setattr(GatewayRunner, "_VOICE_MODE_PATH", rig.mode_path)
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    if runner._session_db is not None:
+        await runner._session_db.close()
+    return runner
 
-    await _owner_walks_out(rig)
 
-    assert reloaded._voice_mode.get(_key(C)) == "voice_only"
-    assert _persisted(rig).get(_key(C)) == "voice_only"
+def _join_records(rig) -> dict:
+    path = rig.runner._voice_join_mode_path()
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior", [None, "on"])
+async def test_a_crash_mid_session_hands_the_mode_back_at_the_next_start(rig, monkeypatch, tmp_path, prior):
+    """A SIGKILL/OOM leaves no leave behind. No voice session survives a process start, so the
+    next start hands every join record back: the chat is not left speaking every reply."""
+    if prior:
+        await _voice(rig, prior)
+    await _join(rig)  # ...and the process dies here: no leave, no shutdown
+
+    fresh = await _start_a_fresh_gateway(rig, monkeypatch, tmp_path)
+
+    expected = {None: None, "on": "voice_only"}[prior]
+    assert fresh._voice_mode.get(_key(C)) == expected
+    assert _persisted(rig).get(_key(C)) == expected
+    assert _join_records(rig) == {}, "a record outliving its process would hand back a stale prior later"
+
+
+@pytest.mark.asyncio
+async def test_the_start_leaves_an_all_with_no_join_record_alone(rig, monkeypatch, tmp_path):
+    """An ``all`` with no record is a hand-set ``/voice tts`` (or a key from before records
+    existed): the two cannot be told apart, so the start never clears it."""
+    rig.mode_path.write_text(json.dumps({_key(C): "all", _key(D): "all"}), encoding="utf-8")
+    rig.runner._voice_join_mode_path().write_text(json.dumps({_key(C): None}), encoding="utf-8")
+
+    fresh = await _start_a_fresh_gateway(rig, monkeypatch, tmp_path)
+
+    assert fresh._voice_mode == {_key(D): "all"}
+    assert _persisted(rig) == {_key(D): "all"}
 
 
 @pytest.mark.asyncio

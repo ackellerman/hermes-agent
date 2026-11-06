@@ -124,6 +124,24 @@ class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
             return {}
         return {str(k): m for k, m in data.items() if ":" in str(k) and (m is None or m in _VOICE_MODES)}
 
+    def _hand_back_join_voice_modes_at_start(self) -> None:
+        """No voice session survives a process start, so every join record on disk is stale: a
+        crash (SIGKILL, OOM, watchdog) skipped its leave. Hand each chat whose mode is still the
+        join's ``all`` its prior mode back, and drop every record. A chat with ``all`` and no
+        record (a hand-set ``/voice tts``, or a key from before records existed) is left alone."""
+        held = self._voice_join_modes()
+        if not held:
+            return
+        for key, prior in held.items():
+            if self._voice_mode.get(key) == "all":
+                if prior is None:
+                    del self._voice_mode[key]
+                else:
+                    self._voice_mode[key] = prior
+        logger.info("Voice: handed back %d voice-join reply mode(s) a previous process left", len(held))
+        held.clear()
+        self._save_voice_modes()
+
     def _claim_voice_mode_for_join(self, voice_key: str) -> None:
         """Record the chat's mode before the join sets ``all`` (a rejoin keeps the first record)."""
         held = self._voice_join_modes()
