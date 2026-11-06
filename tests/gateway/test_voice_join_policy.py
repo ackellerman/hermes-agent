@@ -286,3 +286,72 @@ async def test_an_approved_prompt_rechecks_the_policy_before_joining(root, fleet
     vf.write_fleet(root, _MAP, alpha_legacy=[vf.OTHER_VC])  # control: allowed again
     await seat._do_auto_join(seat._fake_vc(vf.OTHER_VC), vf.HOME_TEXT, vf.GUILD)
     assert vf.GUILD in seat._voice_clients
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry,joined", [({"join": "never"}, False), (None, True)], ids=["never", "unlisted"])
+async def test_a_voice_event_before_on_ready_already_follows_the_policy(root, fleet, monkeypatch, entry, joined):
+    """The gateway can dispatch VOICE_STATE_UPDATE between ``client.start`` and ``on_ready``. In that
+    window the seat's legacy ids alone must not auto-join a VC the root lists as ``never``; an
+    unlisted legacy VC still joins (the control: the early event does reach the auto-join)."""
+    vcs = {**_MAP, str(vf.OTHER_VC): entry} if entry else _MAP
+    vf.write_fleet(root, vcs, alpha_legacy=[vf.OTHER_VC])
+    seat = fleet.seat("alpha")
+    seat._auto_join_cfg = {"enabled": True, "channel_ids": [str(vf.OTHER_VC)], "user_ids": [str(vf.USER)],
+                           "join_mode": "automatic", "require_text_opt_in": False}
+    monkeypatch.setattr(seat, "_select_auto_join_text_channel", lambda guild, channel: vf.HOME_TEXT)
+    fleet.operator_in(vf.MANUAL_VC)
+    operator = seat._fake_guild.get_member(vf.USER)
+    seen = []
+
+    async def start(bot, token):
+        seen.append(vf.GUILD in seat._voice_clients)
+        await bot._events["on_voice_state_update"](operator, fx.voice_state(None),
+                                                   fx.voice_state(seat._fake_vc(vf.OTHER_VC)))
+        seen.append(vf.GUILD in seat._voice_clients)
+        await bot._events["on_ready"]()
+
+    monkeypatch.setattr(fx.FakeBot, "start", start)
+    try:
+        await fx.connect_capturing_handlers(seat, monkeypatch)
+        assert seen == [False, joined]
+    finally:
+        await seat.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_an_unresolved_policy_auto_joins_nothing(root, fleet):
+    """A seat whose policy was never resolved (no connect yet) has an empty auto-join set: its
+    legacy ids alone never trigger an auto-join, here into a VC the root lists as ``never``."""
+    vf.write_fleet(root, {**_MAP, str(vf.OTHER_VC): {"join": "never"}}, alpha_legacy=[vf.OTHER_VC])
+    seat = fleet.seat("alpha")
+    seat._auto_join_cfg = {"enabled": True, "channel_ids": [str(vf.OTHER_VC)]}
+    assert seat._voice_channel_policy is None
+    assert seat._effective_auto_join_channel_ids() == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_the_fresh_read_at_auto_join_logs_at_debug_unless_it_fails_closed(root, fleet, caplog):
+    """One ``Voice channel policy:`` INFO line per seat per connect: the auto-join's fresh read is
+    DEBUG, and ERROR only when that read fails closed."""
+    import logging
+    vf.write_fleet(root, _MAP, alpha_legacy=[vf.OTHER_VC])
+    seat = fleet.seat("alpha")
+    seat._auto_join_cfg = {"enabled": True, "channel_ids": [str(vf.OTHER_VC)]}
+    fleet.operator_in(vf.OTHER_VC)
+
+    def levels():
+        return [r.levelname for r in caplog.records if "Voice channel policy:" in r.getMessage()]
+
+    with caplog.at_level(logging.DEBUG, logger=adapter_mod.logger.name):
+        seat._resolve_voice_channel_policy()
+        assert levels() == ["INFO"]
+        caplog.clear()
+        await seat._do_auto_join(seat._fake_vc(vf.OTHER_VC), vf.HOME_TEXT, vf.GUILD)
+        assert levels() == ["DEBUG"]
+        await seat.disconnect()
+        caplog.clear()
+        (root / "config.yaml").write_text("discord: {voice_channels: [\n")
+        await seat._do_auto_join(seat._fake_vc(vf.OTHER_VC), vf.HOME_TEXT, vf.GUILD)
+        assert levels() == ["ERROR"]
+        assert vf.GUILD not in seat._voice_clients
