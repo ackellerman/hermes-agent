@@ -94,7 +94,7 @@ class FakeReceiver:
 
     instances: list["FakeReceiver"] = []
 
-    def __init__(self, vc: Any, allowed_user_ids: Any = None) -> None:
+    def __init__(self, vc: Any, allowed_user_ids: Any = None, **_bot_exclusion: Any) -> None:
         self.vc, self.pending, self.stopped, self._running = vc, [], False, True
         FakeReceiver.instances.append(self)
 
