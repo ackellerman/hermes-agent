@@ -141,6 +141,21 @@ async def test_a_seat_connected_elsewhere_is_still_checked_for_occupancy(fleet):
     assert beta._voice_clients[vf.GUILD].channel.id == vf.OTHER_VC
 
 
+@pytest.mark.asyncio
+async def test_a_seat_mid_reconnect_is_not_its_own_occupant_and_is_still_checked(fleet):
+    """The rebind skip needs the own client CONNECTED in this VC. Mid-reconnect, the occupancy check
+    runs as for a new join: another bot in the VC refuses it, and the seat never names ITSELF."""
+    assert (await fleet.voice_join("beta", vf.BETA_TEXT)).startswith("Joined voice channel **Voice (manual)**")
+    beta = fleet.seat("beta")
+    beta._voice_clients[vf.GUILD].reconnecting()
+    fleet.members[vf.MANUAL_VC][:] = [m for m in fleet.members[vf.MANUAL_VC] if m.id != vf.BOT_IDS["beta"]]
+    reply = await fleet.voice_join("beta", vf.THREAD, thread=True)
+    assert not reply.startswith("beta is in"), reply
+    fleet.members[vf.MANUAL_VC].append(SimpleNamespace(id=7777, bot=True, display_name="music-bot"))
+    beta._voice_clients[vf.GUILD].reconnecting()
+    assert await fleet.voice_join("beta", vf.BETA_TEXT) == REPLY_OCCUPIED.format(seat="music-bot", vc="Voice (manual)")
+
+
 # --- auto-join never evicts ----------------------------------------------------------------------
 
 @pytest.mark.asyncio
