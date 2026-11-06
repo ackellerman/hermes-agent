@@ -1361,7 +1361,9 @@ class VoiceReceiver:
         counted, and it is allowlisted; any second member (another bot, or a person not on the
         allowlist) makes the SSRC ambiguous. With no user allowlist (a role-only seat) the sole
         member must not be a bot, and the listen loop's role check decides. A sole member that is a
-        bot has its SSRC dropped instead."""
+        bot has its SSRC dropped instead. Accepted (plan review M1): with the operator AND another
+        bot present, a stream whose SPEAKING event was missed is not inferred, so the operator can go
+        unheard on it; guessing would risk attributing the bot's audio to the operator."""
         try:
             channel = self._vc.channel
             if not channel:
