@@ -469,8 +469,36 @@ When the bot is in a voice channel:
 
 - Transcripts appear in the text channel: `[Voice] @user: what you said`
 - Agent responses are sent as text in the channel AND spoken in the VC
-- The text channel is the one where `/voice join` was issued
-- Running `/voice join` from another text channel moves the binding there; speech captured before the move, whether still being transcribed or not yet finished, is dropped, not posted to the new channel
+- The text channel is the one where `/voice join` was issued (or the seat's home channel with `bind: home`, below)
+- Running `/voice join` from another text channel or a thread moves the binding there, where the voice channel policy allows it (`allow_thread_move`); speech captured before the move, whether still being transcribed or not yet finished, is dropped, not posted to the new channel. Spoken replies move with it: the old chat goes back to text
+- Running `/voice join` in the chat that is already bound answers "Already in **VC**; speech is bound to this chat." and changes nothing
+
+### Voice channel policy (multi-seat)
+
+When several profiles (seats) share a Discord server, one map in the **root** `config.yaml` (`~/.hermes/config.yaml`, never a profile's) decides which seat may be in which voice channel:
+
+```yaml
+discord:
+  voice_channels:
+    unlisted: allow                 # allow (default) | refuse: may a seat join a VC with no entry?
+    "111111111111111111":           # an auto-join VC
+      join: auto                    # auto | manual | never
+      seats: [default]              # "*" (default) or profile names allowed to connect
+    "222222222222222222":           # a manual VC
+      join: manual
+      bind: caller                  # caller (default) | home: where /voice join binds speech
+      allow_thread_move: true       # /voice join in another chat/thread may move the binding
+      allow_attach_from_text: false # R1 opt-in, see below
+```
+
+- **R1: `/voice join` never attaches to an auto-join VC.** A caller in an auto VC (a `join: auto` entry, or any served profile's `voice_auto_join.channel_ids`, whether or not that seat is running) is answered "join a manual voice channel first"; nothing connects and the auto-join session keeps its home binding. `allow_attach_from_text: true` on the VC restores the old behaviour.
+- **Occupancy: one seat per VC.** `/voice join` while another seat, or any bot, is in the VC replies "SEAT is in VC; `/voice leave` there first". An auto-join into an occupied VC is skipped; nobody is evicted.
+- `join: never` refuses both `/voice join` and auto-join; `seats` limits which profiles may connect; `unlisted: refuse` makes every VC need an entry.
+- `join: auto` entries drive the named seats' auto-join (still gated by their own `voice_auto_join.enabled` and `user_ids`); a seat's legacy `voice_auto_join.channel_ids` keep counting as auto for that seat.
+- Defaults: a listed entry is `join: manual`, `bind: caller`, `seats: "*"`, both opt-ins `false`. An unlisted VC behaves as before this policy (manual, the typing chat, moves allowed), apart from R1 and occupancy.
+- A profile's own `config.yaml` may carry the same block and can only **narrow** it: lower `join`, drop itself from `seats`, turn an opt-in off, `unlisted: refuse`, `bind: home`. Wider values are ignored with a warning. Only the root may mark a VC `auto`.
+- Unknown keys or values fail **closed**: a bad entry refuses that VC, a bad `unlisted` refuses unlisted VCs, and an unknown top-level key or an unreadable root or profile config refuses every join. Each seat logs its resolved policy in one line at connect (`Voice channel policy: seat=… unlisted=… auto_join=[…] …`, ERROR when it fails closed).
+- The policy is read from disk on every `/voice join`; the auto-join side is read at connect.
 
 ### Echo Prevention
 
@@ -481,6 +509,8 @@ The bot automatically pauses its audio listener while playing TTS replies, preve
 Only users allowed by `DISCORD_ALLOWED_USERS` or `DISCORD_ALLOWED_ROLES` can interact via voice; a role is checked for the speaker each time they talk. Other users' audio is silently ignored.
 
 Speech from another bot account follows the same bot policy as its typed messages. An utterance cannot carry an @mention, so a bot speaker is heard only where a typed bot message needs none: `DISCORD_ALLOW_BOTS=all` with `discord.bots_require_inline_mention: false`. The gateway's bot loop guard then counts its turns.
+
+Unless that policy admits bot speech, a seat never transcribes another bot's audio: an SSRC that belongs to a bot member (or to another seat's bot) is dropped before decryption, and bot utterances are dropped before STT. An unattributed audio stream is mapped to a speaker only when exactly one other member is in the channel and that member is allowlisted.
 
 ```bash
 # ~/.hermes/.env
