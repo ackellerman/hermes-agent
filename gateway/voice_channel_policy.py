@@ -308,6 +308,27 @@ def resolve_voice_policy(seat: str, root_cfg: Mapping, seat_cfg: Optional[Mappin
                        fleet_auto=frozenset(fleet_auto), errors=tuple(errors))
 
 
+def voice_channel_occupant(voice_channel: Any, own_bot_id: Any, fleet_bots: Mapping[int, str]) -> Optional[str]:
+    """The label of a bot in *voice_channel* other than this seat's own: its seat name when it is a
+    fleet bot (``fleet_bots``: bot id -> seat), else its display name. Any bot counts (V-Q1: the
+    operator should know a VC is in use); a fleet id counts even when the member cache misses
+    ``Member.bot``. ``None`` when no other bot is there."""
+    try:
+        members = list(getattr(voice_channel, "members", None) or [])
+    except TypeError:
+        members = []
+    for m in members:
+        mid = getattr(m, "id", None)
+        if mid is None or mid == own_bot_id:
+            continue
+        if mid in fleet_bots:
+            return fleet_bots[mid]
+        if getattr(m, "bot", None) is True:
+            name = getattr(m, "display_name", None)
+            return name if isinstance(name, str) and name else str(mid)
+    return None
+
+
 def _read_config_strict(path: Path) -> tuple[dict, Optional[str]]:
     """``({}, None)`` for a missing file; ``({}, reason)`` for one that cannot be read or parsed."""
     try:
