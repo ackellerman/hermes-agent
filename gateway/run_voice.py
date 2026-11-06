@@ -52,6 +52,21 @@ class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
         profile = self._adapter_profile_for_source(source)
         return self._voice_key(source.platform, source.chat_id, profile=profile)
 
+    def _fleet_discord_bots(self) -> dict[int, str]:
+        """Bot user id -> seat (profile) for every in-process Discord adapter with a logged-in
+        client. Used to recognise a sibling seat's bot in a voice channel (bot-audio exclusion,
+        occupancy) when the member cache does not say it is a bot."""
+        found: dict[int, str] = {}
+        maps = [("default", getattr(self, "adapters", None) or {})]
+        maps += list((getattr(self, "_profile_adapters", None) or {}).items())
+        for profile, adapters in maps:
+            adapter = (adapters or {}).get(Platform.DISCORD)
+            bot_id = getattr(getattr(getattr(adapter, "_client", None), "user", None), "id", None)
+            if isinstance(bot_id, int):
+                owner = getattr(adapter, "_owner_profile", None)
+                found[bot_id] = owner if isinstance(owner, str) and owner else (profile or "default")
+        return found
+
     def _bind_voice_input_callback(self, adapter) -> None:
         """Route voice transcripts (and voice-session ends) back through the adapter that captured them."""
         if hasattr(adapter, "_voice_input_callback"):

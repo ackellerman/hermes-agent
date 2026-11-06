@@ -915,11 +915,22 @@ class VoiceReceiver:
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
     REKEY_FAILURE_STREAK = 25  # consecutive NaCl failures → re-resolve creds
+    # An SSRC nobody claimed (no SPEAKING, inference ambiguous) whose sender never pauses (another
+    # bot's mixer sends frames continuously) never reaches silence: cap what it may buffer.
+    MAX_UNMAPPED_SECONDS = 15
 
-    def __init__(self, voice_client, allowed_user_ids: set | None = None):
+    def __init__(self, voice_client, allowed_user_ids: set | None = None, *,
+                 fleet_bot_ids: Callable[[], set] | None = None, drop_bot_audio: bool = True):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
         self._running = False
+        # Bot-audio exclusion (fork-local): SSRCs mapped to a bot member or a fleet seat's bot are
+        # dropped at packet time unless the seat admits bot speech (``drop_bot_audio=False``, the
+        # #143368 predicate evaluated at join). ``fleet_bot_ids`` covers a member-cache miss.
+        self._fleet_bot_ids = fleet_bot_ids
+        self._drop_bot_audio = drop_bot_audio
+        self._dropped_ssrcs: set[int] = set()
+        self._bot_audio_dropped = 0
 
         # Decryption state, kept as ONE tuple (secret_key, dave_session,
         # dave_protocol_version, dave_downgraded) so the receive thread
@@ -1063,12 +1074,14 @@ class VoiceReceiver:
             self._last_packet_time.clear()
             self._decoders.clear()
             self._ssrc_to_user.clear()
+            self._dropped_ssrcs.clear()
         logger.info(
             "VoiceReceiver stopped (frames ok=%d, decrypt_failed=%d, "
-            "dave_unmapped_dropped=%d)",
+            "dave_unmapped_dropped=%d, bot_audio_dropped=%d)",
             self._decode_ok,
             self._decode_failed,
             self._dave_unmapped_dropped,
+            self._bot_audio_dropped,
         )
 
     def pause(self):
@@ -1082,6 +1095,35 @@ class VoiceReceiver:
     def map_ssrc(self, ssrc: int, user_id: int):
         with self._lock:
             self._ssrc_to_user[ssrc] = user_id
+            self._note_ssrc_owner_locked(ssrc, user_id)
+
+    def _is_bot_user(self, user_id: int) -> bool:
+        """A bot member of the channel, or a fleet seat's bot (the member cache may miss it)."""
+        try:
+            channel = self._vc.channel
+            for m in (channel.members if channel else ()):
+                if m.id == user_id:
+                    if getattr(m, "bot", None) is True:
+                        return True
+                    break
+        except Exception:
+            pass
+        try:
+            return bool(self._fleet_bot_ids) and user_id in (self._fleet_bot_ids() or ())
+        except Exception:
+            return False
+
+    def _note_ssrc_owner_locked(self, ssrc: int, user_id: int) -> None:
+        """Keep the drop set in step with the SSRC's owner (call under ``_lock``); an SSRC Discord
+        reassigns to a person is heard again."""
+        if self._drop_bot_audio and self._is_bot_user(user_id):
+            if ssrc not in self._dropped_ssrcs:
+                logger.info("Dropping voice from bot user %d (ssrc=%d)", user_id, ssrc)
+            self._dropped_ssrcs.add(ssrc)
+            self._buffers.pop(ssrc, None)
+            self._last_packet_time.pop(ssrc, None)
+        else:
+            self._dropped_ssrcs.discard(ssrc)
 
     def _install_speaking_hook(self, conn):
         """Wrap the voice websocket hook to capture SPEAKING events (op 5); ``conn.hook`` is
@@ -1176,6 +1218,9 @@ class VoiceReceiver:
         first_byte = data[0]
         _, _, seq, _timestamp, ssrc = struct.unpack_from(">BBHII", data, 0)
         if ssrc == self._bot_ssrc:
+            return
+        if ssrc in self._dropped_ssrcs:  # another bot's audio: never decrypted, buffered or decoded
+            self._bot_audio_dropped += 1
             return
         # Calculate dynamic RTP header size (RFC 9335 / rtpsize mode)
         cc = first_byte & 0x0F  # CSRC count
@@ -1311,23 +1356,31 @@ class VoiceReceiver:
     # --- Silence detection ---
 
     def _infer_user_for_ssrc(self, ssrc: int) -> int:
-        """Infer user_id for an unmapped SSRC: after a bot rejoin Discord may not resend
-        SPEAKING, so if exactly one allowed user is in the channel, map the SSRC to them."""
+        """Infer user_id for an unmapped SSRC (call under ``_lock``): after a bot rejoin Discord may
+        not resend SPEAKING. Infer only when exactly ONE other member is in the channel, bots
+        counted, and it is allowlisted; any second member (another bot, or a person not on the
+        allowlist) makes the SSRC ambiguous. With no user allowlist (a role-only seat) the sole
+        member must not be a bot, and the listen loop's role check decides. A sole member that is a
+        bot has its SSRC dropped instead."""
         try:
             channel = self._vc.channel
             if not channel:
                 return 0
             bot_id = self._vc.user.id if self._vc.user else 0
+            others = [m for m in channel.members if m.id != bot_id]
+            if len(others) != 1:
+                return 0
+            sole = others[0]
+            if self._is_bot_user(sole.id):
+                self._note_ssrc_owner_locked(ssrc, sole.id)
+                return 0
             allowed = self._allowed_user_ids
-            candidates = [
-                m.id for m in channel.members
-                if m.id != bot_id and (not allowed or str(m.id) in allowed)
-            ]
-            if len(candidates) == 1:
-                uid = candidates[0]
-                self._ssrc_to_user[ssrc] = uid
-                logger.info("Auto-mapped ssrc=%d -> user=%d (sole allowed member)", ssrc, uid)
-                return uid
+            if allowed and str(sole.id) not in allowed:
+                return 0
+            uid = sole.id
+            self._ssrc_to_user[ssrc] = uid
+            logger.info("Auto-mapped ssrc=%d -> user=%d (sole allowed member)", ssrc, uid)
+            return uid
         except Exception:
             pass
         return 0
@@ -1358,6 +1411,12 @@ class VoiceReceiver:
                     # Stale buffer with no valid user — discard
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
+                elif buf_duration >= self.MAX_UNMAPPED_SECONDS and not ssrc_user_map.get(ssrc):
+                    # A sender that never pauses and that nobody claims: keep trying to place
+                    # it, else drop what it buffered rather than grow without bound.
+                    if not self._infer_user_for_ssrc(ssrc):
+                        self._buffers.pop(ssrc, None)
+                        self._last_packet_time.pop(ssrc, None)
         return completed
 
     def flush_pending(self) -> list:
@@ -4579,7 +4638,11 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             self._reset_voice_timeout(guild_id)
             self._bind_voice_text_channel(guild_id, text_channel_id, source)
             try:
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                receiver = VoiceReceiver(
+                    vc, allowed_user_ids=self._allowed_user_ids,
+                    fleet_bot_ids=self._fleet_discord_bot_ids,
+                    drop_bot_audio=not self._bot_voice_speech_admitted(),
+                )
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
@@ -4720,6 +4783,42 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
     # UDP keepalive interval; Discord drops the UDP route after ~60s of silence.
     _KEEPALIVE_INTERVAL = 15
 
+    def _bot_voice_speech_admitted(self) -> bool:
+        """The #143368 bot-speech predicate: an utterance carries no @mention, so bot speech is
+        heard only where a typed bot message needs none (``all`` without the inline-mention rule)."""
+        try:
+            return self._get_allow_bots() == "all" and not self._discord_bots_require_inline_mention()
+        except Exception:
+            return False
+
+    def _fleet_discord_bot_ids(self) -> set:
+        """Bot user ids of every in-process seat (the runner's view), plus this seat's own."""
+        ids: set = set()
+        fleet = getattr(getattr(self, "gateway_runner", None), "_fleet_discord_bots", None)
+        if callable(fleet):
+            try:
+                ids.update(k for k in (fleet() or {}) if isinstance(k, int))
+            except Exception:
+                logger.debug("fleet bot ids unavailable", exc_info=True)
+        own = getattr(getattr(self._client, "user", None), "id", None) if self._client else None
+        if isinstance(own, int):
+            ids.add(own)
+        return ids
+
+    def _refuses_bot_voice(self, guild, user_id: int) -> bool:
+        """True for a bot speaker (``Member.bot`` or a fleet seat's bot) when this seat does not
+        admit bot speech: dropped before STT, in the listen loop and the leave flush."""
+        member = None
+        try:
+            member = guild.get_member(int(user_id)) if guild is not None else None
+        except Exception:
+            member = None
+        is_bot = getattr(member, "bot", None) is True or int(user_id) in self._fleet_discord_bot_ids()
+        if is_bot and not self._bot_voice_speech_admitted():
+            logger.debug("Dropping voice utterance from bot user %s before STT", user_id)
+            return True
+        return False
+
     def discard_pending_voice_input(self, guild_id: int) -> None:
         """Drop speech the receiver holds but has not emitted, before the text binding moves: audio
         captured for the old conversation must never be stamped with the new one (#130311)."""
@@ -4751,6 +4850,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 # Pass guild so role checks stay guild-scoped.
                 _vc_guild = self._client.get_guild(guild_id) if self._client is not None else None
                 for user_id, pcm_data in completed:
+                    if self._refuses_bot_voice(_vc_guild, user_id):
+                        continue
                     if not self._is_allowed_user(str(user_id), guild=_vc_guild, is_dm=False):
                         continue
                     # User speech is activity too; keeps active listeners connected.

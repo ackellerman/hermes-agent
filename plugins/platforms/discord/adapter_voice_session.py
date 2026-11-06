@@ -241,6 +241,9 @@ class DiscordVoiceSessionMixin:
                 listen_task.cancel()
             guild = self._client.get_guild(guild_id) if self._client is not None else None
             for user_id, pcm_data in pending_inputs:
+                refuses_bot = getattr(self, "_refuses_bot_voice", None)
+                if callable(refuses_bot) and refuses_bot(guild, user_id):
+                    continue
                 if self._is_allowed_user(str(user_id), guild=guild, is_dm=False):
                     await self._process_voice_input(guild_id, user_id, pcm_data, captured_for)
             # Tear down the mixer (stops the continuous outgoing stream).
