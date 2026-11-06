@@ -17,6 +17,7 @@ provider, and the model endpoint.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -213,7 +214,11 @@ async def deliver_preturn_brief(
     submitted = False
     try:
         try:
-            future = asyncio.get_running_loop().run_in_executor(None, synthesize_owned)
+            # run_in_executor does not copy contextvars: without the caller's context the worker
+            # loses the seat's profile home and synthesizes with the root config's voice.
+            future = asyncio.get_running_loop().run_in_executor(
+                None, contextvars.copy_context().run, synthesize_owned,
+            )
             submitted = True
             # Consume a late exception even when the waiter has timed out or been cancelled.
             future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
