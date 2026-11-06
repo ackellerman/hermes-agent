@@ -156,6 +156,36 @@ async def test_bind_home_binds_the_seats_home_channel(root, fleet, monkeypatch):
     assert fleet.runner._voice_mode == {f"beta:discord:{vf.HOME_TEXT}": "all"}
 
 
+# --- the receiver a join wires ----------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allow_bots,inline,drop", [
+    (None, None, True),          # default bot policy: other bots' audio is dropped
+    ("all", None, True),         # "all" still needs a typed mention, which speech cannot carry
+    ("all", "false", False),     # the seat admits bot speech (#143368 predicate): keep it
+])
+async def test_a_voice_join_wires_the_receivers_bot_exclusion(fleet, monkeypatch, allow_bots, inline, drop):
+    """The real ``/voice join`` path builds the receiver with ``drop_bot_audio`` from the seat's bot
+    policy and ``fleet_bot_ids`` as the seat's LIVE view of every in-process seat's bot id (a
+    callable, so a seat that connects later is still excluded)."""
+    for var, value in (("DISCORD_ALLOW_BOTS", allow_bots), ("DISCORD_BOTS_REQUIRE_INLINE_MENTION", inline)):
+        monkeypatch.delenv(var, raising=False)
+        if value is not None:
+            monkeypatch.setenv(var, value)
+    fx.FakeReceiver.instances.clear()
+    beta = fleet.seat("beta")
+    fleet.seat("alpha")
+    fleet.operator_in(vf.MANUAL_VC)
+    assert (await fleet.voice_join("beta", vf.BETA_TEXT)).startswith("Joined voice channel **Voice (manual)**")
+    receiver = beta._voice_receivers[vf.GUILD]
+    assert receiver is fx.FakeReceiver.instances[-1]
+    assert receiver.bot_exclusion["drop_bot_audio"] is drop
+    fleet_ids = receiver.bot_exclusion["fleet_bot_ids"]
+    assert callable(fleet_ids) and fleet_ids() == {vf.BOT_IDS["alpha"], vf.BOT_IDS["beta"]}
+    fleet.seat("default")  # connects after the join: the same callable now names it too
+    assert fleet_ids() == set(vf.BOT_IDS.values())
+
+
 # --- the auto-join path --------------------------------------------------------------------------
 
 async def _drive_auto_join(seat, fleet, monkeypatch, vc_id, legacy):

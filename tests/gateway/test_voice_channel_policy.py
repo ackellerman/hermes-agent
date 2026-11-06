@@ -229,6 +229,27 @@ def test_a_config_with_a_utf8_bom_still_parses(fleet):
     assert not p.problems and p.rule(_AUTO_VC).join == "auto"
 
 
+def test_a_standalone_profiles_legacy_auto_join_still_counts_for_r1(fleet):
+    """A ``gateway.standalone`` seat runs its own gateway, outside this process's roster, but it
+    still auto-joins its VC: R1 must count it (``profiles_to_serve(include_standalone=True)``)."""
+    gamma = _cfg(legacy=[_OTHER_VC])
+    gamma["gateway"] = {"standalone": True}
+    _write(fleet / "profiles" / "gamma" / "config.yaml", gamma)
+    p = load_voice_policy("beta")
+    assert p.is_auto_vc(_OTHER_VC) and not p.problems
+    assert p.is_auto_vc(_LEGACY_VC)  # control: alpha (served by the host) counts as before
+
+
+def test_a_top_level_error_in_the_seat_layer_refuses_every_join_for_that_seat():
+    """A seat's own ``discord.voice_channels`` that is not a mapping (or has an unknown top-level key)
+    is a fatal error for THAT seat: every VC is refused, as for the root. Other seats are unaffected."""
+    for bad in (["not", "a", "mapping"], {"unlisted": "allow", "bogus_key": 1}):
+        p = _policy(seat_cfg=_cfg(bad))
+        assert p.seat_layer.errors and not p.rule(_MANUAL_VC).joinable and not p.rule(_OTHER_VC).joinable
+        assert p.rule(_MANUAL_VC).refusal == "invalid" and p.auto_join_channels() == frozenset()
+        assert _policy(seat="beta", seat_cfg=_cfg()).rule(_MANUAL_VC).joinable  # control
+
+
 def test_the_summary_names_the_seat_and_its_resolved_policy(fleet):
     text = load_voice_policy("alpha").summary()
     assert text.startswith("seat=alpha unlisted=allow")
