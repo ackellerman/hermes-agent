@@ -81,6 +81,21 @@ async def test_a_connected_seat_occupies_before_the_member_cache_shows_it(fleet)
 
 
 @pytest.mark.asyncio
+async def test_a_holder_mid_reconnect_still_occupies(fleet):
+    """discord.py's reconnect window: the holder's client is tracked but ``is_connected()`` is False,
+    and Discord drops the bot's voice state, so the member list no longer shows it. It is still the
+    holder (it comes back in the VC); a second seat joining then would leave two bots in the room."""
+    assert (await fleet.voice_join("beta", vf.BETA_TEXT)).startswith("Joined voice channel **Voice (manual)**")
+    beta = fleet.seat("beta")
+    beta._voice_clients[vf.GUILD].reconnecting()
+    fleet.members[vf.MANUAL_VC][:] = [m for m in fleet.members[vf.MANUAL_VC] if m.id != vf.BOT_IDS["beta"]]
+    assert await fleet.voice_join("alpha", vf.ALPHA_TEXT) == _OCCUPIED_BY_BETA
+    assert vf.GUILD not in fleet.seat("alpha")._voice_clients
+    del beta._voice_clients[vf.GUILD]  # control: the client is gone for good (cleanup ran)
+    assert (await fleet.voice_join("alpha", vf.ALPHA_TEXT)).startswith("Joined voice channel **Voice (manual)**")
+
+
+@pytest.mark.asyncio
 async def test_concurrent_joins_leave_exactly_one_seat_in_the_vc(fleet):
     for name in ("alpha", "beta"):  # the member list only updates after the connect yields
         ch = fleet.seat(name)._fake_vc(vf.MANUAL_VC)
