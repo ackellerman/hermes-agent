@@ -145,7 +145,7 @@ def test_the_loader_warns_when_a_root_entry_overrides_a_legacy_id(fleet, caplog)
 
 
 def test_a_root_auto_entry_without_seats_is_a_config_error_that_fails_closed(fleet, caplog):
-    """TARS ruling (F8): ``join: auto`` with no ``seats`` must not default to "*" (every seat with
+    """Build-review ruling (F8): ``join: auto`` with no ``seats`` must not default to "*" (every seat with
     auto-join on would race for the VC). It is an invalid entry: that VC is refused for every seat,
     auto-joined by none, and counts as auto for R1; the loader warns. Explicit ``seats: "*"`` is
     still accepted (control), and other VCs are unaffected."""

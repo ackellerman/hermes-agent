@@ -102,7 +102,7 @@ def _validate_entry(raw: Any, *, seat_layer: bool) -> tuple[Optional[dict], Opti
         return out, None
     join = out.get("join", "manual")
     if join == "auto" and "seats" not in out:
-        # TARS ruling (F8): no "*" default for an auto entry, or every seat with auto-join on races for it.
+        # Build-review ruling (F8): no "*" default for an auto entry, or every seat with auto-join on races for it.
         return None, _AUTO_NEEDS_SEATS
     return {
         "join": join,
