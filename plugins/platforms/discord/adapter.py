@@ -1601,6 +1601,9 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         # the voice channel can undo exactly those and never a user's explicit choice.
         self._auto_join_tts_chats: set[str] = set()
         self._auto_join_cfg: dict[str, Any] = self._load_voice_auto_join_config()
+        # Fleet voice-channel policy (gateway/voice_channel_policy.py), resolved at connect inside
+        # the owning profile's scope, once the seat name is known; None until then.
+        self._voice_channel_policy: Any = None
         # Threads the bot participated in (no @mention needed there); persisted across restarts.
         self._threads = ThreadParticipationTracker("discord")
         self._semantic_thread_renames = SemanticThreadRenames()
@@ -2084,6 +2087,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             # _mark_connected() clears a prior fatal stamp; a bare ``_running = True`` left a transient
             # startup failure reported as ``fatal`` for the life of the process (#102554).
             self._mark_connected()
+            self._resolve_voice_channel_policy()
             self._start_liveness_probe()
             # Once a minute, compare this process's loaded policy to the files on disk (one WARNING):
             # gates apply live now, but plugins/voice still need a restart and that must not be silent.
@@ -4205,6 +4209,22 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
     # ------------------------------------------------------------------
     # Auto-join helpers
     # ------------------------------------------------------------------
+
+    def _resolve_voice_channel_policy(self):
+        """Resolve this seat's view of the fleet voice-channel map and log it once (INFO, or ERROR
+        when it fails closed). Never raises: an unexpected failure resolves to a fail-closed policy."""
+        seat = getattr(self, "_owner_profile", None) or "default"
+        try:
+            from gateway.voice_channel_policy import load_voice_policy
+            policy = load_voice_policy(seat)
+        except Exception as exc:
+            from gateway.voice_channel_policy import resolve_voice_policy
+            policy = resolve_voice_policy(seat, {}, {}, {}, seat_is_root=True,
+                                          errors=[f"policy load failed ({type(exc).__name__})"])
+        self._voice_channel_policy = policy
+        log = logger.error if policy.problems else logger.info
+        log("[%s] Voice channel policy: %s", self.name, policy.summary())
+        return policy
 
     def _auto_join_debounced(self, key: str, seconds: float = 30.0) -> bool:
         """Returns True when key is inside its debounce window (the
