@@ -17,6 +17,7 @@ import os
 import sys
 import threading
 import types
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -26,7 +27,7 @@ import gateway.run as gateway_run
 from gateway.config import Platform
 from gateway.platforms.event import MessageType
 from gateway.session import SessionSource
-import gateway.voice_brief as voice_brief
+from gateway import voice_brief
 _REAL_ASK_MODEL = voice_brief._ask_model
 
 ORDER: list = []
@@ -123,7 +124,7 @@ def edge(monkeypatch):
             fh.write(b"ID3fake")
         return json.dumps({"success": True, "file_path": output_path})
 
-    import tools.tts_tool as tts_tool
+    from tools import tts_tool
 
     monkeypatch.setattr(voice_brief, "_ask_model", fake_ask)
     monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_tts)
@@ -506,7 +507,7 @@ def test_reasoning_only_response_is_not_spoken(edge, monkeypatch, tmp_path):
 
 
 def test_tts_timeout_cleans_late_file(edge, monkeypatch, tmp_path):
-    import tools.tts_tool as tts_tool
+    from tools import tts_tool
     started, release, finished = threading.Event(), threading.Event(), threading.Event()
     paths = []
     def slow_tts(text, output_path=None, **kwargs):
@@ -535,6 +536,41 @@ def test_tts_timeout_cleans_late_file(edge, monkeypatch, tmp_path):
         finally:
             release.set()
     asyncio.run(go())
+
+
+def test_brief_synthesizes_with_the_profile_voice_not_the_root_voice(monkeypatch, tmp_path):
+    """The brief's TTS worker runs in the caller's context: a seat's profile home (a ContextVar) picks
+    the profile's ``tts.edge.voice``, never the root config's. Real config resolution; only the Edge
+    SDK is faked (records the voice it was asked for)."""
+    from tools import tts_tool
+
+    root, profile = tmp_path / "root", tmp_path / "profiles" / "seat"
+    for home, voice in ((root, "en-US-RootVoiceNeural"), (profile, "en-GB-ProfileVoiceNeural")):
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(
+            f"tts:\n  provider: edge\n  edge:\n    voice: {voice}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    voices: list[str] = []
+
+    class _Communicate:
+        def __init__(self, text, voice=None, **kwargs):
+            voices.append(voice)
+
+        async def save(self, path):
+            await asyncio.to_thread(Path(path).write_bytes, b"ID3fake")
+
+    monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: SimpleNamespace(Communicate=_Communicate))
+    monkeypatch.setattr(voice_brief, "_ask_model", lambda route, messages: asyncio.sleep(0, MODEL_OUTPUT))
+    adapter = _EdgeAdapter()
+
+    async def go():
+        with gateway_run._profile_runtime_scope(profile, prepared_secret_scope={}):
+            return await voice_brief.deliver_preturn_brief(
+                adapter=adapter, guild_id=GUILD_ID, chat_id=CHAT_ID, message="hi", route={})
+
+    assert asyncio.run(go()) == MODEL_OUTPUT
+    assert voices == ["en-GB-ProfileVoiceNeural"]
 
 
 def test_strict_legacy_stop_callback_is_not_completion(monkeypatch):
