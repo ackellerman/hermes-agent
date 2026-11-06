@@ -670,6 +670,7 @@ class GatewaySlashCommandsMixin(
 
         def _set_mode(mode: str) -> None:
             self._voice_mode[voice_key] = mode
+            self._disown_join_voice_mode(voice_key)  # set by hand: a voice-channel leave keeps it
             self._save_voice_modes()
             if not adapter:
                 return

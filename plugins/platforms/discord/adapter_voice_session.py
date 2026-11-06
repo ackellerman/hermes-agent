@@ -186,11 +186,6 @@ class DiscordVoiceSessionMixin:
             text_ch_id = self._voice_text_channels.get(guild_id)
             logger.info("Voice connection in guild %d closed by Discord; ending the voice session", guild_id)
             await self._leave_voice_locked(guild_id, reason="disconnect", trigger=None)
-        if self._on_voice_disconnect and text_ch_id:
-            try:
-                self._on_voice_disconnect(str(text_ch_id))
-            except Exception:
-                logger.debug("voice disconnect cleanup failed", exc_info=True)
 
     @staticmethod
     def _voice_client_reconnecting(existing: Any, channel: Any) -> bool:
@@ -285,6 +280,15 @@ class DiscordVoiceSessionMixin:
                 taken = self._take_voice_session(guild_id, None, captured_for)
             if taken is not None:
                 self._emit_voice_session_end(taken, reason, trigger)
+            # Every leave (command, either auto-leave, a close Discord made, shutdown) tells the
+            # runner the session is over, so it hands the bound chat back the reply mode it had
+            # before ``/voice join``. A rebind never leaves; the runner hands that back itself.
+            on_disconnect = getattr(self, "_on_voice_disconnect", None)
+            if on_disconnect and captured_for is not None:
+                try:
+                    on_disconnect(str(captured_for))
+                except Exception:
+                    logger.debug("voice disconnect cleanup failed", exc_info=True)
 
     # --- inactivity timeout (moved from adapter.py) ---------------------------------------------
 
@@ -324,12 +328,6 @@ class DiscordVoiceSessionMixin:
             except Exception:
                 logger.debug("voice mode lookup failed; the inactivity leave proceeds", exc_info=True)
         await self.leave_voice_channel(guild_id, reason="auto_leave", trigger="inactivity")
-        # Notify the runner so it can clean up voice_mode state
-        if self._on_voice_disconnect and text_ch_id:
-            try:
-                self._on_voice_disconnect(str(text_ch_id))
-            except Exception:
-                logger.debug("voice disconnect cleanup failed", exc_info=True)
         if text_ch_id and self._client:
             ch = self._client.get_channel(text_ch_id)
             if ch:

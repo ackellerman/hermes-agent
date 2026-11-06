@@ -94,8 +94,63 @@ class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
             self._VOICE_MODE_PATH.parent.mkdir(parents=True, exist_ok=True)
             payload = json.dumps(self._voice_mode, indent=2)
             self._VOICE_MODE_PATH.write_text(payload, encoding="utf-8")
+            if (held := self.__dict__.get("_voice_join_prior")) is not None:  # never loaded: unchanged on disk
+                self._voice_join_mode_path().write_text(json.dumps(held, indent=2), encoding="utf-8")
         except OSError as e:
             logger.warning("Failed to save voice modes: %s", e)
+
+    # --- the mode a /voice join set: owned by the voice session, handed back when it ends ---------
+    # ``{voice_key: the chat's mode before the join (None = no key)}``, persisted beside the mode
+    # file (a sibling file, so an older reader of the mode file never sees a non-mode value). A
+    # key is here only while the chat's ``all`` is the join's; a mode the user sets by hand
+    # (``/voice on|off|tts``) removes it, so the leave never touches a preference the user chose.
+
+    def _voice_join_mode_path(self):
+        path = self._VOICE_MODE_PATH
+        return path.with_name(f"{path.stem}.join{path.suffix or '.json'}")
+
+    def _voice_join_modes(self) -> dict[str, Optional[str]]:
+        held = self.__dict__.get("_voice_join_prior")
+        if held is None:
+            held = self.__dict__["_voice_join_prior"] = self._load_voice_join_modes()
+        return held
+
+    def _load_voice_join_modes(self) -> dict[str, Optional[str]]:
+        try:
+            data = json.loads(self._voice_join_mode_path().read_text(encoding="utf-8-sig"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): m for k, m in data.items() if ":" in str(k) and (m is None or m in _VOICE_MODES)}
+
+    def _claim_voice_mode_for_join(self, voice_key: str) -> None:
+        """Record the chat's mode before the join sets ``all`` (a rejoin keeps the first record)."""
+        held = self._voice_join_modes()
+        if voice_key not in held:
+            held[voice_key] = self._voice_mode.get(voice_key)
+
+    def _disown_join_voice_mode(self, voice_key: str) -> None:
+        """A mode set by hand is the user's: the leave must leave it alone."""
+        self._voice_join_modes().pop(voice_key, None)
+
+    def _release_join_voice_mode(self, adapter, voice_key: str, chat_id: str) -> None:
+        """The voice session ended (any leave) or moved (a rebind): hand the chat back the mode it
+        had before the join, or remove the key when it had none. A chat the join does not own is
+        left exactly as it is."""
+        held = self._voice_join_modes()
+        if voice_key not in held:
+            return
+        prior = held.pop(voice_key)
+        if self._voice_mode.get(voice_key) == "all":  # still the join's mode
+            if prior is None:
+                del self._voice_mode[voice_key]
+                if isinstance(enabled := getattr(adapter, _ON_SET, None), set):
+                    enabled.discard(chat_id)
+            else:
+                self._voice_mode[voice_key] = prior
+                self._toggle_adapter_auto_tts_set(adapter, chat_id, True, enable=prior != "off")
+        self._save_voice_modes()
 
     @staticmethod
     def _toggle_adapter_auto_tts_set(adapter, chat_id: str, on: bool, *, enable: bool) -> None:
@@ -237,25 +292,23 @@ class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
                 adapter._voice_sources[guild_id] = bound_source
         if previous is not None and previous != text_channel_id:
             self._hand_back_voice_reply_mode(adapter, previous, voice_profile)
-        self._apply_voice_mode(adapter, self._voice_key(Platform.DISCORD, str(text_channel_id), profile=voice_profile),
-                               str(text_channel_id), "all")
+        bound_key = self._voice_key(Platform.DISCORD, str(text_channel_id), profile=voice_profile)
+        self._claim_voice_mode_for_join(bound_key)
+        self._apply_voice_mode(adapter, bound_key, str(text_channel_id), "all")
         return t("gateway.voice.channel_joined", name=voice_channel.name)
 
     def _hand_back_voice_reply_mode(self, adapter, old_chat, voice_profile) -> None:
         """A rebind moves spoken replies with the binding: the old chat's ``all`` (set by the join)
-        and an auto-join's speak enable there are dropped, so the old chat goes back to text."""
+        and an auto-join's speak enable there are dropped, so the old chat goes back to the mode it
+        had before the join (text, when it had none)."""
         old = str(old_chat)
         key = self._voice_key(Platform.DISCORD, old, profile=voice_profile)
-        if self._voice_mode.get(key) == "all":
-            del self._voice_mode[key]
-            self._save_voice_modes()
-            if isinstance(enabled := getattr(adapter, _ON_SET, None), set):
-                enabled.discard(old)
         tracker = getattr(adapter, "_auto_join_tts_chats", None)
         if isinstance(tracker, set) and old in tracker:
             tracker.discard(old)
             if isinstance(enabled := getattr(adapter, _ON_SET, None), set):
                 enabled.discard(old)
+        self._release_join_voice_mode(adapter, key, old)
 
     def _voice_occupant(self, adapter, guild_id: int, voice_channel, seat: str) -> Optional[str]:
         """Who else holds *voice_channel*: a bot member (or a fleet bot id) other than this seat's
@@ -382,24 +435,31 @@ class GatewayVoiceMixin(GatewayVoiceSessionEndMixin):
                 and hasattr(adapter, "is_in_voice_channel")
                 and adapter.is_in_voice_channel(guild_id)):
             return t("gateway.voice.channel_not_joined")
+        # The mode to hand back is the BOUND chat's, wherever the command was typed.
+        bindings = getattr(adapter, "_voice_text_channels", None)
+        bound = bindings.get(guild_id) if isinstance(bindings, dict) else None
         try:
             await adapter.leave_voice_channel(guild_id, reason="command")
         except Exception as e:
             logger.warning("Error leaving voice channel: %s", e)
-        # Always clean up state even if leave raised an exception. The input callback stays bound:
+        # Always clean up state even if leave raised an exception (the adapter's leave already
+        # did when it completed; the release is idempotent). The input callback stays bound:
         # it is per adapter and idle with no receiver, and an auto-join never binds it again.
-        self._apply_voice_mode(adapter, self._voice_key_for_source(event.source),
-                               event.source.chat_id, "off")
+        if bound is not None:
+            profile = self._adapter_profile_for_source(event.source)
+            self._release_join_voice_mode(
+                adapter, self._voice_key(Platform.DISCORD, str(bound), profile=profile), str(bound))
         return t("gateway.voice.channel_left")
 
     def _handle_voice_timeout_cleanup(self, chat_id: str, *, adapter=None) -> None:
-        """Adapter callback on voice-channel timeout: clear runner-side voice_mode state.
+        """Adapter callback when a voice session ends (every leave: command, auto-leave, a close
+        Discord made, shutdown): hand the bound chat back the mode it had before the join.
         ``adapter`` (bound at join) is that profile's bot, not always ``self.adapters[DISCORD]``."""
         if adapter is None:
             adapter = self.adapters.get(Platform.DISCORD)
         key = self._voice_key(Platform.DISCORD, chat_id,
                               profile=getattr(adapter, "_owner_profile", None))
-        self._apply_voice_mode(adapter, key, chat_id, "off")
+        self._release_join_voice_mode(adapter, key, str(chat_id))
 
     def _is_duplicate_voice_transcript(self, binding: tuple, user_id: int, transcript: str) -> bool:
         """Suppress repeated STT outputs for one recent utterance (voice capture can emit it twice a

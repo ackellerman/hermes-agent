@@ -153,16 +153,20 @@ class TestVoiceModeProfileIsolation:
         default_ad.handle_message.assert_not_awaited()
         assert bot2_ad.handle_message.call_args[0][0].source.profile == "bot2"
 
-        # Timeout cleanup from bot2's channel disables bot2's auto-TTS only.
+        # Timeout cleanup from bot2's channel touches bot2's state only: the join's "all" is handed
+        # back as the mode bot2's chat had before it (the hand-set /voice tts above).
         join = MessageEvent(text="/voice channel", message_type=MessageType.TEXT, source=src)
         join.raw_message = SimpleNamespace(guild_id=111, guild=None)
         bot2_ad.join_voice_channel = AsyncMock(return_value=True)
         ch = MagicMock(); ch.name = "General"
         bot2_ad.get_user_voice_channel = AsyncMock(return_value=ch)
         await runner._handle_voice_channel_join(join)
+        assert runner._voice_join_modes() == {"bot2:discord:123": "all"}
         bot2_ad._on_voice_disconnect("123")
-        assert runner._voice_mode["bot2:discord:123"] == "off"
-        assert "123" in bot2_ad._auto_tts_disabled_chats
+        assert runner._voice_mode == {"bot2:discord:123": "all"}
+        assert runner._voice_join_modes() == {}
+        assert "123" in bot2_ad._auto_tts_enabled_chats
+        assert "123" not in default_ad._auto_tts_enabled_chats
         assert "123" not in default_ad._auto_tts_disabled_chats
 
     def test_sync_restores_only_the_owning_profiles_chats(self):

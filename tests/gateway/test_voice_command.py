@@ -556,15 +556,17 @@ class TestVoiceChannelCommands:
 
     @pytest.mark.asyncio
     async def test_leave_success(self, runner):
-        """Successful leave disconnects and clears voice mode."""
+        """Successful leave disconnects and hands the bound chat back its pre-join mode (none)."""
         mock_adapter = AsyncMock()
         mock_adapter.is_in_voice_channel = MagicMock(return_value=True)
         mock_adapter.leave_voice_channel = AsyncMock()
+        mock_adapter._voice_text_channels = {111: 123}
         event = self._make_discord_event("/voice leave")
         runner.adapters[event.source.platform] = mock_adapter
+        runner._claim_voice_mode_for_join("discord:123")  # what /voice join records
         runner._voice_mode["discord:123"] = "all"
         await runner._handle_voice_channel_leave(event)
-        assert runner._voice_mode["discord:123"] == "off"
+        assert "discord:123" not in runner._voice_mode
         mock_adapter.leave_voice_channel.assert_called_once_with(111, reason="command")
 
     # -- _handle_voice_channel_input --
@@ -915,14 +917,16 @@ class TestLeaveExceptionHandling:
             side_effect=RuntimeError("Connection reset")
         )
         mock_adapter._voice_input_callback = MagicMock()
+        mock_adapter._voice_text_channels = {111: 456}
 
         event = _make_event("/voice leave")
         event.raw_message = SimpleNamespace(guild_id=111, guild=None)
         runner.adapters[event.source.platform] = mock_adapter
-        runner._voice_mode["telegram:123"] = "all"
+        runner._claim_voice_mode_for_join("discord:456")  # what /voice join records
+        runner._voice_mode["discord:456"] = "all"
 
         await runner._handle_voice_channel_leave(event)
-        assert runner._voice_mode["telegram:123"] == "off"
+        assert "discord:456" not in runner._voice_mode
 
 
 class TestStreamTtsToSpeaker:
