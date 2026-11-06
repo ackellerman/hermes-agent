@@ -20,7 +20,8 @@ for VCs the root map does not list; a root entry wins over them, with a warning.
 
 Unknown keys and values fail CLOSED: a bad entry refuses that VC; a bad ``unlisted`` value refuses
 unlisted VCs; an unknown top-level key, an unreadable root config or an unreadable served profile
-config refuses every join (F12, F1). Defaults: a listed entry ``join: manual``, ``bind: caller``,
+config refuses every join (F12, F1). A root ``join: auto`` entry without ``seats`` is such a bad entry
+(it does not default to ``"*"``). Defaults: a listed entry ``join: manual``, ``bind: caller``,
 ``seats: "*"``, both opt-ins false (an auto-join always binds the seat's home channel; ``bind`` decides
 `/voice join` only); an unlisted VC behaves as before this policy
 (``join: manual``, ``bind: caller``, ``allow_thread_move: true``), apart from R1 and occupancy.
@@ -41,6 +42,7 @@ BIND_VALUES = ("caller", "home")
 UNLISTED_VALUES = ("allow", "refuse")
 ENTRY_KEYS = frozenset({"join", "bind", "seats", "allow_attach_from_text", "allow_thread_move"})
 _JOIN_RANK = {"never": 0, "manual": 1, "auto": 2}
+_AUTO_NEEDS_SEATS = "join=auto needs an explicit seats list (or seats: \"*\")"
 
 # Replies (fork-local; English only, like the rest of the fork's voice-policy surface).
 REPLY_R1 = "join a manual voice channel first"
@@ -99,6 +101,9 @@ def _validate_entry(raw: Any, *, seat_layer: bool) -> tuple[Optional[dict], Opti
     if seat_layer:
         return out, None
     join = out.get("join", "manual")
+    if join == "auto" and "seats" not in out:
+        # TARS ruling (F8): no "*" default for an auto entry, or every seat with auto-join on races for it.
+        return None, _AUTO_NEEDS_SEATS
     return {
         "join": join,
         "bind": out.get("bind", "caller"),
@@ -141,6 +146,8 @@ def parse_voice_channels(raw: Any, *, where: str, seat_layer: bool = False) -> P
         entry, reason = _validate_entry(value, seat_layer=seat_layer)
         if entry is None:
             parsed.invalid[vc] = f"{where}: VC {vc}: {reason}"
+            if reason == _AUTO_NEEDS_SEATS:
+                parsed.warnings.append(f"{where}: VC {vc}: {reason}; refusing that VC (config error)")
         else:
             parsed.entries[vc] = entry
     return parsed

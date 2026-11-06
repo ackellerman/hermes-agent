@@ -483,7 +483,7 @@ discord:
     unlisted: allow                 # allow (default) | refuse: may a seat join a VC with no entry?
     "111111111111111111":           # an auto-join VC
       join: auto                    # auto | manual | never
-      seats: [default]              # "*" (default) or profile names allowed to connect
+      seats: [default]              # profile names allowed to connect, or "*"; REQUIRED for join: auto
     "222222222222222222":           # a manual VC
       join: manual
       bind: caller                  # caller (default) | home: where /voice join binds speech
@@ -495,7 +495,7 @@ discord:
 - **Occupancy: one seat per VC.** `/voice join` while another seat, or any bot, is in the VC replies "SEAT is in VC; `/voice leave` there first". An auto-join into an occupied VC is skipped; nobody is evicted.
 - `join: never` refuses both `/voice join` and auto-join; `seats` limits which profiles may connect; `unlisted: refuse` makes every VC need an entry.
 - `join: auto` entries drive the named seats' auto-join (still gated by their own `voice_auto_join.enabled` and `user_ids`). A seat's legacy `voice_auto_join.channel_ids` count as auto only for VCs the root map does not list: for a listed VC the root entry wins (a `manual` or `never` entry, or an `auto` entry whose `seats` leave that seat out), and the seat logs a warning.
-- Defaults: a listed entry is `join: manual`, `bind: caller`, `seats: "*"`, both opt-ins `false`. An unlisted VC behaves as before this policy (manual, the typing chat, moves allowed), apart from R1 and occupancy.
+- Defaults: a listed entry is `join: manual`, `bind: caller`, `seats: "*"`, both opt-ins `false`. A `join: auto` entry must name its `seats` (a list, or `"*"` on purpose): without them it is a config error, refused for every seat (fail closed, with a warning). An unlisted VC behaves as before this policy (manual, the typing chat, moves allowed), apart from R1 and occupancy.
 - A profile's own `config.yaml` may carry the same block and can only **narrow** it: lower `join`, drop itself from `seats`, turn an opt-in off, `unlisted: refuse`, `bind: home`. Wider values are ignored with a warning. Only the root may mark a VC `auto`.
 - Unknown keys or values fail **closed**: a bad entry refuses that VC, a bad `unlisted` refuses unlisted VCs, and an unknown top-level key or an unreadable root or profile config refuses every join. Each seat logs its resolved policy in one line at connect (`Voice channel policy: seat=… unlisted=… auto_join=[…] …`, ERROR when it fails closed).
 - The policy is read from disk on every `/voice join`. The auto-join trigger uses the policy read at connect, and every auto-join re-reads the policy from disk before it connects, so a VC changed to `manual` or `never` since is not joined. A VC that became auto-joinable after connect (a new `join: auto` entry, or a refusal lifted) triggers from the seat's next connect.

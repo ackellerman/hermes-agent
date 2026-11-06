@@ -1489,7 +1489,7 @@ platform_toolsets:
 #     "111111111111111111":          # voice channel id
 #       join: manual                 # auto | manual (default) | never
 #       bind: caller                 # caller (default) | home: where /voice join binds speech
-#       seats: "*"                   # "*" (default) or a list of profile names
+#       seats: "*"                   # "*" (default) or a list of profile names; join: auto REQUIRES it
 #       allow_attach_from_text: false  # R1 opt-in: /voice join may attach to an auto VC
 #       allow_thread_move: false     # /voice join elsewhere may move the binding (unlisted VCs: true)
 

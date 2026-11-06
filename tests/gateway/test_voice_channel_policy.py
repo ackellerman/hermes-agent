@@ -144,6 +144,25 @@ def test_the_loader_warns_when_a_root_entry_overrides_a_legacy_id(fleet, caplog)
     assert any(r.levelno == logging.WARNING and _MANUAL_VC in r.getMessage() for r in caplog.records)
 
 
+def test_a_root_auto_entry_without_seats_is_a_config_error_that_fails_closed(fleet, caplog):
+    """TARS ruling (F8): ``join: auto`` with no ``seats`` must not default to "*" (every seat with
+    auto-join on would race for the VC). It is an invalid entry: that VC is refused for every seat,
+    auto-joined by none, and counts as auto for R1; the loader warns. Explicit ``seats: "*"`` is
+    still accepted (control), and other VCs are unaffected."""
+    root = _cfg({_AUTO_VC: {"join": "auto"}, _MANUAL_VC: {"join": "manual"}, _OTHER_VC: {"join": "auto", "seats": "*"}})
+    for seat in ("default", "alpha"):
+        p = _policy(seat=seat, root=root, seat_is_root=seat == "default")
+        rule = p.rule(_AUTO_VC)
+        assert rule.refusal == "invalid" and not rule.joinable and p.is_auto_vc(_AUTO_VC)
+        assert p.auto_join_channels() == frozenset({_OTHER_VC})
+        assert p.rule(_MANUAL_VC).joinable and p.problems
+    _write(fleet / "config.yaml", root)
+    with caplog.at_level(logging.WARNING, logger="gateway.voice_channel_policy"):
+        load_voice_policy("default")
+    assert any(r.levelno == logging.WARNING and _AUTO_VC in r.getMessage() and "seats" in r.getMessage()
+               for r in caplog.records)
+
+
 def test_root_auto_entries_drive_the_named_seats_auto_join():
     p = resolve_voice_policy("default", _ROOT, _ROOT, {"default": _ROOT}, seat_is_root=True)
     assert p.auto_join_channels() == frozenset({_AUTO_VC})
