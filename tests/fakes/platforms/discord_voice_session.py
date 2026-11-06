@@ -96,6 +96,7 @@ class FakeReceiver:
 
     def __init__(self, vc: Any, allowed_user_ids: Any = None, **_bot_exclusion: Any) -> None:
         self.vc, self.pending, self.stopped, self._running = vc, [], False, True
+        self.bot_exclusion = dict(_bot_exclusion)  # drop_bot_audio / fleet_bot_ids, as the join wired them
         FakeReceiver.instances.append(self)
 
     @staticmethod
