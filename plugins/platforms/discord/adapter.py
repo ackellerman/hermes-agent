@@ -4210,9 +4210,11 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
     # Auto-join helpers
     # ------------------------------------------------------------------
 
-    def _resolve_voice_channel_policy(self):
-        """Resolve this seat's view of the fleet voice-channel map and log it once (INFO, or ERROR
-        when it fails closed). Never raises: an unexpected failure resolves to a fail-closed policy."""
+    def _resolve_voice_channel_policy(self, *, store: bool = True):
+        """Resolve this seat's view of the fleet voice-channel map from disk and log it once (INFO, or
+        ERROR when it fails closed). ``store=False`` (the auto-join's fresh check) returns it without
+        replacing the copy resolved at connect, which drives the auto-join trigger. Never raises: an
+        unexpected failure resolves to a fail-closed policy."""
         seat = getattr(self, "_owner_profile", None) or "default"
         try:
             from gateway.voice_channel_policy import load_voice_policy
@@ -4221,18 +4223,21 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             from gateway.voice_channel_policy import resolve_voice_policy
             policy = resolve_voice_policy(seat, {}, {}, {}, seat_is_root=True,
                                           errors=[f"policy load failed ({type(exc).__name__})"])
-        self._voice_channel_policy = policy
+        if store:
+            self._voice_channel_policy = policy
         log = logger.error if policy.problems else logger.info
         log("[%s] Voice channel policy: %s", self.name, policy.summary())
         return policy
 
-    def _effective_auto_join_channel_ids(self) -> frozenset:
+    def _effective_auto_join_channel_ids(self, policy: Any = None) -> frozenset:
         """The VCs this seat auto-joins: its ``voice_auto_join.channel_ids`` (legacy, auto only for VCs
         the root map does not list) plus the root map's ``join: auto`` entries naming this seat, minus
         any the fleet map refuses (``never``, ``seats``, ``unlisted: refuse``, a broken policy). Before
-        connect resolves the policy, the legacy list alone (the previous behaviour)."""
+        connect resolves the policy, the legacy list alone (the previous behaviour). ``policy``
+        overrides the copy resolved at connect."""
         legacy = frozenset(str(c) for c in (self._auto_join_cfg.get("channel_ids") or []) if c)
-        policy = getattr(self, "_voice_channel_policy", None)
+        if policy is None:
+            policy = getattr(self, "_voice_channel_policy", None)
         if policy is None:
             return legacy
         out = set()
@@ -4462,11 +4467,14 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
 
     async def _do_auto_join(self, voice_channel, text_ch_id, guild_id):
         """Execute the auto-join: call ``join_voice_channel`` then announce."""
-        # Re-checked here too: an approval prompt can be answered long after the policy was read.
+        # Re-read the policy from disk here: the one resolved at connect (which decided this
+        # trigger) can be hours old, and an approval prompt can be answered long after it.
         vc_key = str(getattr(voice_channel, "id", ""))
-        if getattr(self, "_voice_channel_policy", None) is not None and vc_key not in self._effective_auto_join_channel_ids():
-            logger.info("Auto-join of VC %s skipped: the voice channel policy no longer allows it", vc_key)
-            return
+        if getattr(self, "_voice_channel_policy", None) is not None:
+            fresh = self._resolve_voice_channel_policy(store=False)
+            if vc_key not in self._effective_auto_join_channel_ids(fresh):
+                logger.info("Auto-join of VC %s skipped: the voice channel policy no longer allows it", vc_key)
+                return
         logger.info(
             "Auto-joining voice channel %s (guild %d), text channel %s",
             voice_channel.id, guild_id, text_ch_id,
