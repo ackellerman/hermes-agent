@@ -498,7 +498,7 @@ discord:
 - Defaults: a listed entry is `join: manual`, `bind: caller`, `seats: "*"`, both opt-ins `false`. An unlisted VC behaves as before this policy (manual, the typing chat, moves allowed), apart from R1 and occupancy.
 - A profile's own `config.yaml` may carry the same block and can only **narrow** it: lower `join`, drop itself from `seats`, turn an opt-in off, `unlisted: refuse`, `bind: home`. Wider values are ignored with a warning. Only the root may mark a VC `auto`.
 - Unknown keys or values fail **closed**: a bad entry refuses that VC, a bad `unlisted` refuses unlisted VCs, and an unknown top-level key or an unreadable root or profile config refuses every join. Each seat logs its resolved policy in one line at connect (`Voice channel policy: seat=… unlisted=… auto_join=[…] …`, ERROR when it fails closed).
-- The policy is read from disk on every `/voice join`; the auto-join side is read at connect.
+- The policy is read from disk on every `/voice join`. The auto-join trigger uses the policy read at connect, and every auto-join re-reads the policy from disk before it connects, so a VC changed to `manual` or `never` since is not joined. A VC that became auto-joinable after connect (a new `join: auto` entry, or a refusal lifted) triggers from the seat's next connect.
 
 ### Echo Prevention
 

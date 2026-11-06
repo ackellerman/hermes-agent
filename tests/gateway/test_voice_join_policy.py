@@ -217,14 +217,42 @@ async def test_a_root_manual_entry_stops_a_seats_legacy_auto_join(root, fleet, m
 
 
 @pytest.mark.asyncio
+async def test_auto_join_rereads_the_policy_changed_after_connect(root, fleet, monkeypatch):
+    """The policy resolved at connect is stale by the time a voice event arrives: the join re-reads
+    it from disk. Nothing here re-resolves by hand; only the on-disk root map changes."""
+    vf.write_fleet(root, _MAP, alpha_legacy=[vf.OTHER_VC])
+    seat = fleet.seat("alpha")
+    handlers = await fx.connect_capturing_handlers(seat, monkeypatch)
+    seat._auto_join_cfg = {"enabled": True, "channel_ids": [str(vf.OTHER_VC)], "user_ids": [str(vf.USER)],
+                           "join_mode": "automatic", "require_text_opt_in": False}
+    monkeypatch.setattr(seat, "_select_auto_join_text_channel", lambda guild, channel: vf.HOME_TEXT)
+    fleet.operator_in(vf.OTHER_VC)
+    operator = seat._fake_guild.get_member(vf.USER)
+    event = (operator, fx.voice_state(None), fx.voice_state(seat._fake_vc(vf.OTHER_VC)))
+    try:
+        assert str(vf.OTHER_VC) in seat._effective_auto_join_channel_ids()  # as resolved at connect
+        vf.write_fleet(root, {**_MAP, str(vf.OTHER_VC): {"join": "never"}}, alpha_legacy=[vf.OTHER_VC])
+        await handlers["on_voice_state_update"](*event)
+        assert vf.GUILD not in seat._voice_clients
+        vf.write_fleet(root, _MAP, alpha_legacy=[vf.OTHER_VC])  # control: allowed again on disk
+        seat._auto_join_debounce.clear()
+        await handlers["on_voice_state_update"](*event)
+        assert vf.GUILD in seat._voice_clients
+    finally:
+        await seat.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_an_approved_prompt_rechecks_the_policy_before_joining(root, fleet, monkeypatch):
-    """``user_prompt`` mode joins when the reaction arrives, possibly after the policy changed."""
-    vf.write_fleet(root, {**_MAP, str(vf.OTHER_VC): {"join": "never"}}, alpha_legacy=[vf.OTHER_VC])
+    """``user_prompt`` mode joins when the reaction arrives, possibly after the policy changed. The
+    policy is resolved once (as connect does); the later changes are on disk only."""
+    vf.write_fleet(root, _MAP, alpha_legacy=[vf.OTHER_VC])
     seat = fleet.seat("alpha")
     seat._resolve_voice_channel_policy()
+    seat._auto_join_cfg = {"enabled": True, "channel_ids": [str(vf.OTHER_VC)]}
+    vf.write_fleet(root, {**_MAP, str(vf.OTHER_VC): {"join": "never"}}, alpha_legacy=[vf.OTHER_VC])
     await seat._do_auto_join(seat._fake_vc(vf.OTHER_VC), vf.HOME_TEXT, vf.GUILD)
     assert vf.GUILD not in seat._voice_clients
     vf.write_fleet(root, _MAP, alpha_legacy=[vf.OTHER_VC])  # control: allowed again
-    seat._resolve_voice_channel_policy()
     await seat._do_auto_join(seat._fake_vc(vf.OTHER_VC), vf.HOME_TEXT, vf.GUILD)
     assert vf.GUILD in seat._voice_clients
