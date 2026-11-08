@@ -142,13 +142,15 @@ def test_lazy_installable_extras_excluded_from_all():
 
 
 def test_stt_whisper_cuda_is_a_gated_opt_in_extra_outside_stt_whisper():
-    """D-014: the CUDA 12 cuBLAS wheel (~600 MB) is its own opt-in extra.
+    """D-014: the CUDA 12 cuBLAS wheel (~670 MB with its nvrtc dependency) is its own opt-in extra.
 
     ctranslate2 4.8.1 dlopens libcublas.so.12 / libcublasLt.so.12 at the first
     GPU inference (no cuDNN, audited with LD_DEBUG=libs), and a CUDA 13 host
     has neither. The extra exact-pins the wheel, is gated to linux/x86_64 in
     [tool.hermes.extras-platforms], and stays out of [all], [voice] and
-    [stt-whisper] so a CPU-only host never downloads it.
+    [stt-whisper] so a CPU-only host never downloads it. Bundles build with
+    --all-extras minus [tool.hermes] opt-in-extras, so it must be listed there
+    too, or every linux x86_64 bundle ships the wheel.
     """
     from packaging.markers import Marker
     from packaging.requirements import Requirement
@@ -167,7 +169,7 @@ def test_stt_whisper_cuda_is_a_gated_opt_in_extra_outside_stt_whisper():
     assert all(req.marker == Marker(gate) for req in reqs)
     for carrier in ("all", "voice", "stt-whisper"):
         assert not any("cu12" in spec or "stt-whisper-cuda" in spec for spec in optional[carrier]), carrier
-    assert "stt-whisper-cuda" not in metadata["tool"]["hermes"].get("opt-in-extras", [])
+    assert "stt-whisper-cuda" in metadata["tool"]["hermes"].get("opt-in-extras", [])
 
 
 def _exact_pins(specs):
