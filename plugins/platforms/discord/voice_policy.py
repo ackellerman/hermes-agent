@@ -31,8 +31,8 @@ class AutoJoinPolicy:
     """
 
     enabled: bool = False
-    channel_ids: FrozenSet[str] = field(default_factory=frozenset)
-    user_ids: FrozenSet[str] = field(default_factory=frozenset)
+    channel_ids: frozenset[str] = field(default_factory=frozenset)
+    user_ids: frozenset[str] = field(default_factory=frozenset)
     join_mode: str = "user_prompt"  # "user_prompt" | "automatic"
     require_text_opt_in: bool = True
 
@@ -67,7 +67,7 @@ class VoicePolicyEvaluator:
         channel_id: str,
         member_id: str,
         member_has_text_access: bool = True,
-    ) -> Tuple[bool, str]:
+    ) -> tuple[bool, str]:
         """Decide whether the bot should auto-join for this member+channel.
 
         Returns ``(True, "")`` when every check passes, or

@@ -341,7 +341,7 @@ class TestEdgeCases:
             user_ids=frozenset({"aaa"}),
         )
         # member_id as int (won't match 'aaa' string)
-        ok, reason = VoicePolicyEvaluator.should_join(
+        ok, _reason = VoicePolicyEvaluator.should_join(
             p, channel_id="111", member_id="aaa",
         )
         assert ok is True  # 'aaa' string matches

@@ -13,7 +13,7 @@ from typing import Any, Optional
 from unittest.mock import AsyncMock
 
 # Import order matters: this installs the discord mock before the adapter module is imported.
-from tests.gateway.test_discord_connect import FakeBot  # noqa: F401  (also installs the discord mock)
+from tests.gateway.test_discord_connect import FakeBot
 
 from gateway.config import PlatformConfig
 from plugins.platforms.discord import adapter as adapter_mod
@@ -92,7 +92,7 @@ class FakeVoiceChannel:
 class FakeReceiver:
     """``VoiceReceiver`` stand-in: ``pending`` is what the leave's final flush returns."""
 
-    instances: list["FakeReceiver"] = []
+    instances: list[FakeReceiver] = []
 
     def __init__(self, vc: Any, allowed_user_ids: Any = None, **_bot_exclusion: Any) -> None:
         self.vc, self.pending, self.stopped, self._running = vc, [], False, True

@@ -11,6 +11,18 @@ import sqlite3
 import sys
 import threading
 
+
+def _pm_generation_dirs(prefixes) -> set[Path]:
+    """The PM generation dir (``<installs>/<key>/{environments,test-environment}/<gen>``) around
+    each prefix that is a generation's ``venv``."""
+    found = set()
+    for prefix in prefixes:
+        venv = Path(prefix).resolve()
+        if venv.name in ("venv", ".venv") and venv.parent.parent.name in ("environments", "test-environment"):
+            found.add(venv.parent)
+    return found
+
+
 _INTERPRETER_PREFIXES = tuple({
     Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
 } | {
@@ -18,6 +30,12 @@ _INTERPRETER_PREFIXES = tuple({
     # whose site-packages sits under the (real) Hermes home; third-party imports from it are the
     # interpreter's installation, not Hermes state.
     Path(p).resolve() for p in sys.path if p and Path(p).name in ("site-packages", "dist-packages")
+} | {
+    # scripts/run_tests.sh runs a PM generation venv (<installs>/<key>/{environments,test-environment}
+    # /<gen>/venv) that sits under the home whenever HOME is the run's fake home. The generation dir
+    # around the venv is that interpreter's installation too: `hermes update` probes
+    # <venv>/../hermes_cli/main.py to find the checkout owning its venv (update_owning_install).
+    *_pm_generation_dirs((sys.prefix, sys.exec_prefix)),
 } | {
     # The default install checks the repo out INSIDE the home (install.sh:
     # INSTALL_DIR=$HERMES_HOME/hermes-agent). Reading test data, sources for tracebacks, or the
@@ -96,26 +114,15 @@ class HomeIOGuard:
             # probe) reads no state; only its contents are guarded.
             if metadata and absolute in roots:
                 return
-            # ``shutil.which`` stats/accesses ``<PATH entry>/<name>``. A developer shell puts
-            # PM's tool store (~/.hermes/tools/...) on PATH; probing an executable there is
-            # command lookup, not reading Hermes state. CI has no such entries.
-            #
-            # The entry itself is probed too: PATH resolution asks whether a directory *is* a
-            # Hermes-managed bin dir (``mcp_tool_config._is_hermes_managed_bin_dir`` resolves
-            # every PATH entry), and that ``stat`` on ``~/.hermes/tools/ripgrep-…`` is the same
-            # command lookup one level up. Without this, every MCP stdio test failed on a
-            # developer host ("TEST BUG: file I/O against the REAL hermes home").
+            # ``shutil.which`` stats/accesses ``<PATH entry>/<name>``, and command resolution
+            # realpath()s the entry itself (is it a Hermes-managed bin dir?), which lstats each of
+            # its ancestors. A developer shell puts PM's tool store (~/.hermes/tools/...) on PATH;
+            # probing there is command lookup, not reading Hermes state. CI has no such entries.
             if metadata:
                 path = os.environ.get("PATH", "")
                 cwd = os.getcwd() if self._relative_path_entries(path) else None
                 entries = self._path_entries(path, cwd)
-                if absolute in entries or os.path.dirname(absolute) in entries:
-                    return
-                # ``Path(entry).resolve()`` walks the entry's whole component chain, so the
-                # ancestors of a PATH entry are probed too (``~/.hermes/tools/<runtime>`` is
-                # the parent of the ``<runtime>/bin`` entry). Metadata-only, on a chain the
-                # operator's own PATH already points at.
-                if any(_contains(absolute, entry) for entry in entries):
+                if os.path.dirname(absolute) in entries or any(_contains(absolute, entry) for entry in entries):
                     return
             # The interpreter's own installation (a PM-managed python under ~/.hermes/tools):
             # stdlib source reads (linecache, traceback) are not Hermes state either, nor is

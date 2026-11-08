@@ -77,6 +77,9 @@ WINDOWS_LOCATION_VARS = (
     "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "APPDATA", "SYSTEMROOT",
     "TEMP", "TMP",
     "ComSpec", "PATHEXT", "PROGRAMFILES", "ProgramFiles", "PROGRAMDATA", "ProgramData",
+    # The hosted Windows images point PowerShell at a shared module analysis cache CI warms;
+    # without it every powershell.exe child re-analyses all modules (~22s on arm64 runners).
+    "PSModuleAnalysisCachePath",
     # Parenthesised name: cannot be read with bash's ${!var}, which is why the launcher no
     # longer reads names itself — this module emits the assignment.
     "ProgramFiles(x86)",
@@ -135,6 +138,10 @@ TEST_KNOB_VARS = (
     "HERMES_E2E_ARTIFACTS", "HERMES_E2E_STRICT_ACCEPTANCE", "HERMES_TEST_SSH_HOST",
     "HERMES_TEST_SSH_USER", "HERMES_TEST_SSH_PORT", "HERMES_TEST_SSH_KEY",
     "HERMES_TEST_DOCKER_IMAGE",
+    # HERMES_TEST_FORKSERVER: runner knob; HERMES_E2E_REQUIRE_TUI fails a missing Ink TUI build in
+    # tests/e2e/core/terminal; HERMES_E2E_UPGRADE_BASE (older name HERMES_E2E_N1_REF) picks the
+    # release tests/e2e/core/upgrade starts from.
+    "HERMES_TEST_FORKSERVER", "HERMES_E2E_REQUIRE_TUI", "HERMES_E2E_UPGRADE_BASE", "HERMES_E2E_N1_REF",
     # Opt-ins, same class as the knobs above.
     "HERMES_RUN_SLOW_PET_TESTS", "HERMES_E2E_BROWSER", "HERMES_RUN_E2E",
     # Launcher/plugin plumbing: PYTHONPATH carries the developer's live-gateway pytest

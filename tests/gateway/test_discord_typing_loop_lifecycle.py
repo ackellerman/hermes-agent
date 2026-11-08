@@ -42,12 +42,12 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-import plugins.platforms.discord.adapter as discord_adapter_mod  # noqa: E402
-from gateway.platforms.base import SendResult  # noqa: E402
-from gateway.platforms.event import MessageEvent, MessageType  # noqa: E402
-from gateway.session import SessionSource, build_session_key  # noqa: E402
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
-from tests.gateway.wait_for_py311 import install as install_py311_wait_for  # noqa: E402
+import plugins.platforms.discord.adapter as discord_adapter_mod
+from gateway.platforms.base import SendResult
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session import SessionSource, build_session_key
+from plugins.platforms.discord.adapter import DiscordAdapter
+from tests.gateway.wait_for_py311 import install as install_py311_wait_for
 
 CHAT = "555000111"
 INTERVAL = 0.2  # production refresh is 2.0 s
@@ -72,7 +72,6 @@ class Recorder:
                 if self.unwind:
                     await asyncio.sleep(self.unwind)
                 raise
-        return None
 
 
 class FastDiscordAdapter(DiscordAdapter):

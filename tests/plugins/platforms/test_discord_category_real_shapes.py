@@ -10,7 +10,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import discord  # noqa: F401  (the real package: these shapes need its cache semantics)
+import discord
 import pytest
 
 from plugins.platforms.discord.adapter import DiscordAdapter

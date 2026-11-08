@@ -183,7 +183,6 @@ class DiscordVoiceSessionMixin:
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
             if self._voice_clients.get(guild_id) is not vc:
                 return
-            text_ch_id = self._voice_text_channels.get(guild_id)
             logger.info("Voice connection in guild %d closed by Discord; ending the voice session", guild_id)
             await self._leave_voice_locked(guild_id, reason="disconnect", trigger=None)
 

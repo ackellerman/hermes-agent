@@ -525,7 +525,7 @@ class TestVoiceChannelCommands:
         mock_channel = MagicMock()
         mock_channel.name = "General"
         mock_adapter = AsyncMock()
-        mock_adapter.join_voice_channel = AsyncMock(side_effect=asyncio.TimeoutError())
+        mock_adapter.join_voice_channel = AsyncMock(side_effect=TimeoutError())
         mock_adapter.get_user_voice_channel = AsyncMock(return_value=mock_channel)
         event = self._make_discord_event()
         runner.adapters[event.source.platform] = mock_adapter

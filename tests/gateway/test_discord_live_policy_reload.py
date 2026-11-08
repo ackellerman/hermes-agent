@@ -296,7 +296,7 @@ def test_free_response_categories_snapshot_is_profile_scoped(tmp_path, monkeypat
 
 
 def test_free_response_categories_change_logs_info_once_per_change(tmp_path, caplog):
-    import hermes_logging  # noqa: F401  (installs the record factory that stamps ``hermes_home``)
+    import hermes_logging
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
     caplog.set_level(logging.INFO, logger=LOGGER)

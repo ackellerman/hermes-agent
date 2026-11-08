@@ -1,6 +1,6 @@
 """Regression tests for Discord category-level channel gates."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import AsyncMock, MagicMock
@@ -64,8 +64,8 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from gateway.config import PlatformConfig  # noqa: E402
-from plugins.platforms.discord.adapter import DiscordAdapter, _apply_yaml_config  # noqa: E402
+from gateway.config import PlatformConfig
+from plugins.platforms.discord.adapter import DiscordAdapter, _apply_yaml_config
 
 
 class FakeCategory:
@@ -188,7 +188,7 @@ class DiscordCategoryChannelGateTests(TestCase):
 # in CI, so isinstance() must resolve against our doubles).
 # ---------------------------------------------------------------------------
 
-import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
+import plugins.platforms.discord.adapter as discord_platform
 
 
 class BehaviourCategory:
@@ -285,7 +285,7 @@ def _make_message(*, channel, content, mentions=None):
         mentions=list(mentions or []),
         attachments=[],
         reference=None,
-        created_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
         channel=channel,
         author=author,
         type=discord_platform.discord.MessageType.default,

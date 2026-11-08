@@ -623,7 +623,7 @@ async def test_t10_a_hung_hook_is_abandoned_at_the_timeout_and_the_leave_does_no
 @pytest.mark.asyncio
 async def test_t9_an_unresolvable_owner_profile_skips_the_hook(homes, monkeypatch, caplog):
     """The scope cannot be entered: the event must not fall through to the launch profile's plugins."""
-    import hermes_cli.profiles as profiles
+    from hermes_cli import profiles
     probe.install_probe(homes.default, returns={"followup_turn": WRAP_UP}, allow_injection=True)
     probe.discover(homes.default)
     rig = Rig(homes.tmp)
@@ -703,7 +703,7 @@ async def test_t6_a_session_opened_by_the_final_utterance_gets_its_id_and_the_fo
 async def test_t10_every_hook_call_gets_a_finite_timeout(homes, monkeypatch, configured, state, expected):
     """``plugins.hook_callback_timeout: 0`` turns the bounded worker off for every hook; this hook must
     still never pin a default-executor thread for as long as a plugin hangs."""
-    import hermes_cli.lifecycle as lifecycle
+    from hermes_cli import lifecycle
     import hermes_yaml as yaml
     probe.install_probe(homes.default)
     if configured is not None:

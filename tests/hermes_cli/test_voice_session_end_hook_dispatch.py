@@ -125,7 +125,7 @@ def test_an_owner_entry_naming_another_callable_attributes_nothing(home):
     """``(hook, id(cb))`` can be reused after GC: an entry whose callable is not THIS one is stale."""
     probe.install_probe(home, "alpha", returns="a")
     manager = probe.discover(home)
-    shell = lambda **_kw: "shell"  # noqa: E731 - a callback no plugin registered
+    shell = lambda **_kw: "shell"
     manager._hooks[HOOK].append(shell)
     _alpha_cb, alpha_owner = next(iter(manager._hook_owner_keys.values()))
     manager._hook_owner_keys[(HOOK, id(shell))] = (object(), alpha_owner)   # forged stale entry

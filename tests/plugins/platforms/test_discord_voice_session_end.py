@@ -28,7 +28,6 @@ class _Recorder:
 
     def __call__(self, end: VoiceSessionEnd):
         self.ends.append(end)
-        return None
 
 
 @pytest.fixture(autouse=True)

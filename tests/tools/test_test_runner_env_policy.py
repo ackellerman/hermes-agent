@@ -38,6 +38,16 @@ def test_run_tests_sh_has_no_second_allowlist():
         assert legacy not in text, f"{legacy!r} is a second env list; extend env_policy.py instead"
 
 
+def test_runner_env_never_forwards_the_account_store():
+    """run_tests.sh's _account_tool_store exports these for its own provisioning only."""
+    environ = {"PATH": "/usr/bin", "HOME": "/home/u", "HERMES_RUNTIME_DIR": "/home/u/.hermes/tools",
+               "UV_PYTHON_INSTALL_DIR": "/home/u/.local/share/uv/python"}
+    for platform in ("linux", "win32"):
+        names = {pair.split("=", 1)[0] for pair in runner_env(environ, platform)}
+        assert "HERMES_RUNTIME_DIR" not in names and "UV_PYTHON_INSTALL_DIR" not in names
+        assert {"PATH", "HOME"} <= names, "control: the allowlisted names are forwarded"
+
+
 def test_launcher_emits_exactly_the_policy_for_the_same_environment():
     """What ``env -i`` is handed equals what the runner gives a child, name for name."""
     probe = {
