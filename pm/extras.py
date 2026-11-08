@@ -67,7 +67,37 @@ ANCHORS: dict[str, str | tuple[str, ...]] = {
     # back-compat alias — Pillow is core — but ensure_import("vision") must
     # still resolve an anchor so availability checks work).
     "vision": "PIL",
+    # CUDA 12 cuBLAS for local STT. ``nvidia.cublas`` is a namespace directory, so importing it
+    # proves nothing about the soname; LIBRARY_PROOFS below requires the .so.12 files themselves.
+    "stt-whisper-cuda": "nvidia.cublas",
 }
+
+# extra -> (package, soname) pairs that must sit in ``<package dir>/lib/``. For wheels that ship
+# only shared libraries: ctranslate2 dlopens ``libcublas.so.12`` (which pulls ``libcublasLt.so.12``)
+# at the first GPU inference, and neither a bare ``nvidia`` namespace nor a CUDA 13 tree loads it.
+LIBRARY_PROOFS: dict[str, tuple[tuple[str, str], ...]] = {
+    "stt-whisper-cuda": (("nvidia.cublas", "libcublas.so.12"), ("nvidia.cublas", "libcublasLt.so.12")),
+}
+
+
+def _library_present(package: str, soname: str) -> bool:
+    """Is *soname* a file in the ``lib/`` dir of *package*? Only the parent package is imported
+    (find_spec's rule for a dotted name); for ``nvidia.cublas`` that is the empty namespace."""
+    try:
+        spec = importlib.util.find_spec(package)
+    except (ImportError, ValueError):
+        return False
+    if spec is None:
+        return False
+    roots = list(spec.submodule_search_locations or ())
+    if not roots and spec.origin:
+        roots = [str(Path(spec.origin).parent)]
+    return any((Path(root) / "lib" / soname).is_file() for root in roots)
+
+
+def _libraries_missing(extra: str) -> tuple[str, ...]:
+    return tuple(soname for package, soname in LIBRARY_PROOFS.get(extra, ())
+                 if not _library_present(package, soname))
 
 
 def _anchors(extra: str) -> tuple[str, ...]:
@@ -95,7 +125,7 @@ def available(extra: str) -> bool:
     unavailable — the anchors are absent by design, not by accident."""
     if not extra_supported(extra):
         return False
-    return all(_importable(a) for a in _anchors(extra))
+    return all(_importable(a) for a in _anchors(extra)) and not _libraries_missing(extra)
 
 
 def _platform_gates() -> dict[str, str]:
@@ -131,7 +161,7 @@ def extra_supported(extra: str, *, environment: dict[str, str] | None = None,
     extra that IS present on this machine (anchors importable) is always
     supported — an installed override beats the table (dev machines,
     hand-synced venvs)."""
-    if all((importable or _importable)(a) for a in _anchors(extra)):
+    if all((importable or _importable)(a) for a in _anchors(extra)) and not _libraries_missing(extra):
         return True
     marker = _platform_gates().get(extra)
     if marker is None:
@@ -262,7 +292,8 @@ def ensure_and_bind(extra, importer, target_globals) -> bool:
 
 
 def missing(extra: str) -> tuple[str, ...]:
-    return tuple(a for a in _anchors(extra) if not _importable(a))
+    """The anchors and proof sonames of *extra* that are absent here."""
+    return (*(a for a in _anchors(extra) if not _importable(a)), *_libraries_missing(extra))
 
 
 def _installed_in(site_packages: Path, anchor: str) -> bool:
@@ -398,7 +429,10 @@ def legacy_selection(project_root: Path) -> list[str]:
         extra for extra in ANCHORS if extra not in {"messaging", "voice", "wake"} and extra not in refused
         # PM refuses a gated extra outside its platform even if a hand-synced venv carried it.
         # Installed first: judging a gate may cost a PM-runtime subprocess.
-        if any(all(_installed_in(tree, anchor) for anchor in _anchors(extra)) for tree in trees)
+        if any(all(_installed_in(tree, anchor) for anchor in _anchors(extra))
+               and all(tree.joinpath(*package.split("."), "lib", soname).is_file()
+                       for package, soname in LIBRARY_PROOFS.get(extra, ()))
+               for tree in trees)
         and extra_supported(extra, importable=lambda _anchor: False)
     )
     return ["all", *carried]

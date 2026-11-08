@@ -86,16 +86,57 @@ def _post_setup_chromium() -> None:
 
 
 # The hook key is the UI provider identifier; extra names belong to pyproject.toml.
-def _python_hook(module, extra, label, installing, on_install=(), always=()) -> dict:
+# ``gpu_extra`` is a second, opt-in extra synced in the same transaction only when the driver-level
+# probe below sees an NVIDIA GPU and the extra's platform gate admits this machine.
+def _python_hook(module, extra, label, installing, on_install=(), always=(), gpu_extra=None, gpu_installing="") -> dict:
     return {"module": module, "extra": extra, "label": label, "installing": installing,
-            "on_install": on_install, "always": always}
+            "on_install": on_install, "always": always, "gpu_extra": gpu_extra, "gpu_installing": gpu_installing}
+
+
+# The NVIDIA kernel driver publishes this file once it is loaded; a module-level name so tests fake it.
+_NVIDIA_PROC_VERSION = "/proc/driver/nvidia/version"
+
+
+def _nvidia_gpu_present() -> bool:
+    """Driver-level NVIDIA probe for the Local Whisper hook. It imports no Python wheel (never
+    ctranslate2: `hermes tools` usually runs where faster-whisper is not importable yet).
+
+    True when the kernel driver's procfs file exists, else when the CUDA driver API
+    (``libcuda.so.1`` via ctypes: ``cuInit`` + ``cuDeviceGetCount``) reports at least one device.
+    ``hermes_platform.host.facts.gpu_class`` is not used: its sysfs fallback reports an NVIDIA
+    card under nouveau, where the CUDA wheel would be ~600 MB of dead weight.
+    """
+    if os.path.exists(_NVIDIA_PROC_VERSION):
+        return True
+    import ctypes
+
+    try:
+        cuda = ctypes.CDLL("libcuda.so.1")
+        if cuda.cuInit(0) != 0:
+            return False
+        count = ctypes.c_int(0)
+        return cuda.cuDeviceGetCount(ctypes.byref(count)) == 0 and count.value > 0
+    except (OSError, AttributeError, TypeError, ValueError):
+        return False
+
+
+def _gpu_extra_wanted(extra: str | None) -> bool:
+    if not extra or not _nvidia_gpu_present():
+        return False
+    from pm.extras import extra_supported
+
+    # Requesting a gated-off extra fails the whole sync (an NVIDIA aarch64 board has a driver).
+    return extra_supported(extra)
 
 
 _PYTHON_POST_SETUP_HOOKS: dict = {
     "faster_whisper": _python_hook(
         "faster_whisper", "stt-whisper", "faster-whisper", "Installing faster-whisper (model ~150MB downloads on first use)...",
         on_install=(f"Model sizes: {_LOCAL_STT_MODEL_SUMMARY}",
-                    "Change via stt.local.model in config.yaml")),
+                    "Change via stt.local.model in config.yaml"),
+        # D-014: CUDA 12 cuBLAS is opt-in; only an NVIDIA host gets it here.
+        gpu_extra="stt-whisper-cuda",
+        gpu_installing="NVIDIA GPU detected: also installing CUDA 12 cuBLAS for GPU transcription (~600MB)..."),
     "kittentts": _python_hook(
         "kittentts", "kittentts", "kittentts", "Installing kittentts (~25-80MB model, CPU-only)...",
         on_install=("Voices: Jasper, Bella, Luna, Bruno, Rosie, Hugo, Kiki, Leo",
@@ -117,8 +158,14 @@ def _post_setup_python(spec: dict) -> None:
 
     label = spec["label"]
     _print_info(f"    {spec['installing']}")
+    selected, kwargs = [spec["extra"]], {}
+    if _gpu_extra_wanted(spec.get("gpu_extra")):
+        _print_info(f"    {spec['gpu_installing']}")
+        selected.append(spec["gpu_extra"])
+        # Chosen on the user's behalf: a `hermes pm install --without` of it stays honored.
+        kwargs["automatic"] = [spec["gpu_extra"]]
     try:
-        pm.sync_venv([spec["extra"]], explicit=True)
+        pm.sync_venv(selected, explicit=True, **kwargs)
     except (pm.InstallError, OSError, ValueError) as exc:
         _print_warning(f"    {label} install failed: {exc}")
         _info_lines("Retry with: hermes tools")
