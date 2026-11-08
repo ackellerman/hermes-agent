@@ -254,6 +254,18 @@ def test_p4_id_shapes(tmp_path, value, author, expected):
     assert _admit(adapter, author, 20) is expected
 
 
+def test_p4b_csv_scalar_two_ids(tmp_path):
+    """An UNQUOTED two-id scalar (``bot_allow_from: <id1>,<id2>``) loads as ONE str and still names two bots."""
+    home = tmp_path / "hh" / "profiles" / "beta"
+    _write_cfg(home, f"discord:\n  allow_bots: mentions\n  bot_allow_from: {BOT_ALPHA},{BOT_GAMMA}\n")
+    beta = _load(home, self_id=BOT_BETA)
+    assert _admit(beta, BOT_ALPHA, 30) is True
+    assert _admit(beta, BOT_GAMMA, 31) is True
+    assert _admit(beta, BOT_OUTSIDER, 32) is False
+    assert _authz(beta, BOT_GAMMA) is True
+    assert _authz(beta, BOT_OUTSIDER) is False
+
+
 # ── P5: history backfill keeps a peer's turn (as background) for a narrowed seat ─────────────────
 def test_p5_history_keeps_unlisted_bot_as_unverified(multi, monkeypatch):
     beta = multi["beta"]
@@ -342,6 +354,36 @@ def test_p8_real_loader(tmp_path, monkeypatch, body):
         assert adapter.bot_admission_mode() == "mentions"
     finally:
         secret_scope.reset_secret_scope(tok)
+    assert "DISCORD_ALLOWED_BOTS" not in os.environ
+
+
+def test_p8b_mentions_without_list_under_platforms_discord(tmp_path, monkeypatch):
+    """``allow_bots: mentions`` directly under ``platforms.discord`` (not ``extra``) and NO list: any
+    mentioned bot is admitted at ingress and by authz, and nothing is written to process env."""
+    from gateway.config import load_gateway_config
+    root = tmp_path / "hh"
+    home = root / "profiles" / "beta"
+    home.mkdir(parents=True)
+    (root / "config.yaml").write_text("discord:\n  allow_bots: mentions\n")
+    (home / "config.yaml").write_text("discord:\n  auto_thread: false\nplatforms:\n  discord:\n    allow_bots: mentions\n")
+    (home / ".env").write_text("DISCORD_BOT_TOKEN=fake\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    tok = secret_scope.set_secret_scope(secret_scope.build_profile_secret_scope(home), profile_home=str(home))
+    try:
+        pc = load_gateway_config().platforms[Platform.DISCORD]
+        adapter = DiscordAdapter(pc)
+        adapter._client = SimpleNamespace(user=SimpleNamespace(id=int(BOT_BETA), bot=True))
+        adapter._text_batch_delay_seconds = 0
+        adapter._snapshot_gate_env()
+        adapter._probe_home, adapter._probe_scoped = home, True
+        assert adapter._get_allow_bots() == "mentions"
+        assert adapter.bot_admission_mode() == "mentions"
+        assert _admit(adapter, BOT_GAMMA, 1) is True
+        assert _admit(adapter, BOT_OUTSIDER, 2) is True
+        assert _authz(adapter, BOT_GAMMA, home=home) is True
+    finally:
+        secret_scope.reset_secret_scope(tok)
+    assert "DISCORD_ALLOW_BOTS" not in os.environ
     assert "DISCORD_ALLOWED_BOTS" not in os.environ
 
 

@@ -386,6 +386,67 @@ class TestBranchGC:
         assert listing.stdout.strip()
 
 
+class TestSweepNeverDeletesTheTrunk:
+    """Upstream's snapshot-then-delete sweep (``worktree_sweep.archive_then_remove``) is a third
+    branch-delete site. Its own name list lacks ``development`` and a remoteless repo counts nothing as
+    published, so without the trunk rule it deletes the integration branch of the tree it removes."""
+
+    @staticmethod
+    def _repo(tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        (tmp_path / "home").mkdir()
+        repo = tmp_path / "work"
+        _git(["init", "-q", "-b", "main", str(repo)], tmp_path)
+        (repo / "a.txt").write_text("a\n")
+        _git(["add", "."], repo)
+        _git(["commit", "-qm", "init"], repo)
+        return repo
+
+    @staticmethod
+    def _branch_exists(repo, name):
+        return subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{name}"],
+            capture_output=True, text=True, cwd=str(repo), check=False,
+        ).returncode == 0
+
+    def test_sweep_archive_then_remove_never_deletes_development_in_a_remoteless_repo(
+        self, tmp_path, monkeypatch,
+    ):
+        from hermes_cli import worktree_sweep
+        repo = self._repo(tmp_path, monkeypatch)
+        _git(["branch", "development"], repo)
+        tree = repo / ".worktrees" / "ondev"
+        _git(["worktree", "add", "-q", str(tree), "development"], repo)
+        (tree / "notes.md").write_text("uncommitted\n")
+        _ref, kept, removed, why = worktree_sweep.archive_then_remove(
+            str(repo), str(tree), reason="dirty", max_untracked_mb=50, unlock=False)
+        assert removed is True, why
+        assert self._branch_exists(repo, "development"), "the sweep deleted the development branch"
+        assert kept == "development"
+
+    def test_sweep_keeps_a_trunk_named_in_no_list(self, tmp_path, monkeypatch):
+        """The trunk resolved by ``_worktree_merge_base_ref`` (``origin/HEAD`` -> ``integration``)
+        survives the sweep of the tree that holds it."""
+        from hermes_cli import worktree_sweep
+        repo = self._repo(tmp_path, monkeypatch)
+        origin = tmp_path / "origin.git"
+        _git(["init", "-q", "--bare", str(origin)], tmp_path)
+        _git(["branch", "integration"], repo)
+        _git(["remote", "add", "origin", str(origin)], repo)
+        _git(["push", "-q", "origin", "integration"], repo)
+        _git(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/integration"], repo)
+        assert "integration" not in worktree_sweep._PROTECTED_BRANCHES
+        tree = repo / ".worktrees" / "ontrunk"
+        _git(["worktree", "add", "-q", str(tree), "integration"], repo)
+        (tree / "notes.md").write_text("uncommitted\n")
+        assert worktree_sweep._trunk_protected(str(repo), "integration") is True
+        _ref, kept, removed, why = worktree_sweep.archive_then_remove(
+            str(repo), str(tree), reason="dirty", max_untracked_mb=50, unlock=False,
+            remote_heads_fn=dict)
+        assert removed is True, why
+        assert kept == "integration" and self._branch_exists(repo, "integration")
+
+
 class TestOlderThanGate:
     def test_young_reapable_tree_kept_under_older_than(self, repo):
         _add_worktree(repo, "hermes-young")

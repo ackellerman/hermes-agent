@@ -307,6 +307,13 @@ def plan_sweep(repo_root: str, max_age_hours: int = 24, settings: Optional[dict]
 # ---------------------------------------------------------------- execution
 
 
+def _trunk_protected(repo_root: str, branch: str) -> bool:
+    """The trunk rule of ``worktree_gc``'s reclaim delete sites (``development`` and whatever branch
+    merged work is measured against, by any name): an unpublished trunk is never deleted here either."""
+    from hermes_cli.worktree_gc import _is_protected_branch  # local: worktree_gc imports this module's peers
+    return _is_protected_branch(repo_root, branch)
+
+
 def _branch_published(repo_root: str, branch: str, remote_heads: Optional[dict]) -> bool:
     """Whether *branch* exists on a remote. Unknown (``ls-remote`` failed) counts as published:
     deleting a branch is never needed for safety, so doubt keeps it."""
@@ -381,7 +388,7 @@ def archive_then_remove(repo_root: str, path: str, *, reason: str, max_untracked
         logger.warning("Archived %s to %s but could not remove it: %s", path, arc.ref, removed.stderr.strip())
         return arc.ref, None, False, removed.stderr.strip() or "git worktree remove failed"
     branch = arc.meta.get("branch")
-    if not branch or keep_branch or branch in _PROTECTED_BRANCHES:
+    if not branch or keep_branch or branch in _PROTECTED_BRANCHES or _trunk_protected(repo_root, branch):
         return arc.ref, branch, True, None
     if remote_heads_fn is None:
         from hermes_cli.worktree_ops import _fetch_remote_branch_heads
