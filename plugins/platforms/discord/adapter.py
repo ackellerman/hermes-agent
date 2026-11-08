@@ -4441,7 +4441,6 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     await ch.send(
                         f"🤖 Hermes auto-joined <#{voice_channel.id}> — transcribing for "
                         "allowlisted users. Use `/voice leave` to disconnect."
-                        
                     )
             except Exception:
                 logger.debug(
