@@ -34,13 +34,16 @@ RESULT_FIELDS = ('final_response', 'failed', 'interrupted', 'completed', 'partia
                  'estimated_cost_usd', 'cost_status', 'cost_source', 'service_tier', 'failure_reason',
                  'session_id', 'requested_model', 'served_model', '_turn_input_tokens', '_turn_output_tokens',
                  'failure_retryable', 'failure_resets_at', 'billing_block', 'free_tier', 'usage_window_message',
-                 'refused_turn_boundary_row_id')
+                 'refused_turn_boundary_row_id', 'context_usage')
 # The structured fields and their allowed keys: ``billing_block`` (``agent/billing_links.BillingBlock``
 # plus ``unverified``) and ``free_tier`` (``agent/turn_recovery._stamp_free_tier``). With
 # ``failure_reason``, ``failure_retryable`` and ``failure_resets_at`` they are what
 # ``agent.error_surface.build_error_surface_from_result`` reads for the owner's error card.
 BILLING_FIELDS = ('provider', 'provider_label', 'model', 'billing_url', 'is_nous', 'message', 'unverified')
-STRUCTURED_FIELDS = {'billing_block': BILLING_FIELDS, 'free_tier': ('kind', 'message')}
+# ``context_usage``: ``agent/context_breakdown.context_usage_fields`` (the context gauge's reading).
+CONTEXT_USAGE_FIELDS = ('context_used', 'context_max', 'context_percent', 'context_source', 'context_estimated')
+STRUCTURED_FIELDS = {'billing_block': BILLING_FIELDS, 'free_tier': ('kind', 'message'),
+                     'context_usage': CONTEXT_USAGE_FIELDS}
 
 
 def _scalar(value):

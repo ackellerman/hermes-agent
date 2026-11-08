@@ -71,6 +71,9 @@ def _clarify_expired_notice() -> str:
 _LEDGER_PASSTHROUGH_KEYS = (
     "estimated_cost_usd", "cost_status", "cost_source", "cache_read_tokens", "cache_write_tokens",
     "reasoning_tokens", "total_tokens", "provider", "turn_exit_reason", "service_tier",
+    # The context gauge's end-of-turn reading (``run_conversation``): stream-json ``result.context``
+    # and the usage file's ``context`` read it from the committed receipt.
+    "context_usage",
 )
 # Beside ``failure_reason`` and ``error``: what ``agent.error_surface.build_error_surface_from_result`` reads,
 # so the authority's ``message.complete`` carries the same error card the TUI path builds;
