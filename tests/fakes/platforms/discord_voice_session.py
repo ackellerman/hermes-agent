@@ -165,7 +165,7 @@ async def connect_capturing_handlers(adapter: DiscordAdapter, monkeypatch: Any) 
     the same objects the rest of the test drives.
     """
     monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
-    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+    monkeypatch.setattr("gateway.status_scoped_locks.release_scoped_lock", lambda scope, identity: None)
     intents = SimpleNamespace(message_content=False, dm_messages=False, guild_messages=False,
                               members=False, voice_states=False)
     monkeypatch.setattr(adapter_mod.Intents, "default", lambda: intents)

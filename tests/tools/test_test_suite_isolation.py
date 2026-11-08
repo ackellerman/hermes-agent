@@ -57,6 +57,11 @@ _KNOWN_UNFIXED: frozenset[tuple[str, str]] = frozenset({
     ("tests/hermes_cli/test_web_memory_provider_setup_install.py", "plugins.memory.find_provider_dir"),
     ("tests/pm/test_worker_publication.py", "plugins.memory.find_provider_dir"),
     ("tests/tui_gateway/test_session_agent_cwd.py", "plugins.memory.load_memory_provider"),
+    # upstream test files that arrived with the 2026-11-08 sync
+    ("tests/agent/test_fork_memory_under_checkpoint_gate.py", "plugins.memory.load_memory_provider"),
+    ("tests/agent/test_memory_provider_caller_profile.py", "plugins.memory.load_memory_provider"),
+    ("tests/tools/test_browser_cloud_provider_cache.py", "plugins.browser.browser_use.provider.BrowserUseBrowserProvider"),
+    ("tests/tools/test_browser_cloud_provider_cache.py", "plugins.browser.browserbase.provider.BrowserbaseBrowserProvider"),
 })
 
 

@@ -693,7 +693,9 @@ class GatewaySlashCommandsMixin(
 
         def _set_mode(mode: str) -> None:
             self._voice_mode[voice_key] = mode
-            self._disown_join_voice_mode(voice_key)  # set by hand: a voice-channel leave keeps it
+            # set by hand: a voice-channel leave keeps it (a runner that tracks no joins has nothing to disown)
+            if (disown := getattr(self, "_disown_join_voice_mode", None)) is not None:
+                disown(voice_key)
             self._save_voice_modes()
             from gateway.session_config import local_voice_transition
             local_voice_transition(event.source, mode)
