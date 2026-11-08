@@ -618,7 +618,6 @@ def install_distribution(
     Use :func:`plan_install` first to preview + prompt."""
     from hermes_cli.profiles import check_alias_collision, create_wrapper_script
     from hermes_cli.profiles_initialization import clone_staging_dir
-    from hermes_constants import clear_named_profile_deleted
     with tempfile.TemporaryDirectory(prefix="hermes_dist_install_") as tmp:
         plan = plan_install(source, Path(tmp), override_name=name)
         if plan.existing and not force:
