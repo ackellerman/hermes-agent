@@ -351,6 +351,18 @@ stt-whisper = [
   "av==18.1.0; (platform_machine != 'ARM64' or sys_platform != 'win32') and (platform_machine != 'x86_64' or platform_system != 'Darwin') and sys_platform != 'android'",
 ]
 audio-io = ["sounddevice==0.5.6", "numpy==2.5.4"]
+# CUDA 12 cuBLAS for local STT on NVIDIA GPUs (D-014): a separate opt-in extra,
+# never in [stt-whisper]/[voice]/[all] and never pulled by stt-whisper's lazy
+# install, so CPU-only hosts don't download ~670 MB (cuBLAS plus the
+# nvidia-cuda-nvrtc-cu12 it hard-requires). Listed in [tool.hermes]
+# opt-in-extras so --all-extras bundles leave it out too. ctranslate2's GPU
+# path (4.8.1 and the locked 4.8.3) dlopens libcublas.so.12 + libcublasLt.so.12 at the first inference and
+# nothing else from CUDA (no cuDNN, cudart static; audited with LD_DEBUG=libs
+# on medium/float16). Selected by `hermes tools` (Local Whisper + an NVIDIA
+# driver) or `hermes pm install --extra stt-whisper-cuda`.
+stt-whisper-cuda = [
+  "nvidia-cublas-cu12==12.9.3.13; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 # WeChat voice decode (tools/transcription_tools.py self-heal path).
 silk = ["pilk==0.2.4"]
 # Wake-engine sub-extras — lazy per-engine installs so a user who only wants
@@ -599,7 +611,8 @@ hermes-acp = "acp_adapter.entry:main"
 # build with --all-extras and pass --no-extra for each of these, so their
 # closures never ship. KittenTTS pulls torch, transformers and spaCy through
 # misaki[en]: installed when the user picks it, not preinstalled.
-opt-in-extras = ["kittentts"]
+# stt-whisper-cuda is ~670 MB of CUDA 12 cuBLAS (+ its nvrtc dependency) that only NVIDIA hosts can use (D-014).
+opt-in-extras = ["kittentts", "stt-whisper-cuda"]
 
 # What `hermes update` compiles before it moves the checkout to this tree, and again after: the
 # launcher and `hermes_bootstrap` import closure plus the CLI entry modules. Every file listed here
@@ -635,6 +648,8 @@ wake-openwakeword = "(platform_machine != 'ARM64' or sys_platform != 'win32') an
 # Gate the extra that carries only faster-whisper; [voice] also has ungated deps (sounddevice,
 # numpy) and stays installable, see test_declared_extra_gates_match_dependency_selection.
 stt-whisper = "(platform_machine != 'ARM64' or sys_platform != 'win32') and (platform_machine != 'x86_64' or platform_system != 'Darwin') and sys_platform != 'android'"
+# nvidia-cublas-cu12 ships the CUDA 12 cuBLAS sonames ctranslate2 loads; only linux x86_64 here.
+stt-whisper-cuda = "sys_platform == 'linux' and platform_machine == 'x86_64'"
 # NeuTTS excludes Python 3.14.
 neutts = "python_version < '3.14'"
 # KittenTTS: onnxruntime has no Intel macOS or Android wheel; misaki[en]'s torch has no
