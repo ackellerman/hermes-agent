@@ -437,6 +437,36 @@ def test_create_if_missing_creates_the_session_with_the_run_launch_flags(store, 
     assert not {"toolsets", "model"} & set(params), params
 
 
+def test_create_if_missing_normalizes_flags_as_the_resume_reads_them(store, monkeypatch):
+    """The titled create is resumed at once, and the resume check reads the flags normalized
+    (``cli_init_mixin._gateway_launch``): a raw value frozen here is refused on every run (exit 2).
+    ``-s`` drops ``skills.auto_load`` names unless rules are ignored; an unparseable ``--reasoning``
+    is ignored (the CLI warns); ``--provider`` counts only with an explicit ``-m``."""
+    db, client = store
+    from hermes_cli import gateway_session_store as gss
+    import agent.skill_commands as sc
+    monkeypatch.setattr(gss, "session_store", lambda: db)
+    monkeypatch.setattr(sc, "resolve_auto_load_skills", lambda _cfg=None: ["alpha"])
+    monkeypatch.delenv("HERMES_IGNORE_RULES", raising=False)
+
+    def created(**flags):
+        gss.create_titled_session("T", types.SimpleNamespace(**flags))
+        return [c for c in client.calls if c[0] == "session.create"][-1][1]
+
+    assert created(skills=["alpha,beta"])["skills"] == ["beta"]
+    assert "skills" not in created(skills=["alpha"])
+    assert created(skills=["alpha,beta"], ignore_rules=True)["skills"] == ["alpha", "beta"]
+    monkeypatch.setenv("HERMES_IGNORE_RULES", "1")
+    assert created(skills=["alpha"])["skills"] == ["alpha"]
+    monkeypatch.delenv("HERMES_IGNORE_RULES")
+    assert "reasoning" not in created(reasoning="bogus")
+    assert created(reasoning=" high ")["reasoning"] == "high"
+    assert "provider" not in created(provider="custom")
+    assert "provider" not in created(model="m2", provider="auto")
+    params = created(model="m2", provider="custom")
+    assert params["model"] == "m2" and params["provider"] == "custom"
+
+
 def test_bare_continue_finds_the_last_session_the_cli_created(tmp_path, monkeypatch):
     """Bare ``-c`` (main.py ``_resolve_last_session``) reads main's labels too: a gateway row labelled
     ``local`` that the CLI created is CLI history."""

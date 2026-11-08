@@ -552,6 +552,43 @@ def session_store():
     return GatewaySessionStore()
 
 
+def _titled_launch(args):
+    """The run's launch flags for the titled create, normalized as the resume right after it reads them
+    (``cli_init_mixin._gateway_launch`` / ``_explicit_launch_skills`` / the CLI's ``--reasoning`` parse):
+    anything frozen here that the resume check reads differently is refused on every run (exit 2).
+
+    - ``--provider`` counts only with an explicit ``-m`` (and never ``auto``), as on a plain create.
+    - an unparseable ``--reasoning`` is warned about and ignored, as the CLI does, not sent to the gateway.
+    - ``-s`` drops ``skills.auto_load`` names (the gateway's agent loads those) unless rules are ignored.
+    """
+    from utils import is_truthy_value
+    launch = {key: getattr(args, key, None) for key in (*_LAUNCH_POLICY, "run_budget", "verbose")}
+    if not launch.get("model") or launch.get("provider") in {"", "auto"}:
+        launch["provider"] = None
+    reasoning = launch.get("reasoning")
+    if reasoning is not None and str(reasoning).strip():
+        from hermes_cli.cli_config_load import _parse_reasoning_config
+        if _parse_reasoning_config(reasoning) is None:
+            logger.warning("Unknown --reasoning '%s', keeping the configured level", reasoning)
+            launch["reasoning"] = None
+        else:
+            launch["reasoning"] = str(reasoning).strip()
+    else:
+        launch["reasoning"] = None
+    raw = launch.get("skills")
+    if raw:
+        items = raw if isinstance(raw, (list, tuple)) else [raw]
+        names = list(dict.fromkeys(n.strip() for item in items for n in str(item).split(",") if n.strip()))
+        ignore = launch.get("ignore_rules") or is_truthy_value(os.environ.get("HERMES_IGNORE_RULES"))
+        auto = set()
+        if not ignore:
+            from agent.skill_commands import resolve_auto_load_skills
+            from cli import CLI_CONFIG
+            auto = set(resolve_auto_load_skills(CLI_CONFIG))
+        launch["skills"] = [n for n in names if n not in auto] or None
+    return launch
+
+
 def create_titled_session(title, args=None):
     """``chat -c <title> --create-if-missing`` for the classic CLI: the gateway's ``session.create``
     with ``title`` (it resolves-or-creates under one owner lock), so this process writes no row.
@@ -560,8 +597,7 @@ def create_titled_session(title, args=None):
     next, and a resume sends no creation policy, so ``-t``/``-m``/... must be on this create or the
     run gets the profile default. Returns the id, or None when the gateway refused (the caller
     prints main's "could not be created" copy)."""
-    launch = {key: getattr(args, key, None) for key in (*_LAUNCH_POLICY, "run_budget", "verbose")}
-    params = _creation_policy(launch)
+    params = _creation_policy(_titled_launch(args))
     params["cwd"] = _launch_cwd()
     params["source"] = "cli"  # main's titled row is `cli` (hermes_cli.main._create_titled_session)
     params["row_cwd"] = ""
