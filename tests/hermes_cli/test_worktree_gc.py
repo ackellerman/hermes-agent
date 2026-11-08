@@ -447,6 +447,53 @@ class TestSweepNeverDeletesTheTrunk:
         assert kept == "integration" and self._branch_exists(repo, "integration")
 
 
+class TestExitDiscardNeverDeletesTheTrunk:
+    """``worktree_exit.apply_exit_choice`` (the Discard answer at ``hermes -w`` exit) is upstream's
+    fourth branch-delete site: it force-deletes the session tree's branch with no name rule at all,
+    so a session started on the trunk would take the integration branch with it."""
+
+    _repo = staticmethod(TestSweepNeverDeletesTheTrunk._repo)
+    _branch_exists = staticmethod(TestSweepNeverDeletesTheTrunk._branch_exists)
+
+    @staticmethod
+    def _discard(repo, tree, branch):
+        from hermes_cli import worktree_exit
+        info = {"path": str(tree), "repo_root": str(repo), "branch": branch,
+                "exit_choice": worktree_exit.DISCARD}
+        assert worktree_exit.apply_exit_choice(info, lambda _msg: None) is True
+        assert not tree.exists(), "the discard did not remove the tree"
+
+    def test_exit_discard_never_deletes_development(self, tmp_path, monkeypatch):
+        repo = self._repo(tmp_path, monkeypatch)
+        _git(["branch", "development"], repo)
+        tree = repo / ".worktrees" / "ondev"
+        _git(["worktree", "add", "-q", str(tree), "development"], repo)
+        (tree / "notes.md").write_text("uncommitted\n")
+        self._discard(repo, tree, "development")
+        assert self._branch_exists(repo, "development"), "exit discard deleted the development branch"
+
+    def test_exit_discard_keeps_a_trunk_named_in_no_list(self, tmp_path, monkeypatch):
+        repo = self._repo(tmp_path, monkeypatch)
+        origin = tmp_path / "origin.git"
+        _git(["init", "-q", "--bare", str(origin)], tmp_path)
+        _git(["branch", "integration"], repo)
+        _git(["remote", "add", "origin", str(origin)], repo)
+        _git(["push", "-q", "origin", "integration"], repo)
+        _git(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/integration"], repo)
+        tree = repo / ".worktrees" / "ontrunk"
+        _git(["worktree", "add", "-q", str(tree), "integration"], repo)
+        self._discard(repo, tree, "integration")
+        assert self._branch_exists(repo, "integration"), "exit discard deleted the resolved trunk"
+
+    def test_exit_discard_still_deletes_a_session_branch(self, tmp_path, monkeypatch):
+        """The guard narrows the delete, it does not disable it: a session branch still goes."""
+        repo = self._repo(tmp_path, monkeypatch)
+        tree = repo / ".worktrees" / "session"
+        _git(["worktree", "add", "-q", "-b", "hermes/session-1", str(tree)], repo)
+        self._discard(repo, tree, "hermes/session-1")
+        assert not self._branch_exists(repo, "hermes/session-1")
+
+
 class TestOlderThanGate:
     def test_young_reapable_tree_kept_under_older_than(self, repo):
         _add_worktree(repo, "hermes-young")

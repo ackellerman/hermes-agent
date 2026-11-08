@@ -109,10 +109,12 @@ def apply_exit_choice(info: dict, echo) -> bool:
         return True
     from hermes_cli._subprocess_compat import noninteractive_git_env
     from hermes_cli.worktree_ops import _git_quiet, release_lsp_clients
+    from hermes_cli.worktree_sweep import _trunk_protected
     release_lsp_clients(path)
     _git_quiet(["worktree", "unlock", path], repo_root, log="git worktree unlock failed (non-fatal)")
     _git_quiet(["worktree", "remove", path, "--force"], repo_root, timeout=60, log="Failed to remove worktree")
-    if branch and not os.path.isdir(path):
+    # Same trunk rule as the sweep and worktree_gc: discarding a tree never deletes the trunk branch.
+    if branch and not os.path.isdir(path) and not _trunk_protected(repo_root, branch):
         _git_quiet(["branch", "-D", branch], repo_root, log=f"Failed to delete branch {branch}",
                    env=noninteractive_git_env())
     echo(f"\033[33m{t('cli.worktree.discarded', path=path)}\033[0m")
