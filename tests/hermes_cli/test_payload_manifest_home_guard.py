@@ -149,16 +149,28 @@ def test_store_root_parent_stamp_probe_is_metadata_only(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("access", ["read", "metadata"])
-def test_manifest_exemption_does_not_follow_a_symlink(tmp_path, access):
-    # The exemption matches the lexical path; a symlink planted at <home>/manifest.json
-    # must not turn it into access to whatever home file it points at. Call check()
-    # directly: under pytest an outer conftest wrapper re-opens the resolved path, which
-    # would mask the guard's own decision.
+@pytest.mark.parametrize("layout", ["symlink-to-home-file", "dangling-symlink", "symlinked-parent"])
+def test_manifest_exemption_does_not_follow_a_symlink(tmp_path, access, layout):
+    # The exemption matches the lexical path; a symlink must not turn it into access to
+    # another home file: one planted at <home>/manifest.json (live or dangling), or one
+    # earlier in the path (<home>/sub -> <home>/x/y, so <home>/sub/../manifest.json is
+    # lexically exempt but the OS opens <home>/x/manifest.json). check() is called
+    # directly: under pytest the autouse conftest guard's realpath() walk of the resolved
+    # path runs through this guard's wrappers and would mask its own decision.
     home = tmp_path / "protected-home"
     home.mkdir()
     secret = home / ".env"
     secret.write_text("SECRET=1", encoding="utf-8")
-    (home / "manifest.json").symlink_to(secret)
+    target = os.path.join(os.fspath(home), "manifest.json")
+    if layout == "symlink-to-home-file":
+        (home / "manifest.json").symlink_to(secret)
+    elif layout == "dangling-symlink":
+        (home / "manifest.json").symlink_to(home / "missing.json")
+    else:
+        (home / "x" / "y").mkdir(parents=True)
+        (home / "x" / "manifest.json").write_text("{}", encoding="utf-8")
+        (home / "sub").symlink_to(home / "x" / "y")
+        target = os.path.join(os.fspath(home), "sub", "..", "manifest.json")
     guard = HomeIOGuard(lambda: [home])
     with pytest.raises(AssertionError, match="REAL hermes home"):
-        guard.check(home / "manifest.json", **{access: True})
+        guard.check(target, **{access: True})
