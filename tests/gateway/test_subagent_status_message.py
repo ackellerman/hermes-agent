@@ -1,0 +1,339 @@
+"""``display.subagent_status: summary``: one status message per ``delegate_task`` call.
+
+The gateway posts the message on the call's first ``subagent.start`` and edits it in place as
+children finish. Grandchildren are indented under their parent's line in the same message. The
+message has its own send path (tool progress off still shows it), stays out of
+``cleanup_progress``, and is never sent to a bot peer or on a muted turn. Once posted, later edits
+land even after the turn's generation moved on (background delegations).
+"""
+
+import asyncio
+import threading
+import time
+from types import SimpleNamespace
+
+import pytest
+
+import gateway.run_turn_progress as progress_mod
+import hermes_yaml
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.session import SessionSource
+from gateway.turn_context import TurnContext
+
+SUMMARY_CONFIG = {"display": {"platforms": {"discord": {"subagent_status": "summary"}}}}
+
+
+class StatusCaptureAdapter(BasePlatformAdapter):
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="***"), Platform.DISCORD)
+        self.sent: list[dict] = []
+        self.edits: list[dict] = []
+        self._lock = threading.Lock()
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        with self._lock:
+            message_id = f"msg-{len(self.sent) + 1}"
+            self.sent.append({"chat_id": chat_id, "content": content, "reply_to": reply_to,
+                              "metadata": metadata, "message_id": message_id})
+        return SendResult(success=True, message_id=message_id)
+
+    async def edit_message(self, chat_id, message_id, content, metadata=None) -> SendResult:
+        with self._lock:
+            self.edits.append({"chat_id": chat_id, "message_id": message_id, "content": content,
+                               "metadata": metadata, "at": time.monotonic()})
+        return SendResult(success=True, message_id=message_id)
+
+    async def send_typing(self, chat_id, metadata=None) -> None:
+        return None
+
+    async def get_chat_info(self, chat_id: str):
+        return {"id": chat_id}
+
+    def latest(self, message_id: str) -> str:
+        """The message's current text: its last edit, else what was sent."""
+        with self._lock:
+            for edit in reversed(self.edits):
+                if edit["message_id"] == message_id:
+                    return edit["content"]
+            for sent in self.sent:
+                if sent["message_id"] == message_id:
+                    return sent["content"]
+        raise AssertionError(f"no message {message_id}")
+
+
+class _StubGatewayRunner:
+    def __init__(self, adapter):
+        self.adapter = adapter
+        self.notices: list[str] = []
+
+    def _delivery_adapter_for(self, source):
+        return self.adapter
+
+    async def _deliver_platform_notice(self, source, content):
+        self.notices.append(content)
+
+
+@pytest.fixture
+def loop():
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    yield loop
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=5)
+    loop.close()
+
+
+@pytest.fixture(autouse=True)
+def _fast_edits(monkeypatch):
+    """Edits coalesce on a 1.5 s window in production; most cases only need the ordering."""
+    monkeypatch.setattr(progress_mod, "SUBAGENT_STATUS_EDIT_INTERVAL", 0.05, raising=False)
+
+
+def _source(**kw):
+    return SessionSource(platform=Platform.DISCORD, chat_id="chan-1", chat_type="thread", **kw)
+
+
+def _turn(loop, *, user_config=SUMMARY_CONFIG, still_current=None, source=None, runner=None, **ctx_kw):
+    from gateway.run_turn_runner import TurnRunner
+    gateway_runner = runner or _StubGatewayRunner(StatusCaptureAdapter())
+    current = still_current if still_current is not None else [True]
+    ctx = TurnContext(
+        source=source or _source(), user_config=user_config, _run_still_current=lambda: current[0],
+        _loop_for_step=loop, _progress_reply_to="anchor-9", _progress_metadata={"thread_id": "t-1"},
+        **ctx_kw,
+    )
+    return TurnRunner(gateway_runner, ctx), gateway_runner, current
+
+
+def _start(turn, sid, *, call, goal, model="claude-opus-5-5", parent=None, depth=0, route=None, count=2, index=0):
+    kw = {"subagent_id": sid, "depth": depth, "model": model, "goal": goal, "task_index": index,
+          "task_count": count, "delegate_call_id": call}
+    if parent is not None:
+        kw["parent_id"] = parent
+    if route is not None:
+        kw["route_label"] = route
+    turn.progress_callback("subagent.start", preview=goal, **kw)
+
+
+def _complete(turn, sid, *, call, goal, status="completed", duration=192.0, parent=None, depth=0, model="claude-opus-5-5"):
+    kw = {"subagent_id": sid, "depth": depth, "model": model, "goal": goal, "delegate_call_id": call,
+          "status": status, "duration_seconds": duration, "summary": "boom" if status != "completed" else "done"}
+    if parent is not None:
+        kw["parent_id"] = parent
+    turn.progress_callback("subagent.complete", preview=kw["summary"], **kw)
+
+
+def _wait(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def _settle(seconds=0.4):
+    time.sleep(seconds)
+
+
+def test_one_message_with_route_label_nesting_and_outcomes(loop):
+    """(1) Two top-level children plus a grandchild: one send, then edits in place."""
+    turn, runner, _ = _turn(loop)
+    adapter = runner.adapter
+    _start(turn, "sa-1", call="call-A", goal="audit the fixtures", model="deepseek-v4.1-flash:cloud", route="flash")
+    _start(turn, "sa-2", call="call-A", goal="draft the test", index=1)
+    # The grandchild belongs to sa-2's own delegate_task call.
+    _start(turn, "sa-3", call="call-B", goal="check the fixture", parent="sa-2", depth=1, count=1)
+    _complete(turn, "sa-3", call="call-B", goal="check the fixture", parent="sa-2", depth=1,
+              status="failed", duration=41.0)
+    _complete(turn, "sa-2", call="call-A", goal="draft the test", duration=192.0)
+
+    assert _wait(lambda: len(adapter.sent) == 1 and "✓ 3m12s" in adapter.latest("msg-1"))
+    _settle()
+    assert len(adapter.sent) == 1, "grandchild's own call must not post separately"
+    assert adapter.edits, "later events edit the first message"
+    assert {e["message_id"] for e in adapter.edits} == {"msg-1"}
+    sent = adapter.sent[0]
+    assert sent["reply_to"] == "anchor-9" and sent["metadata"] == {"thread_id": "t-1"}
+
+    lines = adapter.latest("msg-1").splitlines()
+    assert lines[0] == "🧩 subagents (3)"
+    assert lines[1] == '↳ flash · deepseek-v4.1-flash:cloud — "audit the fixtures"  … running'
+    assert lines[2] == '↳ claude-opus-5-5 — "draft the test"  ✓ 3m12s'
+    assert lines[3] == '    ↳ claude-opus-5-5 — "check the fixture" (nested)  ✗ failed 41s'
+
+
+def test_concurrent_calls_get_separate_messages(loop):
+    """(2) Two delegate_task calls in one turn: two messages, no cross-talk."""
+    turn, runner, _ = _turn(loop)
+    adapter = runner.adapter
+    _start(turn, "a-1", call="call-A", goal="alpha one")
+    _start(turn, "b-1", call="call-B", goal="beta one")
+    _start(turn, "a-2", call="call-A", goal="alpha two", index=1)
+    _start(turn, "b-2", call="call-B", goal="beta two", index=1)
+    _complete(turn, "a-1", call="call-A", goal="alpha one", duration=5)
+    _complete(turn, "b-2", call="call-B", goal="beta two", status="error", duration=7)
+
+    assert _wait(lambda: len(adapter.sent) == 2
+                 and "✓ 5s" in adapter.latest(adapter.sent[0]["message_id"])
+                 and "✗" in adapter.latest(adapter.sent[1]["message_id"]))
+    _settle()
+    assert len(adapter.sent) == 2
+    by_msg = {s["message_id"]: adapter.latest(s["message_id"]) for s in adapter.sent}
+    alpha = next(text for text in by_msg.values() if "alpha one" in text)
+    beta = next(text for text in by_msg.values() if "beta one" in text)
+    assert "beta" not in alpha and "alpha" not in beta
+    assert "alpha two" in alpha and "beta two" in beta
+
+
+def test_posts_with_tool_progress_off(loop):
+    """(3) tool_progress off (no progress queue) + summary: the message still posts."""
+    config = {"display": {"tool_progress": "off", "platforms": {"discord": {"subagent_status": "summary"}}}}
+    turn, runner, _ = _turn(loop, user_config=config, progress_queue=None, tool_progress_enabled=False)
+    _start(turn, "sa-1", call="call-A", goal="audit")
+    assert _wait(lambda: len(runner.adapter.sent) == 1)
+
+
+def test_never_in_cleanup_ids(loop):
+    turn, runner, _ = _turn(loop, _cleanup_progress=True)
+    _start(turn, "sa-1", call="call-A", goal="audit", count=1)
+    _complete(turn, "sa-1", call="call-A", goal="audit", duration=3)
+    assert _wait(lambda: len(runner.adapter.sent) == 1 and "✓ 3s" in runner.adapter.latest("msg-1"))
+    assert turn._ctx._cleanup_msg_ids == []
+
+
+@pytest.mark.parametrize("gate", ["bot_peer", "muted"])
+def test_no_message_for_bot_peer_or_muted_turn(loop, gate):
+    """(4) A bot peer and a muted turn get no status message."""
+    if gate == "bot_peer":
+        turn, runner, _ = _turn(loop, source=_source(is_bot=True))
+    else:
+        turn, runner, _ = _turn(loop, mute_notification_reply=True)
+    _start(turn, "sa-1", call="call-A", goal="audit", count=1)
+    _complete(turn, "sa-1", call="call-A", goal="audit", duration=3)
+    _settle()
+    assert runner.adapter.sent == [] and runner.adapter.edits == []
+
+
+def test_detached_completion_edits_existing_message(loop):
+    """(5) The turn's generation moves on, then a child finishes: its line is edited, no new send."""
+    turn, runner, current = _turn(loop)
+    adapter = runner.adapter
+    _start(turn, "sa-1", call="call-A", goal="background job", count=1)
+    assert _wait(lambda: len(adapter.sent) == 1)
+    current[0] = False
+    _complete(turn, "sa-1", call="call-A", goal="background job", duration=65)
+    assert _wait(lambda: "✓ 1m05s" in adapter.latest("msg-1"))
+    _settle()
+    assert len(adapter.sent) == 1
+
+
+def test_stale_turn_never_opens_a_message(loop):
+    turn, runner, _ = _turn(loop, still_current=[False])
+    _start(turn, "sa-1", call="call-A", goal="audit", count=1)
+    _settle()
+    assert runner.adapter.sent == []
+
+
+def test_thirty_children_stay_under_cap_with_collapse_line(loop):
+    """(6) 30 children: content stays ≤1900 chars, the oldest finished lines collapse."""
+    turn, runner, _ = _turn(loop)
+    adapter = runner.adapter
+    for i in range(30):
+        _start(turn, f"sa-{i}", call="call-A", goal=f"task number {i} " + "x" * 80, count=30, index=i)
+    for i in range(30):
+        _complete(turn, f"sa-{i}", call="call-A", goal=f"task number {i}", duration=10 + i,
+                  status="failed" if i % 3 == 0 else "completed")
+    assert _wait(lambda: adapter.sent and "✓ 39s" in adapter.latest("msg-1"))
+    _settle()
+    for text in [s["content"] for s in adapter.sent] + [e["content"] for e in adapter.edits]:
+        assert len(text) <= 1900
+    final = adapter.latest("msg-1")
+    assert final.splitlines()[0] == "🧩 subagents (30)"
+    collapse = [line for line in final.splitlines() if line.startswith("… ") and " more (" in line]
+    assert len(collapse) == 1
+    hidden = int(collapse[0].split()[1])
+    assert hidden > 0
+    shown = [line for line in final.splitlines() if line.startswith("↳")]
+    assert hidden + len(shown) == 30
+    # The newest lines stay visible; the oldest are the ones collapsed.
+    assert '"task number 29' in final and '"task number 0 ' not in final
+    ok = sum(1 for i in range(hidden) if i % 3 != 0)
+    assert collapse[0] == f"… {hidden} more ({ok} ok, {hidden - ok} failed)"
+
+
+def test_rapid_completions_coalesce_into_at_most_two_edits(loop, monkeypatch):
+    """(7) Five completions within 1 s under the real 1.5 s window: ≤2 edits, the last shows all five."""
+    monkeypatch.setattr(progress_mod, "SUBAGENT_STATUS_EDIT_INTERVAL", 1.5)
+    turn, runner, _ = _turn(loop)
+    adapter = runner.adapter
+    for i in range(5):
+        _start(turn, f"sa-{i}", call="call-A", goal=f"job {i}", count=5, index=i)
+    assert _wait(lambda: len(adapter.sent) == 1)
+    _settle(1.8)  # the starts' own edit (if any) lands
+    before = len(adapter.edits)
+    for i in range(5):
+        _complete(turn, f"sa-{i}", call="call-A", goal=f"job {i}", duration=2 + i)
+        time.sleep(0.15)
+    assert _wait(lambda: adapter.latest("msg-1").count("✓") == 5, timeout=6)
+    _settle(1.8)
+    new_edits = adapter.edits[before:]
+    assert 1 <= len(new_edits) <= 2
+    assert new_edits[-1]["content"].count("✓") == 5
+
+
+@pytest.mark.parametrize("config", [
+    {"display": {"subagent_status": "off"}},
+    hermes_yaml.safe_load("display:\n  platforms:\n    discord:\n      subagent_status: off\n"),
+    {"display": {}},
+    {},
+], ids=["string-off", "yaml-bare-off", "key-absent", "no-display"])
+def test_off_bare_off_and_absent_post_nothing(loop, config):
+    """(8) Config off, YAML bare off (loads as False) and an absent key: no message."""
+    turn, runner, _ = _turn(loop, user_config=config)
+    _start(turn, "sa-1", call="call-A", goal="audit", count=1)
+    _complete(turn, "sa-1", call="call-A", goal="audit", status="failed", duration=3)
+    _settle()
+    assert runner.adapter.sent == [] and runner.adapter.edits == []
+    assert len(runner.notices) == 1, "the failure notice is unchanged when the message is off"
+
+
+def test_line_without_route_has_no_label(loop):
+    """(9) A child with no route shows its model only."""
+    turn, runner, _ = _turn(loop)
+    _start(turn, "sa-1", call="call-A", goal="plain child", model="claude-opus-5-5", count=1)
+    assert _wait(lambda: len(runner.adapter.sent) == 1)
+    assert runner.adapter.latest("msg-1").splitlines()[1] == '↳ claude-opus-5-5 — "plain child"  … running'
+
+
+def test_goal_truncated_to_sixty_chars(loop):
+    turn, runner, _ = _turn(loop)
+    goal = "g" * 200
+    _start(turn, "sa-1", call="call-A", goal=goal, count=1)
+    assert _wait(lambda: len(runner.adapter.sent) == 1)
+    quoted = runner.adapter.latest("msg-1").splitlines()[1].split('"')[1]
+    assert len(quoted) <= 60 and quoted.startswith("g" * 50)
+
+
+def test_failure_notice_unchanged_in_summary_mode(loop):
+    turn, runner, _ = _turn(loop)
+    _start(turn, "sa-1", call="call-A", goal="scan the repo", count=1)
+    _complete(turn, "sa-1", call="call-A", goal="scan the repo", status="failed", duration=8)
+    assert _wait(lambda: len(runner.notices) == 1)
+    assert '"scan the repo"' in runner.notices[0]
+
+
+def test_state_dropped_when_every_line_is_final(loop):
+    turn, runner, _ = _turn(loop)
+    _start(turn, "sa-1", call="call-A", goal="one", count=1)
+    _complete(turn, "sa-1", call="call-A", goal="one", duration=1)
+    assert _wait(lambda: "✓ 1s" in runner.adapter.latest("msg-1"))
+    assert _wait(lambda: not getattr(runner, "_subagent_status_calls", {}))
