@@ -108,6 +108,9 @@ SUBAGENT_STATUS_EDIT_INTERVAL = 1.5  # seconds between edits of one message (the
 _SUBAGENT_STATUS_LIMIT = 1900
 _SUBAGENT_STATUS_GOAL_CHARS = 60
 _SUBAGENT_STATUS_MAX_MESSAGES = 256  # bound on one runner's open messages (lines stranded by a dead child)
+# Consecutive failed deliveries before a message is given up: adapters (Discord) report any edit
+# exception, 5xx and timeouts included, as a plain failure without ``retryable``.
+_SUBAGENT_STATUS_MAX_EDIT_FAILURES = 5
 _SUBAGENT_STATUS_OK = frozenset({"completed", "success", "done"})
 _SUBAGENT_STATUS_EVENTS = frozenset({"subagent.start", "subagent.complete"})
 # Guards every runner's message registry: children report from their own worker threads.
@@ -146,7 +149,7 @@ class _SubagentStatusMessage:
     dirty: bool = True
     pumping: bool = False
     dead: bool = False
-    failures: int = 0
+    failures: int = 0  # consecutive failed deliveries; a successful edit resets it
     last_io: float = 0.0
 
     def settled(self) -> bool:
@@ -497,16 +500,18 @@ class GatewayTurnProgressMixin:
                 kwargs["metadata"] = msg.metadata
             result = await msg.adapter.edit_message(**kwargs)
             if getattr(result, "success", False):
+                msg.failures = 0
                 return
-            error = (getattr(result, "error", "") or "").lower()
-            transient = getattr(result, "retryable", False) or "flood" in error or "retry after" in error
+            logger.debug("subagent status message edit failed: %s", getattr(result, "error", None))
         except Exception:
             logger.debug("subagent status message delivery failed", exc_info=True)
-            transient = True
+        # Any failed edit is retried on the next window with the then-latest state: adapters do
+        # not mark 5xx/timeouts retryable, and the final state must still land. Only a run of
+        # consecutive failures gives the message up.
         with _SUBAGENT_STATUS_LOCK:
             msg.failures += 1
-            if transient and msg.failures < 3:
-                msg.dirty = True  # retried on the next window with the then-latest state
+            if msg.failures < _SUBAGENT_STATUS_MAX_EDIT_FAILURES:
+                msg.dirty = True
             else:
                 msg.dead = True
 

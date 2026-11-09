@@ -392,3 +392,53 @@ def test_state_dropped_when_every_line_is_final(loop):
     _complete(turn, "sa-1", call="call-A", goal="one", duration=1)
     assert _wait(lambda: "✓ 1s" in runner.adapter.latest("msg-1"))
     assert _wait(lambda: not getattr(runner, "_subagent_status_calls", {}))
+
+
+class FlakyEditAdapter(StatusCaptureAdapter):
+    """Edits numbered in ``fail`` (1-based) fail the way Discord reports any edit exception:
+    ``success=False`` with the error text and no ``retryable`` flag."""
+
+    def __init__(self, fail):
+        super().__init__()
+        self.fail = set(fail)
+        self.attempts = 0
+
+    async def edit_message(self, chat_id, message_id, content, metadata=None) -> SendResult:
+        with self._lock:
+            self.attempts += 1
+            failed = self.attempts in self.fail
+        if failed:
+            return SendResult(success=False, error="503 Service Unavailable")
+        return await super().edit_message(chat_id, message_id, content, metadata=metadata)
+
+
+def test_failed_edit_is_retried_and_the_final_state_lands(loop):
+    """A non-retryable edit failure (Discord 5xx) does not freeze the message at '… running'."""
+    adapter = FlakyEditAdapter(fail={1})
+    turn, runner, _ = _turn(loop, runner=_StubGatewayRunner(adapter))
+    _start(turn, "sa-1", call="call-A", goal="one")
+    _start(turn, "sa-2", call="call-A", goal="two", index=1)
+    assert _wait(lambda: len(adapter.sent) == 1)
+    _quiesce(loop, runner)
+    _complete(turn, "sa-1", call="call-A", goal="one", duration=4)
+    _complete(turn, "sa-2", call="call-A", goal="two", duration=6)
+    assert _wait(lambda: adapter.latest("msg-1").count("✓") == 2)
+    _quiesce(loop, runner)
+    assert adapter.attempts >= 2 and len(adapter.sent) == 1
+    assert "running" not in adapter.latest("msg-1")
+
+
+def test_edit_failures_count_consecutively_not_cumulatively(loop):
+    """Every other edit fails over a long run (more failures in total than the give-up limit):
+    each success resets the count, so every completion still lands."""
+    adapter = FlakyEditAdapter(fail=range(1, 40, 2))
+    turn, runner, _ = _turn(loop, runner=_StubGatewayRunner(adapter))
+    n = progress_mod._SUBAGENT_STATUS_MAX_EDIT_FAILURES + 3
+    for i in range(n):
+        _start(turn, f"sa-{i}", call="call-A", goal=f"job {i}", count=n, index=i)
+    assert _wait(lambda: len(adapter.sent) == 1)
+    _quiesce(loop, runner)
+    for i in range(n):
+        _complete(turn, f"sa-{i}", call="call-A", goal=f"job {i}", duration=1 + i)
+        assert _wait(lambda i=i: adapter.latest("msg-1").count("✓") == i + 1), f"completion {i} never landed"
+    assert len(adapter.fail & set(range(1, adapter.attempts + 1))) >= progress_mod._SUBAGENT_STATUS_MAX_EDIT_FAILURES
