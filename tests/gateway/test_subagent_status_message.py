@@ -602,6 +602,37 @@ def test_dead_message_is_a_tombstone_for_its_call(loop):
     assert not getattr(runner, "_subagent_status_calls", {})
 
 
+class RaisingFirstSendAdapter(FailedSendAdapter):
+    """The first send raises (a post that may have landed before the error); later ones succeed,
+    so any retry would show up as a posted message."""
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        with self._lock:
+            self.send_attempts += 1
+            first = self.send_attempts == 1
+        if first:
+            raise ConnectionError("connection reset after write")
+        return await StatusCaptureAdapter.send(self, chat_id, content, reply_to=reply_to, metadata=metadata)
+
+
+def test_first_send_that_raises_is_not_retried(loop):
+    """A first send that raises gives up at once like a success=False one: exactly one attempt,
+    no message, and later starts/completes of that call send nothing (tombstone)."""
+    adapter = RaisingFirstSendAdapter()
+    turn, runner, _ = _turn(loop, runner=_StubGatewayRunner(adapter))
+    _start(turn, "sa-1", call="call-A", goal="one", count=2)
+    assert _wait(lambda: adapter.send_attempts >= 1)
+    _quiesce(loop, runner)
+    assert (adapter.send_attempts, adapter.sent) == (1, [])
+    assert runner._subagent_status_calls["call-A"].dead
+    _start(turn, "sa-2", call="call-A", goal="two", count=2, index=1)
+    _complete(turn, "sa-1", call="call-A", goal="one", duration=1)
+    _complete(turn, "sa-2", call="call-A", goal="two", duration=2)
+    _quiesce(loop, runner)
+    assert adapter.send_attempts == 1 and adapter.sent == [] and adapter.edits == []
+    assert not getattr(runner, "_subagent_status_calls", {})
+
+
 def test_expired_tombstone_lets_a_later_start_post_again(loop, monkeypatch):
     """The tombstone is bounded: past its TTL a start of the same call may try a fresh message."""
     monkeypatch.setattr(progress_mod, "_SUBAGENT_STATUS_TOMBSTONE_TTL", -1.0)

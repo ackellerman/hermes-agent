@@ -513,16 +513,22 @@ class GatewayTurnProgressMixin:
             raise
 
     async def _subagent_status_deliver(self, msg: _SubagentStatusMessage, text: str) -> None:
-        try:
-            if msg.message_id is None:
+        if msg.message_id is None:
+            # A failed first send (success=False or an exception) is never retried: the post may
+            # have landed anyway (timeout), so a retry could duplicate it. The call becomes a tombstone.
+            try:
                 result = await msg.adapter.send(chat_id=msg.chat_id, content=text, reply_to=msg.reply_to,
                                                 metadata=msg.metadata)
-                if getattr(result, "success", False) and getattr(result, "message_id", None):
-                    msg.message_id = str(result.message_id)
-                    return
-                with _SUBAGENT_STATUS_LOCK:
-                    msg.give_up()  # nothing to edit: drop the call rather than post again
+            except Exception:
+                logger.debug("subagent status message send failed", exc_info=True)
+                result = None
+            if getattr(result, "success", False) and getattr(result, "message_id", None):
+                msg.message_id = str(result.message_id)
                 return
+            with _SUBAGENT_STATUS_LOCK:
+                msg.give_up()
+            return
+        try:
             kwargs = {"chat_id": msg.chat_id, "message_id": msg.message_id, "content": text}
             if getattr(msg.adapter, "REQUIRES_EDIT_FINALIZE", False):
                 kwargs["finalize"] = True
