@@ -448,6 +448,27 @@ def test_edit_failures_count_consecutively_not_cumulatively(loop):
     assert len(adapter.fail & set(range(1, adapter.attempts + 1))) >= progress_mod._SUBAGENT_STATUS_MAX_EDIT_FAILURES
 
 
+def test_edits_that_always_fail_give_up_after_the_limit(loop):
+    """A permanently failing edit is bounded: exactly the limit of attempts, then the message is
+    dead and a later completion schedules nothing more."""
+    adapter = FlakyEditAdapter(fail=range(1, 1000))
+    turn, runner, _ = _turn(loop, runner=_StubGatewayRunner(adapter))
+    limit = progress_mod._SUBAGENT_STATUS_MAX_EDIT_FAILURES
+    _start(turn, "sa-1", call="call-A", goal="one")
+    _start(turn, "sa-2", call="call-A", goal="two", index=1)
+    assert _wait(lambda: len(adapter.sent) == 1)
+    _quiesce(loop, runner)
+    msg = runner._subagent_status_calls["call-A"]
+    _complete(turn, "sa-1", call="call-A", goal="one", duration=4)
+    wait_until(lambda: msg.dead, timeout=5.0, what=f"give-up after {limit} failed edits")
+    _quiesce(loop, runner)
+    assert adapter.attempts == limit and not msg.pumping
+    _complete(turn, "sa-2", call="call-A", goal="two", duration=6)
+    _quiesce(loop, runner)
+    assert adapter.attempts == limit and adapter.edits == [] and len(adapter.sent) == 1
+    assert not getattr(runner, "_subagent_status_calls", {})
+
+
 @pytest.mark.parametrize(("value", "expected"), [
     (True, "summary"), ("on", "summary"), ("ON", "summary"), ("summary", "summary"), (" Summary ", "summary"),
     (False, "off"), ("off", "off"), ("OFF", "off"), ("", "off"), ("none", "off"), ("disabled", "off"),
