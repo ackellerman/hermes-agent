@@ -20,10 +20,13 @@ one process write to their own stores). The table is created on first use; there
   depend on progress: the delegate heartbeat stops beating after its stale verdict.
 * A run ends (``running -> idle``) only from the worker's done-callback, or by the orphan rule. A parent
   wait that ends early while the worker is alive leaves the row ``running`` with ``wait_abandoned_at``.
-* Expiry and the orphan rule are applied on every read. ``idle_since`` is reset only by a new run
+* Expiry and the orphan rule are applied on every read: the read looks first and takes the write lock only
+  when a rule would change a row; a read never creates the table. ``idle_since`` is reset only by a new run
   (``take_fence``); reads never touch it.
+* A parent whose session store is a managed worker's ``RuntimeSessionStore`` (no local ``state.db`` path) never
+  keeps its children: nothing here writes through the worker RPC.
 
-Credentials and provider clients are never stored; a resume re-derives them.
+Credentials, provider clients and ACP transport args are never stored; a resume re-derives the route.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ import contextlib
 import contextvars
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -64,6 +68,13 @@ NEVER_KEEP_ATTR = "_delegate_children_never_keep"
 DEFAULT_KEEP_IDLE_DAYS = 7
 DEFAULT_ORPHAN_AFTER_S = 300
 HEARTBEAT_INTERVAL_S = 30.0
+# A provably alive runner is orphaned only once its heartbeat is this many ``orphan_after_s`` old: its tick beats
+# every ``HEARTBEAT_INTERVAL_S`` while the worker lives, so a heartbeat that old means the worker ended and its
+# final write was lost (or the tick never started).
+STALE_ALIVE_FACTOR = 12
+# The worker's done-callback tries the final ``running -> idle`` write this often before handing it to the tick.
+FINISH_ATTEMPTS = 3
+FINISH_RETRY_S = 0.2
 
 ORPHANED_LINE = "child kept as idle-orphaned; resumable with action='resume'"
 
@@ -127,42 +138,59 @@ _BRIEF_FIELDS = (
     "parent_child_id", "spawn_generations", "max_children", "children_spawned",
 )
 
-# Route keys that may be stored. Never an api_key, client or credential pool.
+# Route keys that may be stored. Never an api_key, client, credential pool or ACP transport (``acp_command`` /
+# ``acp_args`` are trusted-config-only and may carry tokens): a resume re-derives the route.
 _ROUTE_KEYS = ("provider", "model", "base_url", "api_mode", "reasoning_effort", "service_tier",
-               "requested_provider", "acp_command", "acp_args", "profile_home")
+               "requested_provider", "profile_home")
 
 
 # ── config ──────────────────────────────────────────────────────────────────
 
 def _delegation_cfg() -> dict[str, Any]:
-    try:
-        from tools.delegate_tool_config import _load_config
-        cfg = _load_config()
-        return cfg if isinstance(cfg, dict) else {}
-    except Exception:
-        return {}
+    from tools.delegate_tool_config import _load_config  # absorbs every config read error itself
+    cfg = _load_config()
+    return cfg if isinstance(cfg, dict) else {}
+
+
+_WARNED: set[tuple[str, str]] = set()
+
+
+def _warn_invalid(key: str, raw: Any, fallback: str) -> None:
+    """One warning per (knob, value), as ``delegate_tool_config._knob`` logs an invalid delegation value."""
+    if (key, repr(raw)) not in _WARNED:
+        _WARNED.add((key, repr(raw)))
+        logger.warning("delegation.%s: invalid value %r; using %s", key, raw, fallback)
 
 
 def keep_sources(cfg: Optional[dict[str, Any]] = None) -> frozenset[str]:
-    """``delegation.keep_sources`` as a set; unset or malformed means ``DEFAULT_KEEP_SOURCES``."""
+    """``delegation.keep_sources`` as a set; unset (null) means ``DEFAULT_KEEP_SOURCES``. Any other non-list value
+    keeps nothing (fail safe: a scalar must not widen the set) and logs a warning."""
     raw = (_delegation_cfg() if cfg is None else cfg).get("keep_sources")
+    if raw is None:
+        return DEFAULT_KEEP_SOURCES
     if isinstance(raw, (list, tuple, set, frozenset)):
         return frozenset(str(s).strip().lower() for s in raw if str(s).strip())
-    return DEFAULT_KEEP_SOURCES
+    _warn_invalid("keep_sources", raw, "no source (no child is kept)")
+    return frozenset()
 
 
-def _positive_number(raw: Any, default: float) -> float:
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
+def _positive_number(key: str, raw: Any, default: float) -> float:
+    if raw is None:
+        return default
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw) or raw <= 0:
+        _warn_invalid(key, raw, f"the default {default}")
         return default
     return float(raw)
 
 
 def keep_idle_days(cfg: Optional[dict[str, Any]] = None) -> float:
-    return _positive_number((_delegation_cfg() if cfg is None else cfg).get("keep_idle_days"), DEFAULT_KEEP_IDLE_DAYS)
+    raw = (_delegation_cfg() if cfg is None else cfg).get("keep_idle_days")
+    return _positive_number("keep_idle_days", raw, DEFAULT_KEEP_IDLE_DAYS)
 
 
 def orphan_after_s(cfg: Optional[dict[str, Any]] = None) -> float:
-    return _positive_number((_delegation_cfg() if cfg is None else cfg).get("orphan_after_s"), DEFAULT_ORPHAN_AFTER_S)
+    raw = (_delegation_cfg() if cfg is None else cfg).get("orphan_after_s")
+    return _positive_number("orphan_after_s", raw, DEFAULT_ORPHAN_AFTER_S)
 
 
 def protects_transcripts(cfg: Optional[dict[str, Any]] = None) -> bool:
@@ -171,13 +199,21 @@ def protects_transcripts(cfg: Optional[dict[str, Any]] = None) -> bool:
     return raw is not False and str(raw).strip().lower() not in ("false", "0", "no", "off")
 
 
+def protects_transcripts_for(db_path: Path | str) -> bool:
+    """``protects_transcripts`` as configured in the profile that owns *db_path* (its ``config.yaml`` beside it),
+    not the ambient one: gateway housekeeping prunes every served profile without entering its scope."""
+    from hermes_cli.config_effective import load_user_config_effective
+    cfg = load_user_config_effective(Path(db_path).parent / "config.yaml").get("delegation")
+    return protects_transcripts(cfg if isinstance(cfg, dict) else {})
+
+
 # ── spawn origin ────────────────────────────────────────────────────────────
 
 _SPAWN_ORIGIN: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("delegate_spawn_origin", default=None)
 
 
 @contextlib.contextmanager
-def spawn_origin(origin: str) -> Iterator[None]:
+def spawn_origin(origin: Optional[str]) -> Iterator[None]:
     """Children built inside this block carry *origin* (``model``, ``review``, ``plugin``)."""
     token = _SPAWN_ORIGIN.set(origin)
     try:
@@ -193,21 +229,29 @@ def current_spawn_origin() -> Optional[str]:
 
 # ── db access ───────────────────────────────────────────────────────────────
 
+def _plain_session_db(db: Any) -> Any:
+    """The SessionDB behind an ``AsyncSessionDB`` (whose methods are coroutine functions), else *db*."""
+    from hermes_state import AsyncSessionDB
+    return db._db if isinstance(db, AsyncSessionDB) else db
+
+
 def parent_db_path(parent_agent: Any) -> Optional[Path]:
     """The parent's ``state.db`` path, or None. Concrete str/Path only (a MagicMock is PathLike)."""
-    path = getattr(getattr(parent_agent, "_session_db", None), "db_path", None)
+    path = getattr(_plain_session_db(getattr(parent_agent, "_session_db", None)), "db_path", None)
     return Path(path) if isinstance(path, (str, Path)) else None
 
 
-def _ensure_table(conn: sqlite3.Connection) -> None:
+def ensure_table(conn: sqlite3.Connection) -> None:
+    """Create ``delegate_children`` (idempotent); also the session-recovery initializer for the table."""
     conn.executescript(_SCHEMA_SQL)
+
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
     from hermes_cli.sqlite_util import open_db
     # wal=False: SessionDB owns state.db's journal mode.
     return open_db(db_path, db_label=f"state.db ({TABLE})", busy_timeout_ms=10_000, wal=False,
-                   row_factory=sqlite3.Row, initialize=_ensure_table)
+                   row_factory=sqlite3.Row, initialize=ensure_table)
 
 
 def _table_exists(conn: sqlite3.Connection) -> bool:
@@ -257,14 +301,30 @@ def _decode_row(row: sqlite3.Row) -> dict[str, Any]:
     return out
 
 
-def _apply_rules(conn: sqlite3.Connection, now: float, cfg: dict[str, Any]) -> None:
-    """Expire idle children past ``keep_idle_days``; orphan a running child whose runner is provably dead, or
-    cannot be checked here (foreign pid namespace, no start ticks) and has not beaten for ``orphan_after_s``.
-    A provably alive runner is never orphaned on age."""
-    from hermes_state_common import _lock_holder_provably_dead
-    conn.execute(f"UPDATE {TABLE} SET status=?, updated_at=? WHERE status=? AND idle_since IS NOT NULL"
-                 " AND ? - idle_since > ?", (EXPIRED, now, IDLE, now, keep_idle_days(cfg) * 86400.0))
+def _runner_alive(runner: Any) -> Optional[bool]:
+    """True only with positive proof (the pid exists in our pid namespace and its kernel start ticks equal the
+    record); False when provably dead or the pid was reused (other start ticks); None when it cannot be checked
+    here (foreign pid namespace, no recorded ticks, or the pid's ticks are unreadable)."""
+    from hermes_state_common import _lock_holder_provably_dead, _proc_start_ticks
+    if not isinstance(runner, dict):
+        return None
+    if _lock_holder_provably_dead(runner):
+        return False
+    if not _runner_checkable(runner):
+        return None
+    ticks = _proc_start_ticks(int(runner["pid"]))  # /proc/<pid>/stat is readable for other users' pids too
+    if ticks is None:
+        return None
+    return ticks == runner["start_ticks"]
+
+
+def _rule_changes(conn: sqlite3.Connection, now: float, cfg: dict[str, Any]) -> tuple[bool, list[tuple[Any, Any]]]:
+    """What ``_apply_rules`` would change, read only: (any idle child to expire, ``(child_id, run_token)`` of every
+    running child to orphan)."""
+    expire = conn.execute(f"SELECT 1 FROM {TABLE} WHERE status=? AND idle_since IS NOT NULL AND ? - idle_since > ?"
+                          " LIMIT 1", (IDLE, now, keep_idle_days(cfg) * 86400.0)).fetchone() is not None
     horizon = orphan_after_s(cfg)
+    orphans = []
     # Tuple unpacking: the async-delegation ledger's connection has no row factory.
     for child_id, run_token, runner_raw, beat in conn.execute(
             f"SELECT child_id, run_token, runner, heartbeat_at FROM {TABLE} WHERE status=?", (RUNNING,)).fetchall():
@@ -272,17 +332,33 @@ def _apply_rules(conn: sqlite3.Connection, now: float, cfg: dict[str, Any]) -> N
             runner = json.loads(runner_raw) if runner_raw else None
         except ValueError:
             runner = None
-        if _lock_holder_provably_dead(runner if isinstance(runner, dict) else {}):
+        age = None if beat is None else now - float(beat)
+        alive = _runner_alive(runner)
+        if alive is False:
             orphan = True
-        elif _runner_checkable(runner):
-            orphan = False
+        elif alive is True:  # its tick beats while the worker lives: only a long-dead tick counts
+            orphan = age is None or age > horizon * STALE_ALIVE_FACTOR
         else:
-            orphan = beat is None or now - float(beat) > horizon
+            orphan = age is None or age > horizon
         if orphan:
-            conn.execute(
-                f"UPDATE {TABLE} SET status=?, idle_reason=?, idle_since=?, orphaned_at=?, runner=NULL, updated_at=?"
-                " WHERE child_id=? AND status=? AND run_token IS ?",
-                (IDLE, ORPHANED, now, now, now, child_id, RUNNING, run_token))
+            orphans.append((child_id, run_token))
+    return expire, orphans
+
+
+def _apply_rules(conn: sqlite3.Connection, now: float, cfg: dict[str, Any]) -> None:
+    """Expire idle children past ``keep_idle_days``. Orphan a running child whose runner is provably dead, or
+    cannot be checked here and has not beaten for ``orphan_after_s``, or is provably alive but has not beaten for
+    ``STALE_ALIVE_FACTOR`` x ``orphan_after_s`` (its final write was lost). An orphaned run ends at its last
+    heartbeat: ``idle_since`` is that time, not the time somebody looked."""
+    expire, orphans = _rule_changes(conn, now, cfg)
+    if expire:
+        conn.execute(f"UPDATE {TABLE} SET status=?, updated_at=? WHERE status=? AND idle_since IS NOT NULL"
+                     " AND ? - idle_since > ?", (EXPIRED, now, IDLE, now, keep_idle_days(cfg) * 86400.0))
+    for child_id, run_token in orphans:
+        conn.execute(
+            f"UPDATE {TABLE} SET status=?, idle_reason=?, idle_since=COALESCE(heartbeat_at, ?), orphaned_at=?,"
+            " runner=NULL, updated_at=? WHERE child_id=? AND status=? AND run_token IS ?",
+            (IDLE, ORPHANED, now, now, now, child_id, RUNNING, run_token))
 
 
 @dataclass(frozen=True)
@@ -308,11 +384,11 @@ class ChildStore:
 
     def __init__(self, db_path: Path | str, *, session_db: Any = None, cfg: Optional[dict[str, Any]] = None):
         self.db_path = Path(db_path)
-        self._session_db = session_db
+        self._session_db = _plain_session_db(session_db)
         self._cfg = cfg
 
     @classmethod
-    def for_agent(cls, agent: Any) -> Optional["ChildStore"]:
+    def for_agent(cls, agent: Any) -> Optional[ChildStore]:
         path = parent_db_path(agent)
         return cls(path, session_db=getattr(agent, "_session_db", None)) if path is not None else None
 
@@ -326,6 +402,20 @@ class ChildStore:
         from hermes_cli.sqlite_util import transaction
         with transaction(_connect(self.db_path), immediate=True) as conn:
             yield conn
+
+    @contextlib.contextmanager
+    def _read_conn(self) -> Iterator[Optional[sqlite3.Connection]]:
+        """A plain connection for reads: no DDL, no write transaction (works on a read-only file and while a
+        writer holds the lock). None when the database or the table does not exist; nothing is created."""
+        if not self.db_path.exists():
+            yield None
+            return
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        try:
+            conn.row_factory = sqlite3.Row
+            yield conn if _table_exists(conn) else None
+        finally:
+            conn.close()
 
     @contextlib.contextmanager
     def _lineage_db(self) -> Iterator[Any]:
@@ -349,8 +439,17 @@ class ChildStore:
             self._apply_rules(conn, time.time() if now is None else now)
 
     def _read(self, sql: str, params: Iterable[Any] = (), *, now: Optional[float] = None) -> list[dict[str, Any]]:
+        """Rows for *sql* with expiry and the orphan rule applied. Reads first; takes the write lock only when a
+        rule would change a row."""
+        now = time.time() if now is None else now
+        with self._read_conn() as conn:
+            if conn is None:
+                return []
+            expire, orphans = _rule_changes(conn, now, self._config())
+            if not expire and not orphans:
+                return [_decode_row(r) for r in conn.execute(sql, tuple(params)).fetchall()]
         with self._write() as conn:
-            self._apply_rules(conn, time.time() if now is None else now)
+            self._apply_rules(conn, now)
             return [_decode_row(r) for r in conn.execute(sql, tuple(params)).fetchall()]
 
     # -- record --
@@ -402,18 +501,15 @@ class ChildStore:
                                 " AND status=?", (now, now, child_id, token, RUNNING)).rowcount == 1
 
     def finish_run(self, child_id: str, token: str, reason: str) -> bool:
-        """``running -> idle`` with *reason*; only the worker's done-callback calls this. A late write from an older
-        run (another token) or onto an already orphaned row changes nothing."""
+        """``running -> idle`` with *reason*: one compare-and-set, written only from the worker's done-callback (or
+        its tick's retry). A late write from an older run (another token) or onto an already orphaned row changes
+        nothing. ``latest_session_id`` is refreshed on read (``show``), not here."""
         now = time.time()
         with self._write() as conn:
-            done = conn.execute(
+            return conn.execute(
                 f"UPDATE {TABLE} SET status=?, idle_reason=?, idle_since=?, runner=NULL, updated_at=?"
                 " WHERE child_id=? AND run_token=? AND status=?",
                 (IDLE, reason, now, now, child_id, token, RUNNING)).rowcount == 1
-        if done:
-            with contextlib.suppress(Exception):
-                self.refresh_latest(child_id)
-        return done
 
     def take_fence(self, child_id: str, *, holder_session_id: Optional[str] = None,
                    now: Optional[float] = None) -> FenceResult:
@@ -551,8 +647,9 @@ class ChildStore:
         """Re-read the child's newest segment from ``stored_child_session`` against the holder's conversation and its
         prior conversations; stored on the row when found."""
         from tools.delegate_tool_sessions import stored_child_session
-        with self._write() as conn:
-            row = _decode(conn.execute(f"SELECT * FROM {TABLE} WHERE child_id=?", (child_id,)).fetchone())
+        with self._read_conn() as conn:
+            row = None if conn is None else _decode(
+                conn.execute(f"SELECT * FROM {TABLE} WHERE child_id=?", (child_id,)).fetchone())
         if row is None:
             return None
         convs = [c for c in [row.get("conversation_id"), *(row.get("prior_conversations") or [])] if c]
@@ -614,7 +711,8 @@ def note_spawn(parent_agent: Any, child: Any, *, goal: str, context: Optional[st
                model: Optional[str], route: Optional[dict[str, Any]] = None, profile_home: Any = None,
                title: Optional[str] = None, keep: Optional[bool] = None) -> bool:
     """Spawn hook (``_build_child_agent``): when the child is kept, stash its record on the child. The row is
-    written when its worker starts (``worker_started``), so a child that never runs leaves no row."""
+    written when its worker starts (``worker_started``), so a child that never runs leaves no row; the holder and
+    its conversation are read then too, so a ``/new`` in between lands the row on the new session."""
     try:
         depth = int(getattr(child, "_delegate_depth", 1) or 1)
         if not should_keep(parent_agent, origin=current_spawn_origin(), child_depth=depth, keep=keep):
@@ -624,7 +722,6 @@ def note_spawn(parent_agent: Any, child: Any, *, goal: str, context: Optional[st
         db_path = parent_db_path(parent_agent)
         if not child_id or not subagent_id or db_path is None:
             return False
-        from agent.prompt_cache_scope import conversation_id
         route = {k: v for k, v in (route or {}).items() if k in _ROUTE_KEYS and v not in (None, "")}
         if "profile_home" in route:
             route["profile_home"] = str(route["profile_home"])
@@ -637,10 +734,8 @@ def note_spawn(parent_agent: Any, child: Any, *, goal: str, context: Optional[st
         }
         child._delegate_child_id = child_id
         setattr(child, _PENDING_ATTR, {
-            "db_path": db_path, "session_db": getattr(parent_agent, "_session_db", None),
-            "child_id": child_id, "subagent_id": subagent_id,
-            "holder_session_id": getattr(parent_agent, "session_id", None),
-            "conversation_id": conversation_id(parent_agent), "brief": brief,
+            "db_path": db_path, "session_db": _plain_session_db(getattr(parent_agent, "_session_db", None)),
+            "child_id": child_id, "subagent_id": subagent_id, "parent": parent_agent, "brief": brief,
         })
         return True
     except Exception:
@@ -650,80 +745,116 @@ def note_spawn(parent_agent: Any, child: Any, *, goal: str, context: Optional[st
 
 class _Tick:
     """Our own progress-independent heartbeat: touches ``heartbeat_at`` every ``HEARTBEAT_INTERVAL_S`` while the
-    worker thread lives; stops when the run is no longer ours or the worker's done-callback stops it."""
+    worker lives. Once the worker is done (``finish``) it stops beating and, if the done-callback could not write
+    the final state, retries that write each interval until it lands; meanwhile the heartbeat goes stale, so the
+    orphan rule still ends the run if the write never lands."""
 
     def __init__(self, store: ChildStore, child_id: str, token: str):
+        from agent.memory_provider import spawn_context_thread
         self.store, self.child_id, self.token = store, child_id, token
         self.stopped = threading.Event()
-        self.thread = threading.Thread(target=self._loop, name=f"delegate-child-beat-{child_id[:12]}", daemon=True)
+        self.reason: Optional[str] = None
+        self.thread = spawn_context_thread(self._loop, name=f"delegate-child-beat-{child_id[:12]}")
 
     def _loop(self) -> None:
         while not self.stopped.wait(HEARTBEAT_INTERVAL_S):
             try:
-                if not self.store.beat(self.child_id, self.token):
+                if self.reason is not None:
+                    self.store.finish_run(self.child_id, self.token, self.reason)
+                    self.stopped.set()
+                elif not self.store.beat(self.child_id, self.token):
                     return
-            except Exception:
-                logger.debug("delegate_children: heartbeat write failed", exc_info=True)
+            except (sqlite3.Error, OSError):
+                logger.debug("delegate_children: heartbeat/final write failed", exc_info=True)
 
-    def start(self) -> "_Tick":
+    def start(self) -> _Tick:
         self.thread.start()
         return self
 
     def stop(self) -> None:
         self.stopped.set()
 
+    def finish(self, reason: str) -> bool:
+        """The worker is done: stop beating and write ``running -> idle`` (``FINISH_ATTEMPTS`` tries). On failure
+        the tick, if it runs, keeps retrying; the row's heartbeat no longer advances either way."""
+        self.reason = reason
+        for attempt in range(FINISH_ATTEMPTS):
+            try:
+                self.store.finish_run(self.child_id, self.token, reason)
+            except (sqlite3.Error, OSError):
+                logger.debug("delegate_children: final write for %s failed", self.child_id, exc_info=True)
+                if attempt + 1 < FINISH_ATTEMPTS:
+                    time.sleep(FINISH_RETRY_S * (attempt + 1))
+                continue
+            self.stopped.set()
+            return True
+        logger.warning("delegate_children: could not mark child %s idle after %d attempts; %s", self.child_id,
+                       FINISH_ATTEMPTS, "its tick keeps retrying" if self.thread.is_alive()
+                       else "it is orphaned once its heartbeat goes stale")
+        return False
+
 
 def _done_reason(future: Any) -> str:
-    try:
-        if future.cancelled() or future.exception() is not None:
-            return INTERRUPTED
-        result = future.result()
-    except BaseException:
+    """``completed`` only for a clean completion (``completed`` is True, not failed or interrupted), which is
+    what the parent sees as completed; anything else (failed, max iterations, interrupted, an exception, a
+    cancelled future) is ``interrupted``. Both are resumable."""
+    if future.cancelled() or future.exception() is not None:
         return INTERRUPTED
-    if isinstance(result, dict) and result.get("interrupted"):
-        return INTERRUPTED
-    return COMPLETED
+    result = future.result()
+    if (isinstance(result, dict) and result.get("completed") is True and not result.get("failed")
+            and not result.get("interrupted")):
+        return COMPLETED
+    return INTERRUPTED
+
+
+def _holder_now(parent: Any) -> tuple[Optional[str], Optional[str]]:
+    """The parent's session and conversation as they are now (the row is inserted at worker start)."""
+    from agent.prompt_cache_scope import conversation_id
+    sid = getattr(parent, "session_id", None)
+    if parent is None or not isinstance(sid, str) or not sid:
+        return None, None
+    return sid, conversation_id(parent) or None
 
 
 def worker_started(child: Any, future: Any, *, task_index: Optional[int] = None,
                    worktree: Optional[dict[str, Any]] = None, workdir: Optional[str] = None) -> Optional[str]:
     """Worker-start hook (``_ChildRun.await_child``): open the run (insert the row for a new kept child, or use the
-    fence a resume took: ``child._delegate_run_token``), start the tick, and set ``idle`` from *future*'s
-    done-callback. Returns the run token, or None for a child that is not kept."""
+    fence a resume took: ``child._delegate_run_token``), set ``idle`` from *future*'s done-callback, and start the
+    tick. The callback is registered before the tick starts, so a tick that cannot start still ends the run.
+    Returns the run token, or None for a child that is not kept."""
     pending = getattr(child, _PENDING_ATTR, None)
     if not isinstance(pending, dict):
         return None
     try:
         store = ChildStore(pending["db_path"], session_db=pending.get("session_db"))
         child_id = pending["child_id"]
+        parent = pending.pop("parent", None)  # no lasting child -> parent reference
         token = getattr(child, "_delegate_run_token", None)
         if not token:
-            brief = dict(pending["brief"], delegation_id=getattr(child, "_delegation_id", None), task_index=task_index,
-                         workdir=workdir)
+            # The async ledger's unit id when the call runs in the background (what a replay is keyed on), else
+            # the live-transcript id of the call.
+            delegation_id = getattr(child, "_delegation_unit_id", None) or getattr(child, "_delegation_id", None)
+            brief = dict(pending["brief"], delegation_id=delegation_id, task_index=task_index, workdir=workdir)
             if worktree:
                 brief.update(repo_root=worktree.get("repo_root"), branch=worktree.get("branch"),
                              base_commit=worktree.get("base_commit"), workdir=worktree.get("path") or workdir)
-            token = store.record_run_start(
-                child_id=child_id, subagent_id=pending["subagent_id"], holder_session_id=pending["holder_session_id"],
-                conversation_id=pending["conversation_id"], brief=brief)
+            holder, conversation = _holder_now(parent)
+            token = store.record_run_start(child_id=child_id, subagent_id=pending["subagent_id"],
+                                           holder_session_id=holder, conversation_id=conversation, brief=brief)
             if token is None:
                 return None
-        child._delegate_run_token = token
-        tick = _Tick(store, child_id, token).start()
-        child._delegate_children_tick = tick
-
-        def _on_done(done_future: Any) -> None:
-            tick.stop()
-            try:
-                store.finish_run(child_id, token, _done_reason(done_future))
-            except Exception:
-                logger.warning("delegate_children: could not mark child %s idle", child_id, exc_info=True)
-
-        future.add_done_callback(_on_done)
-        return token
     except Exception:
         logger.warning("delegate_children: could not record a kept child's run", exc_info=True)
         return None
+    child._delegate_run_token = token
+    tick = _Tick(store, child_id, token)
+    child._delegate_children_tick = tick
+    future.add_done_callback(lambda done_future: tick.finish(_done_reason(done_future)))
+    try:
+        tick.start()  # exits at once when the callback already ran and wrote the final state
+    except RuntimeError:  # no thread to spare: the done-callback still ends the run
+        logger.warning("delegate_children: heartbeat for child %s could not start", child_id, exc_info=True)
+    return token
 
 
 def wait_abandoned(child: Any) -> None:

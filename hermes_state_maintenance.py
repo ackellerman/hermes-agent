@@ -256,15 +256,13 @@ class SessionMaintenanceMixin:
 
     def _kept_children_sql(self) -> Optional[str]:
         """Sessions of kept delegated children (``tools.delegate_children``) and their continuations, which prune
-        spares while ``delegation.keep_protects_transcripts`` is on (default); None when off or nothing is kept."""
-        try:
-            from tools.delegate_children import TABLE, kept_sessions_sql, protects_transcripts
-            if not protects_transcripts():
-                return None
-            if self._read_one("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)) is None:
-                return None
-        except Exception:
-            logger.debug("kept-children prune guard unavailable", exc_info=True)
+        spares while ``delegation.keep_protects_transcripts`` is on (default) in the config of the profile that owns
+        this database. None only when off or the table is absent (nothing kept); any error propagates, so the
+        prune fails instead of deleting kept transcripts."""
+        from tools.delegate_children import TABLE, kept_sessions_sql, protects_transcripts_for
+        if not protects_transcripts_for(self.db_path):
+            return None
+        if self._read_one("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)) is None:
             return None
         return kept_sessions_sql(_CONTINUATION_EDGE_SQL)
 

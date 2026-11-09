@@ -490,6 +490,7 @@ def _dispatch_background(batch: _Batch) -> str:
         # The worker can start before admission returns. Detach only this unit:
         # unsubmitted units must still receive parent stops while a fallback runs.
         for _, _, child in unit.children:
+            child._delegation_unit_id = unit_id  # a kept child's row is keyed on it (tools/delegate_children.py)
             _detach_child(parent_agent, child)
         dispatch = _dispatch_unit(unit, unit_id, slot_key, routing)
         if dispatch.get("status") == "dispatched":

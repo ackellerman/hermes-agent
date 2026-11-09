@@ -35,12 +35,18 @@ def _init_delivery_ledger_schema(conn: sqlite3.Connection) -> None:
     _initialize_schema(conn)
 
 
+def _init_delegate_children_schema(conn: sqlite3.Connection) -> None:
+    from tools.delegate_children import ensure_table
+    ensure_table(conn)
+
+
 # state.db tables created lazily by a gateway module (base ``SessionDB`` never creates them on a fresh
 # destination) -> the initializer owning their DDL. Recovery creates them before copying so owed rows
 # don't silently vanish from a "complete" salvage. Register new lazy tables HERE, not as ``if table ==``.
 # See #100313, #86236.
 _AUXILIARY_TABLE_SCHEMAS: dict[str, Callable[[sqlite3.Connection], None]] = {
     "delivery_obligations": _init_delivery_ledger_schema,
+    "delegate_children": _init_delegate_children_schema,  # kept delegated children (and their prune protection)
 }
 _AUXILIARY_TABLES = tuple(_AUXILIARY_TABLE_SCHEMAS)
 # Salvage is a transcript output, not a runnable clone of accepted work. Copying

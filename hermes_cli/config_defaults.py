@@ -1350,10 +1350,9 @@ DEFAULT_CONFIG = {
         "inherit_mcp_toolsets": True,
         # Per-subagent iteration cap (own budget, independent of the parent's).
         "max_iterations": 250,
-        # Hard per-summary char ceiling on subagent results, layered on the dynamic budget (each
-        # summary is sized to the parent's remaining context headroom; trimmed text spills to
-        # ~/.hermes/cache/delegation/ with a head+tail window + read_file offset footer, nothing
-        # lost). 0 disables the ceiling; the dynamic budget still applies.
+        # Hard per-summary char ceiling on subagent results, layered on the dynamic budget (each summary is sized
+        # to the parent's remaining context headroom; trimmed text spills to ~/.hermes/cache/delegation/ with a
+        # head+tail window + read_file offset footer, nothing lost). 0 disables the ceiling; the dynamic budget applies.
         "max_summary_chars": 24000,
         # Inactivity cap per child (seconds, floor 30) — time with NO progress, not total runtime. 0 = no cap:
         # children fail only from real errors (API, tools, iteration budget). A progressing child (including one
@@ -1375,24 +1374,15 @@ DEFAULT_CONFIG = {
         # Each child re-pays a cold system prompt and re-explores the repo, and one-shot spawns are mostly
         # "review my own work" rather than parallel work (agent/oneshot_footprint.py).
         "oneshot_max_children": 2,
-        # Subagent threads ALWAYS resolve approvals non-interactively (the parent TUI owns stdin;
-        # input() from a worker would deadlock). false = auto-deny, true = auto-approve "once"; both
-        # log a warning audit line. true only for trusted batch work.
+        # Subagent threads ALWAYS resolve approvals non-interactively (the parent TUI owns stdin; input() from a worker
+        # would deadlock). false = auto-deny, true = auto-approve "once" (trusted batch work); both log an audit line.
         "subagent_auto_approve": False,
-        # Subagent background processes (task_id "sa-...") route notify_on_complete / watch_pattern
-        # notifications to the PARENT; false suppresses them (the child's result is the
-        # deliverable). Async-delegation results are NEVER suppressed.
+        # Subagent background processes (task_id "sa-...") route notify_on_complete / watch_pattern notifications
+        # to the PARENT; false suppresses them (the child's result is the deliverable). Async results: never.
         "surface_child_process_notifications": False,
-        # Kept children (tools/delegate_children.py): a child the model spawns from one of these parent
-        # session sources is recorded so the parent can find it again. null = the built-in set
-        # (DEFAULT_KEEP_SOURCES: cli, tui, desktop and the chat platforms; never api_server, webhook,
-        # cron, kanban or one-shot runs). /review and plugin-launched children are never kept.
-        "keep_sources": None,
-        "keep_idle_days": 7,  # a kept child idle longer than this expires
-        # A running child whose runner cannot be checked (foreign pid namespace) and has not beaten for
-        # this long is orphaned (its own heartbeat ticks every 30 s). A provably dead runner orphans at once.
-        "orphan_after_s": 300,
-        "keep_protects_transcripts": True,  # session pruning skips kept children's sessions
+        # Kept children (tools/delegate_children.py): model-spawned children of these parent session sources (null
+        # = DEFAULT_KEEP_SOURCES; never /review, plugin, cron, one-shot); idle expiry, orphan rule, prune protection.
+        "keep_sources": None, "keep_idle_days": 7, "orphan_after_s": 300, "keep_protects_transcripts": True,
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
     # every API call for few-shot priming. Never saved to sessions/logs/trajectories.

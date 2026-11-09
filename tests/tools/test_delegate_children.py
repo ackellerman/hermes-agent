@@ -212,12 +212,6 @@ def test_keep_not_for_a_cron_job_agent_even_with_an_interactive_source(db):
     assert not kept and _rows(db.db_path) == []
 
 
-def test_keep_cron_scheduler_marks_its_agent_never_keep():
-    import inspect
-    from cron import scheduler
-    assert "NEVER_KEEP_ATTR" in inspect.getsource(scheduler.run_job)
-
-
 def test_keep_not_for_a_one_shot_q_run(db, monkeypatch):
     monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
     parent = _parent(db, source="cli")  # a -q run whose row still says cli
@@ -254,13 +248,12 @@ def test_keep_review_dispatch_carries_the_review_origin(monkeypatch):
     assert seen["origin"] == dc.ORIGIN_REVIEW
 
 
-def test_keep_delegate_task_builds_children_under_its_origin(monkeypatch):
-    """The model's call builds under ``model``; an internal caller's origin replaces it."""
+def _stub_delegate_task_build(monkeypatch, on_build):
+    """``delegate_task`` up to ``_build_children``, which runs *on_build* and stops the call there."""
     from tools import delegate_tool
-    seen = []
 
     def fake_build_children(*_a, **_k):
-        seen.append(dc.current_spawn_origin())
+        on_build()
         return [], "stop here"
 
     route = SimpleNamespace(error=None, creds={"model": "m", "provider": None}, refused_entry=lambda i: {})
@@ -269,10 +262,48 @@ def test_keep_delegate_task_builds_children_under_its_origin(monkeypatch):
     monkeypatch.setattr(delegate_tool, "create_live_transcripts", lambda *a, **k: (None, [], []), raising=False)
     import tools.delegation_live_log as live
     monkeypatch.setattr(live, "create_live_transcripts", lambda *a, **k: (None, [], []))
+
+
+def test_keep_delegate_task_builds_children_under_its_origin(monkeypatch):
+    """Only the model's own call (``run_agent._dispatch_delegate_task``) builds under ``model``; a direct caller
+    that names no origin builds under None (never kept); an internal caller's origin is used as given."""
+    from run_agent import AIAgent
+    from tools import delegate_tool
+    seen = []
+    _stub_delegate_task_build(monkeypatch, lambda: seen.append(dc.current_spawn_origin()))
     parent = SimpleNamespace(session_id="p", _delegate_depth=0, _session_db=None)
+    AIAgent._dispatch_delegate_task(parent, {"goal": "g"})
     delegate_tool.delegate_task(goal="g", parent_agent=parent)
     delegate_tool.delegate_task(goal="g", parent_agent=parent, origin=dc.ORIGIN_REVIEW)
-    assert seen == [dc.ORIGIN_MODEL, dc.ORIGIN_REVIEW]
+    assert seen == [dc.ORIGIN_MODEL, None, dc.ORIGIN_REVIEW]
+
+
+@pytest.mark.parametrize("door", ["registry", "plugin_context"])
+def test_keep_registry_and_plugin_dispatch_of_delegate_task_write_no_row(db, monkeypatch, door):
+    """The registry handler is reached only by non-model callers (the model goes through
+    ``_dispatch_delegate_task``), chiefly a plugin's ``ctx.dispatch_tool("delegate_task", ...)``: never kept."""
+    from tools import delegate_tool  # registers delegate_task
+    from tools.registry import registry
+    parent = _parent(db, source="desktop")
+    outcome = {}
+
+    def on_build():
+        _child_session(db, "kid-reg", "parent", "sa-0-reg")
+        child = _child("kid-reg", "sa-0-reg")
+        outcome["origin"] = dc.current_spawn_origin()
+        outcome["kept"] = dc.note_spawn(parent, child, goal="g", context=None, toolsets=None, role="leaf", model=None)
+        outcome["token"] = dc.worker_started(child, Future())
+
+    _stub_delegate_task_build(monkeypatch, on_build)
+    args = {"goal": "plugin work", "origin": "model"}  # an ``origin`` arg is not a schema field: ignored
+    if door == "registry":
+        registry.dispatch("delegate_task", args, parent_agent=parent)
+    else:
+        from hermes_cli.plugins_context import PluginContext
+        ctx = SimpleNamespace(_manager=SimpleNamespace(_cli_ref=None, scope_key=None))
+        PluginContext.dispatch_tool(ctx, "delegate_task", args, parent_agent=parent)
+    assert outcome == {"origin": None, "kept": False, "token": None}
+    assert _rows(db.db_path) == []
 
 
 def test_keep_subagent_lifecycle_launch_writes_no_row(db, monkeypatch):
@@ -570,7 +601,9 @@ def test_expiry_running_child_never_expires(db):
     parent = _parent(db)
     _, future, _, _ = _spawn(db, parent)
     store = dc.ChildStore(db.db_path)
-    assert store.get("kid-1", now=time.time() + 30 * DAY)["status"] == "running"
+    later = time.time() + 30 * DAY
+    _set(db.db_path, "kid-1", heartbeat_at=later)  # its tick still beats then
+    assert store.get("kid-1", now=later)["status"] == "running"
     _finish(future)
 
 
@@ -606,7 +639,7 @@ def _process_runner(proc):
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs /proc start ticks")
 def test_orphan_dead_runner_becomes_idle_orphaned(db):
-    store, token = _running_row(db)
+    store, _ = _running_row(db)
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     runner = _process_runner(proc)
     proc.kill()
@@ -623,8 +656,8 @@ def test_orphan_runner_alive_in_another_process_stays_running(db):
     store, _ = _running_row(db)
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
-        # Even a day-old heartbeat: a provably alive runner is never orphaned on age.
-        _set(db.db_path, "kid-o", runner=json.dumps(_process_runner(proc)), heartbeat_at=time.time() - DAY)
+        # Well past orphan_after_s: a provably alive runner is not orphaned on the plain heartbeat age.
+        _set(db.db_path, "kid-o", runner=json.dumps(_process_runner(proc)), heartbeat_at=time.time() - 1800)
         assert store.get("kid-o")["status"] == "running"
     finally:
         proc.kill()
@@ -712,7 +745,7 @@ def _prune_all(db):
 
 
 def test_prune_spares_a_kept_childs_sessions_and_continuation(db, monkeypatch):
-    monkeypatch.setattr(dc, "_delegation_cfg", lambda: {})
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
     _old_lineage(db)
     candidates = {r["id"] for r in db.list_prune_candidates(older_than_days=None, whole_lineages=True,
                                                             last_active_before=time.time() + 60)}
@@ -722,15 +755,15 @@ def test_prune_spares_a_kept_childs_sessions_and_continuation(db, monkeypatch):
     assert db.get_session("loose") is None and db.get_session("parent") is None
 
 
-def test_prune_without_protection_deletes_kept_transcripts(db, monkeypatch):
-    monkeypatch.setattr(dc, "_delegation_cfg", lambda: {"keep_protects_transcripts": False})
+def test_prune_without_protection_deletes_kept_transcripts(db, tmp_path):
+    (tmp_path / "config.yaml").write_text("delegation:\n  keep_protects_transcripts: false\n")  # the db's own home
     _old_lineage(db)
     _prune_all(db)
     assert db.get_session("kid-1") is None and db.get_session("kid-2") is None
 
 
 def test_prune_expired_child_is_not_protected(db, monkeypatch):
-    monkeypatch.setattr(dc, "_delegation_cfg", lambda: {})
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
     _old_lineage(db)
     _set(db.db_path, "kid-1", status="expired")
     _prune_all(db)
@@ -745,7 +778,7 @@ def test_prune_without_the_table_is_unchanged(db):
 
 
 def test_prune_auto_maintenance_spares_kept_children(db, monkeypatch):
-    monkeypatch.setattr(dc, "_delegation_cfg", lambda: {})
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
     _old_lineage(db)
     conn = sqlite3.connect(db.db_path)
     conn.execute("UPDATE sessions SET started_at = started_at - 400 * 86400, ended_at = ended_at - 400 * 86400")
@@ -762,7 +795,7 @@ def test_prune_manual_hermes_sessions_prune_spares_kept_children(tmp_path, monke
     from hermes_state import SessionDB
     from hermes_cli import sessions_cmd
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr(dc, "_delegation_cfg", lambda: {})
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
     handle = SessionDB(db_path=tmp_path / "state.db")
     try:
         _old_lineage(handle)
@@ -779,3 +812,433 @@ def test_prune_manual_hermes_sessions_prune_spares_kept_children(tmp_path, monke
         assert handle.get_session("loose") is None
     finally:
         handle.close()
+
+
+# ── review round 1 (plan delegate-resume, e1 r2) ────────────────────────────
+
+def _has_table(path):
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute("SELECT 1 FROM sqlite_master WHERE name='delegate_children'").fetchone() is not None
+    finally:
+        conn.close()
+
+
+def _idle_kid(db, parent=None):
+    parent = parent or _parent(db)
+    _, future, token, _ = _spawn(db, parent)
+    _finish(future)
+    store = dc.ChildStore(db.db_path)
+    assert _wait(lambda: store.get("kid-1")["status"] == "idle")
+    return store, token
+
+
+# finding 2: the prune guard fails closed
+
+def test_prune_fails_closed_when_the_kept_guard_cannot_be_read(db, monkeypatch):
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
+    _old_lineage(db)
+    real = db._read_one
+
+    def broken(sql, params=()):
+        if "sqlite_master" in sql:
+            raise sqlite3.OperationalError("database is locked")
+        return real(sql, params)
+
+    monkeypatch.setattr(db, "_read_one", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        _prune_all(db)
+    monkeypatch.setattr(db, "_read_one", real)
+    assert db.get_session("kid-1") is not None and db.get_session("kid-2") is not None
+
+
+# finding 3: malformed knobs fail safe and warn
+
+@pytest.mark.parametrize("raw", ["cli", "cli, tui", {"cli": True}, 5])
+def test_keep_sources_malformed_value_keeps_nothing_and_warns(db, raw, caplog):
+    dc._WARNED.clear()
+    with caplog.at_level("WARNING", logger=dc.__name__):
+        assert dc.keep_sources({"keep_sources": raw}) == frozenset()
+    assert any("keep_sources" in r.getMessage() and repr(raw) in r.getMessage() for r in caplog.records)
+    parent = _parent(db, source="cli")
+    assert not dc.should_keep(parent, origin=dc.ORIGIN_MODEL, child_depth=1, cfg={"keep_sources": raw})
+
+
+def test_keep_sources_null_is_the_default_and_a_list_is_normalized():
+    assert dc.keep_sources({"keep_sources": None}) == dc.DEFAULT_KEEP_SOURCES
+    assert dc.keep_sources({}) == dc.DEFAULT_KEEP_SOURCES
+    assert dc.keep_sources({"keep_sources": ["CLI ", ""]}) == frozenset({"cli"})
+
+
+@pytest.mark.parametrize("raw", [float("nan"), float("inf"), "30", -1, 0, True])
+def test_keep_invalid_numbers_fall_back_with_a_warning(raw, caplog):
+    dc._WARNED.clear()
+    with caplog.at_level("WARNING", logger=dc.__name__):
+        assert dc.keep_idle_days({"keep_idle_days": raw}) == dc.DEFAULT_KEEP_IDLE_DAYS
+        assert dc.orphan_after_s({"orphan_after_s": raw}) == dc.DEFAULT_ORPHAN_AFTER_S
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("keep_idle_days" in m for m in messages) and any("orphan_after_s" in m for m in messages)
+
+
+def test_keep_valid_numbers_and_unset_are_silent(caplog):
+    dc._WARNED.clear()
+    with caplog.at_level("WARNING", logger=dc.__name__):
+        assert dc.keep_idle_days({"keep_idle_days": 30}) == 30.0
+        assert dc.orphan_after_s({}) == dc.DEFAULT_ORPHAN_AFTER_S
+    assert not caplog.records
+
+
+# finding 5: reads take no write lock and run no DDL
+
+def test_record_read_without_the_table_returns_empty_and_creates_nothing(db, tmp_path):
+    store = dc.ChildStore(db.db_path)
+    assert store.get("x") is None and store.held_by("p") == [] and store.resolve("x", ["p"]) is None
+    assert store.show("x", ["p"]) is None
+    assert not _has_table(db.db_path)
+    missing = tmp_path / "nowhere" / "state.db"
+    assert dc.ChildStore(missing).get("x") is None and not missing.exists()
+
+
+def test_record_read_on_a_read_only_db(db):
+    _idle_kid(db)
+    os.chmod(db.db_path, 0o444)
+    try:
+        store = dc.ChildStore(db.db_path)
+        assert store.get("kid-1")["status"] == "idle"
+        assert [r["child_id"] for r in store.held_by("parent")] == ["kid-1"]
+    finally:
+        os.chmod(db.db_path, 0o644)
+
+
+def test_record_read_does_not_wait_on_the_writer_lock(db):
+    parent = _parent(db)
+    _, future, _, _ = _spawn(db, parent)  # running, runner = this live process: no rule applies
+    store = dc.ChildStore(db.db_path)
+    blocker = sqlite3.connect(db.db_path, isolation_level=None)
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        assert store.get("kid-1")["status"] == "running"
+        assert time.monotonic() - started < 2.0
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+    _finish(future)
+
+
+def test_record_read_still_applies_a_due_rule(db):
+    store, _ = _idle_kid(db)
+    _set(db.db_path, "kid-1", idle_since=1_000_000.0)
+    assert store.get("kid-1", now=1_000_000.0 + 8 * DAY)["status"] == "expired"
+    assert _rows(db.db_path)[0]["status"] == "expired"  # written, not only reported
+
+
+# finding 6: a finished worker always leaves running
+
+def test_fence_done_callback_retries_a_failed_final_write(db, monkeypatch):
+    monkeypatch.setattr(dc, "FINISH_RETRY_S", 0.01)
+    real, fails = dc.ChildStore.finish_run, {"n": dc.FINISH_ATTEMPTS - 1}
+
+    def flaky(self, *a, **k):
+        if fails["n"]:
+            fails["n"] -= 1
+            raise sqlite3.OperationalError("database is locked")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(dc.ChildStore, "finish_run", flaky)
+    _, future, _, _ = _spawn(db, _parent(db))
+    _finish(future)
+    assert dc.ChildStore(db.db_path).get("kid-1")["status"] == "idle"
+
+
+def test_fence_tick_retries_the_final_write_after_the_callback_gives_up(db, monkeypatch):
+    monkeypatch.setattr(dc, "FINISH_RETRY_S", 0.0)
+    monkeypatch.setattr(dc, "HEARTBEAT_INTERVAL_S", 0.02)
+    real, fails = dc.ChildStore.finish_run, {"n": dc.FINISH_ATTEMPTS + 3}
+
+    def flaky(self, *a, **k):
+        if fails["n"]:
+            fails["n"] -= 1
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(dc.ChildStore, "finish_run", flaky)
+    child, future, _, _ = _spawn(db, _parent(db))
+    _finish(future)
+    store = dc.ChildStore(db.db_path)
+    assert _wait(lambda: store.get("kid-1")["status"] == "idle")
+    assert _wait(lambda: not child._delegate_children_tick.thread.is_alive())
+
+
+def test_fence_tick_start_failure_still_finishes_the_run(db, monkeypatch):
+    def no_thread(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(dc._Tick, "start", no_thread)
+    _, future, token, kept = _spawn(db, _parent(db))
+    assert kept and token
+    _finish(future)
+    assert dc.ChildStore(db.db_path).get("kid-1")["status"] == "idle"
+
+
+def test_orphan_alive_runner_whose_tick_died_orphans_after_the_stale_horizon(db):
+    """A live runner whose final write was lost: its heartbeat stops and goes stale."""
+    store, _ = _running_row(db)  # runner = this process, provably alive
+    t0 = time.time()
+    _set(db.db_path, "kid-o", heartbeat_at=t0)
+    stale = dc.DEFAULT_ORPHAN_AFTER_S * dc.STALE_ALIVE_FACTOR
+    assert store.get("kid-o", now=t0 + dc.DEFAULT_ORPHAN_AFTER_S + 1)["status"] == "running"
+    assert store.get("kid-o", now=t0 + stale - 1)["status"] == "running"
+    row = store.get("kid-o", now=t0 + stale + 1)
+    assert (row["status"], row["idle_reason"], row["idle_since"]) == ("idle", "orphaned", t0)
+
+
+# finding 7: "provably alive" needs matching start ticks
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs /proc start ticks")
+def test_orphan_reused_pid_with_other_start_ticks_is_dead(db):
+    from hermes_state_pidns import pid_namespace_id
+    store, _ = _running_row(db)
+    beat = time.time()
+    _set(db.db_path, "kid-o", heartbeat_at=beat,
+         runner=json.dumps({"pid": 1, "pidns": pid_namespace_id(), "start_ticks": 123456789}))
+    row = store.get("kid-o")
+    assert (row["status"], row["idle_reason"]) == ("idle", "orphaned")
+    assert row["idle_since"] == beat  # finding 15: the run ended at its last heartbeat
+
+
+def test_orphan_unreadable_runner_falls_to_the_heartbeat_age(db, monkeypatch):
+    import hermes_state_common
+    from hermes_state_pidns import pid_namespace_id
+    store, _ = _running_row(db)
+    t0 = time.time()
+    _set(db.db_path, "kid-o", heartbeat_at=t0,
+         runner=json.dumps({"pid": 424242, "pidns": pid_namespace_id(), "start_ticks": 5}))
+
+    def eperm(_pid, _sig):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(hermes_state_common.os, "kill", eperm)
+    monkeypatch.setattr(hermes_state_common, "_proc_start_ticks", lambda _pid: None)
+    assert store.get("kid-o", now=t0 + 60)["status"] == "running"
+    assert store.get("kid-o", now=t0 + 301)["idle_reason"] == "orphaned"
+
+
+# finding 9: the replayed completion is keyed on the async ledger's unit id
+
+@pytest.mark.parametrize("independent", [False, True])
+def test_orphan_async_units_stamp_the_ledger_unit_id_on_their_children(monkeypatch, independent):
+    """Live-transcript creation failed (no live id): every unit still gets its own ledger id, and its children
+    carry it."""
+    from tools import delegate_tool_config, delegate_tool_dispatch as dd
+    seen = []
+
+    def dispatch(unit, unit_id, _slot_key, _routing):
+        seen.append((unit_id, [getattr(c, "_delegation_unit_id", None) for _, _, c in unit.children]))
+        return {"status": "dispatched", "delegation_id": unit_id}
+
+    monkeypatch.setattr(dd, "_dispatch_unit", dispatch)
+    monkeypatch.setattr(dd, "_resolve_async_wake_sid", lambda *a, **k: "wake")
+    monkeypatch.setattr(dd, "_resolve_async_session_key", lambda *a, **k: ("key", "ui"))
+    monkeypatch.setattr(delegate_tool_config, "_get_independent_completions", lambda: independent)
+    tasks = [{"goal": "a"}, {"goal": "b"}]
+    kids = [SimpleNamespace(session_id=f"k{i}") for i in range(2)]
+    batch = dd._Batch(tasks, [(i, t, kids[i]) for i, t in enumerate(tasks)], SimpleNamespace(session_id="p"),
+                      {"model": "m"}, None, "leaf", 2, None, [None, None], [], "wake", "ui", None, None, False,
+                      time.time())
+    dd._dispatch_background(batch)
+    assert len(seen) == (2 if independent else 1)
+    assert all(unit_id and ids == [unit_id] * len(ids) for unit_id, ids in seen)
+    assert len({unit_id for unit_id, _ in seen}) == len(seen)
+
+
+def test_orphan_replay_keyed_on_the_unit_id_without_a_live_delegation_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_state import SessionDB
+    from tools import async_delegation as ad
+    handle = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        parent = _parent(handle, source="cli")
+        _child_session(handle, "kid-u", "parent", "sa-0-unit")
+        child = _child("kid-u", "sa-0-unit")
+        child._delegation_unit_id = "deleg_unit"  # live transcripts failed: no child._delegation_id
+        with dc.spawn_origin(dc.ORIGIN_MODEL):
+            assert dc.note_spawn(parent, child, goal="g", context=None, toolsets=None, role="leaf", model=None)
+        assert dc.worker_started(child, Future(), task_index=0)
+        child._delegate_children_tick.stop()
+        assert _rows(tmp_path / "state.db")[0]["delegation_id"] == "deleg_unit"
+        ad._persist_dispatch({"delegation_id": "deleg_unit", "parent_session_id": "parent",
+                              "dispatched_at": time.time(), "goal": "g", "goals": ["g"]})
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        conn = sqlite3.connect(tmp_path / "state.db")
+        conn.execute("UPDATE async_delegations SET owner_pid=?, owner_started_at=NULL", (dead.pid,))
+        conn.execute("UPDATE delegate_children SET runner=?", (json.dumps({"pid": dead.pid, "pidns": None}),))
+        conn.commit()
+        conn.close()
+        assert ad.recover_abandoned_delegations() == 1
+        conn = sqlite3.connect(tmp_path / "state.db")
+        event = json.loads(conn.execute("SELECT event_json FROM async_delegations").fetchone()[0])
+        conn.close()
+        assert event["error"].endswith(dc.ORPHANED_LINE)
+    finally:
+        handle.close()
+
+
+# finding 10: idle_reason agrees with the parent-visible status
+
+def _done(result=None, exc=None, cancel=False):
+    future: Future = Future()
+    if cancel:
+        future.cancel()
+    elif exc is not None:
+        future.set_exception(exc)
+    else:
+        future.set_result(result)
+    return future
+
+
+@pytest.mark.parametrize(("future", "reason"), [
+    (lambda: _done({"completed": True, "final_response": "ok"}), "completed"),
+    (lambda: _done({"completed": True, "failed": True}), "interrupted"),
+    (lambda: _done({"completed": False, "failed": True}), "interrupted"),
+    (lambda: _done({"completed": False}), "interrupted"),  # max_iterations
+    (lambda: _done({"completed": True, "interrupted": True}), "interrupted"),
+    (lambda: _done("text"), "interrupted"),
+    (lambda: _done(exc=RuntimeError("boom")), "interrupted"),
+    (lambda: _done(cancel=True), "interrupted"),
+])
+def test_fence_done_reason_completed_only_for_a_clean_completion(future, reason):
+    assert dc._done_reason(future()) == reason
+
+
+# finding 11: an AsyncSessionDB parent
+
+def test_record_async_session_db_parent_is_unwrapped_for_lineage_reads(db):
+    from hermes_state import AsyncSessionDB
+    parent = _parent(db)
+    parent._session_db = AsyncSessionDB(db)
+    _, future, token, kept = _spawn(db, parent)
+    assert kept and token
+    store = dc.ChildStore.for_agent(parent)
+    assert store is not None and store._session_db is db
+    _finish(future)
+    assert _wait(lambda: store.get("kid-1")["status"] == "idle")
+    assert store.resolve("sa-0-aaaa", ["parent"]) == "kid-1"
+    assert store.refresh_latest("kid-1") == "kid-1"
+
+
+# finding 12: the done-callback is one CAS; the lineage read moves to the read
+
+def test_cas_done_callback_does_no_lineage_read(db, monkeypatch):
+    calls = []
+    monkeypatch.setattr(dc.ChildStore, "refresh_latest", lambda self, child_id: calls.append(child_id))
+    store, _ = _idle_kid(db)
+    assert calls == []
+    store.show("kid-1", ["parent"])
+    assert calls == ["kid-1"]
+
+
+# finding 13: salvage keeps the rows
+
+def test_record_session_recovery_copies_kept_children(tmp_path):
+    from hermes_cli.session_recovery import inspect_session_database, recover_session_database
+    from hermes_state import SessionDB
+    source, output = tmp_path / "state.db", tmp_path / "recovered.db"
+    seed = SessionDB(db_path=source)
+    seed.create_session("parent", source="cli")
+    seed.close()
+    assert dc.ChildStore(source).record_run_start(child_id="kid", subagent_id="sa-0-rec", holder_session_id="parent",
+                                                  conversation_id="parent", brief={"goal": "g"})
+    inspection = inspect_session_database(source, work_dir=tmp_path)
+    assert inspection["tables"]["delegate_children"]["rows"] == 1
+    report = recover_session_database(source, output, work_dir=tmp_path)
+    assert report["copy"]["delegate_children"]["status"] == "complete"
+    assert report["copy"]["delegate_children"]["copied_rows"] == 1
+    assert report["complete"] is True and report["verified"] is True
+    assert [(r["child_id"], r["subagent_id"]) for r in _rows(output)] == [("kid", "sa-0-rec")]
+
+
+def test_record_session_recovery_without_kept_children_is_complete(tmp_path):
+    from hermes_cli.session_recovery import recover_session_database
+    from hermes_state import SessionDB
+    source = tmp_path / "state.db"
+    seed = SessionDB(db_path=source)
+    seed.create_session("parent", source="cli")
+    seed.close()
+    report = recover_session_database(source, tmp_path / "recovered.db", work_dir=tmp_path)
+    assert report["complete"] is True and report["verified"] is True
+
+
+# finding 16: protection follows the pruned db's own profile
+
+def test_prune_protection_follows_the_pruned_dbs_own_profile_config(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+    off, on = tmp_path / "profiles" / "off", tmp_path / "profiles" / "on"
+    for home in (off, on):
+        home.mkdir(parents=True)
+    (off / "config.yaml").write_text("delegation:\n  keep_protects_transcripts: false\n")
+    monkeypatch.setattr(dc, "_delegation_cfg", lambda: {"keep_protects_transcripts": True})  # the launch profile
+    handle = SessionDB(db_path=off / "state.db")
+    try:
+        _old_lineage(handle)
+        _prune_all(handle)
+        assert handle.get_session("kid-1") is None
+    finally:
+        handle.close()
+    monkeypatch.setattr(dc, "_delegation_cfg", lambda: {"keep_protects_transcripts": False})
+    handle = SessionDB(db_path=on / "state.db")
+    try:
+        _old_lineage(handle)
+        _prune_all(handle)
+        assert handle.get_session("kid-1") is not None and handle.get_session("kid-2") is not None
+    finally:
+        handle.close()
+
+
+# finding 17: ACP transport args are never stored
+
+def test_record_route_drops_acp_transport_fields(db):
+    parent = _parent(db)
+    _child_session(db, "kid-acp", "parent", "sa-0-acp")
+    child = _child("kid-acp", "sa-0-acp")
+    with dc.spawn_origin(dc.ORIGIN_MODEL):
+        assert dc.note_spawn(parent, child, goal="g", context=None, toolsets=None, role="leaf", model="m",
+                             route={"provider": "p", "acp_command": "agent", "acp_args": ["--token", "tok-123"]})
+    future: Future = Future()
+    assert dc.worker_started(child, future)
+    row = _rows(db.db_path)[0]
+    assert json.loads(row["route"]) == {"provider": "p"} and "tok-123" not in json.dumps(row)
+    _finish(future)
+
+
+# finding 19: worker-process parents
+
+def test_keep_not_for_a_worker_process_parent():
+    """A managed worker's parent writes through ``RuntimeSessionStore`` (no local ``state.db`` path): not kept."""
+    from agent.runtime_session_store import RuntimeSessionStore
+    parent = SimpleNamespace(session_id="parent", _session_db=object.__new__(RuntimeSessionStore), platform="cli",
+                             _delegate_depth=0)
+    assert dc.parent_db_path(parent) is None
+    assert not dc.should_keep(parent, origin=dc.ORIGIN_MODEL, child_depth=1)
+    child = _child("kid-w", "sa-0-w")
+    with dc.spawn_origin(dc.ORIGIN_MODEL):
+        assert not dc.note_spawn(parent, child, goal="g", context=None, toolsets=None, role="leaf", model=None)
+    assert dc.worker_started(child, Future()) is None
+
+
+# finding 20 (e7 part): holder and conversation are read when the row is inserted
+
+def test_record_holder_is_read_when_the_worker_starts(db):
+    parent = _parent(db, session_id="before-new")
+    _child_session(db, "kid-h", "before-new", "sa-0-h")
+    child = _child("kid-h", "sa-0-h")
+    with dc.spawn_origin(dc.ORIGIN_MODEL):
+        assert dc.note_spawn(parent, child, goal="g", context=None, toolsets=None, role="leaf", model=None)
+    db.create_session("after-new", source="cli")
+    parent.session_id = "after-new"  # a /new between the spawn and the worker start
+    future: Future = Future()
+    assert dc.worker_started(child, future)
+    row = _rows(db.db_path)[0]
+    assert (row["holder_session_id"], row["conversation_id"]) == ("after-new", "after-new")
+    _finish(future)

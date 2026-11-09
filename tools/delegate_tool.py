@@ -587,14 +587,14 @@ def delegate_task(
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[dict[str, Any]] = None, images: Optional[list[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
-    credentials_cfg: Optional[dict[str, Any]] = None, origin: str = "model",
+    credentials_cfg: Optional[dict[str, Any]] = None, origin: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
     (per-task beats top-level; capability is depth-derived). Returns JSON with one results entry per task, or a
-    dispatch handle when running in the background. ``origin`` names who asked for the spawn: ``model`` (the
-    model's own call, the only origin whose children may be kept, see ``tools.delegate_children``) or an internal
-    caller such as ``review``."""
+    dispatch handle when running in the background. ``origin`` names who asked for the spawn: ``model`` (passed only
+    by the model's own call, ``run_agent._dispatch_delegate_task``; the only origin whose children may be kept, see
+    ``tools.delegate_children``), an internal caller such as ``review``, or None (the default: never kept)."""
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
@@ -963,7 +963,7 @@ registry.register(
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
-        parent_agent=kw.get("parent_agent"),
+        parent_agent=kw.get("parent_agent"),  # no origin: a plugin's ctx.dispatch_tool child is never kept
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",
