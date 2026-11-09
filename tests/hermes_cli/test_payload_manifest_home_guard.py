@@ -94,6 +94,29 @@ def test_payload_manifest_mutations_remain_refused(tmp_path, monkeypatch, operat
     assert source.read_text(encoding="utf-8") == "replacement"
 
 
+@pytest.mark.parametrize("operation", ["mkdir", "makedirs", "sqlite3"])
+def test_payload_manifest_creation_remains_refused(tmp_path, monkeypatch, operation):
+    # mkdir/makedirs/sqlite3.connect are not flagged destructive (the guard only refuses
+    # them under the home as plain I/O), so the manifest exemption must key on a READ,
+    # not on "not destructive" -- else they could create state at <home>/manifest.json.
+    import sqlite3
+
+    home = tmp_path / "protected-home"
+    home.mkdir()
+    manifest = home / "manifest.json"
+    guard = HomeIOGuard(lambda: [home])
+    with monkeypatch.context() as patcher:
+        guard.install(patcher)
+        with pytest.raises(AssertionError, match="REAL hermes home"):
+            if operation == "mkdir":
+                os.mkdir(manifest)
+            elif operation == "makedirs":
+                os.makedirs(manifest)
+            else:
+                sqlite3.connect(manifest).close()
+    assert not os.path.lexists(manifest)
+
+
 @pytest.mark.parametrize("relative", ["config.yaml", ".env", "state.db", "manifest.json.bak", "nested/manifest.json"])
 def test_manifest_exemption_does_not_allow_other_home_reads(tmp_path, monkeypatch, relative):
     home = tmp_path / "protected-home"
