@@ -938,6 +938,11 @@ class _ChildRun:
                 )
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
+        # A kept child's run (tools/delegate_children.py): our own tick beats while the worker lives, and only
+        # the worker's done-callback sets it idle.
+        with _quiet("delegate_children: worker start hook failed", exc_info=True):
+            from tools.delegate_children import worker_started
+            worker_started(child, future, task_index=task_index, worktree=self.worktree_info)
         # One wait covers both ways out: the worker finishing, or the heartbeat's stale verdict.
         # Without the second, a worker wedged after its final answer holds a finite (-Q / Bot Chat
         # one-shot) turn — and its session lease — forever, since that runtime has no gateway
@@ -1039,6 +1044,10 @@ class _ChildRun:
         }
         _error_entry = self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
         close_deferred = is_timeout and not future.done()
+        if not future.done():  # the wait ended, the worker did not: a kept child stays running
+            with _quiet(None):
+                from tools.delegate_children import wait_abandoned
+                wait_abandoned(child)
         if close_deferred:
             _defer_close_after_timeout(child, future)
         return None, _error_entry, close_deferred

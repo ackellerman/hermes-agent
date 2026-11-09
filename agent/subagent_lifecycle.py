@@ -299,12 +299,14 @@ class SubagentLifecycleService:
             creds = _resolve_delegation_credentials(routing_cfg, parent)
         except ValueError as exc:
             raise SubagentLifecycleError(str(exc)) from exc
-        child = _build_child_preserving_parent_tools(
-            task_index=0, goal=request.goal, context=request.context,
-            toolsets=list(request.allowed_toolsets) if request.allowed_toolsets else None,
-            model=request.model or creds["model"], max_iterations=DEFAULT_MAX_ITERATIONS,
-            task_count=1, parent_agent=parent, role=request.role, **_credential_overrides(creds, routing_cfg),
-        )
+        from tools.delegate_children import ORIGIN_PLUGIN, spawn_origin
+        with spawn_origin(ORIGIN_PLUGIN):  # plugin-launched children are never kept
+            child = _build_child_preserving_parent_tools(
+                task_index=0, goal=request.goal, context=request.context,
+                toolsets=list(request.allowed_toolsets) if request.allowed_toolsets else None,
+                model=request.model or creds["model"], max_iterations=DEFAULT_MAX_ITERATIONS,
+                task_count=1, parent_agent=parent, role=request.role, **_credential_overrides(creds, routing_cfg),
+            )
         subagent_id = str(getattr(child, "_subagent_id", "") or "")
         if not subagent_id:
             raise SubagentLifecycleError("Hermes failed to assign a child identity.")

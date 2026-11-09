@@ -292,6 +292,16 @@ def _owner_liveness() -> Optional[Callable[[Any, Any], bool]]:
     return alive
 
 
+def _kept_orphan_note(conn: sqlite3.Connection, delegation_id: str, task_indexes: Any) -> Optional[str]:
+    """``tools.delegate_children``'s idle-orphaned line for the unit's kept children; None when none are kept."""
+    try:
+        from tools.delegate_children import orphaned_unit_note
+        return orphaned_unit_note(conn, delegation_id, task_indexes)
+    except Exception:
+        logger.debug("Async delegation %s: kept-children check failed", delegation_id, exc_info=True)
+        return None
+
+
 def recover_abandoned_delegations() -> int:
     """Classify records whose owning process disappeared as outcome unknown; children a multi-child unit had already
     recorded (``record_unit_child``) are replayed with their real results."""
@@ -316,6 +326,8 @@ def recover_abandoned_delegations() -> int:
                 done = sum(1 for r in recovered_results if r.get("status") != "unknown")
                 error = (f"Delegation owner exited before the unit finished; {done}/{len(recovered_results)} child "
                          "results were recorded and are included below, the rest are unknown.")
+            if kept_note := _kept_orphan_note(conn, delegation_id, task.get("task_indexes")):
+                error = f"{error} {kept_note}"  # one status story: the kept row says the same
             diagnostics = {"last_known_status": last_state, "task_transcripts": task.get("task_transcripts") or {}}
             # Verbatim transcript tails + a git snapshot of the owner's cwd, so the parent can
             # continue or re-dispatch from the event alone instead of opening files (#116000).

@@ -254,6 +254,20 @@ class SessionMaintenanceMixin:
             clauses.append(_not_pinned_sql())
         return " AND ".join(clauses), params
 
+    def _kept_children_sql(self) -> Optional[str]:
+        """Sessions of kept delegated children (``tools.delegate_children``) and their continuations, which prune
+        spares while ``delegation.keep_protects_transcripts`` is on (default); None when off or nothing is kept."""
+        try:
+            from tools.delegate_children import TABLE, kept_sessions_sql, protects_transcripts
+            if not protects_transcripts():
+                return None
+            if self._read_one("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)) is None:
+                return None
+        except Exception:
+            logger.debug("kept-children prune guard unavailable", exc_info=True)
+            return None
+        return kept_sessions_sql(_CONTINUATION_EDGE_SQL)
+
     def _prune_where(self, older_than_days, source, filters, *, whole_lineages: bool = False) -> tuple[str, list]:
         """Translate the legacy age window into the shared activity filter, then build WHERE.
         ``whole_lineages`` (prune) keeps a compression ancestor while any continuation after it
@@ -268,6 +282,8 @@ class SessionMaintenanceMixin:
         where, params = self._prune_filter_where(source=source, **filters)
         if not whole_lineages:
             return where, params
+        if kept := self._kept_children_sql():
+            where = f"{where} AND s.id NOT IN ({kept})"
         # A compressed-away segment ages with its conversation, not on its own: while any later
         # segment stays, deleting it would cut the start off a chat that is still in use.
         return f"{where} AND s.id NOT IN ({_continued_ancestors_sql(where)})", [*params, *params]

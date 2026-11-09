@@ -168,7 +168,8 @@ def start_review(parent_agent, messages: list[dict[str, Any]], user_prompt: str 
     credentials_cfg = _load_review_credentials_cfg()
 
     from tools.delegate_tool import delegate_task
-    raw = delegate_task(goal=goal, context=context, background=True, parent_agent=parent_agent, credentials_cfg=credentials_cfg)
+    raw = delegate_task(goal=goal, context=context, background=True, parent_agent=parent_agent, credentials_cfg=credentials_cfg,
+                        origin="review")  # a /review run is never kept
     try:
         result = json.loads(raw)
     except Exception:

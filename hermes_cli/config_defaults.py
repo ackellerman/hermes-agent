@@ -1383,6 +1383,16 @@ DEFAULT_CONFIG = {
         # notifications to the PARENT; false suppresses them (the child's result is the
         # deliverable). Async-delegation results are NEVER suppressed.
         "surface_child_process_notifications": False,
+        # Kept children (tools/delegate_children.py): a child the model spawns from one of these parent
+        # session sources is recorded so the parent can find it again. null = the built-in set
+        # (DEFAULT_KEEP_SOURCES: cli, tui, desktop and the chat platforms; never api_server, webhook,
+        # cron, kanban or one-shot runs). /review and plugin-launched children are never kept.
+        "keep_sources": None,
+        "keep_idle_days": 7,  # a kept child idle longer than this expires
+        # A running child whose runner cannot be checked (foreign pid namespace) and has not beaten for
+        # this long is orphaned (its own heartbeat ticks every 30 s). A provably dead runner orphans at once.
+        "orphan_after_s": 300,
+        "keep_protects_transcripts": True,  # session pruning skips kept children's sessions
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
     # every API call for few-shot priming. Never saved to sessions/logs/trajectories.

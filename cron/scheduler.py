@@ -2604,6 +2604,9 @@ def run_job(
         agent = _construct_cron_agent(
             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
             session_db=_session_db)
+        # Nobody comes back to a finished job to resume its children: they are never kept.
+        from tools.delegate_children import NEVER_KEEP_ATTR
+        setattr(agent, NEVER_KEEP_ATTR, True)
         _audit = _FireAudit(job, job_id, model)
 
         result = _run_agent_with_watchdog(

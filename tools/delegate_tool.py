@@ -358,6 +358,12 @@ def _build_child_agent(
         child._session_init_model_config["_delegate_from"] = parent_sid
         child._session_init_model_config[SUBAGENT_ID_KEY] = subagent_id
     child._delegate_profile_home = profile_home  # _ChildRun.await_child runs the conversation in this scope
+    # Kept children (tools/delegate_children.py): the record is stashed now, written when the worker starts.
+    with _quiet("delegate_children: spawn hook failed", exc_info=True):
+        from tools.delegate_children import note_spawn
+        note_spawn(parent_agent, child, goal=goal, context=context, toolsets=child_toolsets, role=effective_role,
+                   model=rt.get("model"), route={**rt, "reasoning_effort": override_reasoning_effort,
+                                                 "profile_home": profile_home}, profile_home=profile_home)
     if child_pool is not None:
         child._credential_pool = child_pool
 
@@ -581,12 +587,14 @@ def delegate_task(
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[dict[str, Any]] = None, images: Optional[list[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
-    credentials_cfg: Optional[dict[str, Any]] = None,
+    credentials_cfg: Optional[dict[str, Any]] = None, origin: str = "model",
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
     (per-task beats top-level; capability is depth-derived). Returns JSON with one results entry per task, or a
-    dispatch handle when running in the background."""
+    dispatch handle when running in the background. ``origin`` names who asked for the spawn: ``model`` (the
+    model's own call, the only origin whose children may be kept, see ``tools.delegate_children``) or an internal
+    caller such as ``review``."""
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
@@ -676,17 +684,19 @@ def delegate_task(
     if refused:  # settled before anything runs: transcripts and manifest show the refusal (async units skip them)
         _settle_refused_transcripts(refused, live_deleg_id, live_writers, _live_home)
     _announce_batch(parent_agent, len(task_list), live_deleg_id)
-    origin = _capture_origin()
+    routing_origin = _capture_origin()
 
-    children, err = _build_children(
-        task_list, task_schemas, routes, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
-    )
+    from tools.delegate_children import spawn_origin
+    with spawn_origin(origin):
+        children, err = _build_children(
+            task_list, task_schemas, routes, top_role=top_role, max_iterations=default_max_iter,
+            parent_agent=parent_agent, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        )
     if err:
         return tool_error(err)
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
-        live_deleg_id, live_writers, live_paths, *origin, overall_start,
+        live_deleg_id, live_writers, live_paths, *routing_origin, overall_start,
         live_home=_live_home, refused=refused,
     )
     return _run_batch(batch, background)
