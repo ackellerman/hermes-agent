@@ -330,11 +330,20 @@ class _ChildProgressRelay:
         kw["tool_count"] = self.tool_count
         return kw
 
+    # Keys that describe THIS child's own delegate_task call: a nested child's re-relayed event
+    # never inherits them (an unrouted grandchild under a routed child has no route label).
+    _CALL_SCOPED_KEYS = ("route_label", "delegation_id", "delegate_call_id")
+
     def _relay(self, event_type: str, tool_name: str | None = None, preview: str | None = None, args=None, **kwargs):
         if self.parent_cb:
             # kwargs override identity (e.g. status, duration_seconds).
+            identity = self._identity_kwargs()
+            nested = kwargs.get("subagent_id")
+            if nested is not None and nested != self.subagent_id:
+                for key in self._CALL_SCOPED_KEYS:
+                    identity.pop(key, None)
             with _quiet("Parent callback failed: %s"):
-                self.parent_cb(event_type, tool_name, preview, args, **{**self._identity_kwargs(), **kwargs})
+                self.parent_cb(event_type, tool_name, preview, args, **{**identity, **kwargs})
 
     def _tree_line(self, text: str) -> None:
         """Print one tree-view line above the CLI spinner (no-op without a spinner)."""

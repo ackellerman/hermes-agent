@@ -315,6 +315,60 @@ def test_line_without_route_has_no_label(loop):
     assert runner.adapter.latest("msg-1").splitlines()[1] == '↳ claude-opus-5-5 — "plain child"  … running'
 
 
+def _route(label=None, backend="default"):
+    from tools.delegate_tool_routes import TaskRoute
+    return TaskRoute(creds={"model": "claude-opus-5-5", "provider": "anthropic", "base_url": None, "api_key": None,
+                            "api_mode": None}, routing_cfg={}, label=label, backend=backend)
+
+
+def _build_call(monkeypatch, parent_agent, goals, routes, *, prefix, parent_id=None, depth=0, model):
+    """One real ``_build_children`` call whose stub children carry real relays to ``parent_agent``."""
+    import tools.delegate_tool as dt
+    from tools.delegate_tool import _build_child_progress_callback
+
+    def fake_build(*, task_index, goal, parent_agent, task_count, **_kw):
+        ref: dict = {}
+        relay = _build_child_progress_callback(task_index, goal, parent_agent, task_count,
+                                               subagent_id=f"{prefix}{task_index}", parent_id=parent_id,
+                                               depth=depth, model=model, session_ref=ref)
+        return SimpleNamespace(_progress_identity_ref=ref, tool_progress_callback=relay)
+
+    monkeypatch.setattr(dt, "_build_child_preserving_parent_tools", fake_build)
+    children, err = dt._build_children(
+        [{"goal": goal} for goal in goals], [None] * len(goals), routes, top_role="leaf", max_iterations=5,
+        parent_agent=parent_agent, live_deleg_id=None, live_writers=[],
+    )
+    assert err is None
+    return [child for _i, _t, child in children]
+
+
+def test_unrouted_grandchild_of_a_routed_child_has_no_route_label(loop, monkeypatch):
+    """A grandchild's events are re-relayed through its routed parent child: they must not pick up
+    that child's route label (or its call id) on the way up."""
+    turn, runner, _ = _turn(loop)
+    top = SimpleNamespace(session_id="parent-sess", _delegate_spinner=None, _subagent_id=None,
+                          tool_progress_callback=turn.progress_callback)
+    (child,) = _build_call(monkeypatch, top, ["routed child"], [_route(label="flash", backend="ollama")],
+                           prefix="sa-c", model="model-c")
+    child_agent = SimpleNamespace(session_id="child-sess", _delegate_spinner=None, _subagent_id="sa-c0",
+                                  tool_progress_callback=child.tool_progress_callback)
+    (grand,) = _build_call(monkeypatch, child_agent, ["plain grandchild"], [_route()], prefix="sa-g",
+                           parent_id="sa-c0", depth=1, model="model-g")
+    child.tool_progress_callback("subagent.start", preview="routed child")
+    grand.tool_progress_callback("subagent.start", preview="plain grandchild")
+
+    adapter = runner.adapter
+    assert _wait(lambda: "plain grandchild" in adapter.latest("msg-1"))
+    _quiesce(loop, runner)
+    assert len(adapter.sent) == 1
+    lines = adapter.latest("msg-1").splitlines()
+    assert lines[1] == '↳ flash · model-c — "routed child"  … running'
+    assert lines[2] == '    ↳ model-g — "plain grandchild" (nested)  … running'
+    call_ids = {child._progress_identity_ref["delegate_call_id"], grand._progress_identity_ref["delegate_call_id"]}
+    assert len(call_ids) == 2, "the grandchild keeps its own call id through the relay"
+    assert set(getattr(runner, "_subagent_status_calls", {})) == call_ids
+
+
 def test_goal_truncated_to_sixty_chars(loop):
     turn, runner, _ = _turn(loop)
     goal = "g" * 200
