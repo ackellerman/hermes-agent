@@ -118,9 +118,10 @@ class HomeIOGuard:
             # its metadata. Permit that exact path for metadata probes and
             # read-only opens; writes, deletes, replacement destinations and
             # creation (mkdir, makedirs, sqlite3.connect) stay guarded.
+            # A symlink there would turn the exemption into access to its target.
             if (metadata or read) and not destructive and any(
                 absolute == os.path.join(root, "manifest.json") for root in roots
-            ):
+            ) and not os.path.islink(absolute):
                 return
             # store_root() probes the parent install stamp during default-layout discovery.
             # Its existence is metadata; never exempt reading or mutating home state.
