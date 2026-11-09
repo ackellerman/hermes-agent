@@ -183,3 +183,55 @@ def test_explicit_sync_records_the_extra_and_rebuilds_keep_it(monkeypatch, tmp_p
         install.sync_venv(**kwargs)
         assert package.built and "stt-whisper-cuda" in package.built[-1], kwargs
         assert "stt-whisper-cuda" in _recorded()
+
+    # `hermes update` itself (hermes_cli/update_completion.py) syncs with
+    # evict_incompatible_plugins=True, i.e. pm.plugin_eviction.sync_evicting. Only the
+    # interpreter probe (it runs PM's pinned toolchain) is stubbed: plugin discovery,
+    # _target_selection and the Facts ledger are the real code.
+    from pm import plugin_eviction
+
+    monkeypatch.setattr(plugin_eviction, "_interpreter_version", lambda: "3.13.0")
+    evicting = []
+    real_sync_evicting = plugin_eviction.sync_evicting
+
+    def spy(*args, **kwargs):
+        evicting.append(kwargs)
+        return real_sync_evicting(*args, **kwargs)
+
+    monkeypatch.setattr(plugin_eviction, "sync_evicting", spy)
+    package.built.clear()
+    monkeypatch.setattr(package, "expected_stamp", lambda enabled, **_: "update:" + "+".join(enabled))
+    install.sync_venv(explicit=True, evict_incompatible_plugins=True)
+    assert len(evicting) == 1 and evicting[0]["extras"] is None  # the update's bare sync
+    assert package.built and "stt-whisper-cuda" in package.built[-1]
+    assert "stt-whisper-cuda" in _recorded()
+
+
+def test_installed_extras_requires_the_proof_sonames(tmp_path, monkeypatch):
+    """The bundle inventory (pm.features.installed_extras) uses the same soname proof as
+    available()/legacy_selection(): a tree with only CUDA 13 cuBLAS does not list the extra."""
+    import subprocess
+
+    from pm import features
+    from pm.environments import site_packages
+
+    target_root = tmp_path / "target"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(target_root)],
+                   capture_output=True, check=True, timeout=60)
+    target = target_root / "bin" / "python"
+    dependencies = tmp_path / "dependencies"
+    tree = site_packages(dependencies)
+    lib = tree / "nvidia" / "cublas" / "lib"
+    lib.mkdir(parents=True)
+    (lib / "libcublas.so.13").write_bytes(b"")
+    repo = tmp_path / "source"
+    repo.mkdir()
+    (repo / "pyproject.toml").write_text('[project.optional-dependencies]\n"stt-whisper-cuda"=[]\n',
+                                         encoding="utf-8")
+    assert not extras.libraries_in_tree(tree, "stt-whisper-cuda")
+    assert features.installed_extras(repo, dependencies, python_exe=target) == []
+    (lib / "libcublas.so.12").write_bytes(b"")
+    assert features.installed_extras(repo, dependencies, python_exe=target) == []  # Lt still missing
+    (lib / "libcublasLt.so.12").write_bytes(b"")
+    assert extras.libraries_in_tree(tree, "stt-whisper-cuda")
+    assert features.installed_extras(repo, dependencies, python_exe=target) == ["stt-whisper-cuda"]

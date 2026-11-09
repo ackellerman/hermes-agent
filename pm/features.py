@@ -98,10 +98,13 @@ def installed_extras(repo_dir: Path, venv_dir: Path, *, python_exe: Path) -> lis
 
     The staged interpreter owns the site layout. Only the selected tree's
     .pth files are processed, so editable packages keep their launch behavior.
+    An extra with ``LIBRARY_PROOFS`` also needs its sonames in one of the
+    target's site trees (``extras.libraries_in_tree``, the check
+    ``legacy_selection`` uses): its anchor alone can be an empty namespace.
     """
     import subprocess
 
-    from pm.extras import _anchors
+    from pm.extras import _anchors, libraries_in_tree
 
     required = {extra: _anchors(extra) for extra in declared_extras(repo_dir)}
     anchors = sorted({anchor for group in required.values() for anchor in group})
@@ -121,7 +124,7 @@ with contextlib.redirect_stdout(sys.stderr):
             result[anchor] = importlib.util.find_spec(anchor) is not None
         except (ImportError, ValueError):
             result[anchor] = False
-print(json.dumps(result))
+print(json.dumps({"anchors": result, "sites": list(sites)}))
 """
     try:
         child = subprocess.run(
@@ -134,10 +137,15 @@ print(json.dumps(result))
         detail = (getattr(exc, "stderr", None) or str(exc)).strip()
         raise FeatureProbeError(f"feature inventory failed on {python_exe}: {detail}") from exc
     try:
-        resolved = json.loads(child.stdout)
+        reported = json.loads(child.stdout)
     except ValueError as exc:
         raise FeatureProbeError("feature inventory returned invalid JSON") from exc
+    resolved = reported.get("anchors") if isinstance(reported, dict) else None
+    sites = reported.get("sites") if isinstance(reported, dict) else None
     if (not isinstance(resolved, dict) or set(resolved) != set(anchors)
-            or any(type(value) is not bool for value in resolved.values())):
+            or any(type(value) is not bool for value in resolved.values())
+            or not isinstance(sites, list) or any(not isinstance(site, str) for site in sites)):
         raise FeatureProbeError("feature inventory returned incomplete anchor results")
-    return sorted(extra for extra, group in required.items() if all(resolved[anchor] for anchor in group))
+    return sorted(extra for extra, group in required.items()
+                  if all(resolved[anchor] for anchor in group)
+                  and any(libraries_in_tree(Path(site), extra) for site in sites))

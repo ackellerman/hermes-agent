@@ -95,6 +95,14 @@ def _library_present(package: str, soname: str) -> bool:
     return any((Path(root) / "lib" / soname).is_file() for root in roots)
 
 
+def libraries_in_tree(tree: Path, extra: str) -> bool:
+    """Does the site-packages *tree* hold every LIBRARY_PROOFS soname of *extra*? Read from
+    disk, never imported: the old-venv carry and the bundle inventory judge trees this process
+    does not run from. True for an extra without proofs."""
+    return all(Path(tree).joinpath(*package.split("."), "lib", soname).is_file()
+               for package, soname in LIBRARY_PROOFS.get(extra, ()))
+
+
 def _libraries_missing(extra: str) -> tuple[str, ...]:
     return tuple(soname for package, soname in LIBRARY_PROOFS.get(extra, ())
                  if not _library_present(package, soname))
@@ -430,8 +438,7 @@ def legacy_selection(project_root: Path) -> list[str]:
         # PM refuses a gated extra outside its platform even if a hand-synced venv carried it.
         # Installed first: judging a gate may cost a PM-runtime subprocess.
         if any(all(_installed_in(tree, anchor) for anchor in _anchors(extra))
-               and all(tree.joinpath(*package.split("."), "lib", soname).is_file()
-                       for package, soname in LIBRARY_PROOFS.get(extra, ()))
+               and libraries_in_tree(tree, extra)
                for tree in trees)
         and extra_supported(extra, importable=lambda _anchor: False)
     )
