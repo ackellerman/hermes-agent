@@ -8,9 +8,9 @@ from tools.delegate_tool import _build_child_progress_callback
 from tools.delegate_tool_routes import TaskRoute
 
 
-def _route(label=None, backend="default"):
+def _route(label=None, backend="default", error=None):
     return TaskRoute(creds={"model": "claude-opus-5-5", "provider": "anthropic", "base_url": None, "api_key": None,
-                            "api_mode": None}, routing_cfg={}, label=label, backend=backend)
+                            "api_mode": None}, routing_cfg={}, label=label, backend=backend, error=error)
 
 
 def _parent(events):
@@ -56,3 +56,12 @@ def test_route_label_only_when_the_task_has_a_route(monkeypatch):
     by_goal = {kw["goal"]: kw for kw in events}
     assert by_goal["routed"]["route_label"] == "flash"
     assert "route_label" not in by_goal["plain"]
+
+
+def test_events_carry_the_number_of_children_the_call_built(monkeypatch):
+    """A route-refused task builds no child: the call's events count only the built ones."""
+    events = _run_call(monkeypatch, [{"goal": "a"}, {"goal": "refused"}, {"goal": "b"}],
+                       [_route(), _route(backend="ollama", error="no route"), _route()])
+    assert sorted(kw["goal"] for kw in events) == ["a", "b"]
+    assert {kw.get("delegate_call_children") for kw in events} == {"2"}
+    assert {kw["task_count"] for kw in events} == {3}, "the batch's i/N slot is unchanged"

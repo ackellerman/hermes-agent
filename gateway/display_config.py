@@ -183,6 +183,15 @@ def _norm_int(value: Any) -> int:
         return 0
 
 
+def _norm_subagent_status(value: Any) -> str:
+    """Opt-in posting feature: only an explicit yes (True, "on", "summary", ...) enables it;
+    False, bare YAML ``off``, empty and unknown strings (typos) all mean off."""
+    if isinstance(value, bool):
+        return "summary" if value else "off"
+    val = str(value).strip().lower()
+    return "summary" if val == "summary" or val in _TRUTHY else "off"
+
+
 _NORMALISERS: dict[str, Any] = {
     "tool_progress": _norm_tristate("all", "off", {"off", "new", "all", "verbose", "log"}),
     "show_reasoning": _norm_bool,
@@ -198,7 +207,7 @@ _NORMALISERS: dict[str, Any] = {
     "tool_progress_grouping": _norm_choice(("accumulate", "separate")),
     "reasoning_style": _norm_choice(("code", "blockquote", "subtext")),
     "tool_preview_length": _norm_int,
-    "subagent_status": _norm_tristate("summary", "off", {"summary", "off"}),
+    "subagent_status": _norm_subagent_status,
 }
 
 

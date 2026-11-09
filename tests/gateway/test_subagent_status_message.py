@@ -319,10 +319,10 @@ def test_line_without_route_has_no_label(loop):
     assert runner.adapter.latest("msg-1").splitlines()[1] == '↳ claude-opus-5-5 — "plain child"  … running'
 
 
-def _route(label=None, backend="default"):
+def _route(label=None, backend="default", error=None):
     from tools.delegate_tool_routes import TaskRoute
     return TaskRoute(creds={"model": "claude-opus-5-5", "provider": "anthropic", "base_url": None, "api_key": None,
-                            "api_mode": None}, routing_cfg={}, label=label, backend=backend)
+                            "api_mode": None}, routing_cfg={}, label=label, backend=backend, error=error)
 
 
 def _build_call(monkeypatch, parent_agent, goals, routes, *, prefix, parent_id=None, depth=0, model):
@@ -446,3 +446,148 @@ def test_edit_failures_count_consecutively_not_cumulatively(loop):
         _complete(turn, f"sa-{i}", call="call-A", goal=f"job {i}", duration=1 + i)
         assert _wait(lambda i=i: adapter.latest("msg-1").count("✓") == i + 1), f"completion {i} never landed"
     assert len(adapter.fail & set(range(1, adapter.attempts + 1))) >= progress_mod._SUBAGENT_STATUS_MAX_EDIT_FAILURES
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    (True, "summary"), ("on", "summary"), ("ON", "summary"), ("summary", "summary"), (" Summary ", "summary"),
+    (False, "off"), ("off", "off"), ("OFF", "off"), ("", "off"), ("none", "off"), ("disabled", "off"),
+    ("summery", "off"), ("verbose", "off"),
+])
+def test_subagent_status_normaliser_table(value, expected):
+    """Opt-in: only an explicit yes enables it; empty, unknown strings and typos are off."""
+    from gateway.display_config import resolve_display_setting
+    config = {"display": {"platforms": {"discord": {"subagent_status": value}}}}
+    assert resolve_display_setting(config, "discord", "subagent_status", "off") == expected
+    assert resolve_display_setting({"display": {"subagent_status": value}}, "discord", "subagent_status") == expected
+
+
+def test_subagent_status_absent_is_off():
+    from gateway.display_config import resolve_display_setting
+    assert resolve_display_setting({}, "discord", "subagent_status") == "off"
+    assert resolve_display_setting({"display": {}}, "discord", "subagent_status", "summary") == "off"
+
+
+def test_refused_task_does_not_keep_the_call_open(loop, monkeypatch):
+    """A route-refused task builds no child and never starts: once the built children finish,
+    the call is over and its state is dropped."""
+    turn, runner, _ = _turn(loop)
+    top = SimpleNamespace(session_id="parent-sess", _delegate_spinner=None, _subagent_id=None,
+                          tool_progress_callback=turn.progress_callback)
+    built = _build_call(monkeypatch, top, ["one", "refused", "two"],
+                        [_route(), _route(backend="ollama", error="no route"), _route()], prefix="sa-", model="m")
+    assert len(built) == 2
+    for child, goal in zip(built, ("one", "two")):
+        child.tool_progress_callback("subagent.start", preview=goal)
+    for child in built:
+        child.tool_progress_callback("subagent.complete", preview="done", status="completed", duration_seconds=2)
+    adapter = runner.adapter
+    assert _wait(lambda: adapter.latest("msg-1").count("✓") == 2)
+    assert _wait(lambda: not getattr(runner, "_subagent_status_calls", {}))
+    assert adapter.latest("msg-1").splitlines()[0] == "🧩 subagents (2)"
+
+
+def test_call_stays_open_until_every_built_child_started(loop):
+    """One child finished, its sibling has not started yet: the call is not over, so the sibling's
+    start edits the same message instead of posting a second one."""
+    turn, runner, _ = _turn(loop)
+    adapter = runner.adapter
+    _start(turn, "sa-1", call="call-A", goal="one", count=2)
+    _complete(turn, "sa-1", call="call-A", goal="one", duration=1)
+    assert _wait(lambda: "✓ 1s" in adapter.latest("msg-1"))
+    _quiesce(loop, runner)
+    assert "call-A" in getattr(runner, "_subagent_status_calls", {})
+    _start(turn, "sa-2", call="call-A", goal="two", count=2, index=1)
+    assert _wait(lambda: '"two"' in adapter.latest("msg-1"))
+    _quiesce(loop, runner)
+    assert len(adapter.sent) == 1
+
+
+def test_header_shows_started_of_expected(loop):
+    """The header counts started children against the call's built children while some are pending."""
+    turn, runner, _ = _turn(loop)
+    adapter = runner.adapter
+    _start(turn, "sa-0", call="call-A", goal="job 0", count=3)
+    assert _wait(lambda: len(adapter.sent) == 1)
+    assert adapter.sent[0]["content"].splitlines()[0] == "🧩 subagents (1/3)"
+    _start(turn, "sa-1", call="call-A", goal="job 1", count=3, index=1)
+    _start(turn, "sa-2", call="call-A", goal="job 2", count=3, index=2)
+    assert _wait(lambda: adapter.latest("msg-1").splitlines()[0] == "🧩 subagents (3)")
+
+
+def test_send_and_edits_carry_reply_to_and_metadata(loop):
+    turn, runner, _ = _turn(loop)
+    adapter = runner.adapter
+    _start(turn, "sa-1", call="call-A", goal="one", count=1)
+    assert _wait(lambda: len(adapter.sent) == 1)
+    _quiesce(loop, runner)
+    _complete(turn, "sa-1", call="call-A", goal="one", duration=1)
+    assert _wait(lambda: "✓ 1s" in adapter.latest("msg-1"))
+    _quiesce(loop, runner)
+    assert [(s["chat_id"], s["reply_to"], s["metadata"]) for s in adapter.sent] == [("chan-1", "anchor-9", {"thread_id": "t-1"})]
+    assert adapter.edits and all(e["metadata"] == {"thread_id": "t-1"} for e in adapter.edits)
+
+
+def test_local_viewer_turn_posts_nothing(loop):
+    """A local route's viewers get subagent.* through the event stream; no adapter message."""
+    config = {"display": {"subagent_status": "summary"}}
+    source = SessionSource(platform=Platform.LOCAL, chat_id="local-1", chat_type="dm")
+    turn, runner, _ = _turn(loop, user_config=config, source=source)
+    turn._approval_owner = (SimpleNamespace(sessions={}), "s", 1)
+    _start(turn, "sa-1", call="call-A", goal="audit", count=1)
+    _complete(turn, "sa-1", call="call-A", goal="audit", duration=3)
+    _quiesce(loop, runner)
+    assert runner.adapter.sent == [] and runner.adapter.edits == []
+
+
+class NoEditAdapter(StatusCaptureAdapter):
+    edit_message = BasePlatformAdapter.edit_message  # an adapter that cannot edit in place
+
+
+def test_adapter_without_edit_support_posts_nothing(loop):
+    turn, runner, _ = _turn(loop, runner=_StubGatewayRunner(NoEditAdapter()))
+    _start(turn, "sa-1", call="call-A", goal="audit", count=1)
+    _complete(turn, "sa-1", call="call-A", goal="audit", duration=3)
+    _quiesce(loop, runner)
+    assert runner.adapter.sent == []
+
+
+class FailedSendAdapter(StatusCaptureAdapter):
+    def __init__(self):
+        super().__init__()
+        self.send_attempts = 0
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        with self._lock:
+            self.send_attempts += 1
+        return SendResult(success=False, error="403 Missing Access")
+
+
+def test_dead_message_is_a_tombstone_for_its_call(loop):
+    """The first send failed: later starts of that call (and a nested call under it) post nothing
+    until the call is over; then the state is dropped."""
+    adapter = FailedSendAdapter()
+    turn, runner, _ = _turn(loop, runner=_StubGatewayRunner(adapter))
+    _start(turn, "sa-1", call="call-A", goal="one", count=2)
+    assert _wait(lambda: adapter.send_attempts == 1)
+    _quiesce(loop, runner)
+    _start(turn, "sa-2", call="call-A", goal="two", count=2, index=1)
+    _start(turn, "sa-3", call="call-B", goal="grand of one", parent="sa-1", depth=1, count=1)
+    _quiesce(loop, runner)
+    assert adapter.send_attempts == 1 and adapter.edits == []
+    for sid, call, goal in (("sa-3", "call-B", "grand of one"), ("sa-1", "call-A", "one"), ("sa-2", "call-A", "two")):
+        _complete(turn, sid, call=call, goal=goal, duration=1)
+    _quiesce(loop, runner)
+    assert adapter.send_attempts == 1
+    assert not getattr(runner, "_subagent_status_calls", {})
+
+
+def test_expired_tombstone_lets_a_later_start_post_again(loop, monkeypatch):
+    """The tombstone is bounded: past its TTL a start of the same call may try a fresh message."""
+    monkeypatch.setattr(progress_mod, "_SUBAGENT_STATUS_TOMBSTONE_TTL", -1.0)
+    adapter = FailedSendAdapter()
+    turn, runner, _ = _turn(loop, runner=_StubGatewayRunner(adapter))
+    _start(turn, "sa-1", call="call-A", goal="one", count=2)
+    assert _wait(lambda: adapter.send_attempts == 1)
+    _quiesce(loop, runner)
+    _start(turn, "sa-2", call="call-A", goal="two", count=2, index=1)
+    assert _wait(lambda: adapter.send_attempts == 2)

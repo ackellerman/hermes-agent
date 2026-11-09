@@ -320,11 +320,12 @@ class _ChildProgressRelay:
         kw.update({k: getattr(self, k) for k in ("subagent_id", "parent_id", "depth", "model") if getattr(self, k) is not None})
         if self.toolsets is not None:
             kw["toolsets"] = list(self.toolsets)
-        # child_session_id / delegation_id / delegate_call_id / route_label are filled into the
-        # shared ref once the child exists, so every relayed event lets UIs open its session and
-        # group it by its delegate_task call.
+        # child_session_id / delegation_id / delegate_call_id / delegate_call_children / route_label
+        # are filled into the shared ref once the child exists, so every relayed event lets UIs open
+        # its session and group it by its delegate_task call.
         for src, dst in (("session_id", "child_session_id"), ("delegation_id", "delegation_id"),
-                         ("delegate_call_id", "delegate_call_id"), ("route_label", "route_label")):
+                         ("delegate_call_id", "delegate_call_id"), ("delegate_call_children", "delegate_call_children"),
+                         ("route_label", "route_label")):
             if self.session_ref.get(src):
                 kw[dst] = str(self.session_ref[src])
         kw["tool_count"] = self.tool_count
@@ -332,7 +333,7 @@ class _ChildProgressRelay:
 
     # Keys that describe THIS child's own delegate_task call: a nested child's re-relayed event
     # never inherits them (an unrouted grandchild under a routed child has no route label).
-    _CALL_SCOPED_KEYS = ("route_label", "delegation_id", "delegate_call_id")
+    _CALL_SCOPED_KEYS = ("route_label", "delegation_id", "delegate_call_id", "delegate_call_children")
 
     def _relay(self, event_type: str, tool_name: str | None = None, preview: str | None = None, args=None, **kwargs):
         if self.parent_cb:

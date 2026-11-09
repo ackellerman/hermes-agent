@@ -522,6 +522,12 @@ def _build_children(
             child._delegation_id = live_deleg_id
             _ident_ref["delegation_id"] = live_deleg_id
         children.append((i, t, child))
+    # Children the call actually built (route-refused tasks never start): the gateway's status
+    # message knows the call is over once that many have started and finished.
+    for _i, _t, built in children:
+        _built_ref = getattr(built, "_progress_identity_ref", None)
+        if isinstance(_built_ref, dict):
+            _built_ref["delegate_call_children"] = len(children)
     return children, None
 
 

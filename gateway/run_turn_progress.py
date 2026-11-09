@@ -111,6 +111,9 @@ _SUBAGENT_STATUS_MAX_MESSAGES = 256  # bound on one runner's open messages (line
 # Consecutive failed deliveries before a message is given up: adapters (Discord) report any edit
 # exception, 5xx and timeouts included, as a plain failure without ``retryable``.
 _SUBAGENT_STATUS_MAX_EDIT_FAILURES = 5
+# A message that went dead (failed first send, exhausted edits) stays registered as a tombstone
+# until its lines are final, at most this long, so later starts of its call never post again.
+_SUBAGENT_STATUS_TOMBSTONE_TTL = 600.0
 _SUBAGENT_STATUS_OK = frozenset({"completed", "success", "done"})
 _SUBAGENT_STATUS_EVENTS = frozenset({"subagent.start", "subagent.complete"})
 # Guards every runner's message registry: children report from their own worker threads.
@@ -143,18 +146,31 @@ class _SubagentStatusMessage:
     loop: Any
     edit_accepts_metadata: bool
     lines: dict = dataclasses.field(default_factory=dict)  # subagent_id -> line, in start order
-    expected: dict = dataclasses.field(default_factory=dict)  # delegate_call_id -> task_count
+    expected: dict = dataclasses.field(default_factory=dict)  # delegate_call_id -> children the call built
     seen: dict = dataclasses.field(default_factory=dict)  # delegate_call_id -> lines started
     message_id: Optional[str] = None
     dirty: bool = True
     pumping: bool = False
     dead: bool = False
+    dead_at: float = 0.0
     failures: int = 0  # consecutive failed deliveries; a successful edit resets it
     last_io: float = 0.0
 
     def settled(self) -> bool:
+        """Every started line is final and every call's built children have started."""
         return all(line.status is not None for line in self.lines.values()) and all(
             self.seen.get(call, 0) >= count for call, count in self.expected.items())
+
+    def expected_total(self) -> int:
+        return sum(max(count, self.seen.get(call, 0)) for call, count in self.expected.items())
+
+    def expired(self) -> bool:
+        return self.dead and time.monotonic() - self.dead_at > _SUBAGENT_STATUS_TOMBSTONE_TTL
+
+    def give_up(self) -> None:
+        """Caller holds ``_SUBAGENT_STATUS_LOCK``."""
+        if not self.dead:
+            self.dead, self.dead_at = True, time.monotonic()
 
 
 def _format_subagent_duration(seconds: float) -> str:
@@ -201,9 +217,11 @@ def _render_subagent_status(msg: _SubagentStatusMessage) -> str:
     base = min((line.depth for line in ordered), default=0)
     by_age = list(msg.lines.values())
     candidates = [line for line in by_age if line.status is not None] + [line for line in by_age if line.status is None]
+    expected = msg.expected_total()
+    count = f"{len(ordered)}/{expected}" if expected > len(ordered) else f"{len(ordered)}"
 
     def compose(hidden: set) -> str:
-        out = [f"🧩 subagents ({len(ordered)})"]
+        out = [f"🧩 subagents ({count})"]
         if hidden:
             gone = [line for line in by_age if line.subagent_id in hidden]
             ok = sum(1 for line in gone if line.status in _SUBAGENT_STATUS_OK)
@@ -419,6 +437,9 @@ class GatewayTurnProgressMixin:
             calls = self._subagent_status_registry()
             msg = calls.get(call_id) or next(
                 (m for m in calls.values() if parent_id is not None and str(parent_id) in m.lines), None)
+            if msg is not None and msg.expired():
+                self._subagent_status_forget(calls, msg)
+                msg = None
             if msg is None:
                 # Only a live turn opens a message; later edits are not gated on the generation.
                 if not self._ctx._run_still_current():
@@ -426,8 +447,12 @@ class GatewayTurnProgressMixin:
                 msg = self._subagent_status_open(calls)
                 if msg is None:
                     return None
+            # A dead message stays the call's tombstone: its later starts post nothing.
             calls[call_id] = msg
-            msg.expected[call_id] = max(msg.expected.get(call_id, 0), int(kwargs.get("task_count") or 1))
+            # The children the call actually built (a route-refused task never starts); older
+            # events without the stamp fall back to the call's task count.
+            built = int(kwargs.get("delegate_call_children") or kwargs.get("task_count") or 1)
+            msg.expected[call_id] = max(msg.expected.get(call_id, 0), built)
             if sid not in msg.lines:
                 msg.seen[call_id] = msg.seen.get(call_id, 0) + 1
                 msg.lines[sid] = _SubagentStatusLine(
@@ -443,11 +468,13 @@ class GatewayTurnProgressMixin:
             msg = calls.get(str(kwargs.get("delegate_call_id") or "")) or next(
                 (m for m in calls.values() if sid in m.lines), None)
             line = msg.lines.get(sid) if msg is not None else None
-            if line is None:
+            if msg is None or line is None:
                 return None
             line.status = str(kwargs.get("status") or "completed")
             line.duration = kwargs.get("duration_seconds")
             msg.dirty = True
+            if msg.dead and msg.settled():
+                self._subagent_status_forget(calls, msg)  # the tombstone's call is over
             return msg
 
     def _subagent_status_kick(self, msg: _SubagentStatusMessage) -> None:
@@ -467,7 +494,9 @@ class GatewayTurnProgressMixin:
                 with _SUBAGENT_STATUS_LOCK:
                     if msg.dead or not msg.dirty:
                         msg.pumping = False
-                        if msg.dead or (msg.message_id is not None and msg.settled()):
+                        # Dropped once the call is over; a dead message not yet settled stays
+                        # registered as the call's tombstone.
+                        if msg.settled() and (msg.dead or msg.message_id is not None):
                             self._subagent_status_forget(self._subagent_status_registry(), msg)
                         return
                     wait = 0.0 if msg.message_id is None else msg.last_io + SUBAGENT_STATUS_EDIT_INTERVAL - time.monotonic()
@@ -491,7 +520,8 @@ class GatewayTurnProgressMixin:
                 if getattr(result, "success", False) and getattr(result, "message_id", None):
                     msg.message_id = str(result.message_id)
                     return
-                msg.dead = True  # nothing to edit: drop the call rather than post again
+                with _SUBAGENT_STATUS_LOCK:
+                    msg.give_up()  # nothing to edit: drop the call rather than post again
                 return
             kwargs = {"chat_id": msg.chat_id, "message_id": msg.message_id, "content": text}
             if getattr(msg.adapter, "REQUIRES_EDIT_FINALIZE", False):
@@ -513,7 +543,7 @@ class GatewayTurnProgressMixin:
             if msg.failures < _SUBAGENT_STATUS_MAX_EDIT_FAILURES:
                 msg.dirty = True
             else:
-                msg.dead = True
+                msg.give_up()
 
     def _progress_live_status(self, event_type: str, tool_name, args) -> None:
         """Live status line (Slack assistant status): stash the tool phrase on the adapter; the
