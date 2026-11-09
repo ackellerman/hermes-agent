@@ -104,7 +104,7 @@ def _nvidia_gpu_present() -> bool:
     True when the kernel driver's procfs file exists, else when the CUDA driver API
     (``libcuda.so.1`` via ctypes: ``cuInit`` + ``cuDeviceGetCount``) reports at least one device.
     ``hermes_platform.host.facts.gpu_class`` is not used: its sysfs fallback reports an NVIDIA
-    card under nouveau, where the CUDA wheel would be ~600 MB of dead weight.
+    card under nouveau, where the CUDA wheels would be ~670 MB of dead weight.
     """
     if os.path.exists(_NVIDIA_PROC_VERSION):
         return True
@@ -116,17 +116,37 @@ def _nvidia_gpu_present() -> bool:
             return False
         count = ctypes.c_int(0)
         return cuda.cuDeviceGetCount(ctypes.byref(count)) == 0 and count.value > 0
-    except (OSError, AttributeError, TypeError, ValueError):
+    except Exception:  # any ctypes failure means "no usable GPU", never a failed setup
         return False
 
 
 def _gpu_extra_wanted(extra: str | None) -> bool:
-    if not extra or not _nvidia_gpu_present():
+    """Add *extra* to the provider's sync? Every check that can refuse it runs before the probe,
+    and each one is a case where requesting it would fail the whole sync."""
+    if not extra:
         return False
     from pm.extras import extra_supported
 
-    # Requesting a gated-off extra fails the whole sync (an NVIDIA aarch64 board has a driver).
-    return extra_supported(extra)
+    # Platform gate first: a gated-off host (an NVIDIA aarch64 board has a driver) never
+    # dlopens libcuda.so.1 or calls cuInit just to learn the extra can't install there.
+    if not extra_supported(extra):
+        return False
+    from pm.features import read_features
+
+    # A frozen bundle (lazy installs off) refuses extras outside its shipped feature set, and
+    # opt-in extras are never shipped: requesting it would lose the base provider too.
+    # Same order as pm.install._feature_policy: the policy is only read when a set exists.
+    # A policy that can't be read leaves the opt-in extra out: the base provider still installs.
+    try:
+        shipped = read_features()
+        if shipped is not None and extra not in shipped:
+            from pm.install import lazy_installs_allowed
+
+            if not lazy_installs_allowed():
+                return False
+    except Exception:
+        return False
+    return _nvidia_gpu_present()
 
 
 _PYTHON_POST_SETUP_HOOKS: dict = {
@@ -136,7 +156,7 @@ _PYTHON_POST_SETUP_HOOKS: dict = {
                     "Change via stt.local.model in config.yaml"),
         # D-014: CUDA 12 cuBLAS is opt-in; only an NVIDIA host gets it here.
         gpu_extra="stt-whisper-cuda",
-        gpu_installing="NVIDIA GPU detected: also installing CUDA 12 cuBLAS for GPU transcription (~600MB)..."),
+        gpu_installing="NVIDIA GPU detected: also installing CUDA 12 cuBLAS for GPU transcription (~670MB)..."),
     "kittentts": _python_hook(
         "kittentts", "kittentts", "kittentts", "Installing kittentts (~25-80MB model, CPU-only)...",
         on_install=("Voices: Jasper, Bella, Luna, Bruno, Rosie, Hugo, Kiki, Leo",
