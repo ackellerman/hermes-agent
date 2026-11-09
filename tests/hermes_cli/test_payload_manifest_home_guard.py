@@ -11,12 +11,19 @@ from tests.home_io_guard import HomeIOGuard
 @pytest.mark.parametrize("contents", [None, "{}", "not-json"])
 def test_real_payload_discovery_can_read_a_manifest_beside_an_in_home_checkout(tmp_path, monkeypatch, contents):
     from pm.environments import _payload_manifest
+    import tests.home_io_guard as home_io_guard
 
     home = tmp_path / "protected-home"
     checkout = home / "hermes-agent"
     checkout.mkdir(parents=True)
     if contents is not None:
         (home / "manifest.json").write_text(contents, encoding="utf-8")
+    # _payload_manifest also probes <checkout>/manifest.json (the in-place payload layout).
+    # In a real default-install run that checkout is the RUNNING one, which the guard already
+    # exempts as the interpreter's installation; model that here so only the probe beside the
+    # checkout -- the real home's manifest.json -- is left for the exemption under test.
+    monkeypatch.setattr(home_io_guard, "_INTERPRETER_PREFIX_STRS",
+                        (*home_io_guard._INTERPRETER_PREFIX_STRS, os.path.normcase(os.path.abspath(checkout))))
     guard = HomeIOGuard(lambda: [home])
     with monkeypatch.context() as patcher:
         guard.install(patcher)
