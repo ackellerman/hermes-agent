@@ -84,7 +84,7 @@ class HomeIOGuard:
         self.checking = threading.local()
         self.directories: dict[int, Path] = {}
 
-    def check(self, value, *, dir_fd=None, metadata=False, destructive=False):
+    def check(self, value, *, dir_fd=None, metadata=False, destructive=False, read=False):
         if value is None or isinstance(value, int) or getattr(self.checking, "active", False):
             return
         self.checking.active = True
@@ -115,9 +115,12 @@ class HomeIOGuard:
             if metadata and absolute in roots:
                 return
             # Payload discovery reads the manifest beside the checkout, not just
-            # its metadata. Permit that exact read path but keep writes, deletes
-            # and replacement destinations under the home guarded.
-            if not destructive and any(absolute == os.path.join(root, "manifest.json") for root in roots):
+            # its metadata. Permit that exact path for metadata probes and
+            # read-only opens; writes, deletes, replacement destinations and
+            # creation (mkdir, makedirs, sqlite3.connect) stay guarded.
+            if (metadata or read) and not destructive and any(
+                absolute == os.path.join(root, "manifest.json") for root in roots
+            ):
                 return
             # store_root() probes the parent install stamp during default-layout discovery.
             # Its existence is metadata; never exempt reading or mutating home state.
@@ -200,7 +203,7 @@ class HomeIOGuard:
         )
 
     def install(self, monkeypatch):
-        def wrap(module, name, parameters, *, metadata=False, destructive=False):
+        def wrap(module, name, parameters, *, metadata=False, destructive=False, read=False):
             original = getattr(module, name)
 
             @wraps(original)
@@ -208,7 +211,8 @@ class HomeIOGuard:
                 for index, (parameter, descriptor) in enumerate(parameters):
                     value = args[index] if index < len(args) else kwargs.get(parameter)
                     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
-                               destructive=destructive(args, kwargs) if callable(destructive) else destructive)
+                               destructive=destructive(args, kwargs) if callable(destructive) else destructive,
+                               read=read(args, kwargs) if callable(read) else read)
                 return original(*args, **kwargs)
 
             monkeypatch.setattr(module, name, guarded)
@@ -218,7 +222,8 @@ class HomeIOGuard:
             return any(flag in mode for flag in "wax+")
 
         for module in (builtins, io):
-            wrap(module, "open", (("file", None),), destructive=open_writes)
+            wrap(module, "open", (("file", None),), destructive=open_writes,
+                 read=lambda args, kwargs: not open_writes(args, kwargs))
         for name in ("mkdir", "unlink", "remove", "rmdir", "chmod", "utime"):
             wrap(os, name, (("path", "dir_fd"),), destructive=name != "mkdir")
         for name in ("stat", "lstat", "readlink", "access"):
@@ -234,7 +239,8 @@ class HomeIOGuard:
 
         @wraps(original_open)
         def guarded_open(path, flags, *args, **kwargs):
-            self.check(path, dir_fd=kwargs.get("dir_fd"), destructive=bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC)))
+            writes = bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC))
+            self.check(path, dir_fd=kwargs.get("dir_fd"), destructive=writes, read=not writes)
             fd = original_open(path, flags, *args, **kwargs)
             candidate = Path(os.fsdecode(path))
             if kwargs.get("dir_fd") is not None and not candidate.is_absolute():
