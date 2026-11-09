@@ -114,6 +114,11 @@ class HomeIOGuard:
             # probe) reads no state; only its contents are guarded.
             if metadata and absolute in roots:
                 return
+            # Payload discovery reads the manifest beside the checkout, not just
+            # its metadata. Permit that exact read path but keep writes, deletes
+            # and replacement destinations under the home guarded.
+            if not destructive and any(absolute == os.path.join(root, "manifest.json") for root in roots):
+                return
             # ``shutil.which`` stats/accesses ``<PATH entry>/<name>``, and command resolution
             # realpath()s the entry itself (is it a Hermes-managed bin dir?), which lstats each of
             # its ancestors. A developer shell puts PM's tool store (~/.hermes/tools/...) on PATH;
