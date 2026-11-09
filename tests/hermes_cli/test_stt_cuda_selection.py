@@ -39,6 +39,17 @@ def no_wheel_imports(monkeypatch):
     assert not any(n.split(".")[0] in _RefuseWheelImports.blocked for n in sys.modules)
 
 
+@pytest.fixture(autouse=True)
+def no_shipped_features(tmp_path, monkeypatch):
+    """A private store with no enabled-features.json, so a frozen file on the test host can't
+    decide the selection; the frozen-bundle tests write their own."""
+    from pm import paths
+
+    store = tmp_path / "no-bundle" / "tools"
+    store.mkdir(parents=True)
+    monkeypatch.setattr(paths, "store_root", lambda: store)
+
+
 @pytest.mark.parametrize("gpu,expected", [
     (True, ["stt-whisper", "stt-whisper-cuda"]),
     (False, ["stt-whisper"]),
@@ -64,6 +75,73 @@ def test_gpu_on_an_ungated_platform_skips_the_cuda_extra(monkeypatch):
     asking for it would fail the whole Local Whisper install."""
     monkeypatch.setattr(post_setup, "_nvidia_gpu_present", lambda: True)
     monkeypatch.setattr("pm.extras.extra_supported", lambda extra, **_: extra != "stt-whisper-cuda")
+    with patch("pm.sync_venv") as sync:
+        _run_post_setup("faster_whisper")
+    sync.assert_called_once_with(["stt-whisper"], explicit=True)
+
+
+def test_gated_off_host_never_runs_the_probe(monkeypatch):
+    """The platform gate is judged first: a host it rejects never dlopens libcuda.so.1."""
+    monkeypatch.setattr(post_setup, "_nvidia_gpu_present", lambda: pytest.fail("probe ran on a gated-off host"))
+    monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: pytest.fail("libcuda loaded"))
+    monkeypatch.setattr("pm.extras.extra_supported", lambda extra, **_: extra != "stt-whisper-cuda")
+    with patch("pm.sync_venv") as sync:
+        _run_post_setup("faster_whisper")
+    sync.assert_called_once_with(["stt-whisper"], explicit=True)
+
+
+def _frozen_bundle(monkeypatch, tmp_path, shipped):
+    """A bundle's enabled-features.json beside a private store, with lazy installs off."""
+    from pm import features, paths
+
+    store = tmp_path / "tools"
+    store.mkdir()
+    monkeypatch.setattr(paths, "store_root", lambda: store)
+    monkeypatch.setattr(paths, "repo_root", lambda: tmp_path / "hermes")
+    features.write_features(shipped, base_dir=tmp_path)
+    monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
+
+
+def test_frozen_bundle_installs_local_whisper_without_the_cuda_extra(monkeypatch, tmp_path, capsys):
+    """Lazy installs off + a shipped set without the opt-in extra (bundles never ship it): the
+    hook syncs stt-whisper alone, and that sync passes the real frozen-set policy."""
+    from pm import install
+
+    _frozen_bundle(monkeypatch, tmp_path, ["all", "stt-whisper", "voice"])
+    monkeypatch.setattr(post_setup, "_nvidia_gpu_present", lambda: pytest.fail("probe ran for an unshippable extra"))
+    monkeypatch.setattr("pm.extras.extra_supported", lambda extra, **_: True)
+    # The real policy refuses the pair the hook used to send ...
+    with pytest.raises(pm.InstallError, match="outside this bundle's frozen feature set"):
+        install._feature_policy(["stt-whisper", "stt-whisper-cuda"], repair=False)
+    requested = []
+
+    def sync(extras, **kwargs):
+        requested.append((list(extras), kwargs))
+        install._feature_policy(extras, repair=False)  # ... and admits what it sends now
+
+    with patch("pm.sync_venv", side_effect=sync):
+        _run_post_setup("faster_whisper")
+    assert requested == [(["stt-whisper"], {"explicit": True})]
+    out = capsys.readouterr().out
+    assert "faster-whisper dependencies ready" in out and "install failed" not in out
+
+
+def test_frozen_bundle_that_ships_the_cuda_extra_still_selects_it(monkeypatch, tmp_path):
+    _frozen_bundle(monkeypatch, tmp_path, ["all", "stt-whisper", "stt-whisper-cuda", "voice"])
+    monkeypatch.setattr(post_setup, "_nvidia_gpu_present", lambda: True)
+    monkeypatch.setattr("pm.extras.extra_supported", lambda extra, **_: True)
+    with patch("pm.sync_venv") as sync:
+        _run_post_setup("faster_whisper")
+    sync.assert_called_once_with(["stt-whisper", "stt-whisper-cuda"], explicit=True, automatic=["stt-whisper-cuda"])
+
+
+def test_unreadable_feature_policy_leaves_the_cuda_extra_out(monkeypatch):
+    def broken():
+        raise RuntimeError("features unreadable")
+
+    monkeypatch.setattr("pm.features.read_features", broken)
+    monkeypatch.setattr(post_setup, "_nvidia_gpu_present", lambda: pytest.fail("probe ran without a policy"))
+    monkeypatch.setattr("pm.extras.extra_supported", lambda extra, **_: True)
     with patch("pm.sync_venv") as sync:
         _run_post_setup("faster_whisper")
     sync.assert_called_once_with(["stt-whisper"], explicit=True)
@@ -105,6 +183,9 @@ def test_probe_trusts_the_driver_proc_file_without_loading_libcuda(tmp_path, mon
     (_FakeCuda(init=100), False),  # CUDA_ERROR_NO_DEVICE
     (_FakeCuda(count=3, status=1), False),
     (OSError("libcuda.so.1: cannot open shared object file"), False),
+    # Any ctypes failure means "no usable GPU"; none may abort the hook.
+    (RuntimeError("driver API misbehaved"), False),
+    (ctypes.ArgumentError("argument 1: wrong type"), False),
 ])
 def test_probe_falls_back_to_the_driver_api(tmp_path, monkeypatch, no_wheel_imports, cuda, present):
     monkeypatch.setattr(post_setup, "_NVIDIA_PROC_VERSION", str(tmp_path / "absent"))
