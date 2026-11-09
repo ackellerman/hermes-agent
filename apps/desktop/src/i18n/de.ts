@@ -2982,6 +2982,8 @@ export const deOverrides = {
     approvedUser: name => `${name} freigegeben`,
     approvedHint: 'Sie werden bei ihrer nächsten Message automatisch erkannt.',
     revokedUser: name => `Zugriff für ${name} entzogen`,
+    revokeSurvives: location =>
+      `Pairing-Eintrag entfernt, aber ${location} autorisiert diesen Nutzer weiterhin`,
     failedApprove: name => `Konnte ${name} nicht freigeben`,
     failedRevoke: name => `Konnte ${name} nicht entziehen`,
     pairingLockedOut:

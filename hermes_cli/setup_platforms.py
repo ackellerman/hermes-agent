@@ -221,12 +221,19 @@ def _setup_webhooks():
           "   Open config in your editor:  hermes config edit")
 
 
-# (platform label, credential env var, home-channel env vars — any one satisfies)
+# (platform key, display label, credential env var, home-channel env vars — any one satisfies)
 _HOME_CHANNEL_CHECKS = (
-    ("Telegram", "TELEGRAM_BOT_TOKEN", ("TELEGRAM_HOME_CHANNEL",)), ("Discord", "DISCORD_BOT_TOKEN", ("DISCORD_HOME_CHANNEL",)),
-    ("Slack", "SLACK_BOT_TOKEN", ("SLACK_HOME_CHANNEL",)), ("BlueBubbles", "BLUEBUBBLES_SERVER_URL", ("BLUEBUBBLES_HOME_CHANNEL",)),
-    ("QQBot", "QQ_APP_ID", ("QQBOT_HOME_CHANNEL", "QQ_HOME_CHANNEL")),
+    ("telegram", "Telegram", "TELEGRAM_BOT_TOKEN", ("TELEGRAM_HOME_CHANNEL",)),
+    ("discord", "Discord", "DISCORD_BOT_TOKEN", ("DISCORD_HOME_CHANNEL",)),
+    ("slack", "Slack", "SLACK_BOT_TOKEN", ("SLACK_HOME_CHANNEL",)),
+    ("bluebubbles", "BlueBubbles", "BLUEBUBBLES_SERVER_URL", ("BLUEBUBBLES_HOME_CHANNEL",)),
+    ("qqbot", "QQBot", "QQ_APP_ID", ("QQBOT_HOME_CHANNEL", "QQ_HOME_CHANNEL")),
 )
+
+# Platform blocks the loader merges, in authored-precedence order (root block first:
+# `gateway/config_loader.py::platform_section` / `merge_platform_sections`). A top-level `<plat>:`
+# block is NOT merged by the loader, so it is not a place routing reads a home channel from (F5).
+_HOME_CHANNEL_BLOCK_PREFIXES = (("platforms",), ("gateway", "platforms"))
 
 
 def _is_progress(status: str) -> bool:
@@ -235,12 +242,66 @@ def _is_progress(status: str) -> bool:
     return not (s == "not configured" or s.startswith(("partially", "plugin disabled")))
 
 
+def _yaml_home_channels() -> dict[str, str]:
+    """``platform -> authored home channel`` from config.yaml (routing is NOT changed here).
+
+    The diagnostic used to read env only, so a home channel configured in YAML (the documented
+    surface for most platforms) was reported as missing. It must now accept exactly what routing
+    accepts, or it suppresses a warning routing would earn: ``platforms.<plat>.home_channel`` /
+    ``gateway.platforms.<plat>.home_channel`` as a mapping carrying ``platform`` and ``chat_id`` —
+    i.e. anything ``HomeChannel.from_dict`` parses. A scalar, a mapping without ``platform`` and a
+    top-level ``<plat>:`` block are not homes routing can deliver to (F5).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
+    except Exception:
+        return {}
+    found: dict[str, str] = {}
+    for prefix in _HOME_CHANNEL_BLOCK_PREFIXES:
+        block = cfg
+        for key in prefix:
+            block = block.get(key) if isinstance(block, dict) else None
+        if not isinstance(block, dict):
+            continue
+        for platform_key, _label, _token_var, _home_vars in _HOME_CHANNEL_CHECKS:
+            if platform_key in found:
+                continue  # first authored block wins, mirroring the loader's precedence
+            chat_id = _routed_home_chat_id(block.get(platform_key))
+            if chat_id:
+                found[platform_key] = chat_id
+    return found
+
+
+def _routed_home_chat_id(platform_block) -> str:
+    """``chat_id`` when routing would build a ``HomeChannel`` here, else ``""``.
+
+    Parses through ``HomeChannel.from_dict`` itself so the diagnostic cannot drift from routing
+    (a missing ``platform``, a scalar or an unknown platform value is not a home).
+    """
+    if not isinstance(platform_block, dict):
+        return ""
+    home = platform_block.get("home_channel")
+    if not isinstance(home, dict) or not home.get("platform") or home.get("chat_id") in (None, ""):
+        return ""
+    try:
+        from gateway.config import HomeChannel
+
+        return str(HomeChannel.from_dict(home).chat_id or "").strip()
+    except Exception:  # invalid platform value / unparsable dict: routing would not deliver either
+        return ""
+
+
 def _warn_missing_home_channels() -> None:
-    """Platforms with a token but no home channel."""
+    """Platforms with a token but no home channel — in YAML or in env."""
     from hermes_cli.setup import get_env_value, _info, print_warning
+    yaml_homes = _yaml_home_channels()
     missing_home = [
-        plat for plat, token_var, home_vars in _HOME_CHANNEL_CHECKS
-        if get_env_value(token_var) and not any(get_env_value(v) for v in home_vars)]
+        label for platform_key, label, token_var, home_vars in _HOME_CHANNEL_CHECKS
+        if get_env_value(token_var)
+        and not any(get_env_value(v) for v in home_vars)
+        and not yaml_homes.get(platform_key)
+    ]
     if not missing_home:
         return
     print()

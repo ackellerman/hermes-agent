@@ -437,6 +437,25 @@ export interface PairingResponse {
   pending: PairingUser[]
 }
 
+/** One place that still names a revoked user (gateway/access_grants.py). */
+export interface PairingGrantSource {
+  kind: string
+  location: string
+  chat_scope: string
+  entry: string
+  removable: boolean
+  reason: string
+  /** null = cannot be evaluated offline (role list, username entry, unreadable file). */
+  authorizes_now: boolean | null
+}
+
+export interface PairingRevokeResult {
+  ok: boolean
+  revoked: boolean
+  removed: PairingGrantSource[]
+  still_authorized_by: PairingGrantSource[]
+}
+
 export interface MessagingPlatformUpdate {
   clear_env?: string[]
   enabled?: boolean

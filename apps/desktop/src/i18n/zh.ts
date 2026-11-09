@@ -2514,6 +2514,7 @@ export const zhOverrides = {
     approvedUser: name => `已批准 ${name}`,
     approvedHint: '对方下次发送消息时会被自动识别。',
     revokedUser: name => `已撤销 ${name}`,
+    revokeSurvives: location => `已撤销配对记录，但 ${location} 仍然允许该用户访问`,
     failedApprove: name => `批准 ${name} 失败`,
     failedRevoke: name => `撤销 ${name} 失败`,
     pairingLockedOut: '批准失败次数过多，该平台已被暂时锁定，请稍后再试。',

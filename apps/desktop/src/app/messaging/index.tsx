@@ -543,8 +543,22 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
     }))
 
     try {
-      await revokePairing(user.platform, user.user_id, scopeProfile)
-      notify({ kind: 'success', title: m.revokedUser(pairingLabel(user)), message: user.platform })
+      const result = await revokePairing(user.platform, user.user_id, scopeProfile)
+      // The endpoint removes the pairing record only. A config.yaml allow list is an independent
+      // grant, so a bare "revoked" toast here would be a lie: name the survivor instead.
+      const survivor = result.still_authorized_by?.[0]
+      if (survivor) {
+        // Not a failure (the record IS gone) but the user is still admitted, so it must not read
+        // as a success either. The desktop's own NotificationKind has 'warning', which is the
+        // accurate severity (the shared web toast has no warning kind and keeps 'error').
+        notify({
+          kind: 'warning',
+          title: m.revokedUser(pairingLabel(user)),
+          message: m.revokeSurvives(survivor.location)
+        })
+      } else {
+        notify({ kind: 'success', title: m.revokedUser(pairingLabel(user)), message: user.platform })
+      }
       await refreshPairing()
     } catch (err) {
       setPairing(snapshot)
