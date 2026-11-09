@@ -98,3 +98,19 @@ def test_manifest_exemption_does_not_allow_other_home_reads(tmp_path, monkeypatc
         guard.install(patcher)
         with pytest.raises(AssertionError, match="REAL hermes home"):
             target.read_text(encoding="utf-8")
+
+
+def test_store_root_parent_stamp_probe_is_metadata_only(tmp_path, monkeypatch):
+    from pm.paths import install_stamp_path
+
+    home = tmp_path / "protected-home"
+    home.mkdir()
+    stamp = install_stamp_path(home)
+    guard = HomeIOGuard(lambda: [home])
+    with monkeypatch.context() as patcher:
+        guard.install(patcher)
+        assert not stamp.is_file()
+        with pytest.raises(AssertionError, match="REAL hermes home"):
+            stamp.read_text(encoding="utf-8")
+        with pytest.raises(AssertionError, match="REAL hermes home"):
+            (home / "config.yaml").is_file()
