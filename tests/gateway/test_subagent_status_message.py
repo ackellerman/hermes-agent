@@ -273,7 +273,9 @@ def test_thirty_children_stay_under_cap_with_collapse_line(loop):
 
 
 def test_rapid_completions_coalesce_into_at_most_two_edits(loop, monkeypatch):
-    """(7) Five completions within 1 s under the real 1.5 s window: ≤2 edits, the last shows all five."""
+    """(7) Five completions within 1 s under the real 1.5 s window: ≤2 edits, the last shows all five.
+    A loop barrier after each completion lets the pump run between them, so without the window
+    each completion would get its own edit."""
     monkeypatch.setattr(progress_mod, "SUBAGENT_STATUS_EDIT_INTERVAL", 1.5)
     turn, runner, _ = _turn(loop)
     adapter = runner.adapter
@@ -284,6 +286,8 @@ def test_rapid_completions_coalesce_into_at_most_two_edits(loop, monkeypatch):
     before = len(adapter.edits)
     for i in range(5):  # back to back: well within 1 s, inside one 1.5 s edit window
         _complete(turn, f"sa-{i}", call="call-A", goal=f"job {i}", duration=2 + i)
+        for _ in range(3):  # the kick's schedule, the pump's step, and its edit all get to run
+            asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop).result(5)
     assert _wait(lambda: adapter.latest("msg-1").count("✓") == 5, timeout=6)
     _quiesce(loop, runner)
     new_edits = adapter.edits[before:]
