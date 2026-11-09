@@ -879,16 +879,16 @@ def test_plugin_platform_env_name_and_alias_match_without_a_live_registry(home, 
 
 def test_unresolvable_platform_allowlist_env_fails_closed(home, monkeypatch, capsys):
     """F2: no registry entry and no known env name → an ``unresolved`` row (exit 3), never nothing."""
-    monkeypatch.delenv("BUZZ_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("NOSUCHPLAT_ALLOWED_USERS", raising=False)
     _write_home(home, "")
 
-    grants = _find(platform="buzz", user="deadbeef")
+    grants = _find(platform="nosuchplat", user="deadbeef")
     unresolved = [s for s in grants if s.kind == "unresolved"]
     assert unresolved and unresolved[0].authorizes_now is None
     assert unresolved[0].removable is False
     assert "not resolvable" in unresolved[0].reason
 
-    assert _revoke_cli(_store(), platform="buzz", user="deadbeef") == 3
+    assert _revoke_cli(_store(), platform="nosuchplat", user="deadbeef") == 3
     assert "No other configured source names" not in capsys.readouterr().out
 
 
