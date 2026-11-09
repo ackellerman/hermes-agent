@@ -320,9 +320,11 @@ class _ChildProgressRelay:
         kw.update({k: getattr(self, k) for k in ("subagent_id", "parent_id", "depth", "model") if getattr(self, k) is not None})
         if self.toolsets is not None:
             kw["toolsets"] = list(self.toolsets)
-        # child_session_id / delegation_id are filled into the shared ref once
-        # the child exists, so every relayed event lets UIs open its session.
-        for src, dst in (("session_id", "child_session_id"), ("delegation_id", "delegation_id")):
+        # child_session_id / delegation_id / delegate_call_id / route_label are filled into the
+        # shared ref once the child exists, so every relayed event lets UIs open its session and
+        # group it by its delegate_task call.
+        for src, dst in (("session_id", "child_session_id"), ("delegation_id", "delegation_id"),
+                         ("delegate_call_id", "delegate_call_id"), ("route_label", "route_label")):
             if self.session_ref.get(src):
                 kw[dst] = str(self.session_ref[src])
         kw["tool_count"] = self.tool_count

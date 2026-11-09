@@ -20,6 +20,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.session import SessionSource
 from gateway.turn_context import TurnContext
+from tests.waiting import wait_until
 
 SUMMARY_CONFIG = {"display": {"platforms": {"discord": {"subagent_status": "summary"}}}}
 
@@ -65,7 +66,7 @@ class StatusCaptureAdapter(BasePlatformAdapter):
             for sent in self.sent:
                 if sent["message_id"] == message_id:
                     return sent["content"]
-        raise AssertionError(f"no message {message_id}")
+        return ""
 
 
 class _StubGatewayRunner:
@@ -132,16 +133,14 @@ def _complete(turn, sid, *, call, goal, status="completed", duration=192.0, pare
 
 
 def _wait(predicate, timeout=5.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.02)
-    return predicate()
+    return wait_until(predicate, timeout=timeout)
 
 
-def _settle(seconds=0.4):
-    time.sleep(seconds)
+def _quiesce(loop, runner, timeout=5.0):
+    """Every update scheduled so far has run, and no message still has an edit pending."""
+    asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop).result(timeout)
+    wait_until(lambda: not any(m.pumping for m in list(getattr(runner, "_subagent_status_calls", {}).values())),
+               timeout=timeout)
 
 
 def test_one_message_with_route_label_nesting_and_outcomes(loop):
@@ -157,7 +156,7 @@ def test_one_message_with_route_label_nesting_and_outcomes(loop):
     _complete(turn, "sa-2", call="call-A", goal="draft the test", duration=192.0)
 
     assert _wait(lambda: len(adapter.sent) == 1 and "✓ 3m12s" in adapter.latest("msg-1"))
-    _settle()
+    _quiesce(loop, runner)
     assert len(adapter.sent) == 1, "grandchild's own call must not post separately"
     assert adapter.edits, "later events edit the first message"
     assert {e["message_id"] for e in adapter.edits} == {"msg-1"}
@@ -182,10 +181,13 @@ def test_concurrent_calls_get_separate_messages(loop):
     _complete(turn, "a-1", call="call-A", goal="alpha one", duration=5)
     _complete(turn, "b-2", call="call-B", goal="beta two", status="error", duration=7)
 
+    def texts():
+        return [adapter.latest(s["message_id"]) for s in list(adapter.sent)]
+
     assert _wait(lambda: len(adapter.sent) == 2
-                 and "✓ 5s" in adapter.latest(adapter.sent[0]["message_id"])
-                 and "✗" in adapter.latest(adapter.sent[1]["message_id"]))
-    _settle()
+                 and any("alpha one" in text and "✓ 5s" in text for text in texts())
+                 and any("beta two" in text and "✗ error 7s" in text for text in texts()))
+    _quiesce(loop, runner)
     assert len(adapter.sent) == 2
     by_msg = {s["message_id"]: adapter.latest(s["message_id"]) for s in adapter.sent}
     alpha = next(text for text in by_msg.values() if "alpha one" in text)
@@ -219,7 +221,7 @@ def test_no_message_for_bot_peer_or_muted_turn(loop, gate):
         turn, runner, _ = _turn(loop, mute_notification_reply=True)
     _start(turn, "sa-1", call="call-A", goal="audit", count=1)
     _complete(turn, "sa-1", call="call-A", goal="audit", duration=3)
-    _settle()
+    _quiesce(loop, runner)
     assert runner.adapter.sent == [] and runner.adapter.edits == []
 
 
@@ -232,14 +234,14 @@ def test_detached_completion_edits_existing_message(loop):
     current[0] = False
     _complete(turn, "sa-1", call="call-A", goal="background job", duration=65)
     assert _wait(lambda: "✓ 1m05s" in adapter.latest("msg-1"))
-    _settle()
+    _quiesce(loop, runner)
     assert len(adapter.sent) == 1
 
 
 def test_stale_turn_never_opens_a_message(loop):
     turn, runner, _ = _turn(loop, still_current=[False])
     _start(turn, "sa-1", call="call-A", goal="audit", count=1)
-    _settle()
+    _quiesce(loop, runner)
     assert runner.adapter.sent == []
 
 
@@ -253,7 +255,7 @@ def test_thirty_children_stay_under_cap_with_collapse_line(loop):
         _complete(turn, f"sa-{i}", call="call-A", goal=f"task number {i}", duration=10 + i,
                   status="failed" if i % 3 == 0 else "completed")
     assert _wait(lambda: adapter.sent and "✓ 39s" in adapter.latest("msg-1"))
-    _settle()
+    _quiesce(loop, runner)
     for text in [s["content"] for s in adapter.sent] + [e["content"] for e in adapter.edits]:
         assert len(text) <= 1900
     final = adapter.latest("msg-1")
@@ -278,13 +280,12 @@ def test_rapid_completions_coalesce_into_at_most_two_edits(loop, monkeypatch):
     for i in range(5):
         _start(turn, f"sa-{i}", call="call-A", goal=f"job {i}", count=5, index=i)
     assert _wait(lambda: len(adapter.sent) == 1)
-    _settle(1.8)  # the starts' own edit (if any) lands
+    _quiesce(loop, runner)  # the starts' own edit (if any) lands
     before = len(adapter.edits)
-    for i in range(5):
+    for i in range(5):  # back to back: well within 1 s, inside one 1.5 s edit window
         _complete(turn, f"sa-{i}", call="call-A", goal=f"job {i}", duration=2 + i)
-        time.sleep(0.15)
     assert _wait(lambda: adapter.latest("msg-1").count("✓") == 5, timeout=6)
-    _settle(1.8)
+    _quiesce(loop, runner)
     new_edits = adapter.edits[before:]
     assert 1 <= len(new_edits) <= 2
     assert new_edits[-1]["content"].count("✓") == 5
@@ -301,7 +302,7 @@ def test_off_bare_off_and_absent_post_nothing(loop, config):
     turn, runner, _ = _turn(loop, user_config=config)
     _start(turn, "sa-1", call="call-A", goal="audit", count=1)
     _complete(turn, "sa-1", call="call-A", goal="audit", status="failed", duration=3)
-    _settle()
+    _quiesce(loop, runner)
     assert runner.adapter.sent == [] and runner.adapter.edits == []
     assert len(runner.notices) == 1, "the failure notice is unchanged when the message is off"
 

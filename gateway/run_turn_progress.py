@@ -102,6 +102,126 @@ def publish_worker_tool_event(authority, session_id, generation, frame) -> bool:
     return True
 
 
+# ── per-call subagent status message (display.subagent_status: summary) ─────────────────────
+
+SUBAGENT_STATUS_EDIT_INTERVAL = 1.5  # seconds between edits of one message (the progress bubble's window)
+_SUBAGENT_STATUS_LIMIT = 1900
+_SUBAGENT_STATUS_GOAL_CHARS = 60
+_SUBAGENT_STATUS_MAX_MESSAGES = 256  # bound on one runner's open messages (lines stranded by a dead child)
+_SUBAGENT_STATUS_OK = frozenset({"completed", "success", "done"})
+_SUBAGENT_STATUS_EVENTS = frozenset({"subagent.start", "subagent.complete"})
+# Guards every runner's message registry: children report from their own worker threads.
+_SUBAGENT_STATUS_LOCK = threading.Lock()
+
+
+@dataclasses.dataclass
+class _SubagentStatusLine:
+    subagent_id: str
+    parent_id: Optional[str]
+    depth: int
+    label: str  # 'route · model — "goal"'
+    status: Optional[str] = None  # None while running
+    duration: Optional[float] = None
+
+    def outcome(self) -> str:
+        if self.status is None:
+            return "… running"
+        took = f" {_format_subagent_duration(self.duration)}" if isinstance(self.duration, (int, float)) else ""
+        return f"✓{took}" if self.status in _SUBAGENT_STATUS_OK else f"✗ {self.status}{took}"
+
+
+@dataclasses.dataclass(eq=False)  # identity: one runner registry maps several call ids to one message
+class _SubagentStatusMessage:
+    """One status message: every child of one ``delegate_task`` call plus their nested children."""
+    adapter: Any
+    chat_id: Any
+    reply_to: Any
+    metadata: Optional[dict]
+    loop: Any
+    edit_accepts_metadata: bool
+    lines: dict = dataclasses.field(default_factory=dict)  # subagent_id -> line, in start order
+    expected: dict = dataclasses.field(default_factory=dict)  # delegate_call_id -> task_count
+    seen: dict = dataclasses.field(default_factory=dict)  # delegate_call_id -> lines started
+    message_id: Optional[str] = None
+    dirty: bool = True
+    pumping: bool = False
+    dead: bool = False
+    failures: int = 0
+    last_io: float = 0.0
+
+    def settled(self) -> bool:
+        return all(line.status is not None for line in self.lines.values()) and all(
+            self.seen.get(call, 0) >= count for call, count in self.expected.items())
+
+
+def _format_subagent_duration(seconds: float) -> str:
+    total = max(0, round(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def _subagent_status_label(kwargs: dict) -> str:
+    goal = " ".join(str(kwargs.get("goal") or "").split())
+    if len(goal) > _SUBAGENT_STATUS_GOAL_CHARS:
+        goal = goal[:_SUBAGENT_STATUS_GOAL_CHARS - 1] + "…"
+    head = " · ".join(str(part) for part in (kwargs.get("route_label"), kwargs.get("model")) if part)
+    return f'{head} — "{goal}"' if head else f'"{goal}"'
+
+
+def _subagent_status_tree(lines: dict) -> list:
+    """Lines in display order: each child right under its parent's line (start order otherwise)."""
+    children: dict = {}
+    roots = []
+    for line in lines.values():
+        if line.parent_id in lines:
+            children.setdefault(line.parent_id, []).append(line)
+        else:
+            roots.append(line)
+    ordered: list = []
+    stack = list(reversed(roots))
+    while stack:
+        line = stack.pop()
+        ordered.append(line)
+        stack.extend(reversed(children.get(line.subagent_id, [])))
+    return ordered
+
+
+def _render_subagent_status(msg: _SubagentStatusMessage) -> str:
+    """Header + one line per child, indented by event depth. Over the cap, the oldest finished
+    lines (then the oldest running ones) fold into one "… N more (k ok, m failed)" line."""
+    ordered = _subagent_status_tree(msg.lines)
+    base = min((line.depth for line in ordered), default=0)
+    by_age = list(msg.lines.values())
+    candidates = [line for line in by_age if line.status is not None] + [line for line in by_age if line.status is None]
+
+    def compose(hidden: set) -> str:
+        out = [f"🧩 subagents ({len(ordered)})"]
+        if hidden:
+            gone = [line for line in by_age if line.subagent_id in hidden]
+            ok = sum(1 for line in gone if line.status in _SUBAGENT_STATUS_OK)
+            running = sum(1 for line in gone if line.status is None)
+            tail = f", {running} running" if running else ""
+            out.append(f"… {len(gone)} more ({ok} ok, {len(gone) - ok - running} failed{tail})")
+        for line in ordered:
+            if line.subagent_id not in hidden:
+                indent = max(0, line.depth - base)
+                nested = " (nested)" if indent else ""
+                out.append(f"{'    ' * indent}↳ {line.label}{nested}  {line.outcome()}")
+        return "\n".join(out)
+
+    hidden: set = set()
+    text = compose(hidden)
+    while len(text) > _SUBAGENT_STATUS_LIMIT and candidates:
+        hidden.add(candidates.pop(0).subagent_id)
+        text = compose(hidden)
+    return text[:_SUBAGENT_STATUS_LIMIT]
+
+
 class GatewayTurnProgressMixin:
     # ── shared thread→loop plumbing ─────────────────────────────────────────────────────────
 
@@ -155,6 +275,7 @@ class GatewayTurnProgressMixin:
             except Exception:
                 # Best-effort: a viewer frame never blocks the failure notice below, but a lost one is logged.
                 logger.debug("Local viewer progress publish failed for %s", event_type, exc_info=True)
+        self._subagent_status_event(event_type, kwargs)
         # Failed subagent → one clean user-facing notice, handled FIRST, before every progress-queue
         # gate: platforms with tool_progress off must still hear about a dead delegation.
         if event_type == "subagent.complete":
@@ -224,6 +345,170 @@ class GatewayTurnProgressMixin:
                     platform=ctx.source.platform, user_config=ctx.user_config)
         except Exception:
             logger.debug("subagent failure notice failed", exc_info=True)
+
+    # ── per-call subagent status message (display.subagent_status: summary) ─────────────────
+    # Its own send path, like the failure notice: it runs with tool progress off, is never a
+    # cleanup_progress bubble, and keeps editing after the turn ends (background delegations), so
+    # its state lives on the gateway runner (keyed by delegate_call_id), not on this turn.
+
+    def _subagent_status_event(self, event_type: str, kwargs: dict) -> None:
+        if event_type not in _SUBAGENT_STATUS_EVENTS or not kwargs.get("subagent_id"):
+            return
+        try:
+            if not self._subagent_status_enabled():
+                return
+            if event_type == "subagent.start":
+                msg = self._subagent_status_start(kwargs)
+            else:
+                msg = self._subagent_status_finish(kwargs)
+            if msg is not None:
+                self._subagent_status_kick(msg)
+        except Exception:
+            logger.debug("subagent status message update failed", exc_info=True)
+
+    def _subagent_status_enabled(self) -> bool:
+        ctx = self._ctx
+        if not isinstance(ctx.user_config, dict) or ctx.mute_notification_reply or local_viewer_turn(self):
+            return False
+        from gateway.bot_peer_notices import automatic_notices_allowed
+        if not automatic_notices_allowed(ctx.source):
+            return False
+        from gateway.display_config import resolve_display_setting
+        from gateway.run import _platform_config_key
+        platform_key = _platform_config_key(ctx.source.platform)
+        return resolve_display_setting(ctx.user_config, platform_key, "subagent_status", "off") == "summary"
+
+    def _subagent_status_registry(self) -> dict:
+        """delegate_call_id -> message; a nested call's id maps to its parent line's message.
+        Caller holds ``_SUBAGENT_STATUS_LOCK``."""
+        calls = getattr(self._runner, "_subagent_status_calls", None)
+        if calls is None:
+            calls = self._runner._subagent_status_calls = {}
+        return calls
+
+    def _subagent_status_open(self, calls: dict) -> Optional[_SubagentStatusMessage]:
+        ctx = self._ctx
+        adapter = self._runner._delivery_adapter_for(ctx.source)
+        # Only an adapter that edits in place: otherwise every update would be a new message.
+        adapter_edit = getattr(type(adapter), "edit_message", None)
+        if adapter is None or adapter_edit is None or adapter_edit is BasePlatformAdapter.edit_message:
+            return None
+        open_msgs = list(dict.fromkeys(calls.values()))
+        for stale in open_msgs[:max(0, len(open_msgs) - _SUBAGENT_STATUS_MAX_MESSAGES + 1)]:
+            self._subagent_status_forget(calls, stale)
+        return _SubagentStatusMessage(
+            adapter=adapter, chat_id=ctx.source.chat_id, reply_to=ctx._progress_reply_to,
+            metadata=ctx._progress_metadata, loop=ctx._loop_for_step,
+            edit_accepts_metadata=bool(ctx._progress_metadata) and _accepts_keyword(adapter.edit_message, "metadata"),
+        )
+
+    @staticmethod
+    def _subagent_status_forget(calls: dict, msg: _SubagentStatusMessage) -> None:
+        for call_id in [key for key, value in calls.items() if value is msg]:
+            del calls[call_id]
+
+    def _subagent_status_start(self, kwargs: dict) -> Optional[_SubagentStatusMessage]:
+        call_id = str(kwargs.get("delegate_call_id") or "")
+        if not call_id:
+            return None
+        sid, parent_id = str(kwargs["subagent_id"]), kwargs.get("parent_id")
+        with _SUBAGENT_STATUS_LOCK:
+            calls = self._subagent_status_registry()
+            msg = calls.get(call_id) or next(
+                (m for m in calls.values() if parent_id is not None and str(parent_id) in m.lines), None)
+            if msg is None:
+                # Only a live turn opens a message; later edits are not gated on the generation.
+                if not self._ctx._run_still_current():
+                    return None
+                msg = self._subagent_status_open(calls)
+                if msg is None:
+                    return None
+            calls[call_id] = msg
+            msg.expected[call_id] = max(msg.expected.get(call_id, 0), int(kwargs.get("task_count") or 1))
+            if sid not in msg.lines:
+                msg.seen[call_id] = msg.seen.get(call_id, 0) + 1
+                msg.lines[sid] = _SubagentStatusLine(
+                    sid, None if parent_id is None else str(parent_id), int(kwargs.get("depth") or 0),
+                    _subagent_status_label(kwargs))
+            msg.dirty = True
+            return msg
+
+    def _subagent_status_finish(self, kwargs: dict) -> Optional[_SubagentStatusMessage]:
+        sid = str(kwargs["subagent_id"])
+        with _SUBAGENT_STATUS_LOCK:
+            calls = self._subagent_status_registry()
+            msg = calls.get(str(kwargs.get("delegate_call_id") or "")) or next(
+                (m for m in calls.values() if sid in m.lines), None)
+            line = msg.lines.get(sid) if msg is not None else None
+            if line is None:
+                return None
+            line.status = str(kwargs.get("status") or "completed")
+            line.duration = kwargs.get("duration_seconds")
+            msg.dirty = True
+            return msg
+
+    def _subagent_status_kick(self, msg: _SubagentStatusMessage) -> None:
+        with _SUBAGENT_STATUS_LOCK:
+            if msg.pumping or msg.dead:
+                return
+            msg.pumping = True
+        if self._schedule(self._subagent_status_pump(msg), "subagent status scheduling error", loop=msg.loop) is None:
+            with _SUBAGENT_STATUS_LOCK:
+                msg.pumping = False
+
+    async def _subagent_status_pump(self, msg: _SubagentStatusMessage) -> None:
+        """Single flight per message: the first send goes at once, then at most one edit per
+        ``SUBAGENT_STATUS_EDIT_INTERVAL`` carrying the latest state, until nothing is pending."""
+        try:
+            while True:
+                with _SUBAGENT_STATUS_LOCK:
+                    if msg.dead or not msg.dirty:
+                        msg.pumping = False
+                        if msg.dead or (msg.message_id is not None and msg.settled()):
+                            self._subagent_status_forget(self._subagent_status_registry(), msg)
+                        return
+                    wait = 0.0 if msg.message_id is None else msg.last_io + SUBAGENT_STATUS_EDIT_INTERVAL - time.monotonic()
+                    text = _render_subagent_status(msg) if wait <= 0 else None
+                    msg.dirty = text is None
+                if text is None:
+                    await asyncio.sleep(wait)
+                    continue
+                await self._subagent_status_deliver(msg, text)
+                msg.last_io = time.monotonic()
+        except BaseException:
+            with _SUBAGENT_STATUS_LOCK:
+                msg.pumping = False
+            raise
+
+    async def _subagent_status_deliver(self, msg: _SubagentStatusMessage, text: str) -> None:
+        try:
+            if msg.message_id is None:
+                result = await msg.adapter.send(chat_id=msg.chat_id, content=text, reply_to=msg.reply_to,
+                                                metadata=msg.metadata)
+                if getattr(result, "success", False) and getattr(result, "message_id", None):
+                    msg.message_id = str(result.message_id)
+                    return
+                msg.dead = True  # nothing to edit: drop the call rather than post again
+                return
+            kwargs = {"chat_id": msg.chat_id, "message_id": msg.message_id, "content": text}
+            if getattr(msg.adapter, "REQUIRES_EDIT_FINALIZE", False):
+                kwargs["finalize"] = True
+            if msg.edit_accepts_metadata:
+                kwargs["metadata"] = msg.metadata
+            result = await msg.adapter.edit_message(**kwargs)
+            if getattr(result, "success", False):
+                return
+            error = (getattr(result, "error", "") or "").lower()
+            transient = getattr(result, "retryable", False) or "flood" in error or "retry after" in error
+        except Exception:
+            logger.debug("subagent status message delivery failed", exc_info=True)
+            transient = True
+        with _SUBAGENT_STATUS_LOCK:
+            msg.failures += 1
+            if transient and msg.failures < 3:
+                msg.dirty = True  # retried on the next window with the then-latest state
+            else:
+                msg.dead = True
 
     def _progress_live_status(self, event_type: str, tool_name, args) -> None:
         """Live status line (Slack assistant status): stash the tool phrase on the adapter; the

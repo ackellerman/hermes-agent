@@ -13,6 +13,7 @@ tool calls or reasoning.
 
 import logging
 import time
+import uuid
 import weakref
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -470,6 +471,9 @@ def _build_children(
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
     from tools.delegation_live_log import wrap_progress_callback
     from tools.delegation_output_schema import append_output_contract
+    # One id per delegate_task call, on every relayed event: the gateway's per-call status message
+    # groups on it (delegation_id can be None when live transcripts fail).
+    delegate_call_id = uuid.uuid4().hex
     children = []
     for i, t in enumerate(task_list):
         route = routes[i]
@@ -507,13 +511,16 @@ def _build_children(
         if _writer is not None:
             child.tool_progress_callback = wrap_progress_callback(getattr(child, "tool_progress_callback", None), _writer)
             child._live_transcript_path = str(_writer.path)
+        _ident_ref = getattr(child, "_progress_identity_ref", None)
+        _ident_ref = _ident_ref if isinstance(_ident_ref, dict) else {}
+        _ident_ref["delegate_call_id"] = delegate_call_id
         if route.report() is not None:
             child._delegate_route = route.report()
+            if route.label:
+                _ident_ref["route_label"] = route.label
         if live_deleg_id:
             child._delegation_id = live_deleg_id
-            _ident_ref = getattr(child, "_progress_identity_ref", None)
-            if isinstance(_ident_ref, dict):
-                _ident_ref["delegation_id"] = live_deleg_id
+            _ident_ref["delegation_id"] = live_deleg_id
         children.append((i, t, child))
     return children, None
 
