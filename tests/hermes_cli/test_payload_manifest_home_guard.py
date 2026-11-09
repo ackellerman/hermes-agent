@@ -11,7 +11,7 @@ from tests.home_io_guard import HomeIOGuard
 @pytest.mark.parametrize("contents", [None, "{}", "not-json"])
 def test_real_payload_discovery_can_read_a_manifest_beside_an_in_home_checkout(tmp_path, monkeypatch, contents):
     from pm.environments import _payload_manifest
-    import tests.home_io_guard as home_io_guard
+    from tests import home_io_guard
 
     home = tmp_path / "protected-home"
     checkout = home / "hermes-agent"
@@ -117,7 +117,9 @@ def test_payload_manifest_creation_remains_refused(tmp_path, monkeypatch, operat
     assert not os.path.lexists(manifest)
 
 
-@pytest.mark.parametrize("relative", ["config.yaml", ".env", "state.db", "manifest.json.bak", "nested/manifest.json"])
+@pytest.mark.parametrize(
+    "relative", ["config.yaml", ".env", "state.db", "manifest.json.bak", "nested/manifest.json", "manifest.json/inner"]
+)
 def test_manifest_exemption_does_not_allow_other_home_reads(tmp_path, monkeypatch, relative):
     home = tmp_path / "protected-home"
     target = home / relative
@@ -144,3 +146,19 @@ def test_store_root_parent_stamp_probe_is_metadata_only(tmp_path, monkeypatch):
             stamp.read_text(encoding="utf-8")
         with pytest.raises(AssertionError, match="REAL hermes home"):
             (home / "config.yaml").is_file()
+
+
+@pytest.mark.parametrize("access", ["read", "metadata"])
+def test_manifest_exemption_does_not_follow_a_symlink(tmp_path, access):
+    # The exemption matches the lexical path; a symlink planted at <home>/manifest.json
+    # must not turn it into access to whatever home file it points at. Call check()
+    # directly: under pytest an outer conftest wrapper re-opens the resolved path, which
+    # would mask the guard's own decision.
+    home = tmp_path / "protected-home"
+    home.mkdir()
+    secret = home / ".env"
+    secret.write_text("SECRET=1", encoding="utf-8")
+    (home / "manifest.json").symlink_to(secret)
+    guard = HomeIOGuard(lambda: [home])
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(home / "manifest.json", **{access: True})
