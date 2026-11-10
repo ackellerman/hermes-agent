@@ -1364,6 +1364,11 @@ class VoiceReceiver:
     # --- Packet handler (called from SocketReader thread) ---
 
     def _on_packet(self, data: bytes):
+        # The arrival stamp is taken HERE, on receipt, and carried through the transport decrypt,
+        # the DAVE hold and the decode: everything downstream can be slow (a cold model load
+        # holding the GIL, a ring replay), and a frame heard before `t_ready` must be cut by when
+        # it was HEARD, not by when this thread got round to decoding it.
+        arrived = time.monotonic()
         if not self._running or self._paused:
             return
 
@@ -1504,11 +1509,11 @@ class VoiceReceiver:
                 # object survives protocol downgrades to 0 and passthrough
                 # transitions, where plaintext is legitimate and must fall
                 # through to opus below.
-                self._hold_dave_payload(ssrc, decrypted)
+                self._hold_dave_payload(ssrc, decrypted, arrived_at=arrived)
                 return
 
         # --- Opus decode -> PCM ---
-        self._decode_into_buffer(ssrc, decrypted)
+        self._decode_into_buffer(ssrc, decrypted, arrived_at=arrived)
 
     def _dave_decrypt(self, ssrc: int, user_id: int, payload: bytes,
                       session=None) -> Optional[bytes]:
@@ -1546,9 +1551,10 @@ class VoiceReceiver:
                 logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
             return None
 
-    def _hold_dave_payload(self, ssrc: int, payload: bytes) -> None:
-        """Hold a post-NaCl payload from an as-yet unattributable SSRC."""
+    def _hold_dave_payload(self, ssrc: int, payload: bytes, *, arrived_at: Optional[float] = None) -> None:
+        """Hold a post-NaCl payload from an as-yet unattributable SSRC, stamped with its arrival."""
         evicted = 0
+        held_at = time.monotonic() if arrived_at is None else arrived_at
         with self._lock:
             pending = self._dave_pending.get(ssrc)
             if pending is None:
@@ -1559,7 +1565,7 @@ class VoiceReceiver:
                 # Count it: these are the only voice bytes this path can lose.
                 self._dave_unmapped_dropped += 1
                 evicted = self._dave_unmapped_dropped
-            pending.append((time.monotonic(), payload))
+            pending.append((held_at, payload))
         if evicted and (evicted == 1 or evicted % 50 == 0):
             logger.info(
                 "DAVE active with unresolved sender: hold ring full, "

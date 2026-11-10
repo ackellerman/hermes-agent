@@ -692,6 +692,59 @@ async def test_a_flush_inside_the_deaf_window_drops_what_the_buffers_hold(
 
 
 @pytest.mark.asyncio
+async def test_the_arrival_stamp_is_taken_on_receipt_not_at_decode(
+        monkeypatch, nacl, decoders):
+    """A reader that falls behind still stamps the packet when it reached the socket.
+
+    The transport decrypt is blocked while the tone ends, so the frame was HEARD before
+    ``t_ready`` and its decode runs after it.  Stamping at decode entry (what the cut used to
+    read) admits exactly the audio the tone is supposed to fence off (e6 finding 4).
+    """
+    lease_release, seen = threading.Event(), {}
+
+    def lease(name, install=False):
+        seen["called"] = True
+        lease_release.wait(10)
+        return dict(_WARM_CPU)
+
+    env = _env(monkeypatch, lease=lease, timeout=10)
+    await _join(env)
+    receiver = env.receiver
+    receiver.map_ssrc(SSRC, OPERATOR)
+    assert await _until(lambda: seen.get("called"))
+    assert env.ready_at is None
+
+    in_decrypt, let_decrypt = threading.Event(), threading.Event()
+
+    def slow_decrypt(encrypted, header, nonce):
+        in_decrypt.set()
+        assert let_decrypt.wait(10)
+        return b"opus-frame"
+
+    monkeypatch.setattr(nacl, "decrypt", slow_decrypt)
+    header = struct.pack(">BBHII", 0x80, 0x78, 1, 1001, SSRC)
+    reader = threading.Thread(target=receiver._on_packet,
+                              args=(header + b"opus-frame" + b"nonc",), daemon=True)
+    reader.start()
+    assert await _until(in_decrypt.is_set)
+    receiver.mark_ready()                       # the tone ended while this frame sat undecrypted
+    let_decrypt.set()
+    reader.join(10)
+    assert not reader.is_alive()
+
+    # The stamp travelled through the blocked decrypt: it is receipt time, not decode entry.
+    with receiver._lock:
+        [(stamp, nbytes)] = list(receiver._arrivals[SSRC])
+    assert nbytes == FRAME_BYTES
+    assert stamp <= receiver.ready_at, "the frame was stamped at decode, after the tone"
+
+    _quiet(env)
+    assert receiver.check_silence() == [], "the frame was admitted by its decode time"
+    assert receiver._pre_ready_dropped == 1
+    lease_release.set()
+
+
+@pytest.mark.asyncio
 async def test_the_leave_flush_applies_the_same_cut(monkeypatch, nacl, decoders):
     """The leave path flushes instead of polling: the cut must be applied there too."""
     release, seen = threading.Event(), {}
