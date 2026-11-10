@@ -13,9 +13,11 @@ side-effect free until it decides CUDA can actually work:
   nothing is missing and a CUDA device is visible, warm the model through
   ``stt_lease.warm_stt_provider(install=False)`` so the log proves the effective device.
 
-Importing ctranslate2 and loading medium take seconds, so the gateway runs this on an executor
+Importing ctranslate2 and loading medium take seconds, so the gateway runs this on a daemon
 thread as a fire-and-forget task beside the turn-machinery warm-up, never inside it
-(``gateway/run_startup.py::_start_startup_stt_check``): the inbound gate must not wait for a model.
+(``gateway/run_startup.py::_start_startup_stt_check``): the inbound gate must not wait for a model,
+and neither must process exit — a cold download behind ``asyncio.run``'s default executor would be
+joined at loop close.
 """
 
 from __future__ import annotations
@@ -55,8 +57,9 @@ def _cuda_device_count() -> int:
 def _warn_missing_cuda_libraries(missing: Sequence[str]) -> None:
     logger.warning(
         "Local STT is configured for CUDA and a CUDA device is visible, but the CUDA 12 "
-        "libraries ctranslate2 dlopens at the first inference are missing: %s (searched the "
-        "site-packages of this interpreter, prefix %s). Transcription will run on CPU. "
+        "libraries ctranslate2 dlopens at the first inference cannot be loaded: %s (neither the "
+        "nvidia wheels in this interpreter's site-packages nor the dynamic loader can resolve "
+        "them; prefix %s). Transcription will run on CPU. "
         "Fix: %s", ", ".join(missing), sys.prefix, INSTALL_HINT)
 
 
@@ -78,6 +81,12 @@ def check_local_stt_at_startup(stt_config: Optional[dict[str, Any]] = None) -> d
 
     if stt_config is None:
         stt_config = transcription_tools._load_stt_config()
+    # ``stt: enabled`` (a scalar instead of a mapping) reaches here from ``_load_stt_config``, which
+    # returns whatever the ``stt`` key holds; a boot probe must skip, not die on ``.get`` (r1 F3).
+    if not isinstance(stt_config, dict):
+        logger.debug("[STT] startup CUDA check skipped: stt config is %s, not a mapping",
+                     type(stt_config).__name__)
+        stt_config = {}
     provider = (transcription_tools._get_provider(stt_config) or "").lower().strip()
     result: dict[str, Any] = {"provider": provider, "action": "skipped", "reason": "",
                               "missing": (), "cuda_devices": None}
@@ -85,7 +94,9 @@ def check_local_stt_at_startup(stt_config: Optional[dict[str, Any]] = None) -> d
         result["reason"] = "provider-not-local"
         return result
 
-    local_cfg = stt_config.get("local") or {}
+    local_cfg = stt_config.get("local")
+    if not isinstance(local_cfg, dict):
+        local_cfg = {}
     requested = str(local_cfg.get("device") or "auto").strip().lower()
     result["device"] = requested
     if requested not in _CUDA_DEVICES:

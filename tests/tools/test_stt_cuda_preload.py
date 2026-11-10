@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -38,15 +40,28 @@ CUBLAS12_FILES = ("libcublas.so.12", "libcublas.so.12.9.3.13",
 
 
 class _FakeCtypes:
-    """Stands in for the ``ctypes`` module so the resolver's dlopen calls are observable."""
+    """Stands in for the ``ctypes`` module so the resolver's dlopen calls are observable.
+
+    ``resolvable`` models the DYNAMIC LOADER: a BARE soname (``ctypes.CDLL("libcublas.so.12")``)
+    loads only when the loader search can find it — a distro package, a kept ``LD_LIBRARY_PATH``, a
+    system CUDA 12 toolkit, or a copy another module loaded ``RTLD_GLOBAL``. A full path is loaded
+    from disk, as the real ``ctypes.CDLL`` does. Empty ``resolvable`` is a host with no CUDA 12
+    anywhere the loader can see.
+    """
 
     RTLD_GLOBAL = ctypes.RTLD_GLOBAL
 
-    def __init__(self):
+    def __init__(self, *, resolvable=(), fail=()):
+        self.resolvable = set(resolvable)
+        self.fail = set(fail)
         self.loaded: list[tuple[str, int]] = []
 
     def CDLL(self, path, mode=0):
-        self.loaded.append((Path(path).name, mode))
+        name = Path(str(path)).name
+        bare = str(path) == name  # a soname for the loader to search, not a path from the wheel
+        if name in self.fail or (bare and name not in self.resolvable):
+            raise OSError(f"{name}: cannot open shared object file: No such file or directory")
+        self.loaded.append((name, mode))
         return object()
 
 
@@ -127,9 +142,37 @@ def test_resolver_names_a_missing_soname(tmp_path, monkeypatch):
     assert [name for name, _mode in fake.loaded] == ["libcublas.so.12"]
 
 
-def test_resolver_reports_every_soname_when_the_wheel_is_absent(monkeypatch):
+def test_resolver_reports_every_soname_when_neither_source_has_it(monkeypatch):
+    """No wheel tree AND nothing the loader can resolve: both sonames are missing."""
     monkeypatch.setattr(tl, "_ilu", SimpleNamespace(find_spec=lambda name: None))
     fake = _FakeCtypes()
+    monkeypatch.setattr(tl, "ctypes", fake)
+
+    assert tl.preload_cuda_libraries() == ("libcublasLt.so.12", "libcublas.so.12")
+    assert fake.loaded == []
+
+
+def test_resolver_accepts_a_soname_the_loader_already_resolves(monkeypatch):
+    """No wheel package, but the loader resolves the bare soname (review r1 F1).
+
+    ctranslate2 dlopens ``libcublas.so.12`` with no path, so a distro package, a kept
+    ``LD_LIBRARY_PATH`` or a system CUDA 12 toolkit is a working CUDA 12 install. Calling that
+    "missing" was a silent GPU→CPU downgrade under the default ``device: auto``.
+    """
+    monkeypatch.setattr(tl, "_ilu", SimpleNamespace(find_spec=lambda name: None))
+    fake = _FakeCtypes(resolvable=("libcublasLt.so.12", "libcublas.so.12"))
+    monkeypatch.setattr(tl, "ctypes", fake)
+
+    assert tl.preload_cuda_libraries() == ()
+    # Loaded by soname through the loader, in dependency order, into the global scope.
+    assert [name for name, _mode in fake.loaded] == ["libcublasLt.so.12", "libcublas.so.12"]
+    assert all(mode & ctypes.RTLD_GLOBAL for _name, mode in fake.loaded)
+
+
+def test_resolver_never_asks_the_loader_for_a_cu13_soname(monkeypatch):
+    """The loader fallback is pinned to ``.so.12``: cu13 is unusable, however resolvable."""
+    monkeypatch.setattr(tl, "_ilu", SimpleNamespace(find_spec=lambda name: None))
+    fake = _FakeCtypes(resolvable=("libcublasLt.so.13", "libcublas.so.13"))
     monkeypatch.setattr(tl, "ctypes", fake)
 
     assert tl.preload_cuda_libraries() == ("libcublasLt.so.12", "libcublas.so.12")
@@ -141,6 +184,45 @@ def test_resolver_is_idempotent(tmp_path, monkeypatch):
 
     assert tl.preload_cuda_libraries() == ()
     assert tl.preload_cuda_libraries() == ()
+    assert [name for name, _mode in fake.loaded] == ["libcublasLt.so.12", "libcublas.so.12"]
+
+
+def test_resolver_retries_only_the_soname_that_failed(tmp_path, monkeypatch):
+    """Lt loads, cuBLAS raises: name cuBLAS alone, retry it alone, heal without a restart (r1 F5)."""
+    fake = _install_tree(tmp_path, monkeypatch, CUBLAS12_FILES)
+    fake.fail = {"libcublas.so.12"}
+
+    assert tl.preload_cuda_libraries() == ("libcublas.so.12",)
+    assert [name for name, _mode in fake.loaded] == ["libcublasLt.so.12"]
+    assert tl.preload_cuda_libraries() == ("libcublas.so.12",)  # retried, still failing
+
+    fake.fail = set()  # the missing wheel arrived
+    assert tl.preload_cuda_libraries() == ()
+    assert [name for name, _mode in fake.loaded] == ["libcublasLt.so.12", "libcublas.so.12"]
+
+    assert tl.preload_cuda_libraries() == ()
+    assert len(fake.loaded) == 2  # both loaded: no further dlopen
+
+
+def test_resolver_serializes_concurrent_callers(tmp_path, monkeypatch):
+    """A lease warm and the boot check can race; the probe-then-load pair must be atomic (r1 F5)."""
+    fake = _install_tree(tmp_path, monkeypatch, CUBLAS12_FILES)
+    load = fake.CDLL
+
+    def _slow_load(path, mode=0):
+        time.sleep(0.02)  # widen the window the lock exists to close
+        return load(path, mode)
+
+    fake.CDLL = _slow_load
+    results: list[tuple[str, ...]] = []
+    threads = [threading.Thread(target=lambda: results.append(tl.preload_cuda_libraries()))
+               for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+    assert results == [()] * 8
     assert [name for name, _mode in fake.loaded] == ["libcublasLt.so.12", "libcublas.so.12"]
 
 
@@ -184,6 +266,17 @@ def test_auto_with_missing_sonames_loads_straight_on_cpu(monkeypatch, created, c
 
 def test_auto_with_sonames_present_keeps_the_requested_device(monkeypatch, created):
     monkeypatch.setattr(tl, "preload_cuda_libraries", lambda: ())
+
+    tl._load_local_whisper_model("small", device="auto", compute_type="auto")
+
+    assert created == [("auto", "auto")]
+
+
+def test_auto_stays_on_cuda_when_only_the_loader_has_the_libraries(monkeypatch, created):
+    """The consequence of review r1 F1: no wheel package, loader resolves → no GPU→CPU downgrade."""
+    monkeypatch.setattr(tl, "_ilu", SimpleNamespace(find_spec=lambda name: None))
+    monkeypatch.setattr(
+        tl, "ctypes", _FakeCtypes(resolvable=("libcublasLt.so.12", "libcublas.so.12")))
 
     tl._load_local_whisper_model("small", device="auto", compute_type="auto")
 
@@ -312,6 +405,44 @@ def test_warm_inference_failure_that_is_not_cuda_is_reported(local_provider, mon
     assert result["warmed"] is False
     assert result["action"] == "error"
     assert "CUDA out of memory" in result["error"]
+
+
+def test_idle_timer_is_touched_before_the_warm_inference(local_provider, monkeypatch):
+    """unload_after_idle_seconds > 0: touching after the warm leaves an eviction window (r1 F6)."""
+    events: list[str] = []
+    monkeypatch.setattr(tt, "_touch_transcription_time", lambda: events.append("touch"))
+
+    class _RecordingModel(_FakeWhisper):
+        def transcribe(self, audio, **kwargs):
+            events.append("transcribe")
+            return super().transcribe(audio, **kwargs)
+
+    monkeypatch.setattr(tt, "_get_or_load_local_model", lambda name, cfg: _RecordingModel("cuda"))
+
+    stt_lease.warm_stt_provider()
+
+    assert events == ["touch", "transcribe"]
+
+
+def test_warm_silence_wav_is_rendered_once_per_process(local_provider, monkeypatch):
+    """Every lease used to pay a mkdtemp + 32 KB write on the desktop dictation path (r1 F6)."""
+    paths: list[str] = []
+
+    class _PathRecordingModel(_FakeWhisper):
+        def transcribe(self, audio, **kwargs):
+            paths.append(audio)
+            return super().transcribe(audio, **kwargs)
+
+    monkeypatch.setattr(tt, "_get_or_load_local_model", lambda name, cfg: _PathRecordingModel("cuda"))
+
+    stt_lease.warm_stt_provider()
+    stt_lease.warm_stt_provider()
+
+    assert len(paths) == 2
+    assert paths[0] == paths[1]
+    assert paths[0].endswith("silence.wav")
+    # Shared for the process: the warm must not delete the file a concurrent lease is reading.
+    assert Path(paths[0]).is_file()
 
 
 # ============================================================================

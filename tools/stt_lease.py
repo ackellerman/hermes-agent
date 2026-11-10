@@ -25,6 +25,7 @@ instantly eligible for unload.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import shutil
@@ -45,20 +46,35 @@ _stt_leases: set = set()
 _WARM_AUDIO_SECONDS = 1.0
 _WARM_SAMPLE_RATE = 16_000
 
+# One WAV per process: every lease needs the same bytes, and a mkdtemp + 32 KB write on every
+# mic-open was pure overhead on the desktop dictation path (review r1 F6).
+_warm_audio_lock = threading.Lock()
+_warm_audio_paths: dict[tuple[int, float], str] = {}
+
 
 def _warm_silence_path() -> str:
-    """~1 s of 16 kHz mono 16-bit silence as a temp WAV.
+    """~1 s of 16 kHz mono 16-bit silence as a WAV, rendered once per process.
 
     A file rather than a numpy array on purpose: numpy is not a core dependency, and the warm must
-    work anywhere faster-whisper does (its test environments included).
+    work anywhere faster-whisper does (its test environments included). The file is shared by every
+    lease and removed once at interpreter exit; readers only pass the path to ``transcribe``, never
+    writing to it.
     """
-    path = os.path.join(tempfile.mkdtemp(prefix="hermes-stt-warm-"), "silence.wav")
-    with wave.open(path, "wb") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)
-        wav.setframerate(_WARM_SAMPLE_RATE)
-        wav.writeframes(b"\x00\x00" * int(_WARM_SAMPLE_RATE * _WARM_AUDIO_SECONDS))
-    return path
+    key = (_WARM_SAMPLE_RATE, _WARM_AUDIO_SECONDS)
+    with _warm_audio_lock:
+        cached = _warm_audio_paths.get(key)
+        if cached is not None and os.path.isfile(cached):
+            return cached
+        directory = tempfile.mkdtemp(prefix="hermes-stt-warm-")
+        path = os.path.join(directory, "silence.wav")
+        with wave.open(path, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(_WARM_SAMPLE_RATE)
+            wav.writeframes(b"\x00\x00" * int(_WARM_SAMPLE_RATE * _WARM_AUDIO_SECONDS))
+        atexit.register(shutil.rmtree, directory, True)
+        _warm_audio_paths[key] = path
+        return path
 
 
 def _effective_device(model: Any) -> str:
@@ -90,19 +106,16 @@ def _warm_inference(model: Any, model_name: str, stt_config: dict[str, Any]) -> 
     warm_path = _warm_silence_path()
     started = time.monotonic()
     try:
-        try:
-            segments, _info = model.transcribe(warm_path, **kwargs)
-            list(segments)
-        except Exception as exc:
-            if not transcription_tools._looks_like_cuda_lib_error(exc):
-                raise
-            logger.warning("[STT] warm-up inference on '%s' failed on CUDA (%s) — evicting the "
-                           "cached model and warming CPU (int8)", model_name, exc)
-            model = transcription_tools._replace_cached_model_on_cpu(model_name)
-            segments, _info = model.transcribe(warm_path, **kwargs)
-            list(segments)
-    finally:
-        shutil.rmtree(os.path.dirname(warm_path), ignore_errors=True)
+        segments, _info = model.transcribe(warm_path, **kwargs)
+        list(segments)
+    except Exception as exc:
+        if not transcription_tools._looks_like_cuda_lib_error(exc):
+            raise
+        logger.warning("[STT] warm-up inference on '%s' failed on CUDA (%s) — evicting the "
+                       "cached model and warming CPU (int8)", model_name, exc)
+        model = transcription_tools._replace_cached_model_on_cpu(model_name)
+        segments, _info = model.transcribe(warm_path, **kwargs)
+        list(segments)
     return _effective_device(model), int((time.monotonic() - started) * 1000)
 
 
@@ -157,11 +170,14 @@ def warm_stt_provider(
         if model is None:  # defensive: load failed without raising
             result.update(action="error", error="Local whisper model failed to load")
             return result
+        # A just-loaded model counts as activity: the idle-unload watcher must
+        # not treat the load as idle time and evict the model. Touch BEFORE the
+        # warm inference — with unload_after_idle_seconds > 0 the warm is the
+        # longest idle-shaped window in the lease, and touching after it invites
+        # an eviction that empties the cache slot mid-warm (review r1 F6).
+        transcription_tools._touch_transcription_time()
         # Prove the device, not the load: one short inference, CPU fallback on a CUDA lib error.
         device, transcribe_ms = _warm_inference(model, model_name, stt_config)
-        # A just-warmed model counts as activity: the idle-unload watcher must
-        # not treat the load itself as idle time and evict it immediately.
-        transcription_tools._touch_transcription_time()
         # Register with the idle-lifetime mechanism: a model loaded ONLY by
         # warm-up (mic open → cancel, no transcription) would otherwise sit
         # resident with no watcher, silently ignoring

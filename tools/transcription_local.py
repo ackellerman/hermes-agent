@@ -15,6 +15,7 @@ import platform
 import shlex
 import subprocess
 import tempfile
+import threading
 import importlib.util as _ilu
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -139,6 +140,9 @@ def _looks_like_cuda_lib_error(exc: BaseException) -> bool:
 # are found and loaded here, at runtime, from the interpreter's own site-packages.
 _CUDA12_CUBLAS_SONAMES: tuple[str, ...] = ("libcublasLt.so.12", "libcublas.so.12")  # Lt first
 _PRELOADED_CUDA_SONAMES: set[str] = set()
+# Two threads can reach the loader at once (a lease warm and the boot check), and the docstring's
+# idempotency is only true for a serial caller: the probe-then-load pair has to be atomic.
+_CUDA_PRELOAD_LOCK = threading.Lock()
 
 
 def cuda_library_dir(package: str = "nvidia.cublas") -> Optional[Path]:
@@ -147,6 +151,11 @@ def cuda_library_dir(package: str = "nvidia.cublas") -> Optional[Path]:
     Resolved with ``find_spec`` on the exact wheel package: taking any ``nvidia/*/lib`` directory
     would hand back the CUDA 13 tree (``nvidia/cudnn``'s ``.so.9``, a cuBLAS 13 ``.so.13``), which
     ctranslate2 cannot use. ``None`` when the wheel is not installed here at all.
+
+    The layout is the LINUX wheel one (``nvidia/<pkg>/lib``). Windows wheels put the DLLs in
+    ``nvidia/<pkg>/bin``, so this resolver would report everything missing there — out of scope
+    because the ``stt-whisper-cuda`` extra is gated ``sys_platform == 'linux'``
+    (``[tool.hermes.extras-platforms]``), and ctranslate2's CUDA backend is not on macOS at all.
     """
     try:
         spec = _ilu.find_spec(package)
@@ -167,27 +176,44 @@ def cuda_library_dir(package: str = "nvidia.cublas") -> Optional[Path]:
 def preload_cuda_libraries() -> tuple[str, ...]:
     """Load the CUDA 12 libraries ctranslate2 needs; return the sonames still missing.
 
-    Empty tuple means every soname is loaded. Idempotent: a soname already loaded in this process
-    is skipped, so a second call returns ``()`` without touching the loader, and a partially
-    populated tree reports only the names it could not load. ``RTLD_GLOBAL`` is required —
+    Empty tuple means every soname is loaded. Idempotent and thread-safe: a soname already loaded
+    in this process is skipped, so a second call returns ``()`` without touching the loader, and a
+    partially populated tree reports only the names it could not load (a later call retries those
+    alone, which is how a mid-flight install heals itself). ``RTLD_GLOBAL`` is required —
     ctranslate2's extension resolves these symbols through the global scope.
+
+    The wheel is the PRIMARY source, not the only one. ctranslate2 dlopens the bare soname
+    (``strings … libctranslate2 | grep libcublas`` → ``libcublas.so.12``, no path), so the loader's
+    own search decides: a distro package, a kept ``LD_LIBRARY_PATH``, a system CUDA 12 toolkit or an
+    already-loaded copy satisfies it. Reporting those hosts as "missing" was a silent GPU→CPU
+    downgrade under the default ``device: auto`` (review r1 F1). The name stays pinned to
+    ``.so.12``, so a cu13 tree is never picked up either way.
     """
     lib_dir = cuda_library_dir()
     missing: list[str] = []
-    for soname in _CUDA12_CUBLAS_SONAMES:
-        if soname in _PRELOADED_CUDA_SONAMES:
-            continue
-        path = lib_dir / soname if lib_dir is not None else None
-        if path is None or not path.is_file():
-            missing.append(soname)
-            continue
-        try:
-            ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
-        except OSError as exc:
-            logger.debug("Preloading CUDA library %s failed: %s", path, exc)
-            missing.append(soname)
-            continue
-        _PRELOADED_CUDA_SONAMES.add(soname)
+    with _CUDA_PRELOAD_LOCK:
+        for soname in _CUDA12_CUBLAS_SONAMES:
+            if soname in _PRELOADED_CUDA_SONAMES:
+                continue
+            path = lib_dir / soname if lib_dir is not None else None
+            if path is not None and path.is_file():
+                try:
+                    ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+                except OSError as exc:
+                    # A broken/unloadable wheel file is not the end: the loader may still have a
+                    # usable copy on its search path.
+                    logger.debug("Preloading CUDA library %s failed: %s", path, exc)
+                else:
+                    _PRELOADED_CUDA_SONAMES.add(soname)
+                    continue
+            try:
+                ctypes.CDLL(soname, mode=ctypes.RTLD_GLOBAL)
+            except OSError as exc:
+                logger.debug("CUDA library %s is not resolvable by the loader: %s", soname, exc)
+                missing.append(soname)
+                continue
+            logger.debug("CUDA library %s resolved by the dynamic loader", soname)
+            _PRELOADED_CUDA_SONAMES.add(soname)
     return tuple(missing)
 
 
