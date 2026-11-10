@@ -26,6 +26,7 @@ export const frAuxTasks: AuxTaskCopyMap = {
     hint: 'Sous-agent de révision /review'
   },
   voice_chat: { label: 'Chat vocal', hint: 'Réponses parlées du mode vocal' },
+  voice_brief: { label: 'Brief vocal', hint: 'Bref résumé parlé avant le tour vocal' },
   triage_specifier: {
     label: 'Précision du triage',
     hint: 'Détail des spécifications Kanban'

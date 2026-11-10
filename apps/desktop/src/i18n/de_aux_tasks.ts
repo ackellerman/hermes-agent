@@ -26,6 +26,7 @@ export const deAuxTasks: AuxTaskCopyMap = {
     hint: '/review Bewertungs-Subagent'
   },
   voice_chat: { label: 'Sprachchat', hint: 'Gesprochene Antworten im Sprachmodus' },
+  voice_brief: { label: 'Sprach-Briefing', hint: 'Gesprochenes Briefing vor dem Sprachzug' },
   triage_specifier: {
     label: 'Triage-Spezifizierer',
     hint: 'Kanban-Spezifikation ausarbeiten'

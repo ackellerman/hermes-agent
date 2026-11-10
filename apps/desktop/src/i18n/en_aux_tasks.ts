@@ -8,6 +8,7 @@ export const enAuxTasks: AuxTaskCopyMap = {
   title_generation: { label: 'Title gen', hint: 'Session titles' },
   review: { label: 'Review', hint: '/review reviewer subagent' },
   voice_chat: { label: 'Voice chat', hint: 'Spoken voice-mode replies' },
+  voice_brief: { label: 'Voice brief', hint: 'Pre-turn spoken brief on voice turns' },
   triage_specifier: { label: 'Triage specifier', hint: 'Kanban spec fleshing' },
   kanban_decomposer: { label: 'Kanban decomposer', hint: 'Task decomposition' },
   profile_describer: { label: 'Profile describer', hint: 'Auto profile descriptions' },

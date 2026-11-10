@@ -26,6 +26,7 @@ export const esAuxTasks: AuxTaskCopyMap = {
     hint: 'subagente revisor de /review'
   },
   voice_chat: { label: 'Chat de voz', hint: 'Respuestas habladas del modo voz' },
+  voice_brief: { label: 'Breve de voz', hint: 'Resumen hablado antes del turno de voz' },
   triage_specifier: {
     label: 'Especificador de triaje',
     hint: 'Detalle de especificaciones de Kanban'
