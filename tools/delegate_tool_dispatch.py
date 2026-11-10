@@ -116,8 +116,16 @@ def _record_finished_child(batch: _Batch, entry: Any, honor_parent_interrupt: bo
     """Detached (background) unit: durably record a child on the unit's own row the moment it finishes, so an owner
     death before the unit's join — or anywhere before its durable completion write, the whole remaining window for a
     one-child unit — loses only children still running, never finished work (#116000). Best-effort by construction:
-    ``record_unit_child`` never raises into the join."""
+    ``record_unit_child`` never raises into the join.
+
+    The entry is stamped with its kept-child ids (``child_id``, ``subagent_id``, ``resume_hint``) BEFORE the durable
+    copy, exactly as finalize stamps it later: this snapshot is what ``recover_abandoned_delegations`` replays after
+    an owner crash, and the recovered completion must name the child the parent can resume, not just its task index.
+    """
     if not honor_parent_interrupt and batch.unit_id and isinstance(entry, dict):
+        from tools.delegate_children import stamp_completion_entry
+        child = next((c for (i, _task, c) in batch.children if i == entry.get("task_index")), None)
+        stamp_completion_entry(entry, child)
         record_unit_child(batch.unit_id, entry)
 
 def _release_unstarted_child(batch: _Batch, child: Any) -> None:
@@ -374,6 +382,14 @@ _BACKGROUND_NOTES = {
     ),
     "control_hint": (
         "While a child runs you can orchestrate it live with this same tool: delegate_task(action='list') to see live "
+        "children, action='steer' with subagent_id + message to redirect one, action='stop' with subagent_id to end "
+        "one early."
+    ),
+    # Same sentence, but naming the id a kept child actually has (its ``child_id``). Only used when at least one
+    # child of the call is kept: a call with no kept child keeps the wording above byte for byte and never
+    # advertises an id the model does not have.
+    "control_hint_kept": (
+        "While a child runs you can orchestrate it live with this same tool: delegate_task(action='list') to see live "
         "children, action='steer' with child_id (or subagent_id) + message to redirect one, action='stop' with "
         "child_id (or subagent_id) to end one early."
     ),
@@ -398,12 +414,10 @@ def _dispatched_payload(batch: _Batch, units: list[tuple[_Batch, str]]) -> dict:
             for unit, uid in units
         ]
     sids = [getattr(c, "_subagent_id", None) for (_, _, c) in batch.children]
-    if any(isinstance(s, str) and s for s in sids):
-        payload["subagent_ids"] = sids
-        payload["control_hint"] = _BACKGROUND_NOTES["control_hint"]
     # Per-child handles for kept children (tools/delegate_children.py): the stable ``child_id`` next to the live
-    # ``subagent_id``. A child that is not kept has no ``child_id`` key at all (never a fake id); with no kept
-    # child the handle keeps its exact old shape.
+    # ``subagent_id``. A child that is not kept has no ``child_id`` key at all (never a fake id), and with no kept
+    # child in the call the handle keeps its exact old shape — ``children`` is absent and ``control_hint`` is the
+    # subagent_id-only sentence.
     children = []
     for i, _, child in batch.children:
         entry = {"task_index": i, "subagent_id": getattr(child, "_subagent_id", None)}
@@ -411,7 +425,11 @@ def _dispatched_payload(batch: _Batch, units: list[tuple[_Batch, str]]) -> dict:
         if isinstance(child_id, str) and child_id:
             entry["child_id"] = child_id
         children.append(entry)
-    if any("child_id" in entry for entry in children):
+    kept = any("child_id" in entry for entry in children)
+    if any(isinstance(s, str) and s for s in sids):
+        payload["subagent_ids"] = sids
+        payload["control_hint"] = _BACKGROUND_NOTES["control_hint_kept" if kept else "control_hint"]
+    if kept:
         payload["children"] = children
     if batch.refused:
         payload["refused"] = batch.refused

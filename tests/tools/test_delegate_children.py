@@ -1767,9 +1767,14 @@ def test_ids_dispatch_handle_carries_child_id_and_subagent_id_per_kept_child(db,
     assert "child_id" not in payload["children"][1]
     assert "child_id" in payload["control_hint"]
 
-    # With no kept child the handle keeps its exact old shape (additive-only change).
+    # With no kept child: no ``children`` key, and the ``control_hint`` sentence is the pre-e2 one, byte for byte
+    # (it must not advertise a ``child_id`` the call does not have).
     dd, loose_only = _dispatch_batch(parent, [(0, {"goal": "a"}, loose)])
-    assert "children" not in json.loads(dd._dispatch_background(loose_only))
+    loose_payload = json.loads(dd._dispatch_background(loose_only))
+    assert "children" not in loose_payload
+    assert loose_payload["control_hint"] == dd._BACKGROUND_NOTES["control_hint"]
+    assert "child_id" not in loose_payload["control_hint"]
+    assert "action='steer' with subagent_id + message" in loose_payload["control_hint"]
 
 
 def test_ids_completion_result_carries_child_id_and_the_resume_hint(db):
@@ -1907,3 +1912,332 @@ def test_prune_parent_sparing_requires_the_roots_argument():
     from hermes_state_maintenance import SessionMaintenanceMixin
     parameters = inspect.signature(SessionMaintenanceMixin._parents_still_needed).parameters
     assert parameters["roots"].default is inspect.Parameter.empty
+
+
+# ── e3: list — kept children in the default scope, scope='profile', query, restart ───────────────
+
+def _kept_idle(db, parent, child_sid="kid-1", subagent_id="sa-0-aaaa", goal="find the token"):
+    """Spawn a kept child, let its worker finish, and return once its row is idle (kept, not live)."""
+    _child_session(db, child_sid, parent.session_id, subagent_id)
+    child = _child(child_sid, subagent_id)
+    with dc.spawn_origin(dc.ORIGIN_MODEL):
+        assert dc.note_spawn(parent, child, goal=goal, context="ctx", toolsets=["file"], role="leaf", model="m",
+                             route={"provider": "p", "model": "m"})
+    future: Future = Future()
+    assert dc.worker_started(child, future, task_index=0)
+    _finish(future)
+    assert _wait(lambda: (dc.ChildStore(db.db_path).get(child_sid) or {}).get("status") == "idle")
+    return child
+
+
+def _title(db, session_id, title):
+    conn = sqlite3.connect(db.db_path)
+    try:
+        conn.execute("UPDATE sessions SET title=? WHERE id=?", (title, session_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_list_returns_a_kept_child_after_it_finished(db):
+    """e3 red test: ``action='list'`` still names a child that finished (on e2's tree the count is 0)."""
+    import tools.delegate_tool_registry as dtr
+    parent = _parent(db)
+    _kept_idle(db, parent)
+
+    payload = dtr._list_payload(parent)  # no arguments: the default shape and scope
+
+    assert payload["count"] == 1
+    assert payload["subagents"] == []
+    assert payload["scope"] == "session"
+    entry = payload["children"][0]
+    assert (entry["child_id"], entry["subagent_id"]) == ("kid-1", "sa-0-aaaa")
+    assert entry["goal"] == "find the token"
+    assert (entry["status"], entry["idle_reason"], entry["resumable"]) == ("idle", "completed", True)
+    assert entry["holder_session_id"] == "parent" and entry["read_only"] is False
+    assert "context" not in entry and "route" not in entry  # no brief, no credentials in the listing
+
+
+def test_list_counts_a_running_kept_child_once(db):
+    """A kept child running in THIS process is listed as live, not a second time as a kept row."""
+    import tools.delegate_tool_registry as dtr
+    parent = _parent(db)
+    child, future, _, _ = _spawn(db, parent)
+    dtr, _stub = _live_child_record("sa-0-aaaa", parent)
+    try:
+        payload = json.loads(dtr._handle_control_action("list", None, None, parent))
+        assert [e["subagent_id"] for e in payload["subagents"]] == ["sa-0-aaaa"]
+        assert "children" not in payload
+        assert payload["count"] == 1
+    finally:
+        dtr._unregister_subagent("sa-0-aaaa")
+        child._delegate_children_tick.stop()
+        _finish(future)
+    assert _wait(lambda: dc.ChildStore(db.db_path).get("kid-1")["status"] == "idle")
+    finished = json.loads(dtr._handle_control_action("list", None, None, parent))
+    assert finished["subagents"] == []
+    assert [c["child_id"] for c in finished["children"]] == ["kid-1"]  # once, from the row, not twice
+    assert finished["count"] == 1
+
+
+def test_list_default_scope_is_this_sessions_children_only(db):
+    """Two sessions of one profile: the plain list is the caller's own children."""
+    import tools.delegate_tool_registry as dtr
+    mine = _parent(db, session_id="parent")
+    other = _parent(db, session_id="other")
+    _kept_idle(db, mine, child_sid="kid-mine", subagent_id="sa-0-mine")
+    _kept_idle(db, other, child_sid="kid-other", subagent_id="sa-0-other")
+
+    payload = json.loads(dtr._handle_control_action("list", None, None, mine))
+
+    assert payload["count"] == 1
+    assert [c["child_id"] for c in payload["children"]] == ["kid-mine"]
+    assert payload["children"][0]["read_only"] is False
+    assert "profile_children" not in payload
+
+
+def test_list_profile_scope_adds_the_profiles_other_kept_children_with_their_holder(db):
+    import tools.delegate_tool_registry as dtr
+    mine = _parent(db, session_id="parent")
+    other = _parent(db, session_id="other")
+    _kept_idle(db, mine, child_sid="kid-mine", subagent_id="sa-0-mine", goal="mine")
+    _kept_idle(db, other, child_sid="kid-other", subagent_id="sa-0-other", goal="theirs")
+    _title(db, "other", "the other session")
+
+    assert json.loads(dtr._handle_control_action("list", None, None, mine))["count"] == 1
+    payload = json.loads(dtr._handle_control_action("list", None, None, mine, scope="profile"))
+
+    assert payload["scope"] == "profile" and payload["count"] == 2
+    assert [c["child_id"] for c in payload["children"]] == ["kid-mine"]
+    entry = payload["profile_children"][0]
+    assert entry["child_id"] == "kid-other" and entry["goal"] == "theirs"
+    assert entry["holder_session_id"] == "other" and entry["holder_label"] == "the other session"
+    assert entry["read_only"] is True and entry["resumable"] is False
+
+
+def test_list_query_filters_within_both_scopes(db):
+    """``query`` is a case-insensitive substring over goal, child_id, subagent_id and title, in either scope."""
+    import tools.delegate_tool_registry as dtr
+    mine = _parent(db, session_id="parent")
+    other = _parent(db, session_id="other")
+    _kept_idle(db, mine, child_sid="kid-1", subagent_id="sa-0-aaaa", goal="Find the TOKEN")
+    _kept_idle(db, mine, child_sid="kid-2", subagent_id="sa-0-bbbb", goal="summarise the report")
+    _set(db.db_path, "kid-2", title="Weekly digest")
+    _kept_idle(db, other, child_sid="kid-3", subagent_id="sa-0-cccc", goal="token audit")
+
+    def listed(parent, **kwargs):
+        return json.loads(dtr._handle_control_action("list", None, None, parent, **kwargs))
+
+    assert listed(mine)["count"] == 2
+    assert [c["child_id"] for c in listed(mine, query="token")["children"]] == ["kid-1"]
+    assert [c["child_id"] for c in listed(mine, query="TOKEN", scope="profile")["children"]] == ["kid-1"]
+    assert [c["child_id"] for c in listed(mine, query="token", scope="profile")["profile_children"]] == ["kid-3"]
+    assert listed(mine, query="KID-2")["children"][0]["child_id"] == "kid-2"
+    assert listed(mine, query="sa-0-bb")["children"][0]["child_id"] == "kid-2"
+    assert listed(mine, query="digest")["children"][0]["child_id"] == "kid-2"
+    empty = listed(mine, query="nothing-matches")
+    assert empty["count"] == 0 and "children" not in empty
+    assert "'nothing-matches'" in empty["note"] and "without a query" in empty["note"]
+
+
+def test_list_two_profiles_in_one_process_never_see_each_other(tmp_path):
+    """Another profile's ``state.db`` is never opened: not in the default scope, not in ``scope='profile'``."""
+    from hermes_state import SessionDB
+    import tools.delegate_tool_registry as dtr
+    alpha = SessionDB(db_path=tmp_path / "profiles" / "alpha" / "state.db")
+    beta = SessionDB(db_path=tmp_path / "profiles" / "beta" / "state.db")
+    db_a, db_b = alpha._db if hasattr(alpha, "_db") else alpha, beta._db if hasattr(beta, "_db") else beta
+    try:
+        parent_a = _parent(db_a)
+        parent_b = _parent(db_b)
+        _kept_idle(db_a, parent_a, child_sid="kid-a", subagent_id="sa-a", goal="alpha work")
+        _kept_idle(db_b, parent_b, child_sid="kid-b", subagent_id="sa-b", goal="beta work")
+
+        assert json.loads(dtr._handle_control_action("list", None, None, parent_a))["count"] == 1
+        payload = json.loads(dtr._handle_control_action("list", None, None, parent_a, scope="profile"))
+
+        assert payload["count"] == 1
+        assert [c["child_id"] for c in payload["children"]] == ["kid-a"]
+        assert [c["goal"] for c in payload["children"]] == ["alpha work"]
+        assert "profile_children" not in payload
+    finally:
+        alpha.close()
+        beta.close()
+
+
+def test_list_survives_a_restart(tmp_path):
+    """A new process opens the same ``state.db``: the kept child is still listed, with no live registry at all."""
+    from hermes_state import SessionDB
+    import tools.delegate_tool_registry as dtr
+    path = tmp_path / "state.db"
+    first = SessionDB(db_path=path)
+    try:
+        _kept_idle(first, _parent(first))
+    finally:
+        first.close()  # the owner process ends here
+    reopened = SessionDB(db_path=path)
+    try:
+        assert dtr._active_subagents == {}  # nothing in-process survives; the payload is built from the db
+        payload = json.loads(dtr._handle_control_action("list", None, None, _parent(reopened)))
+        assert payload["count"] == 1
+        entry = payload["children"][0]
+        assert (entry["child_id"], entry["status"], entry["resumable"]) == ("kid-1", "idle", True)
+    finally:
+        reopened.close()
+
+
+def test_list_profile_routes_child_is_read_only_to_the_session_that_spawned_it(db, tmp_path):
+    """A child that ran as another profile (``profile_routes``) is listed, and read-only even for its spawner."""
+    import tools.delegate_tool_registry as dtr
+    parent = _parent(db)
+    home = tmp_path / "profiles" / "researcher"
+    home.mkdir(parents=True)
+    _child_session(db, "kid-r", "parent", "sa-0-route")
+    child = _child("kid-r", "sa-0-route")
+    with dc.spawn_origin(dc.ORIGIN_MODEL):
+        assert dc.note_spawn(parent, child, goal="audit the routes", context=None, toolsets=None, role="leaf",
+                             model="m", route={"provider": "p", "model": "m", "profile_home": home},
+                             profile_home=home)
+    future: Future = Future()
+    assert dc.worker_started(child, future, task_index=0)
+    _finish(future)
+    assert _wait(lambda: (dc.ChildStore(db.db_path).get("kid-r") or {}).get("status") == "idle")
+
+    entry = dtr._list_payload(parent)["children"][0]
+
+    assert entry["child_id"] == "kid-r"
+    assert entry["profile"] == "researcher"
+    assert entry["read_only"] is True and entry["resumable"] is False
+
+
+def test_list_keeps_the_newest_twenty_kept_children(db):
+    """The plan's 20-child cap applies to kept rows; the newest by activity win and the note says so."""
+    import tools.delegate_tool_registry as dtr
+    parent = _parent(db)
+    for i in range(22):
+        _kept_idle(db, parent, child_sid=f"kid-{i:02d}", subagent_id=f"sa-{i:02d}", goal=f"task {i}")
+
+    payload = dtr._list_payload(parent)
+
+    assert len(payload["children"]) == 20 and payload["count"] == 20
+    assert payload["children"][0]["child_id"] == "kid-21"
+    shown = [c["child_id"] for c in payload["children"]]
+    assert "kid-00" not in shown and "kid-01" not in shown
+    assert "2 older kept children of this session" in payload["note"]
+
+
+def test_list_does_not_wait_on_a_writer_lock(db):
+    """The roster reads this every turn: a listing takes no write lock and never creates the table."""
+    import tools.delegate_tool_registry as dtr
+    parent = _parent(db)
+    _kept_idle(db, parent)
+    assert dtr._list_payload(parent)["count"] == 1
+    writer = sqlite3.connect(db.db_path)
+    writer.execute("BEGIN IMMEDIATE")
+    try:
+        started = time.monotonic()
+        payload = dtr._list_payload(parent, scope="profile")
+        assert payload["count"] == 1
+        assert time.monotonic() - started < 2.0
+    finally:
+        writer.rollback()
+        writer.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs /proc start ticks")
+def test_list_shows_a_dead_runners_child_as_idle_orphaned(db):
+    """A row whose runner died (a restart's leftover) is listed by e1's rules: idle-orphaned and resumable."""
+    import tools.delegate_tool_registry as dtr
+    parent = _parent(db)
+    child, _future, _, _ = _spawn(db, parent)
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    _set(db.db_path, "kid-1", runner=json.dumps({"pid": dead.pid, "pidns": None}))
+    try:
+        entry = dtr._list_payload(parent)["children"][0]
+        assert (entry["status"], entry["idle_reason"], entry["resumable"]) == ("idle", "orphaned", True)
+    finally:
+        child._delegate_children_tick.stop()
+
+
+def test_list_delegate_task_routes_scope_and_query(db):
+    from tools.delegate_tool import delegate_task
+    parent = _parent(db)
+    _kept_idle(db, parent)
+
+    plain = json.loads(delegate_task(action="list", parent_agent=parent))
+    assert plain["count"] == 1
+    assert plain["scope"] == "session"
+    searched = json.loads(delegate_task(action="list", parent_agent=parent, scope="profile", query="TOKEN"))
+    assert [c["child_id"] for c in searched["children"]] == ["kid-1"]
+    refused = delegate_task(action="list", parent_agent=parent, scope="everything")
+    assert "scope='session'" in refused and "'everything'" in refused
+
+
+# ── e2 carry-ins (review round 1) ────────────────────────────────────────────────────────────────
+
+def test_ids_recovered_completion_of_a_finished_child_carries_its_ids(tmp_path, monkeypatch):
+    """Carry-in 3: a crash after one child of a unit finished replays that child's entry with the ``child_id``
+    and ``resume_hint`` the live completion would have carried (on e2's tree the durable copy is bare)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_state import SessionDB
+    from tools import async_delegation as ad
+    from tools import delegate_tool_dispatch as dd
+    handle = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        parent = _parent(handle, source="cli")
+        _child_session(handle, "kid-u", "parent", "sa-0-unit")
+        child = _child("kid-u", "sa-0-unit")
+        child._delegation_unit_id = "deleg_unit"
+        with dc.spawn_origin(dc.ORIGIN_MODEL):
+            assert dc.note_spawn(parent, child, goal="g", context=None, toolsets=None, role="leaf", model=None)
+        future: Future = Future()
+        assert dc.worker_started(child, future, task_index=0)
+        _finish(future)
+        assert _wait(lambda: (dc.ChildStore(handle.db_path).get("kid-u") or {}).get("status") == "idle")
+        ad._persist_dispatch({"delegation_id": "deleg_unit", "parent_session_id": "parent",
+                              "dispatched_at": time.time(), "goal": "g", "goals": ["g", "h"],
+                              "is_batch": True})
+        # The moment child 0 finishes, the unit is still running: this is the crash-recovery copy.
+        entry = {"task_index": 0, "status": "completed", "summary": "the token is 42"}
+        dd._record_finished_child(SimpleNamespace(unit_id="deleg_unit", children=[(0, {"goal": "g"}, child)]),
+                                  entry, False)
+        assert entry["child_id"] == "kid-u"  # the live entry carries the ids too, exactly as finalize would
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        conn = sqlite3.connect(tmp_path / "state.db")
+        conn.execute("UPDATE async_delegations SET owner_pid=?, owner_started_at=NULL", (dead.pid,))
+        conn.commit()
+        conn.close()
+        assert ad.recover_abandoned_delegations() == 1
+        conn = sqlite3.connect(tmp_path / "state.db")
+        event = json.loads(conn.execute("SELECT event_json FROM async_delegations").fetchone()[0])
+        conn.close()
+        replayed = event["results"][0]
+        assert replayed["status"] == "completed" and replayed["summary"] == "the token is 42"
+        assert (replayed["child_id"], replayed["subagent_id"]) == ("kid-u", "sa-0-unit")
+        assert replayed["resume_hint"] == dc.resume_hint("kid-u")
+        assert event["results"][1]["status"] == "unknown"  # the child that never finished is still unknown
+    finally:
+        handle.close()
+
+
+def test_ids_child_of_another_profile_never_resolves(tmp_path):
+    """Carry-in 4: two profiles, two ``state.db`` files, one process — parent A can never address profile B's
+    child by its ``child_id`` (a different mechanism from the other-conversation case)."""
+    from hermes_state import SessionDB
+    import tools.delegate_tool_registry as dtr
+    alpha = SessionDB(db_path=tmp_path / "profiles" / "alpha" / "state.db")
+    beta = SessionDB(db_path=tmp_path / "profiles" / "beta" / "state.db")
+    db_a, db_b = alpha._db if hasattr(alpha, "_db") else alpha, beta._db if hasattr(beta, "_db") else beta
+    try:
+        parent_a = _parent(db_a, session_id="parent-a")
+        parent_b = _parent(db_b, session_id="parent-b")
+        _kept_idle(db_b, parent_b, child_sid="kid-b", subagent_id="sa-b", goal="beta work")
+        out = dtr._handle_control_action("steer", None, "hijack", parent_a, child_id="kid-b")
+        assert "No child with child_id 'kid-b'" in out
+        stop = dtr._handle_control_action("stop", None, None, parent_a, child_id="kid-b")
+        assert "No child with child_id 'kid-b'" in stop
+    finally:
+        alpha.close()
+        beta.close()

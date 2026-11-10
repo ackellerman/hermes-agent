@@ -283,7 +283,12 @@ def _process_accounting_lines(r: dict) -> list:
 def _format_async_delegation(evt: dict) -> str:
     """Self-contained re-injection for an async-delegation completion: the FULL
     original task source (goal, context, toolsets, role, model), dispatch time, status
-    and result, so an agent deep in unrelated context can act on it or re-dispatch."""
+    and result, so an agent deep in unrelated context can act on it or re-dispatch.
+
+    A kept child's resume hint is the batch formatter's: every kept child's completion arrives as a batch event
+    (``results``), which is where ``resume_hint`` is carried. The single-event form below has no per-child entry
+    to hang it on, and no producer puts ``resume_hint`` in a single-delegation event (cron parents are never
+    kept), so it does not look for one."""
     deleg_id = evt.get("delegation_id", "unknown")
     completed_at = evt.get("completed_at") or time.time()
     if evt.get("task_failure_notice"):
@@ -317,9 +322,6 @@ def _format_async_delegation(evt: dict) -> str:
             lines += _recovery_lines(evt)
         if summary:
             lines += ["Partial output:", summary]
-    hint = evt.get("resume_hint")
-    if isinstance(hint, str) and hint.strip():
-        lines.append(hint.strip())  # the completion text ends with the kept child's resume hint
     return "\n".join(lines)
 
 

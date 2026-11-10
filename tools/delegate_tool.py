@@ -587,21 +587,24 @@ def delegate_task(
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[dict[str, Any]] = None, images: Optional[list[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, child_id: Optional[str] = None, message: Optional[str] = None,
-    parent_agent=None,
+    parent_agent=None, scope: Optional[str] = None, query: Optional[str] = None,
     credentials_cfg: Optional[dict[str, Any]] = None, origin: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
     (per-task beats top-level; capability is depth-derived). Returns JSON with one results entry per task, or a
-    dispatch handle when running in the background. ``origin`` names who asked for the spawn: ``model`` (passed only
-    by the model's own call, ``run_agent._dispatch_delegate_task``; the only origin whose children may be kept, see
-    ``tools.delegate_children``), an internal caller such as ``review``, or None (the default: never kept)."""
+    dispatch handle when running in the background. ``scope``/``query`` narrow ``action='list'`` (this session's
+    kept children, or the whole profile's, filtered by a substring). ``origin`` names who asked for the spawn:
+    ``model`` (passed only by the model's own call, ``run_agent._dispatch_delegate_task``; the only origin whose
+    children may be kept, see ``tools.delegate_children``), an internal caller such as ``review``, or None (the
+    default: never kept)."""
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
     normalized_action = (action or "").strip().lower()
     if normalized_action in _CONTROL_ACTIONS:
-        return _handle_control_action(normalized_action, subagent_id, message, parent_agent, child_id=child_id)
+        return _handle_control_action(normalized_action, subagent_id, message, parent_agent, child_id=child_id,
+                                      scope=scope, query=query)
     if normalized_action and normalized_action != "spawn":
         return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, or stop.")
 
@@ -876,11 +879,13 @@ DELEGATE_TASK_SCHEMA = {
             # delegations always run in the background. Unadvertised; do not re-add.
             "action": _p(
                 "string",
-                "Default 'spawn'. Live control of running children: "
-                "'list' = ids/goals/status/transcripts; 'steer' = queue "
-                "course-correction text into one child (subagent_id + "
-                "message) without stopping it; 'stop' = end one child "
-                "early (subagent_id; partial result still returns). "
+                "Default 'spawn'. Live control of running children and the kept "
+                "children this session holds: 'list' = ids/goals/status/transcripts "
+                "(add scope='profile' for the whole profile's kept children, "
+                "query=<text> to search); 'steer' = queue "
+                "course-correction text into one child (subagent_id or child_id "
+                "+ message) without stopping it; 'stop' = end one child "
+                "early (subagent_id or child_id; partial result still returns). "
                 "Control actions return immediately; goal/tasks are ignored unless spawning.",
                 enum=["spawn", "list", "steer", "stop"],
             ),
@@ -889,6 +894,18 @@ DELEGATE_TASK_SCHEMA = {
                 "string",
                 "Kept-child key, also a target for action='steer'/'stop': the child_id a kept child's dispatch handle "
                 "or completion result carries. Stable across the child's own compression; preferred over subagent_id.",
+            ),
+            "scope": _p(
+                "string",
+                "For action='list': 'session' (default) = the live and kept children this session holds; "
+                "'profile' = also the same profile's other kept children, each labelled with the holder session "
+                "that owns it and read_only when it is not yours.",
+                enum=["session", "profile"],
+            ),
+            "query": _p(
+                "string",
+                "For action='list': case-insensitive substring filter over a child's goal, child_id, subagent_id "
+                "and title, in either scope. Leave it out to list everything the session holds.",
             ),
             "message": _p(
                 "string",
@@ -901,7 +918,7 @@ DELEGATE_TASK_SCHEMA = {
 }
 
 
-_LIVE_CONTROL_PARAMS = frozenset({"action", "subagent_id", "child_id", "message"})
+_LIVE_CONTROL_PARAMS = frozenset({"action", "subagent_id", "child_id", "message", "scope", "query"})
 
 
 def oneshot_delegate_function(function: dict) -> dict:

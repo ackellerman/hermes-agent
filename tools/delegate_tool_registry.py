@@ -234,7 +234,23 @@ def _owns_subagent_record(record: dict[str, Any], parent_agent: Any) -> bool:
     # Compression rotation on either side: compare lineage tips.
     return _resolve_session_lineage(owner_sid, parent_agent) in {parent_sid, _resolve_session_lineage(parent_sid, parent_agent)}
 
-def _list_payload(parent_agent: Any) -> dict[str, Any]:
+def _list_payload(parent_agent: Any, *, scope: Optional[str] = None, query: Optional[str] = None) -> dict[str, Any]:
+    """The model-facing ``action='list'`` payload.
+
+    ``subagents`` is the unchanged live view (the running children of this conversation's spawn tree).
+    ``children`` adds the kept children this session holds, idle/expired/orphaned included, each with the
+    ``child_id`` a later ``resume``/``steer``/``stop`` takes, its status and whether this session may act on it;
+    ``scope='profile'`` adds ``profile_children``: the same profile's other kept children, labelled with the
+    holder session that owns them and ``read_only`` (another session's child, or one that ran as another
+    profile — a ``profile_routes`` child). ``query`` filters both lists, case-insensitively, over goal, ids and
+    title. At most ``delegate_children.LIST_LIMIT`` kept children are listed per list.
+
+    The kept half is read from the parent's own ``state.db`` on every call, so a restart keeps the list; the live
+    registry can only narrow it (a child running in THIS process is listed once, in ``subagents``, where its
+    live state is current). Another profile's ``state.db`` is never opened.
+    """
+    from agent.prompt_cache_scope import conversation_id
+    from tools.delegate_children import LIST_LIMIT, ChildStore, list_entry
     with _active_subagents_lock:
         records = list(_active_subagents.values())
     entries = []
@@ -252,13 +268,59 @@ def _list_payload(parent_agent: Any) -> dict[str, Any]:
             "accepting_steer": bool(r.get("accepting_steer", False)),
             "live_transcript": getattr(r.get("agent"), "_live_transcript_path", None),
         })
-    payload: dict[str, Any] = {"action": "list", "count": len(entries), "subagents": entries}
-    if not entries:
-        payload["note"] = (
-            "No live subagents right now. Children that already finished "
-            "have delivered (or will deliver) their results as normal "
-            "completion messages — there is nothing to steer or stop."
-        )
+    scope_name = "profile" if scope == "profile" else "session"
+    children: list[dict[str, Any]] = []
+    others: list[dict[str, Any]] = []
+    omitted = omitted_others = 0
+    store = ChildStore.for_agent(parent_agent)
+    if store is not None:
+        try:
+            conversation = conversation_id(parent_agent) or ""
+        except Exception:
+            conversation = ""
+        conversations = [conversation] if conversation else []
+        profile = store.profile
+        if conversations:
+            live_ids = [e["subagent_id"] for e in entries if isinstance(e.get("subagent_id"), str)]
+            rows, omitted = store.kept_children(conversations=conversations, exclude_subagent_ids=live_ids,
+                                                query=query)
+            labels = store.holder_labels([r.get("holder_session_id") for r in rows])
+            children = [list_entry(r, conversations=conversations, profile=profile,
+                                   holder_label=labels.get(str(r.get("holder_session_id") or ""))) for r in rows]
+            if scope_name == "profile":
+                rows, omitted_others = store.kept_children(exclude_conversations=conversations, query=query)
+                labels = store.holder_labels([r.get("holder_session_id") for r in rows])
+                others = [list_entry(r, conversations=conversations, profile=profile,
+                                     holder_label=labels.get(str(r.get("holder_session_id") or ""))) for r in rows]
+    payload: dict[str, Any] = {
+        "action": "list", "scope": scope_name, "count": len(entries) + len(children) + len(others),
+        "subagents": entries,
+    }
+    if children:
+        payload["children"] = children
+    if others:
+        payload["profile_children"] = others
+    needle = (query or "").strip()
+    if not entries and not children and not others:
+        if needle:
+            payload["note"] = (
+                f"No live subagent or kept child matches '{needle}' in "
+                + ("this session" if scope_name == "session" else "this profile")
+                + ". Use action='list' without a query to see what it holds."
+            )
+        else:
+            payload["note"] = (
+                "No live subagents right now, and "
+                + ("this session holds no kept children" if scope_name == "session"
+                   else "this profile holds no other kept children")
+                + ". Children that already finished have delivered (or will deliver) their results as normal "
+                  "completion messages — there is nothing to steer or stop."
+            )
+    elif omitted or omitted_others:
+        older = [f"{omitted} older kept children of this session" if omitted else "",
+                 f"{omitted_others} older kept children of the profile" if omitted_others else ""]
+        payload["note"] = (f"Showing the newest {LIST_LIMIT} kept children per list; "
+                           + " and ".join(o for o in older if o) + " not shown.")
     return payload
 
 def _no_live_subagent_error(subagent_id: str) -> str:
@@ -301,16 +363,24 @@ def _child_id_target(child_id: str, parent_agent: Any) -> tuple[Optional[str], O
 
 
 def _handle_control_action(action: str, subagent_id: Optional[str], message: Optional[str], parent_agent: Any,
-                           *, child_id: Optional[str] = None) -> str:
+                           *, child_id: Optional[str] = None, scope: Optional[str] = None,
+                           query: Optional[str] = None) -> str:
     """Synchronous control plane for delegate_task: list/steer/stop. Runs in-turn (never backgrounded) over the same
     registry the TUI overlay drives, scoped so a conversation can only control its own spawn tree.
 
     ``child_id`` is the stable kept-child key (its first session id, from the dispatch handle or a completion
     result); it resolves through ``ChildStore`` to the live ``subagent_id``. ``subagent_id`` keeps its exact old
     behaviour: a live, owned record is found directly. A ``child_id`` that does not resolve, or names a child that
-    is no longer running, is refused with a clear error — never a silent no-op."""
+    is no longer running, is refused with a clear error — never a silent no-op. ``scope`` and ``query`` apply to
+    ``list`` only (see ``_list_payload``)."""
     if action == "list":
-        return json.dumps(_list_payload(parent_agent), ensure_ascii=False)
+        wanted_scope = (scope or "").strip().lower() or "session"
+        if wanted_scope not in ("session", "profile"):
+            return tool_error(
+                f"action='list' accepts scope='session' (this session's children, the default) or "
+                f"scope='profile' (the profile's other kept children too), not '{scope}'."
+            )
+        return json.dumps(_list_payload(parent_agent, scope=wanted_scope, query=query), ensure_ascii=False)
 
     cid = (child_id or "").strip()
     if cid:

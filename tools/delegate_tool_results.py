@@ -411,18 +411,13 @@ def _stamp_child_identities(results, child_by_index) -> None:
     id, what ``steer``/``stop``/``resume`` accept) next to ``subagent_id``, plus the one-line ``resume_hint``
     the completion text ends with. A child that is not kept gains nothing: the field is absent, never a fake id.
     Runs after the redaction/summary passes: ids are host-owned and the hint is parent-facing prose, so neither
-    belongs in the child's summary (memory, hooks and the spill file keep the clean answer)."""
-    from tools.delegate_children import resume_hint
+    belongs in the child's summary (memory, hooks and the spill file keep the clean answer).
+
+    ``tools.delegate_children.stamp_completion_entry`` is the one definition, shared with the durable record of a
+    finished child of a still-running unit so a crash-recovery replay carries the same ids."""
+    from tools.delegate_children import stamp_completion_entry
     for entry in results:
-        child = child_by_index.get(entry.get("task_index"))
-        child_id = getattr(child, "_delegate_child_id", None)
-        if not (isinstance(child_id, str) and child_id):
-            continue
-        entry["child_id"] = child_id
-        subagent_id = getattr(child, "_subagent_id", None)
-        if isinstance(subagent_id, str) and subagent_id:
-            entry["subagent_id"] = subagent_id
-        entry["resume_hint"] = resume_hint(child_id)
+        stamp_completion_entry(entry, child_by_index.get(entry.get("task_index")))
 
 
 def _finalize_child_results(

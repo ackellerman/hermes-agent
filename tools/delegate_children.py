@@ -75,6 +75,12 @@ READ_WRITE_BUSY_MS = 250
 
 ORPHANED_LINE = "child kept as idle-orphaned; resumable with action='resume'"
 
+# ``action='list'`` shows at most this many kept children per list (the plan's 20-child cap). The roster
+# (agent/turn_context.py) applies its own smaller cap.
+LIST_LIMIT = 20
+# A holder session's title is shown as its short label in the profile-wide list.
+HOLDER_LABEL_MAX = 60
+
 # The one line that ends a kept child's completion text: model- and user-visible prose, one sentence,
 # naming the action and the id the parent will address the child by later.
 RESUME_HINT = "This child is kept: send it a follow-up with action='resume', child_id={child_id}."
@@ -83,6 +89,25 @@ RESUME_HINT = "This child is kept: send it a follow-up with action='resume', chi
 def resume_hint(child_id: str) -> str:
     """The resume hint for *child_id* (see ``RESUME_HINT``)."""
     return RESUME_HINT.format(child_id=child_id)
+
+
+def stamp_completion_entry(entry: dict[str, Any], child: Any) -> bool:
+    """Add the parent's stable handles to a kept child's completion *entry*: ``child_id`` (its first session
+    id — what ``steer``/``stop``/``resume`` accept) next to ``subagent_id``, plus the one-line ``resume_hint``
+    the completion text ends with. A child that is not kept gains nothing (the keys stay absent, never a fake
+    id). One definition serves both places a completion entry is built: the finalize pass
+    (``delegate_tool_results._stamp_child_identities``) and the durable record of a finished child of a
+    still-running unit (``delegate_tool_dispatch._record_finished_child``), so a replay after the owner process
+    died carries the same ids the live completion would have."""
+    child_id = getattr(child, "_delegate_child_id", None)
+    if not (isinstance(child_id, str) and child_id):
+        return False
+    entry["child_id"] = child_id
+    subagent_id = getattr(child, "_subagent_id", None)
+    if isinstance(subagent_id, str) and subagent_id:
+        entry["subagent_id"] = subagent_id
+    entry["resume_hint"] = resume_hint(child_id)
+    return True
 
 
 RUNNING, IDLE, CLOSED, EXPIRED = "running", "idle", "closed", "expired"
@@ -381,6 +406,52 @@ def _project(row: dict[str, Any], now: float, orphaned: set[Any], cfg: dict[str,
     return row
 
 
+# ── listing (action='list') ─────────────────────────────────────────────────
+
+def _visible_clause(conversations: Iterable[str]) -> tuple[str, tuple[Any, ...]]:
+    """``(sql, params)``: the row's holder conversation — ``conversation_id`` or a ``prior_conversations``
+    entry of a transfer — is one of *conversations*. Columns are unqualified (one table)."""
+    convs = [c for c in conversations if c]
+    marks = ", ".join("?" * len(convs))
+    clause = (f"(conversation_id IN ({marks}) OR EXISTS (SELECT 1 FROM json_each(CASE WHEN"
+               f" json_valid(prior_conversations) THEN prior_conversations ELSE '[]' END) j"
+               f" WHERE j.value IN ({marks})))")
+    return clause, (*convs, *convs)
+
+
+def list_entry(row: dict[str, Any], *, conversations: Iterable[str] = (), profile: Optional[str] = None,
+               holder_label: Optional[str] = None) -> dict[str, Any]:
+    """One ``action='list'`` entry for a kept row: the ids the parent addresses it by, its status and whether
+    this session may act on it. No brief, route or transcript: the model asks ``show`` for those.
+
+    ``read_only`` is True when the session may see the child but not resume, steer or stop it: another
+    conversation of the profile holds it, or it ran as another profile (a ``profile_routes`` child, ``profile``
+    on the row). A released child stays readable here; ``claim`` is what moves it.
+    """
+    convs = [c for c in conversations if c]
+    held_here = row.get("conversation_id") in convs or bool(
+        set(row.get("prior_conversations") or ()) & set(convs))
+    other_profile = bool(row.get("profile")) and bool(profile) and row.get("profile") != profile
+    read_only = (not held_here) or other_profile
+    entry: dict[str, Any] = {
+        "child_id": row.get("child_id"),
+        "subagent_id": row.get("subagent_id"),
+        "goal": row.get("goal"),
+        "status": row.get("status"),
+        "idle_reason": row.get("idle_reason"),
+        "resumable": (not read_only) and row.get("status") == IDLE,
+        "holder_session_id": row.get("holder_session_id"),
+        "read_only": read_only,
+    }
+    if row.get("title"):
+        entry["title"] = row["title"]
+    if other_profile:
+        entry["profile"] = row["profile"]
+    if holder_label:
+        entry["holder_label"] = holder_label[:HOLDER_LABEL_MAX]
+    return entry
+
+
 @dataclass(frozen=True)
 class FenceResult:
     """Outcome of ``take_fence``. ``ok`` with a fresh ``token``; otherwise ``reason``: ``running`` (send a
@@ -629,6 +700,76 @@ class ChildStore:
     def held_by(self, holder_session_id: str, *, now: Optional[float] = None) -> list[dict[str, Any]]:
         return self._read(f"SELECT * FROM {TABLE} WHERE holder_session_id=? AND status IN (?, ?)"
                           " ORDER BY created_at DESC", (holder_session_id, RUNNING, IDLE), now=now)
+
+    @property
+    def profile(self) -> str:
+        """This db's own profile: the name of its ``profiles/<name>`` home, else ``default``."""
+        return _profile_for(self.db_path)
+
+    def kept_children(self, *, conversations: Optional[Iterable[str]] = None,
+                      exclude_conversations: Iterable[str] = (), exclude_subagent_ids: Iterable[str] = (),
+                      query: Optional[str] = None, now: Optional[float] = None,
+                      limit: int = LIST_LIMIT) -> tuple[list[dict[str, Any]], int]:
+        """Kept rows for ``action='list'``, newest activity first, with expiry/orphan rules applied on read:
+        ``(rows, omitted)``.
+
+        With *conversations*, only the children that session holds (its ``conversation_id`` or a
+        ``prior_conversations`` entry — the same visibility ``resolve`` uses); without, every kept row of this
+        db except those *exclude_conversations* can see (the profile-wide list). *exclude_subagent_ids* drops
+        the rows of children already listed as live in this process. *query* is a case-insensitive substring
+        over goal, child_id, subagent_id and title. At most *limit* rows come back; *omitted* counts the rest.
+        A read: the table is never created and no write lock is taken unless a rule is due.
+        """
+        where = ["kept = 1"]
+        params: list[Any] = []
+        if conversations is not None:
+            convs = [c for c in conversations if c]
+            if not convs:
+                return [], 0
+            clause, values = _visible_clause(convs)
+            where.append(clause)
+            params.extend(values)
+        excluded = [c for c in exclude_conversations if c]
+        if excluded:
+            clause, values = _visible_clause(excluded)
+            where.append(f"NOT {clause}")
+            params.extend(values)
+        live_ids = [s for s in exclude_subagent_ids if s]
+        if live_ids:
+            where.append(f"subagent_id NOT IN ({', '.join('?' * len(live_ids))})")
+            params.extend(live_ids)
+        needle = (query or "").strip().lower()
+        if needle:
+            fields = ("COALESCE(goal, '')", "child_id", "COALESCE(subagent_id, '')", "COALESCE(title, '')")
+            where.append("(" + " OR ".join(f"instr(lower({field}), ?) > 0" for field in fields) + ")")
+            params.extend([needle] * len(fields))
+        activity = "max(COALESCE(updated_at, 0), COALESCE(heartbeat_at, 0), COALESCE(created_at, 0))"
+        sql = (f"SELECT * FROM {TABLE} WHERE " + " AND ".join(where)
+               + f" ORDER BY {activity} DESC, child_id LIMIT ?")
+        rows = self._read(sql, (*params, int(limit) + 1), now=now)
+        if len(rows) <= limit:
+            return rows, 0
+        counted = self._read(f"SELECT COUNT(*) AS total FROM {TABLE} WHERE " + " AND ".join(where),
+                             tuple(params), now=now)
+        total = int(counted[0]["total"]) if counted else len(rows)
+        return rows[:limit], max(0, total - int(limit))
+
+    def holder_labels(self, session_ids: Iterable[Optional[str]]) -> dict[str, str]:
+        """``{holder session id: title}`` for the sessions a listing names, one read of the same ``state.db``
+        (``sessions`` lives beside ``delegate_children``). ``{}`` when the table or its title column is absent."""
+        ids = [s for s in dict.fromkeys(session_ids) if s]
+        if not ids:
+            return {}
+        with self._read_conn() as conn:
+            if conn is None:
+                return {}
+            try:
+                rows = conn.execute(f"SELECT id, title FROM sessions WHERE id IN ({', '.join('?' * len(ids))})",
+                                    ids).fetchall()
+            except sqlite3.Error:
+                return {}
+        return {str(r["id"]): str(r["title"]).strip() for r in rows
+                if r["title"] is not None and str(r["title"]).strip()}
 
     def show(self, ref: str, conversation_ids: Iterable[str], *, now: Optional[float] = None) -> Optional[dict[str, Any]]:
         """The row for *ref* (a ``child_id`` or a ``subagent_id`` alias) visible to *conversation_ids*, with
