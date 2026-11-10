@@ -3021,11 +3021,20 @@ def _ld_library_path_line(system: bool, target_home_dir: str | None = None) -> s
 
     The installed unit is the fallback source: the unit is regenerated and compared on every
     start/restart/status, and a shell without the export (ssh, cron, ``sudo`` strips ``LD_*``)
-    must not be able to "repair" the line away."""
+    must not be able to "repair" the line away.
+
+    One exception, applied to both sources: a component inside an install's
+    ``installs/<key>/environments/`` generation is dropped, each drop logged at INFO. A dependency
+    sync replaces that generation, so a unit carrying it hardcodes a path the next ``hermes update``
+    deletes — the failure this filter exists for. Components merely absent from disk are kept: an
+    unmounted volume is not stale."""
     raw = os.environ.get("LD_LIBRARY_PATH", "") or _installed_unit_ld_library_path(system)
     components = [p for p in raw.split(":") if p]
     if target_home_dir is not None:
         components = [_remap_path_for_user(p, target_home_dir) for p in components]
+    components = _drop_install_environment_components(
+        components, _ld_library_path_install_roots(system=system, target_home_dir=target_home_dir)
+    )
     return _systemd_env_line("LD_LIBRARY_PATH", ":".join(components)) if components else ""
 
 
@@ -3042,6 +3051,63 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
         return str(target_default / current_hermes.relative_to(current_default))
     except ValueError:
         return str(current_hermes)  # Completely custom path (not under ~/.hermes) — keep as-is
+
+
+def _installs_root_for_hermes_home(hermes_home: str | Path) -> Path:
+    """``<root>/installs`` beside a Hermes home: a profile lives under its data root, and a custom
+    HERMES_HOME is its own root (``get_default_hermes_root``'s rule)."""
+    home = Path(hermes_home)
+    root = home.parent.parent if home.parent.name == "profiles" else home
+    return root / "installs"
+
+
+def _is_install_environment_component(component: str, installs_root: Path) -> bool:
+    """True when *component* sits under ``<installs_root>/<install key>/environments/`` — any install
+    key, including one from an older or other checkout. Lexical on purpose and it never stats: a
+    component that is merely missing from disk (an unmounted volume) is not stale."""
+    try:
+        relative = Path(os.path.normpath(component)).relative_to(Path(os.path.normpath(installs_root)))
+    except ValueError:
+        return False
+    parts = relative.parts
+    return len(parts) >= 3 and parts[1] == "environments"
+
+
+def _ld_library_path_install_roots(system: bool, target_home_dir: str | None) -> list[Path]:
+    """The installs roots whose dependency generations the unit must not carry. A system unit is
+    written for the target user, so it is filtered against that user's home, as the components were
+    remapped; the caller's own root stays in the list for a component the remap left untouched."""
+    from pm.environments import installs_root
+
+    candidates = [installs_root()]
+    if system and target_home_dir:
+        candidates.append(_installs_root_for_hermes_home(_hermes_home_for_target_user(target_home_dir)))
+    roots: list[Path] = []
+    for root in candidates:
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _drop_install_environment_components(components: list[str], installs_roots: list[Path]) -> list[str]:
+    """Drop the components that point into a dependency generation, keeping every other one in order.
+    ``hermes update`` (a pm sync) replaces those generations, so the path is dead by the time CUDA
+    dlopens it — the stale unit line that made local STT fall back to CPU."""
+    kept: list[str] = []
+    for component in components:
+        stale_root = next(
+            (root for root in installs_roots if _is_install_environment_component(component, root)), None
+        )
+        if stale_root is None:
+            kept.append(component)
+            continue
+        logger.info(
+            "Dropping LD_LIBRARY_PATH component %s from the gateway unit: it lies under %s, an "
+            "install generation that the next dependency sync replaces",
+            component,
+            stale_root,
+        )
+    return kept
 
 
 def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
