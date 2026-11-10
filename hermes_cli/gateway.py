@@ -3053,10 +3053,21 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
         return str(current_hermes)  # Completely custom path (not under ~/.hermes) — keep as-is
 
 
-def _installs_root_for_hermes_home(hermes_home: str | Path) -> Path:
-    """``<root>/installs`` beside a Hermes home: a profile lives under its data root, and a custom
-    HERMES_HOME is its own root (``get_default_hermes_root``'s rule)."""
+def _installs_root_for_hermes_home(
+    hermes_home: str | Path, target_home_dir: str | Path | None = None
+) -> Path:
+    """``<root>/installs`` beside a Hermes home, with ``get_default_hermes_root``'s rule but anchored
+    on the *target user's* native home (this process's ``Path.home()`` when no target is given).
+
+    A home anywhere inside ``<home>/.hermes`` — a subdirectory, ``profiles/<name>``, or the
+    ``profiles`` dir itself — belongs to that native home, which is where pm puts the generations
+    (``hermes_constants._hermes_root_of``'s containment rule; the path shape alone gets
+    ``~/.hermes/subdir`` wrong). Only a home outside it is its own root, and then a profile lives
+    under its data root."""
     home = Path(hermes_home)
+    native_home = (Path(target_home_dir) if target_home_dir is not None else Path.home()) / ".hermes"
+    if home.is_relative_to(native_home):
+        return native_home / "installs"
     root = home.parent.parent if home.parent.name == "profiles" else home
     return root / "installs"
 
@@ -3064,7 +3075,12 @@ def _installs_root_for_hermes_home(hermes_home: str | Path) -> Path:
 def _is_install_environment_component(component: str, installs_root: Path) -> bool:
     """True when *component* sits under ``<installs_root>/<install key>/environments/`` — any install
     key, including one from an older or other checkout. Lexical on purpose and it never stats: a
-    component that is merely missing from disk (an unmounted volume) is not stale."""
+    component that is merely missing from disk (an unmounted volume) is not stale.
+
+    That leniency has a deliberate fail-open set, so this is not a total guard: a relative
+    component, a symlinked component (neither is resolved), a component written resolved while
+    ``installs_root()`` is unresolved (a symlinked ``HOME``), and a component under a different
+    installs root (another data root's ``installs``, e.g. a borrowed checkout) are all kept."""
     try:
         relative = Path(os.path.normpath(component)).relative_to(Path(os.path.normpath(installs_root)))
     except ValueError:
@@ -3081,7 +3097,11 @@ def _ld_library_path_install_roots(system: bool, target_home_dir: str | None) ->
 
     candidates = [installs_root()]
     if system and target_home_dir:
-        candidates.append(_installs_root_for_hermes_home(_hermes_home_for_target_user(target_home_dir)))
+        candidates.append(
+            _installs_root_for_hermes_home(
+                _hermes_home_for_target_user(target_home_dir), target_home_dir
+            )
+        )
     roots: list[Path] = []
     for root in candidates:
         if root not in roots:
