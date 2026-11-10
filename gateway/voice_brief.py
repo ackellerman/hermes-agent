@@ -181,7 +181,7 @@ async def _ask_model(route: dict[str, Any], messages: list[dict[str, str]]) -> s
         route_info=route_info,
     )
     logger.info(
-        "Voice brief route: requested %s/%s, served by %s/%s%s",
+        "Voice brief route: requested %s/%s (turn), served by %s/%s%s",
         route.get("provider") or "auto", route.get("model") or "default",
         route_info.get("provider") or "auto", route_info.get("model") or "default",
         f" via {route_info['fallback_label']}" if route_info.get("fallback_label") else "",
