@@ -149,7 +149,7 @@ class CanonicalSnapshotInfo(SessionInventoryFields):
     config_warning: str | None = None
     # ``session.create``'s created-vs-resolved report (``gateway/session_controls.py`` ``_create``):
     # true when that call staged and committed the row, false when it resolved an existing one.
-    # Absent from ``session.resume``.
+    # Written only by ``_create``; a resume omits it because nothing serialises this model.
     created: bool | None = None
 
 
