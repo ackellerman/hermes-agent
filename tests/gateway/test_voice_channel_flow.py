@@ -118,6 +118,9 @@ def _receiver(*, members, allowed=(), dave=False, pver=0) -> VoiceReceiver:
     )
     receiver = VoiceReceiver(vc, allowed_user_ids=set(allowed))
     receiver.start()
+    # The join's ready gate has opened: these tests are about the pipeline AFTER ready, so every
+    # frame below arrives post-tone and the pre-tone cut must leave it alone.
+    receiver.mark_ready()
     return receiver
 
 

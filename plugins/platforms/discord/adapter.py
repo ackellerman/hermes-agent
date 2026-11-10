@@ -1053,27 +1053,32 @@ class VoiceReceiver:
         self.refresh_credentials("ready gate re-armed")
 
     def _cut_pre_ready_locked(self, ssrc: int) -> int:
-        """Drop the PCM whose frames ARRIVED at or before ``t_ready`` (call under ``_lock``).
+        """Drop the PCM whose frames ARRIVED before the join was ready (call under ``_lock``).
 
         The arrival stamps, not the flush time, decide: a frame held back by the DAVE ring or by a
-        slow poll still counts as heard before the tone. Returns the number of frames removed.
+        slow poll still counts as heard before the tone.  ``_ready_at is None`` means the gate has
+        not opened yet (the deaf window: a cold model load, a DAVE negotiation, or a move's
+        re-arm), so every arrival stamped so far is pre-tone and the whole prefix goes — a flush
+        inside that window must not hand STT the audio the plan forbids.  Returns the number of
+        frames removed.
         """
         ready_at = self._ready_at
-        if ready_at is None:
-            return 0
         arrivals = self._arrivals.get(ssrc)
         if not arrivals:
             return 0
+        cutoff = time.monotonic() if ready_at is None else ready_at
         cut_bytes = 0
         cut_frames = 0
-        while arrivals and arrivals[0][0] <= ready_at:
+        while arrivals and arrivals[0][0] <= cutoff:
             _arrived_at, nbytes = arrivals.popleft()
             cut_bytes += nbytes
             cut_frames += 1
         if cut_frames:
             buf = self._buffers.get(ssrc)
             if buf:
-                del buf[:cut_bytes]
+                # Clamp to the buffer: the deque is a byte-exact prefix of it only while the two
+                # stay in step, and deleting past the end would take live post-tone speech with it.
+                del buf[:min(cut_bytes, len(buf))]
             self._pre_ready_dropped += cut_frames
             logger.debug(
                 "Discarded %d pre-tone PCM frame(s) (ssrc=%d, %d bytes)",

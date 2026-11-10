@@ -656,6 +656,42 @@ async def test_a_packet_arriving_after_the_tone_reaches_stt(monkeypatch, nacl, d
 
 
 @pytest.mark.asyncio
+async def test_a_flush_inside_the_deaf_window_drops_what_the_buffers_hold(
+        monkeypatch, nacl, decoders):
+    """Before ``t_ready`` is stamped, a flush must drop, not deliver.
+
+    ``_ready_at is None`` covers the whole deaf window — a cold model load, a DAVE negotiation, a
+    move's re-arm — and the cut's old ``return 0`` handed STT exactly the audio the plan forbids:
+    the speaker only has to stop for ``SILENCE_THRESHOLD``, or the bot only has to leave.  Both
+    flush paths are checked, because a leave flushes instead of polling.
+    """
+    release, seen = threading.Event(), {}
+
+    def lease(name, install=False):
+        seen["called"] = True
+        release.wait(10)
+        return dict(_WARM_CPU)
+
+    env = _env(monkeypatch, lease=lease, timeout=10)
+    await _join(env)
+    receiver = env.receiver
+    receiver.map_ssrc(SSRC, OPERATOR)
+    assert await _until(lambda: seen.get("called"))
+    _speak(env, nacl, SSRC, 40)                 # 0.8 s while the model is still loading
+    assert env.ready_at is None
+
+    _quiet(env)
+    assert receiver.check_silence() == [], "the deaf window's audio was flushed before the tone"
+    assert receiver._pre_ready_dropped == 40
+
+    _speak(env, nacl, SSRC, 30)                 # a fresh segment, still before the tone
+    assert env.ready_at is None
+    assert receiver.flush_pending() == [], "the leave flush delivered pre-tone audio"
+    assert receiver._pre_ready_dropped == 70
+    release.set()
+
+
+@pytest.mark.asyncio
 async def test_the_leave_flush_applies_the_same_cut(monkeypatch, nacl, decoders):
     """The leave path flushes instead of polling: the cut must be applied there too."""
     release, seen = threading.Event(), {}
