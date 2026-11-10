@@ -21,8 +21,9 @@ one process write to their own stores). The table is created on first use; there
 * A run ends (``running -> idle``) only from the worker's done-callback, or by the orphan rule. A parent
   wait that ends early while the worker is alive leaves the row ``running`` with ``wait_abandoned_at``.
 * Expiry and the orphan rule are applied on every read: the read looks first and takes the write lock only
-  when a rule would change a row; a read never creates the table. ``idle_since`` is reset only by a new run
-  (``take_fence``); reads never touch it.
+  when a rule would change a row; a read never creates the table. A store that cannot be written (read-only,
+  or locked longer than ``READ_WRITE_BUSY_MS``) shows the derived state instead of raising or stalling.
+  ``idle_since`` is reset only by a new run (``take_fence``); reads never touch it.
 * A parent whose session store is a managed worker's ``RuntimeSessionStore`` (no local ``state.db`` path) never
   keeps its children: nothing here writes through the worker RPC.
 
@@ -68,13 +69,9 @@ NEVER_KEEP_ATTR = "_delegate_children_never_keep"
 DEFAULT_KEEP_IDLE_DAYS = 7
 DEFAULT_ORPHAN_AFTER_S = 300
 HEARTBEAT_INTERVAL_S = 30.0
-# A provably alive runner is orphaned only once its heartbeat is this many ``orphan_after_s`` old: its tick beats
-# every ``HEARTBEAT_INTERVAL_S`` while the worker lives, so a heartbeat that old means the worker ended and its
-# final write was lost (or the tick never started).
-STALE_ALIVE_FACTOR = 12
-# The worker's done-callback tries the final ``running -> idle`` write this often before handing it to the tick.
-FINISH_ATTEMPTS = 3
-FINISH_RETRY_S = 0.2
+# A read path may need a write (persisting a due rule, refreshing ``latest_session_id``): it waits at most this
+# long for a writer's lock, then shows the derived state and leaves the write to the next read.
+READ_WRITE_BUSY_MS = 250
 
 ORPHANED_LINE = "child kept as idle-orphaned; resumable with action='resume'"
 
@@ -247,10 +244,10 @@ def ensure_table(conn: sqlite3.Connection) -> None:
 
 
 
-def _connect(db_path: Path) -> sqlite3.Connection:
+def _connect(db_path: Path, busy_timeout_ms: int = 10_000) -> sqlite3.Connection:
     from hermes_cli.sqlite_util import open_db
     # wal=False: SessionDB owns state.db's journal mode.
-    return open_db(db_path, db_label=f"state.db ({TABLE})", busy_timeout_ms=10_000, wal=False,
+    return open_db(db_path, db_label=f"state.db ({TABLE})", busy_timeout_ms=busy_timeout_ms, wal=False,
                    row_factory=sqlite3.Row, initialize=ensure_table)
 
 
@@ -327,38 +324,51 @@ def _rule_changes(conn: sqlite3.Connection, now: float, cfg: dict[str, Any]) -> 
     orphans = []
     # Tuple unpacking: the async-delegation ledger's connection has no row factory.
     for child_id, run_token, runner_raw, beat in conn.execute(
-            f"SELECT child_id, run_token, runner, heartbeat_at FROM {TABLE} WHERE status=?", (RUNNING,)).fetchall():
+            f"SELECT child_id, run_token, runner, heartbeat_at FROM {TABLE} WHERE status=? ORDER BY rowid",
+            (RUNNING,)).fetchall():
         try:
             runner = json.loads(runner_raw) if runner_raw else None
         except ValueError:
             runner = None
-        age = None if beat is None else now - float(beat)
         alive = _runner_alive(runner)
         if alive is False:
             orphan = True
-        elif alive is True:  # its tick beats while the worker lives: only a long-dead tick counts
-            orphan = age is None or age > horizon * STALE_ALIVE_FACTOR
+        elif alive is True:  # a provably alive runner is never orphaned on age
+            orphan = False
         else:
-            orphan = age is None or age > horizon
+            orphan = beat is None or now - float(beat) > horizon
         if orphan:
             orphans.append((child_id, run_token))
     return expire, orphans
 
 
 def _apply_rules(conn: sqlite3.Connection, now: float, cfg: dict[str, Any]) -> None:
-    """Expire idle children past ``keep_idle_days``. Orphan a running child whose runner is provably dead, or
-    cannot be checked here and has not beaten for ``orphan_after_s``, or is provably alive but has not beaten for
-    ``STALE_ALIVE_FACTOR`` x ``orphan_after_s`` (its final write was lost). An orphaned run ends at its last
-    heartbeat: ``idle_since`` is that time, not the time somebody looked."""
-    expire, orphans = _rule_changes(conn, now, cfg)
-    if expire:
-        conn.execute(f"UPDATE {TABLE} SET status=?, updated_at=? WHERE status=? AND idle_since IS NOT NULL"
-                     " AND ? - idle_since > ?", (EXPIRED, now, IDLE, now, keep_idle_days(cfg) * 86400.0))
+    """Orphan a running child whose runner is provably dead, or cannot be checked here and has not beaten for
+    ``orphan_after_s``; then expire idle children past ``keep_idle_days``. A provably alive runner is never
+    orphaned on age. The orphan pass runs first, so expiry sees the post-orphan state: a run that died longer
+    ago than ``keep_idle_days`` is expired once, not idle-orphaned on one read and expired on the next. An
+    orphaned run ended at its last heartbeat: ``idle_since`` is that time, not the time somebody looked."""
+    _expire, orphans = _rule_changes(conn, now, cfg)
+    keep_s = keep_idle_days(cfg) * 86400.0
     for child_id, run_token in orphans:
         conn.execute(
             f"UPDATE {TABLE} SET status=?, idle_reason=?, idle_since=COALESCE(heartbeat_at, ?), orphaned_at=?,"
             " runner=NULL, updated_at=? WHERE child_id=? AND status=? AND run_token IS ?",
             (IDLE, ORPHANED, now, now, now, child_id, RUNNING, run_token))
+    conn.execute(f"UPDATE {TABLE} SET status=?, updated_at=? WHERE status=? AND idle_since IS NOT NULL"
+                 " AND ? - idle_since > ?", (EXPIRED, now, IDLE, now, keep_s))
+
+
+def _project(row: dict[str, Any], now: float, orphaned: set[Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    """*row* as ``_apply_rules`` would have left it, for a read that could not write (read-only or locked store):
+    the same orphan-then-expire state, derived here instead of persisted. The next writable read writes it."""
+    if row.get("status") == RUNNING and row.get("child_id") in orphaned:
+        row = dict(row, status=IDLE, idle_reason=ORPHANED, runner=None, orphaned_at=now,
+                   idle_since=row.get("heartbeat_at") or now)
+    if row.get("status") == IDLE and row.get("idle_since") is not None:
+        if now - float(row["idle_since"]) > keep_idle_days(cfg) * 86400.0:
+            row = dict(row, status=EXPIRED)
+    return row
 
 
 @dataclass(frozen=True)
@@ -398,9 +408,9 @@ class ChildStore:
         return _delegation_cfg() if self._cfg is None else self._cfg
 
     @contextlib.contextmanager
-    def _write(self) -> Iterator[sqlite3.Connection]:
+    def _write(self, busy_timeout_ms: int = 10_000) -> Iterator[sqlite3.Connection]:
         from hermes_cli.sqlite_util import transaction
-        with transaction(_connect(self.db_path), immediate=True) as conn:
+        with transaction(_connect(self.db_path, busy_timeout_ms), immediate=True) as conn:
             yield conn
 
     @contextlib.contextmanager
@@ -440,17 +450,26 @@ class ChildStore:
 
     def _read(self, sql: str, params: Iterable[Any] = (), *, now: Optional[float] = None) -> list[dict[str, Any]]:
         """Rows for *sql* with expiry and the orphan rule applied. Reads first; takes the write lock only when a
-        rule would change a row."""
+        rule would change a row, and degrades to the state ``_apply_rules`` would have written when the store is
+        read-only or locked (the roster reads every turn and must not break on such a store)."""
         now = time.time() if now is None else now
+        cfg = self._config()
         with self._read_conn() as conn:
             if conn is None:
                 return []
-            expire, orphans = _rule_changes(conn, now, self._config())
-            if not expire and not orphans:
+            _expire, orphans = _rule_changes(conn, now, cfg)
+            if not orphans and not _expire:
                 return [_decode_row(r) for r in conn.execute(sql, tuple(params)).fetchall()]
-        with self._write() as conn:
-            self._apply_rules(conn, now)
-            return [_decode_row(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+            before = [_decode_row(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+        try:
+            with self._write(READ_WRITE_BUSY_MS) as conn:
+                self._apply_rules(conn, now)
+                return [_decode_row(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+        except sqlite3.OperationalError:
+            logger.debug("delegate_children: rule write skipped (%s); showing the derived state", self.db_path,
+                         exc_info=True)
+            orphaned = {child_id for child_id, _ in orphans}
+            return [_project(row, now, orphaned, cfg) for row in before]
 
     # -- record --
 
@@ -474,15 +493,17 @@ class ChildStore:
                                tuple(fields.values()))
             return token if cur.rowcount == 1 else None
 
-    def update_brief(self, child_id: str, **fields: Any) -> None:
-        """Fill brief fields known only after the record (the worktree, the workdir)."""
+    def update_brief(self, child_id: str, run_token: str, **fields: Any) -> None:
+        """Fill brief fields known only after the record (the worktree, the workdir). Guarded by the caller's
+        ``run_token``: a stale run (its fence was taken over, or the row was orphaned and resumed) must not fill
+        fields onto the row a newer run owns. e4: pass the token of the run doing the writing, never a cached one."""
         fields = {k: v for k, v in fields.items() if k in _BRIEF_FIELDS and v is not None}
         if not fields:
             return
         sets = ", ".join(f"{k}=?" for k in fields)
         with self._write() as conn:
-            conn.execute(f"UPDATE {TABLE} SET {sets}, updated_at=? WHERE child_id=?",
-                         (*fields.values(), time.time(), child_id))
+            conn.execute(f"UPDATE {TABLE} SET {sets}, updated_at=? WHERE child_id=? AND run_token IS ?",
+                         (*fields.values(), time.time(), child_id, run_token))
 
     # -- run fence --
 
@@ -645,7 +666,8 @@ class ChildStore:
 
     def refresh_latest(self, child_id: str) -> Optional[str]:
         """Re-read the child's newest segment from ``stored_child_session`` against the holder's conversation and its
-        prior conversations; stored on the row when found."""
+        prior conversations; stored on the row when found. A read path: it waits at most ``READ_WRITE_BUSY_MS``
+        for a writer's lock and leaves the row for the next read when it cannot write."""
         from tools.delegate_tool_sessions import stored_child_session
         with self._read_conn() as conn:
             row = None if conn is None else _decode(
@@ -656,7 +678,7 @@ class ChildStore:
         with self._lineage_db() as db:
             tip = stored_child_session(db, row["subagent_id"], convs)
         if tip and tip != row.get("latest_session_id"):
-            with self._write() as conn:
+            with self._write(READ_WRITE_BUSY_MS) as conn:
                 conn.execute(f"UPDATE {TABLE} SET latest_session_id=?, updated_at=? WHERE child_id=?",
                              (tip, time.time(), child_id))
         return tip or row.get("latest_session_id")
@@ -745,9 +767,8 @@ def note_spawn(parent_agent: Any, child: Any, *, goal: str, context: Optional[st
 
 class _Tick:
     """Our own progress-independent heartbeat: touches ``heartbeat_at`` every ``HEARTBEAT_INTERVAL_S`` while the
-    worker lives. Once the worker is done (``finish``) it stops beating and, if the done-callback could not write
-    the final state, retries that write each interval until it lands; meanwhile the heartbeat goes stale, so the
-    orphan rule still ends the run if the write never lands."""
+    worker lives. Once the worker is done (``finish``) it stops beating and, if the done-callback's single write
+    did not land, retries that write each interval until it lands; meanwhile the heartbeat goes stale."""
 
     def __init__(self, store: ChildStore, child_id: str, token: str):
         from agent.memory_provider import spawn_context_thread
@@ -764,7 +785,7 @@ class _Tick:
                     self.stopped.set()
                 elif not self.store.beat(self.child_id, self.token):
                     return
-            except (sqlite3.Error, OSError):
+            except Exception:  # the tick is the only liveness signal: never let it end early
                 logger.debug("delegate_children: heartbeat/final write failed", exc_info=True)
 
     def start(self) -> _Tick:
@@ -775,23 +796,19 @@ class _Tick:
         self.stopped.set()
 
     def finish(self, reason: str) -> bool:
-        """The worker is done: stop beating and write ``running -> idle`` (``FINISH_ATTEMPTS`` tries). On failure
-        the tick, if it runs, keeps retrying; the row's heartbeat no longer advances either way."""
+        """The worker is done: stop beating and write ``running -> idle`` on this one attempt, so a write-locked
+        store cannot delay the parent's result (the tick, while it runs, retries the write each interval)."""
         self.reason = reason
-        for attempt in range(FINISH_ATTEMPTS):
-            try:
-                self.store.finish_run(self.child_id, self.token, reason)
-            except (sqlite3.Error, OSError):
-                logger.debug("delegate_children: final write for %s failed", self.child_id, exc_info=True)
-                if attempt + 1 < FINISH_ATTEMPTS:
-                    time.sleep(FINISH_RETRY_S * (attempt + 1))
-                continue
-            self.stopped.set()
-            return True
-        logger.warning("delegate_children: could not mark child %s idle after %d attempts; %s", self.child_id,
-                       FINISH_ATTEMPTS, "its tick keeps retrying" if self.thread.is_alive()
-                       else "it is orphaned once its heartbeat goes stale")
-        return False
+        try:
+            self.store.finish_run(self.child_id, self.token, reason)
+        except (sqlite3.Error, OSError):
+            logger.debug("delegate_children: final write for %s failed", self.child_id, exc_info=True)
+            logger.warning("delegate_children: could not mark child %s idle; %s", self.child_id,
+                           "its tick keeps retrying" if self.thread.is_alive()
+                           else "it stays running until the process exits")
+            return False
+        self.stopped.set()
+        return True
 
 
 def _done_reason(future: Any) -> str:

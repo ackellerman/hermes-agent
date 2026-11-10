@@ -601,9 +601,8 @@ def test_expiry_running_child_never_expires(db):
     parent = _parent(db)
     _, future, _, _ = _spawn(db, parent)
     store = dc.ChildStore(db.db_path)
-    later = time.time() + 30 * DAY
-    _set(db.db_path, "kid-1", heartbeat_at=later)  # its tick still beats then
-    assert store.get("kid-1", now=later)["status"] == "running"
+    # A running child with a fresh heartbeat is never expired, however far ahead the reader's clock is.
+    assert store.get("kid-1", now=time.time() + 30 * DAY)["status"] == "running"
     _finish(future)
 
 
@@ -656,12 +655,28 @@ def test_orphan_runner_alive_in_another_process_stays_running(db):
     store, _ = _running_row(db)
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
-        # Well past orphan_after_s: a provably alive runner is not orphaned on the plain heartbeat age.
-        _set(db.db_path, "kid-o", runner=json.dumps(_process_runner(proc)), heartbeat_at=time.time() - 1800)
+        # Even a day-old heartbeat: a provably alive runner is never orphaned on age (D-005 option 2).
+        _set(db.db_path, "kid-o", runner=json.dumps(_process_runner(proc)), heartbeat_at=time.time() - DAY)
         assert store.get("kid-o")["status"] == "running"
     finally:
         proc.kill()
         proc.wait()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs /proc start ticks")
+def test_orphan_a_run_that_died_before_keep_idle_days_is_expired_on_the_first_read(db):
+    """Expiry is evaluated after the orphan pass, in the same write: one state, not idle-orphaned then expired."""
+    store, _ = _running_row(db)
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    runner = _process_runner(proc)
+    proc.kill()
+    proc.wait()
+    _set(db.db_path, "kid-o", runner=json.dumps(runner), heartbeat_at=time.time() - 10 * DAY)
+    first = store.get("kid-o")
+    assert (first["status"], first["idle_reason"]) == ("expired", "orphaned")
+    assert store.get("kid-o")["status"] == "expired"  # stable: the next read agrees
+    assert store.take_fence("kid-o").reason == "expired"
+    assert _rows(db.db_path)[0]["status"] == "expired"
 
 
 def test_orphan_foreign_pidns_runner_uses_the_heartbeat_age(db):
@@ -888,6 +903,19 @@ def test_keep_valid_numbers_and_unset_are_silent(caplog):
     assert not caplog.records
 
 
+# finding 10 (INFO, r3): update_brief is guarded by the run token
+
+def test_record_update_brief_refuses_a_stale_run_token(db):
+    store, token = _running_row(db)
+    store.finish_run("kid-o", token, "completed")
+    new = store.take_fence("kid-o").token
+    assert new and new != token
+    store.update_brief("kid-o", token, workdir="/stale")  # an older run must not fill the new run's row
+    assert _rows(db.db_path)[0]["workdir"] is None
+    store.update_brief("kid-o", new, workdir="/fresh")
+    assert _rows(db.db_path)[0]["workdir"] == "/fresh"
+
+
 # finding 5: reads take no write lock and run no DDL
 
 def test_record_read_without_the_table_returns_empty_and_creates_nothing(db, tmp_path):
@@ -900,14 +928,59 @@ def test_record_read_without_the_table_returns_empty_and_creates_nothing(db, tmp
 
 
 def test_record_read_on_a_read_only_db(db):
-    _idle_kid(db)
+    store, _ = _idle_kid(db)
+    db.close()  # the open handle would keep -wal/-shm alive and make the file writable anyway
     os.chmod(db.db_path, 0o444)
     try:
-        store = dc.ChildStore(db.db_path)
         assert store.get("kid-1")["status"] == "idle"
         assert [r["child_id"] for r in store.held_by("parent")] == ["kid-1"]
     finally:
         os.chmod(db.db_path, 0o644)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs /proc start ticks")
+def test_record_read_derives_a_due_rule_on_a_read_only_db(tmp_path):
+    """e6's roster reads every turn: a due orphan on an unwritable store shows the derived state, never raises."""
+    from hermes_state import SessionDB
+    handle = SessionDB(db_path=tmp_path / "state.db")
+    store = dc.ChildStore(handle.db_path)
+    token = store.record_run_start(child_id="kid-ro", subagent_id="sa-0-ro", holder_session_id="parent",
+                                   conversation_id="parent", brief={"goal": "g"})
+    assert token
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    runner = _process_runner(proc)
+    proc.kill()
+    proc.wait()
+    _set(handle.db_path, "kid-ro", runner=json.dumps(runner), heartbeat_at=time.time() - 60)
+    handle.close()
+    os.chmod(handle.db_path, 0o444)
+    try:
+        row = store.get("kid-ro")
+        assert (row["status"], row["idle_reason"]) == ("idle", "orphaned")
+        assert [r["child_id"] for r in store.held_by("parent")] == ["kid-ro"]
+        assert _rows(handle.db_path)[0]["status"] == "running"  # derived for display, nothing written
+    finally:
+        os.chmod(handle.db_path, 0o644)
+    assert store.get("kid-ro")["status"] == "idle"  # the next writable read persists it
+
+
+def test_record_show_does_not_stall_on_a_writer_lock_when_the_tip_moved(db):
+    store, _ = _idle_kid(db)
+    db.end_session("kid-1", "compression")
+    db.create_session("kid-2", source="subagent", parent_session_id="kid-1",
+                      model_config={"_delegate_from": "parent", "_subagent_id": "sa-0-aaaa"})  # the tip moved
+    blocker = sqlite3.connect(db.db_path, isolation_level=None)
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        row = store.show("kid-1", ["parent"])
+        assert time.monotonic() - started < 3.0
+        assert (row["child_id"], row["latest_session_id"]) == ("kid-1", "kid-1")  # refresh skipped, shown stale
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+    assert store.refresh_latest("kid-1") == "kid-2"  # the next read lands it
+    assert _rows(db.db_path)[0]["latest_session_id"] == "kid-2"
 
 
 def test_record_read_does_not_wait_on_the_writer_lock(db):
@@ -935,26 +1008,31 @@ def test_record_read_still_applies_a_due_rule(db):
 
 # finding 6: a finished worker always leaves running
 
-def test_fence_done_callback_retries_a_failed_final_write(db, monkeypatch):
-    monkeypatch.setattr(dc, "FINISH_RETRY_S", 0.01)
-    real, fails = dc.ChildStore.finish_run, {"n": dc.FINISH_ATTEMPTS - 1}
+def test_fence_done_callback_makes_one_attempt_and_does_not_wait(db, monkeypatch, caplog):
+    """A write-locked store must not delay the parent's result: one attempt, no retry loop, no sleep."""
+    monkeypatch.setattr(dc, "HEARTBEAT_INTERVAL_S", 60.0)
+    calls = []
 
-    def flaky(self, *a, **k):
-        if fails["n"]:
-            fails["n"] -= 1
-            raise sqlite3.OperationalError("database is locked")
-        return real(self, *a, **k)
+    def locked(self, *a, **k):
+        calls.append(a)
+        raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(dc.ChildStore, "finish_run", flaky)
-    _, future, _, _ = _spawn(db, _parent(db))
-    _finish(future)
-    assert dc.ChildStore(db.db_path).get("kid-1")["status"] == "idle"
+    monkeypatch.setattr(dc.ChildStore, "finish_run", locked)
+    child, future, _, _ = _spawn(db, _parent(db))
+    with caplog.at_level("WARNING", logger=dc.__name__):
+        started = time.monotonic()
+        _finish(future)
+    assert time.monotonic() - started < 1.0
+    assert len(calls) == 1  # one attempt; the tick retries, not the callback
+    assert child._delegate_children_tick.thread.is_alive()
+    assert _rows(db.db_path)[0]["status"] == "running"
+    assert any("could not mark child kid-1 idle" in r.getMessage() for r in caplog.records)
+    child._delegate_children_tick.stop()
 
 
-def test_fence_tick_retries_the_final_write_after_the_callback_gives_up(db, monkeypatch):
-    monkeypatch.setattr(dc, "FINISH_RETRY_S", 0.0)
+def test_fence_tick_lands_the_final_write_after_the_callbacks_attempt_fails(db, monkeypatch):
     monkeypatch.setattr(dc, "HEARTBEAT_INTERVAL_S", 0.02)
-    real, fails = dc.ChildStore.finish_run, {"n": dc.FINISH_ATTEMPTS + 3}
+    real, fails = dc.ChildStore.finish_run, {"n": 2}  # literal: only a retrying writer gets past two failures
 
     def flaky(self, *a, **k):
         if fails["n"]:
@@ -970,6 +1048,27 @@ def test_fence_tick_retries_the_final_write_after_the_callback_gives_up(db, monk
     assert _wait(lambda: not child._delegate_children_tick.thread.is_alive())
 
 
+def test_fence_tick_survives_an_unexpected_error(db, monkeypatch):
+    """The tick is the only liveness signal: an exception that is not a sqlite3 error must not end it."""
+    monkeypatch.setattr(dc, "HEARTBEAT_INTERVAL_S", 0.02)
+    real, calls = dc.ChildStore.beat, {"n": 0}
+
+    def flaky(self, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("boom")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(dc.ChildStore, "beat", flaky)
+    child, future, _, _ = _spawn(db, _parent(db))
+    tick = child._delegate_children_tick
+    assert _wait(lambda: calls["n"] >= 3)  # it kept beating after the ValueError
+    assert tick.thread.is_alive()
+    _finish(future)
+    assert _wait(lambda: not tick.thread.is_alive())
+    assert dc.ChildStore(db.db_path).get("kid-1")["status"] == "idle"
+
+
 def test_fence_tick_start_failure_still_finishes_the_run(db, monkeypatch):
     def no_thread(self):
         raise RuntimeError("can't start new thread")
@@ -981,15 +1080,22 @@ def test_fence_tick_start_failure_still_finishes_the_run(db, monkeypatch):
     assert dc.ChildStore(db.db_path).get("kid-1")["status"] == "idle"
 
 
-def test_orphan_alive_runner_whose_tick_died_orphans_after_the_stale_horizon(db):
-    """A live runner whose final write was lost: its heartbeat stops and goes stale."""
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs /proc start ticks")
+def test_orphan_alive_runner_whose_tick_died_stays_running_until_its_process_is_gone(db):
+    """D-005 option 2: a provably alive runner is never orphaned on age, however stale its heartbeat; once its
+    process is gone the same row is idle-orphaned at its last heartbeat."""
     store, _ = _running_row(db)  # runner = this process, provably alive
-    t0 = time.time()
+    t0 = time.time() - DAY
     _set(db.db_path, "kid-o", heartbeat_at=t0)
-    stale = dc.DEFAULT_ORPHAN_AFTER_S * dc.STALE_ALIVE_FACTOR
-    assert store.get("kid-o", now=t0 + dc.DEFAULT_ORPHAN_AFTER_S + 1)["status"] == "running"
-    assert store.get("kid-o", now=t0 + stale - 1)["status"] == "running"
-    row = store.get("kid-o", now=t0 + stale + 1)
+    assert store.get("kid-o", now=t0 + 30 * DAY)["status"] == "running"
+    fence = store.take_fence("kid-o", now=t0 + 30 * DAY)  # no second run behind a running child
+    assert (fence.ok, fence.reason, fence.steer_receipt) == (False, "running", True)
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    runner = _process_runner(proc)
+    proc.kill()
+    proc.wait()
+    _set(db.db_path, "kid-o", runner=json.dumps(runner))  # the owning process is gone (a restart)
+    row = store.get("kid-o", now=t0 + 60)
     assert (row["status"], row["idle_reason"], row["idle_since"]) == ("idle", "orphaned", t0)
 
 
