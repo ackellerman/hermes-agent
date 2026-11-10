@@ -213,15 +213,15 @@ class _Env:
 
 
 def _env(monkeypatch, *, lease=None, tone=True, timeout=5.0, requested="cpu",
-         cuda_extra=False, gpu=False, gain=0.5, mixer=False) -> _Env:
+         cuda_extra=False, gpu=False, gain=0.5, mixer=False, warm_device="cpu") -> _Env:
     """A real adapter whose ready gate runs against canned STT and GPU facts."""
-    adapter = fx.make_adapter(bot_user_id=ME)
+    adapter = fx.make_adapter(bot_user_id=ME, stt_device=warm_device)
     adapter._voice_fx_cfg = {
         **adapter._voice_fx_cfg,
         "ready_tone_enabled": tone, "ready_timeout_s": timeout, "ready_tone_gain": gain,
         "enabled": mixer,
     }
-    adapter._voice_stt_lease_acquire = lease or (lambda name, install=False: dict(_WARM_CPU))
+    adapter._voice_stt_lease_acquire = lease or adapter._voice_stt_lease_acquire
     if ready_mod is not None:
         monkeypatch.setattr(ready_mod, "_cuda_extra_selected", lambda: cuda_extra)
         monkeypatch.setattr(ready_mod, "_cuda_device_visible", lambda: gpu)
@@ -461,6 +461,22 @@ async def test_auto_with_the_cuda_extra_and_a_failed_cuda_is_degraded(monkeypatc
 @pytest.mark.asyncio
 async def test_auto_with_a_visible_gpu_and_no_cuda_extra_is_plain_ready(monkeypatch):
     env = _env(monkeypatch, requested="auto", cuda_extra=False, gpu=True)
+    await _join(env)
+    assert await _until(lambda: _ready(env))
+    assert env.info()["degraded"] is False
+    assert env.text.send.await_count == 0
+    assert len(env.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_gpu_that_really_warms_on_cuda_is_plain_ready(monkeypatch):
+    """A pin that was honoured has nothing to report, whatever the host was set up for.
+
+    The fake can now report the device the warm actually landed on, so the gate's comparison is
+    exercised from both sides: the request says cuda, the inference says cuda, and no degraded line
+    goes out.
+    """
+    env = _env(monkeypatch, requested="cuda", warm_device="cuda")
     await _join(env)
     assert await _until(lambda: _ready(env))
     assert env.info()["degraded"] is False

@@ -149,8 +149,13 @@ def make_guild(client: Any, gid: int = GUILD) -> Any:
     return guild
 
 
-def make_adapter(*, owner: Optional[str] = None, bot_user_id: int = 999) -> DiscordAdapter:
-    """A real ``DiscordAdapter`` on a fake client: one guild, one text channel, voice timers off."""
+def make_adapter(*, owner: Optional[str] = None, bot_user_id: int = 999,
+                 stt_device: str = "cpu") -> DiscordAdapter:
+    """A real ``DiscordAdapter`` on a fake client: one guild, one text channel, voice timers off.
+
+    ``stt_device`` is the device the canned warm lease reports; the default (``cpu``) is what a
+    host without a usable GPU sees, and a GPU-path test can vary it.
+    """
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token=f"fake-{bot_user_id}"))
     if owner:
         adapter.set_owner_profile(owner)
@@ -168,7 +173,8 @@ def make_adapter(*, owner: Optional[str] = None, bot_user_id: int = 999) -> Disc
     # engine out of a fake join, and the tone stays off so no clip is rendered or played. Tests of
     # the gate itself (tests/gateway/test_voice_ready_gate.py) set their own lease and cfg.
     adapter._voice_stt_lease_acquire = lambda lease, install=False: {
-        "provider": "local", "warmed": True, "action": "cached", "device": "cpu", "model": "tiny",
+        "provider": "local", "warmed": True, "action": "cached", "device": stt_device,
+        "model": "tiny",
     }
     adapter._voice_fx_cfg = {**adapter._voice_fx_cfg, "ready_tone_enabled": False}
     adapter._fake_guild, adapter._fake_text = guild, text
