@@ -129,7 +129,10 @@ def _gpu_extra_wanted(extra: str | None) -> bool:
 
     # Platform gate first: a gated-off host (an NVIDIA aarch64 board has a driver) never
     # dlopens libcuda.so.1 or calls cuInit just to learn the extra can't install there.
-    if not extra_supported(extra):
+    # Ignore the installed override, exactly as pm.install._feature_policy does: anchors already
+    # importable on a rejected platform (a hand-installed cu12 tree) must not let the hook ask
+    # for an extra the policy then refuses, sinking the base provider too.
+    if not extra_supported(extra, importable=lambda _: False):
         return False
     from pm.features import read_features
 

@@ -90,6 +90,39 @@ def test_gated_off_host_never_runs_the_probe(monkeypatch):
     sync.assert_called_once_with(["stt-whisper"], explicit=True)
 
 
+def _rejected_platform_with_installed_anchors(monkeypatch):
+    """A gated-off host that already holds everything the extra would install: the gate marker
+    rejects this platform, yet both anchors import and both cu12 sonames sit in the tree."""
+    from pm import extras
+
+    monkeypatch.setattr(extras, "_PLATFORM_GATES", {"stt-whisper-cuda": "sys_platform == 'win32'"})
+    monkeypatch.setattr(extras, "_importable", lambda anchor: True)
+    monkeypatch.setattr(extras, "_library_present", lambda package, soname: True)
+
+
+def test_installed_anchors_never_override_a_gated_off_platform(monkeypatch):
+    """The hook's gate check ignores the installed override, like pm.install._feature_policy:
+    a hand-installed nvidia-cublas-cu12 on a rejected platform must not make the hook request an
+    extra the policy then refuses — that failure would take Local Whisper itself down."""
+    from pm import extras, install
+
+    _rejected_platform_with_installed_anchors(monkeypatch)
+    # The bare check is fooled by the installed override (what the hook used to call) ...
+    assert extras.extra_supported("stt-whisper-cuda") is True
+    # ... and the policy's form is not.
+    assert extras.extra_supported("stt-whisper-cuda", importable=lambda _: False) is False
+    monkeypatch.setattr(post_setup, "_nvidia_gpu_present", lambda: True)
+    requested = []
+
+    def sync(wanted, **kwargs):
+        requested.append((list(wanted), kwargs))
+        install._feature_policy(wanted, repair=False)  # the real policy admits what the hook sends
+
+    with patch("pm.sync_venv", side_effect=sync):
+        _run_post_setup("faster_whisper")
+    assert requested == [(["stt-whisper"], {"explicit": True})]
+
+
 def _frozen_bundle(monkeypatch, tmp_path, shipped):
     """A bundle's enabled-features.json beside a private store, with lazy installs off."""
     from pm import features, paths
