@@ -29,9 +29,6 @@ the behaviour, not on a collection error.
 
 import pytest
 
-# The `-m`/`--provider`/`--api-key`/`--base-url` keys the launch policy carries as a route.
-_ROUTE_FLAGS = ("model", "provider", "api_key", "base_url")
-
 
 def _cli_host(monkeypatch, model, provider, *, config=None, **attrs):
     """A CLI stand-in carrying the constructor phases this element reads.
