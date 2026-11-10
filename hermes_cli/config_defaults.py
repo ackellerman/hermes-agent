@@ -772,6 +772,12 @@ DEFAULT_CONFIG = {
         "memory_query_rewrite": _aux(8, reasoning_effort=False),
         "tts_audio_tags": _aux(30),
         "voice_chat": {**_aux(120), "reasoning_effort": "none"},  # agent/voice_turn_route.py; off = lowest valid
+        # Spoken pre-turn brief on Discord voice-input turns (gateway/voice_brief.py): one sentence
+        # that restates the request before the turn runs. Short and cheap — 15s cap, and no
+        # reasoning_effort key (the pinned model's own default effort applies). task_chain_only: a
+        # PINNED route uses this task's own fallback_chain alone — never the main agent's model and
+        # never the built-in discovery chain; inert while provider stays "auto".
+        "voice_brief": _aux(15, reasoning_effort=False, task_chain_only=True),
         # Kanban: triage_specifier expands a Triage one-liner into a spec; kanban_decomposer a JSON graph.
         "triage_specifier": _aux(120),
         "kanban_decomposer": _aux(180),

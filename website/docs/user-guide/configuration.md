@@ -1526,6 +1526,7 @@ $ hermes model
 [ ] title_generation     currently: openrouter / google/gemini-3-flash-preview
 [ ] tts_audio_tags       currently: auto / main model
 [ ] voice_chat           currently: auto / main model
+[ ] voice_brief          currently: auto / main model
 [ ] compression          currently: auto / main model
 [ ] approval             currently: auto / main model
 [ ] triage_specifier     currently: auto / main model
@@ -1539,6 +1540,31 @@ Select a task, pick a provider (OAuth flows open a browser; API-key providers pr
 The **Delegation** entry is special: it routes the model used by `delegate_task` subagents and persists to the top-level `delegation.*` section (`delegation.provider` / `delegation.model`) rather than `auxiliary.*`, because subagents are full child agents, not side-LLM calls. Its `auto` means "inherit the parent agent's provider, model, and credentials."
 
 The **Voice chat** entry picks the model that answers spoken voice-mode turns (tools included); typed turns stay on the main model. See [Voice chat model](features/voice-mode.md#voice-chat-model).
+
+The **Voice brief** entry picks the model that speaks the pre-turn brief on Discord voice-input turns: before the turn
+runs, that model restates the request in one sentence, which is spoken in the bound voice channel and posted to the
+bound text channel. The feature is opt-in per profile with `discord.voice_brief.enabled: true` (off by default). Like
+every other auxiliary task the slot ships on `auto` — your main model and that route's fallback chain — but a brief is
+one sentence, so it carries a 15s timeout and no `reasoning_effort`, and it is the one task that can be told to stay
+on its own chain:
+
+```yaml
+auxiliary:
+  voice_brief:
+    provider: "openrouter"                       # auxiliary.voice_brief.provider — "auto" = main model
+    model: "google/gemini-3.6-flash"             # auxiliary.voice_brief.model
+    fallback_chain:                              # auxiliary.voice_brief.fallback_chain
+      - provider: nous
+        model: deepseek/deepseek-chat
+    task_chain_only: true                        # auxiliary.voice_brief.task_chain_only
+```
+
+`auxiliary.voice_brief.task_chain_only: true` (the shipped value) means **when a provider is pinned**, the brief
+never falls back to the main agent's model or the built-in discovery chain: it walks its own
+`auxiliary.voice_brief.fallback_chain` and stops there. On `auto` the key is inert — an auto brief follows your
+session route and that route's ordered fallback chain like any other auxiliary task. Set it to `false` to give a
+pinned brief the main-model safety net instead. See
+[Per-task fallback chain for auxiliary tasks](#per-task-fallback-chain-for-auxiliary-tasks) for the entry shape.
 
 If you do not want Hermes to auto-generate titles after the first exchange, set
 `auxiliary.title_generation.enabled: false`. Manual titles still work through
@@ -1683,6 +1709,21 @@ auxiliary:
     api_key: ""
     timeout: 30
 
+  # Spoken pre-turn brief on Discord voice-input turns. Opt in per profile with
+  # discord.voice_brief.enabled: true. One sentence, so a short timeout and no
+  # reasoning_effort; task_chain_only keeps a PINNED route on its own chain
+  # instead of the main model / discovery chain (inert while provider is "auto").
+  voice_brief:
+    provider: "auto"
+    model: ""                  # empty = main chat model
+    base_url: ""
+    api_key: ""
+    timeout: 15
+    # fallback_chain:
+    #   - provider: nous
+    #     model: deepseek/deepseek-chat
+    task_chain_only: true
+
   # Context compression timeout (separate from compression.* config)
   compression:
     timeout: 120               # seconds — compression summarizes long conversations, needs more time
@@ -1741,7 +1782,7 @@ auxiliary:
 ```
 
 :::tip
-Each auxiliary task has a configurable `timeout` (in seconds). Defaults: vision 120s, approval 30s, compression 120s, title generation 30s, every other task 30s. Increase these if you use slow local models for auxiliary tasks — a reasoning model that emits a thinking block before its answer routinely needs more than 30s for a title, and a request that hits the deadline is logged as `Auxiliary <task>: request to <base_url> timed out after <N>s (raise auxiliary.<task>.timeout …)` before Hermes tries the fallback chain. Title generation, compression and vision give up on the primary route after one full timeout window (no same-provider retry) so a slow model cannot multiply the wait. Vision also has a separate `download_timeout` (default 30s) for the HTTP image download — increase this for slow connections or self-hosted image servers.
+Each auxiliary task has a configurable `timeout` (in seconds). Defaults: vision 120s, approval 30s, compression 120s, title generation 30s, voice_brief 15s, every other task 30s. Increase these if you use slow local models for auxiliary tasks — a reasoning model that emits a thinking block before its answer routinely needs more than 30s for a title, and a request that hits the deadline is logged as `Auxiliary <task>: request to <base_url> timed out after <N>s (raise auxiliary.<task>.timeout …)` before Hermes tries the fallback chain. Title generation, compression and vision give up on the primary route after one full timeout window (no same-provider retry) so a slow model cannot multiply the wait. Vision also has a separate `download_timeout` (default 30s) for the HTTP image download — increase this for slow connections or self-hosted image servers.
 :::
 
 :::info
