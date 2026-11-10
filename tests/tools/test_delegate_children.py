@@ -1,3 +1,6 @@
+# health: allow FILE_LINES -- the plan (delegate-resume) keeps one test module per element and pins it in every
+# element's verify command (``run_tests.sh tests/tools/test_delegate_children.py -k <topic>``, e1-e7); e3's
+# list/scope/query tests must be selectable HERE, so a topical split would silence the plan's own verification.
 """Kept delegated children (``tools.delegate_children``): the record, the keep rule, the run fence, expiry,
 orphans and prune protection (plan delegate-resume, e1)."""
 
@@ -1960,7 +1963,6 @@ def test_list_returns_a_kept_child_after_it_finished(db):
 
 def test_list_counts_a_running_kept_child_once(db):
     """A kept child running in THIS process is listed as live, not a second time as a kept row."""
-    import tools.delegate_tool_registry as dtr
     parent = _parent(db)
     child, future, _, _ = _spawn(db, parent)
     dtr, _stub = _live_child_record("sa-0-aaaa", parent)

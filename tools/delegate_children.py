@@ -422,7 +422,7 @@ def _visible_clause(conversations: Iterable[str]) -> tuple[str, tuple[Any, ...]]
 def list_entry(row: dict[str, Any], *, conversations: Iterable[str] = (), profile: Optional[str] = None,
                holder_label: Optional[str] = None) -> dict[str, Any]:
     """One ``action='list'`` entry for a kept row: the ids the parent addresses it by, its status and whether
-    this session may act on it. No brief, route or transcript: the model asks ``show`` for those.
+    this session may act on it. No brief, route or transcript: a listing stays small.
 
     ``read_only`` is True when the session may see the child but not resume, steer or stop it: another
     conversation of the profile holds it, or it ran as another profile (a ``profile_routes`` child, ``profile``

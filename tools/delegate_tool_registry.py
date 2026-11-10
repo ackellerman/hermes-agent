@@ -245,9 +245,13 @@ def _list_payload(parent_agent: Any, *, scope: Optional[str] = None, query: Opti
     profile — a ``profile_routes`` child). ``query`` filters both lists, case-insensitively, over goal, ids and
     title. At most ``delegate_children.LIST_LIMIT`` kept children are listed per list.
 
+    ``count`` is the number of children the payload names across its lists — each child once: a kept row that is
+    live in THIS process is dropped from ``children`` because ``subagents`` carries its current state. Both kept
+    lists appear only when they are non-empty, and a note explains an empty result (nothing held, or nothing
+    matching ``query``) and the 20-row cap.
+
     The kept half is read from the parent's own ``state.db`` on every call, so a restart keeps the list; the live
-    registry can only narrow it (a child running in THIS process is listed once, in ``subagents``, where its
-    live state is current). Another profile's ``state.db`` is never opened.
+    registry can only narrow it. Another profile's ``state.db`` is never opened.
     """
     from agent.prompt_cache_scope import conversation_id
     from tools.delegate_children import LIST_LIMIT, ChildStore, list_entry
@@ -276,7 +280,8 @@ def _list_payload(parent_agent: Any, *, scope: Optional[str] = None, query: Opti
     if store is not None:
         try:
             conversation = conversation_id(parent_agent) or ""
-        except Exception:
+        except Exception:  # a listing must not fail on a lineage walk; it degrades to the live view
+            logger.debug("conversation_id failed for a listing", exc_info=True)
             conversation = ""
         conversations = [conversation] if conversation else []
         profile = store.profile
