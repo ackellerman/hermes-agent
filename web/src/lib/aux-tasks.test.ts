@@ -59,3 +59,10 @@ describe("auxTaskRows", () => {
     expect(rows.at(-1)).toEqual({ key: "side_task", label: "Side", hint: "", inheritFrom: "compression" });
   });
 });
+
+describe("BUILTIN_AUX_TASKS", () => {
+  it("offers voice_brief immediately after voice_chat", () => {
+    expect(builtinKeys).toContain("voice_brief");
+    expect(builtinKeys.indexOf("voice_brief")).toBe(builtinKeys.indexOf("voice_chat") + 1);
+  });
+});

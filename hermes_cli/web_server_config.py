@@ -605,7 +605,7 @@ def _normalize_config_for_web(config: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 # Canonical auxiliary task slots. Keep in sync with DEFAULT_CONFIG["auxiliary"]
-# in hermes_cli/config.py — listed here for deterministic ordering in the UI.
+# in hermes_cli/config_defaults.py — listed here for deterministic ordering in the UI.
 _AUX_TASK_SLOTS: tuple[str, ...] = (
     "vision", "compression", "approval", "mcp", "title_generation", "review",
     "voice_chat", "voice_brief", "triage_specifier", "kanban_decomposer",
