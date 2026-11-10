@@ -109,6 +109,9 @@ def test_warns_once_when_a_gpu_is_visible_and_sonames_are_missing(stt, caplog, m
     text = warnings[0].getMessage()
     for soname in BOTH_SONAMES:
         assert soname in text
+    # The wording must say what was actually tried: both sources, not only the wheel (r2 NIT 4 —
+    # without this, a revert to r1's "searched the site-packages of this interpreter" stays green).
+    assert "dynamic loader" in text
     assert sys.prefix in text
     assert HINT in text
     assert result["action"] == "warned"
@@ -284,6 +287,106 @@ def test_startup_check_runs_on_a_daemon_thread(monkeypatch):
 
     assert seen["daemon"] is True, "an executor thread would be joined by asyncio.run at close"
     assert seen["name"] == "startup-stt-check"
+
+
+class _RecordingScope:
+    """Stand-in for the launch-profile scope: records entry/exit order."""
+
+    def __init__(self, events: list):
+        self.events = events
+
+    async def __aenter__(self):
+        self.events.append("enter")
+        return "profile:work"
+
+    async def __aexit__(self, *exc_info):
+        self.events.append("exit")
+        return False
+
+
+def _stub_gateway_run(monkeypatch, factory):
+    """Give ``gateway.run_startup`` a ``gateway.run`` whose scope factory is *factory*.
+
+    The real module is not imported on purpose: ``run_startup`` reaches it lazily, and importing it
+    inside a worktree can trip the home-I/O guard (``hermes_cli._early_recovery`` stats the
+    interrupted-pull marker under the git dir).
+    """
+    module = types.ModuleType("gateway.run")
+    module._async_profile_runtime_scope = factory  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "gateway.run", module)
+
+
+@pytest.mark.parametrize("multiplex", [False, True])
+def test_a_raising_probe_runs_exactly_once(multiplex, monkeypatch):
+    """Only scope ENTRY is guarded: a probe body that raises must propagate, not be re-run.
+
+    Under multiplex (the default) the old ``async with`` around ``return await _run_probe()`` let a
+    body exception hit ``except Exception`` and re-run the probe at the bottom — outside the launch
+    profile, so with the CUDA check that meant two warnings, two model loads and the second one
+    reading ``stt.*`` from the wrong profile (review r2 F2).
+    """
+    events: list = []
+    _stub_gateway_run(monkeypatch, lambda _home: _RecordingScope(events))
+    runs: list = []
+
+    def probe():
+        runs.append("body")
+        raise RuntimeError("boom")
+
+    async def drive():
+        with pytest.raises(RuntimeError, match="boom"):
+            await _Runner(multiplex=multiplex)._run_boot_probe_in_launch_scope(probe)
+
+    asyncio.run(drive())
+
+    assert runs == ["body"], "the launch-scope guard re-ran a probe whose body raised"
+    assert events == (["enter", "exit"] if multiplex else [])
+
+
+def test_a_scope_that_cannot_be_entered_runs_the_probe_once_unscoped(monkeypatch):
+    """The fallback the guard exists for: a scope that cannot be built must not abort startup."""
+
+    class _Broken:
+        async def __aenter__(self):
+            raise RuntimeError("no profile runtime here")
+
+        async def __aexit__(self, *exc_info):  # pragma: no cover — never entered
+            return False
+
+    _stub_gateway_run(monkeypatch, lambda _home: _Broken())
+    runs: list = []
+
+    def probe():
+        runs.append("body")
+        return "value"
+
+    async def drive():
+        return await _Runner(multiplex=True)._run_boot_probe_in_launch_scope(probe)
+
+    assert asyncio.run(drive()) == "value"
+    assert runs == ["body"]
+
+
+def test_the_stt_check_reports_a_failure_at_warning(monkeypatch):
+    """The done callback is the net for a failure the body guard does not swallow; its level is what
+    keeps a late failure visible instead of indistinguishable from silence (r2 NIT 4, mutation M7)."""
+    levels: list = []
+
+    def _record(message, *, level=logging.WARNING):
+        levels.append(level)
+        return lambda task: None
+
+    monkeypatch.setattr(GatewayStartupMixin, "_late_failure_callback", staticmethod(_record))
+    monkeypatch.setattr(stt_startup, "check_local_stt_at_startup", lambda **_: {"action": "skipped"})
+
+    async def drive():
+        runner = _Runner()
+        runner._start_startup_stt_check()
+        await runner._startup_stt_task
+
+    asyncio.run(drive())
+
+    assert levels == [logging.WARNING]
 
 
 def test_a_failed_check_is_reported_at_warning(monkeypatch, caplog):

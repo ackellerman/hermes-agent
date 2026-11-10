@@ -75,18 +75,17 @@ def check_local_stt_at_startup(stt_config: Optional[dict[str, Any]] = None) -> d
     """Warn once (and warm when CUDA can work) for local STT at gateway start.
 
     Returns the decision (``action`` / ``reason`` / ``missing`` / ``cuda_devices`` / ``warm``) for
-    tests and diagnostics. Blocking; the caller runs it off the event loop.
+    tests and diagnostics. Blocking; the caller runs it off the event loop's thread — the CUDA
+    preload inside it still holds the GIL for the duration of its ``dlopen``s
+    (``transcription_local.preload_cuda_libraries``).
     """
     from tools import transcription_tools
 
     if stt_config is None:
-        stt_config = transcription_tools._load_stt_config()
-    # ``stt: enabled`` (a scalar instead of a mapping) reaches here from ``_load_stt_config``, which
-    # returns whatever the ``stt`` key holds; a boot probe must skip, not die on ``.get`` (r1 F3).
-    if not isinstance(stt_config, dict):
-        logger.debug("[STT] startup CUDA check skipped: stt config is %s, not a mapping",
-                     type(stt_config).__name__)
-        stt_config = {}
+        stt_config = transcription_tools._load_stt_config()  # already a mapping
+    # ``stt: enabled`` (a scalar instead of a mapping) must skip, not die on ``.get`` (r1 F3).
+    # Shared with the lease path so both entry points degrade identically (review r2 F3).
+    stt_config = transcription_tools._coerce_stt_config(stt_config)
     provider = (transcription_tools._get_provider(stt_config) or "").lower().strip()
     result: dict[str, Any] = {"provider": provider, "action": "skipped", "reason": "",
                               "missing": (), "cuda_devices": None}

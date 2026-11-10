@@ -84,17 +84,36 @@ _IDLE_UNLOAD_CHECK_INTERVAL = 30  # seconds between idle checks
 
 
 # ---- Config helpers -----------------------------------------------------
+def _coerce_stt_config(section: Any) -> dict:
+    """The ``stt`` section as a mapping; ``{}`` when the key holds anything else (or nothing).
+
+    ``stt: enabled`` in config.yaml (or a list) makes ``load_config().get("stt")`` return that
+    value, and every reader below calls ``.get`` on the result. The boot probe had a guard of its
+    own; the desktop's mic-open lease loads the section itself and did not — so the guard belongs
+    at the loader and at every entry point that accepts a caller-supplied section, or one typo in
+    config.yaml raises ``AttributeError`` on a path the user hits every time they press the mic
+    (review r2 F3).
+    """
+    if section is None:
+        return {}
+    if not isinstance(section, dict):
+        logger.debug("[STT] stt config is %s, not a mapping; treating it as empty",
+                     type(section).__name__)
+        return {}
+    return section
+
+
 def _load_stt_config() -> dict:
-    """Load the ``stt`` section from user config, falling back to defaults."""
+    """Load the ``stt`` section from user config, falling back to defaults (always a mapping)."""
     try:
         from hermes_cli.config import load_config
-        return load_config().get("stt") or {}
+        return _coerce_stt_config(load_config().get("stt"))
     except Exception:
         return {}
 
 
 def is_stt_enabled(stt_config: Optional[dict] = None) -> bool:
-    cfg = _load_stt_config() if stt_config is None else stt_config
+    cfg = _load_stt_config() if stt_config is None else _coerce_stt_config(stt_config)
     return is_truthy_value(cfg.get("enabled", True), default=True)
 
 

@@ -144,7 +144,11 @@ def warm_stt_provider(
     from tools.transcription_local import _normalize_local_model
 
     if stt_config is None:
-        stt_config = transcription_tools._load_stt_config()
+        stt_config = transcription_tools._load_stt_config()  # already a mapping
+    # A caller-supplied section can still be a scalar (``stt: enabled`` read straight from
+    # config.yaml): same guard as the boot probe, so a mic-open reports an action, not
+    # ``AttributeError: 'str' object has no attribute 'get'`` (review r2 F3).
+    stt_config = transcription_tools._coerce_stt_config(stt_config)
     name = (provider or transcription_tools._get_provider(stt_config) or "").lower().strip()
     result: dict[str, Any] = {"provider": name, "warmed": False, "action": "noop"}
     if name not in {"local", "local_command"}:
