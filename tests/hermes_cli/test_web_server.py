@@ -1589,6 +1589,23 @@ CONFIG_SCHEMA = ProviderConfigSchema(
         )
 
 
+    def test_model_set_aux_accepts_the_voice_brief_slot(self):
+        """``POST /api/model/set`` accepts every slot ``hermes model`` offers.
+
+        ``auxiliary.voice_brief`` shipped in DEFAULT_CONFIG and the CLI picker, but
+        ``_AUX_TASK_SLOTS`` (the REST allowlist) was never extended, so the API answered 400
+        ``unknown auxiliary task: voice_brief`` and the Web/Desktop pickers had no row.
+        """
+        from hermes_cli.config import load_config
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={"scope": "auxiliary", "provider": "auto", "model": "", "task": "voice_brief"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["tasks"] == ["voice_brief"]
+        assert load_config()["auxiliary"]["voice_brief"]["provider"] == "auto"
+
     def test_deleting_the_active_custom_endpoint_clears_its_model_mirror(self):
         """Deleting an endpoint must not leave its credential running the agent.
 
