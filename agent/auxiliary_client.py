@@ -7263,41 +7263,19 @@ async def _acreate_with_progress(
     return await _aggregate_chat_stream_async(chunks, model=model, total_ceiling=total_ceiling)
 
 
+# The resolved-route record, the ladder's shapes and _task_stops_at_chain live in their own
+# module (this facade keeps its line cap); re-exported here because callers and tests reach them
+# as agent.auxiliary_client.<name>.
+from agent.auxiliary_task_route import (
+    _LadderRoute, _LadderStep, _PreparedAuxRequest, _ResolvedAuxRoute, _rung,
+    _task_stops_at_chain,
+)
+
+
 # Shared request head + recovery ladder for call_llm / async_call_llm: the entry points differ
 # only in how a request is awaited, so route resolution and the ordered recovery ladder are
 # written once. The ladder is a generator yielding ``_LadderStep`` requests and receiving the
 # response (or thrown exception), so rung ORDER and accept/re-raise contracts match on both wires.
-class _ResolvedAuxRoute(NamedTuple):
-    client: Any
-    final_model: Optional[str]
-    resolved_provider: str
-    effective_provider: str
-
-
-def _task_stops_at_chain(task: Optional[str], resolved_provider: Optional[str]) -> bool:
-    """``auxiliary.<task>.task_chain_only`` AND a non-``auto`` resolved provider.
-
-    The key means "an explicit pin is absolute" (D-124): a task whose route the operator pinned
-    uses its own configured ``fallback_chain`` as the whole fallback policy, and never the main
-    agent's model or the built-in discovery chain. It is read at the three doors a pinned task can
-    leave its route through — the ``openrouter``/``custom`` auto re-probe in
-    ``_resolve_call_client``, the request-time main-agent net in ``_ladder_provider_fallback`` and
-    the quarantine walk's discovery rung in ``_next_fallback_after_quarantine`` — so the gate is
-    the same at each of them.
-
-    The non-``auto`` half is not a convenience: ``auto`` already means "follow the main route and
-    its chain", so the key must be inert there. The shipped ``auxiliary.voice_brief`` block sets
-    ``task_chain_only: true`` with ``provider: auto``, and an auto brief answers exactly as it
-    does without the key.
-    """
-    if not task:
-        return False
-    provider = (resolved_provider or "").strip().lower()
-    if not provider or provider == "auto":
-        return False
-    return bool(_get_auxiliary_task_config(str(task)).get("task_chain_only"))
-
-
 def _resolve_call_client(
     task: Optional[str], *, provider: Optional[str], model: Optional[str], base_url: Optional[str],
     api_key: Optional[str], resolved_provider: str, resolved_model: Optional[str],
@@ -7362,21 +7340,6 @@ def _resolve_call_client(
         raise AuxiliaryClientUnavailable(f"No LLM provider configured for task={task} "
                                          f"provider={resolved_provider}. Run: hermes setup")
     return _ResolvedAuxRoute(client, final_model, resolved_provider, effective_provider)
-
-
-class _PreparedAuxRequest(NamedTuple):
-    client: Any
-    final_model: Optional[str]
-    kwargs: dict[str, Any]
-    resolved_provider: str
-    request_provider: str
-    resolved_model: Optional[str]
-    resolved_base_url: Optional[str]
-    resolved_api_key: Optional[str]
-    resolved_api_mode: Optional[str]
-    effective_timeout: float
-    effective_extra_body: dict[str, Any]
-    base_info: str
 
 
 def _prepare_aux_request(
@@ -7447,13 +7410,6 @@ def _prepare_aux_request(
         effective_extra_body, base_info)
 
 
-class _LadderStep(NamedTuple):
-    """A provider request the ladder asks its driver to perform. kind: "call" (client, kwargs) |
-    "retry_same_provider" (provider, model) | "fallback" (fb_client, fb_model, fb_label)."""
-    kind: str
-    args: tuple
-
-
 # Ordered (predicate, reason) pairs for the provider-fallback rung: first match
 # wins, so a payment-flavoured 429 reads as "payment error", not "rate limit".
 _FALLBACK_REASONS: tuple[tuple[Callable[[Exception], bool], str], ...] = (
@@ -7466,18 +7422,6 @@ _FALLBACK_REASONS: tuple[tuple[Callable[[Exception], bool], str], ...] = (
     # a slow local model reads as an unreachable endpoint (#89445).
     (_is_timeout_error, "request timed out"), (_is_connection_error, "connection error"),
 )
-
-
-def _rung(step: _LadderStep, accept: Callable[[Exception], bool]):
-    """One ladder rung: perform ``step``; yields ``(response, None)`` on success,
-    ``(None, exc)`` when ``accept(exc)`` lets the next rung handle it, else re-raises."""
-    try:
-        result = yield step
-    except Exception as exc:
-        if not accept(exc):
-            raise
-        return None, exc
-    return result, None
 
 
 def _param_rung_accepts(exc: Exception) -> bool:
@@ -7499,24 +7443,6 @@ def _param_rung_accepts(exc: Exception) -> bool:
 
 def _credential_rung_accepts(exc: Exception) -> bool:
     return _is_auth_error(exc) or _is_payment_error(exc) or _is_rate_limit_error(exc)
-
-
-# Immutable route context shared by the recovery rungs.
-class _LadderRoute(NamedTuple):
-    client: Any
-    task: Optional[str]
-    tag: str
-    async_mode: bool
-    base_info: str
-    resolved_provider: str
-    resolved_model: Optional[str]
-    resolved_base_url: Optional[str]
-    resolved_api_key: Optional[str]
-    resolved_api_mode: Optional[str]
-    final_model: Optional[str]
-    main_runtime: Optional[dict[str, Any]]
-    route_info: Optional[dict[str, str]]
-    timeout: Optional[float]
 
 
 def _without_temperature(kwargs: dict) -> Optional[dict]:

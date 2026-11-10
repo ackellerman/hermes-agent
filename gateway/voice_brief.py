@@ -136,12 +136,11 @@ def failure_class(exc: Exception) -> str:
 
     if isinstance(exc, auxiliary_client.AuxiliaryClientUnavailable):
         return "provider unavailable"
+    # The predicates are pure functions of the exception, so they run unguarded: a blind
+    # ``except`` here would swallow a real predicate bug as "unclassified".
     for predicate, label in auxiliary_client._FALLBACK_REASONS:
-        try:
-            if predicate(exc):
-                return label
-        except Exception:
-            continue
+        if predicate(exc):
+            return label
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
         return "request timed out"
     return type(exc).__name__
