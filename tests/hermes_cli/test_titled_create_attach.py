@@ -315,6 +315,28 @@ def test_the_classic_open_session_skips_the_check_only_for_its_own_new_row():
             open_with(marker)
 
 
+def test_the_own_new_row_skips_the_classic_only_flags_too():
+    """The classic-only half of the guard (`--run-budget`, `-v`) is skipped for the created row only.
+
+    Those two flags are compared against the row's frozen `launch_request` below the created-here
+    skip, so a created row — whose frozen request is exactly what this process just sent — resumes
+    without that comparison either. The same id with no marker (a second invocation) and a marker
+    naming another session still refuse a run-budget/verbose difference, naming both flags.
+    """
+    from hermes_cli.gateway_client import GatewayClientError
+    from hermes_cli.gateway_session_store import _check_resume_launch
+
+    frozen = _snapshot("local-made", {"launch_request": {"model": "wire-model", "run_budget": 900.0}})
+    launch = {"model": "wire-model", "run_budget": 60.0, "verbose": True}
+
+    _check_resume_launch(launch, frozen, created_here="local-made")  # the create's own resume
+
+    with pytest.raises(GatewayClientError, match="--run-budget, -v/--verbose differ"):
+        _check_resume_launch(launch, frozen)  # a second invocation on the same id
+    with pytest.raises(GatewayClientError, match="--run-budget, -v/--verbose differ"):
+        _check_resume_launch(launch, frozen, created_here="local-other")  # another session's marker
+
+
 def test_the_shared_comparison_takes_created_here(monkeypatch, tmp_path):
     """`check_resume_policy` carries the same parameter (default False) for the shared comparison.
 
