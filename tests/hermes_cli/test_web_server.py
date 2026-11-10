@@ -1600,11 +1600,21 @@ CONFIG_SCHEMA = ProviderConfigSchema(
 
         resp = self.client.post(
             "/api/model/set",
-            json={"scope": "auxiliary", "provider": "auto", "model": "", "task": "voice_brief"},
+            json={
+                "scope": "auxiliary",
+                "provider": "openrouter",
+                "model": "probe/model-x",
+                "task": "voice_brief",
+            },
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["tasks"] == ["voice_brief"]
-        assert load_config()["auxiliary"]["voice_brief"]["provider"] == "auto"
+
+        # A non-default pin: DEFAULT_CONFIG ships provider="auto"/model="", and load_config()
+        # deep-merges the defaults, so asserting those would pass even with the write dropped.
+        stored = load_config()["auxiliary"]["voice_brief"]
+        assert stored["provider"] == "openrouter"
+        assert stored["model"] == "probe/model-x"
 
     def test_deleting_the_active_custom_endpoint_clears_its_model_mirror(self):
         """Deleting an endpoint must not leave its credential running the agent.
