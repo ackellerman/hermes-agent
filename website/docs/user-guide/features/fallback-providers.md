@@ -444,7 +444,7 @@ To keep fallback for a job, leave it unpinned and choose its model with `cron.mo
 |---------|-------------------|----------------|
 | Main agent model | `fallback_providers` in config.yaml — per-turn failover on errors (primary restored each turn) | `fallback_providers:` (top-level list) |
 | Auxiliary tasks (any) — auto users | Full auto-detection chain (main agent model first, then provider chain) on capacity errors | `auxiliary.<task>.provider: auto` |
-| Auxiliary tasks (any) — explicit provider | `fallback_chain` (if set) → main agent model → warn + raise, on capacity errors; auth errors (401) walk `fallback_chain` only | `auxiliary.<task>.fallback_chain` |
+| Auxiliary tasks (any) — explicit provider | `fallback_chain` (if set) → main agent model → warn + raise, on capacity errors; auth errors (401) walk `fallback_chain` only — **unless the task sets `task_chain_only: true`**, which stops at `fallback_chain` for every error class and never reaches the main agent model or the discovery chain (`auxiliary.voice_brief` ships it) | `auxiliary.<task>.fallback_chain`, `auxiliary.<task>.task_chain_only` |
 | Vision | Layered (see above) + internal OpenRouter retry | `auxiliary.vision` |
 | Context compression | Layered (see above); degrades to no-summary if all layers unavailable | `auxiliary.compression` |
 | MCP helpers | Layered (see above) | `auxiliary.mcp` |
