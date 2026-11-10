@@ -147,8 +147,15 @@ def test_model_request_describes_understanding_and_next_action_without_confirmat
     ))
     monkeypatch.setattr(auxiliary_client, "async_call_llm", endpoint)
     asyncio.run(voice_brief._ask_model(route, voice_brief.brief_messages(spoken)))
-    assert endpoint.await_args.kwargs["provider"] == route["provider"]
-    assert endpoint.await_args.kwargs["model"] == route["model"]
+    # The brief asks for its own auxiliary task; its route is config, not a call argument (explicit
+    # args outrank auxiliary.<task>.*, so a route kwarg here would make every pin unreachable).
+    assert endpoint.await_args.kwargs["task"] == "voice_brief"
+    assert endpoint.await_args.kwargs["main_runtime"] == {
+        "provider": route["provider"], "model": route["model"],
+        "base_url": None, "api_key": None, "api_mode": None,
+    }
+    for key in ("provider", "model", "base_url", "api_key"):
+        assert key not in endpoint.await_args.kwargs
     messages = endpoint.await_args.kwargs["messages"]
     assert messages == [
         {"role": "system", "content": (
@@ -162,7 +169,8 @@ def test_model_request_describes_understanding_and_next_action_without_confirmat
     # No token cap: reasoning models bill thinking against max_tokens and starved the sentence.
     assert "max_tokens" not in endpoint.await_args.kwargs
     assert endpoint.await_args.kwargs["reasoning_config"] == {"enabled": False}
-    assert endpoint.await_args.kwargs["timeout"] == voice_brief.MODEL_TIMEOUT_S
+    # One budget: the router applies auxiliary.voice_brief.timeout itself.
+    assert "timeout" not in endpoint.await_args.kwargs
 
 
 def _source() -> SessionSource:

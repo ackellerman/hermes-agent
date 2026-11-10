@@ -676,6 +676,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         route = {
             "provider": runtime.get("provider"), "model": model,
             "base_url": runtime.get("base_url"), "api_key": runtime.get("api_key"),
+            "api_mode": runtime.get("api_mode"),
         }
         if not (route["provider"] and route["model"]):
             return self._proxy_error_result(failure_text("no routed model"))

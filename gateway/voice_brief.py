@@ -1,8 +1,10 @@
 """Spoken PRE-TURN brief for Discord voice-input turns.
 
 Opt-in per profile (``discord.voice_brief.enabled``, default off). Before a voice turn runs,
-one bounded auxiliary call to the turn's OWN routed provider/model asks for one short sentence,
-in the model's own words, stating its understanding and what it will do next. That sentence is
+one bounded auxiliary call for the ``voice_brief`` task asks for one short sentence, in the
+model's own words, stating its understanding and what it will do next. The task route is its own
+(``auxiliary.voice_brief.*``) and defaults to ``auto``: the turn's routed provider/model, with the
+profile's fallback policy behind it. That sentence is
 synthesized with the profile's configured TTS provider, played in the turn's bound voice
 channel (awaited), and posted to the bound text channel. Only then does the turn run — exactly
 as it does without this feature: no gated tools, no muted streaming, no rewritten history.
@@ -131,25 +133,58 @@ def _response_text(response: Any) -> str:
     return content if isinstance(content, str) else ""
 
 
+def _main_runtime(route: dict[str, Any]) -> dict[str, Any]:
+    """The turn's live runtime, in the shape the auxiliary router reads for ``provider: auto``.
+
+    Passing it (rather than explicit ``provider``/``model`` arguments) is what makes ``auto`` mean
+    "this turn's route" without pinning anything: explicit call args outrank ``auxiliary.<task>.*``,
+    so an argument of our own would make every configured pin unreachable. ``api_mode`` travels with
+    the pair so the brief speaks over the session's transport.
+    """
+    return {key: route.get(key) for key in ("provider", "model", "base_url", "api_key", "api_mode")}
+
+
+def _model_timeout() -> float:
+    """One budget for the model call: ``auxiliary.voice_brief.timeout``, else ``MODEL_TIMEOUT_S``.
+
+    The auxiliary client applies the same configured value to the request itself, so the outer
+    ``asyncio.wait_for`` reads it from the same place: a constant here would cut a configured longer
+    call short, and a shorter configuration would abandon a request that is still running.
+    """
+    from agent.auxiliary_client import _get_task_timeout
+
+    return _get_task_timeout(CONFIG_SECTION, MODEL_TIMEOUT_S)
+
+
 async def _ask_model(route: dict[str, Any], messages: list[dict[str, str]]) -> str:
-    """One auxiliary call on the turn's routed provider/model. No tools are offered at all.
+    """One auxiliary call on the brief's own task route. No tools are offered at all.
+
+    ``task`` is the routing decision: with the shipped ``provider: auto`` the request lands on
+    ``main_runtime`` (the turn's own route) and then that route's fallback chain; a configured
+    ``auxiliary.voice_brief`` pin wins over it. No ``provider``/``model``/``base_url``/``api_key``
+    of our own, for the reason in ``_main_runtime``.
 
     No ``max_tokens``: reasoning models (DeepSeek V4 on Ollama Cloud) bill thinking against it, and a
-    small cap returned an empty sentence with finish_reason=length. ``MODEL_TIMEOUT_S`` is the only
-    bound on the call; ``MAX_BRIEF_CHARS`` still rejects an over-long sentence.
+    small cap returned an empty sentence with finish_reason=length. No ``timeout`` either — the
+    router applies ``auxiliary.voice_brief.timeout`` once and ``deliver_preturn_brief`` bounds the
+    same value from outside; ``MAX_BRIEF_CHARS`` still rejects an over-long sentence.
     """
     from agent.auxiliary_client import async_call_llm
 
+    route_info: dict[str, str] = {}
     response = await async_call_llm(
-        task=None,
-        provider=route.get("provider") or None,
-        model=route.get("model") or None,
-        base_url=route.get("base_url") or None,
-        api_key=route.get("api_key") or None,
+        task=CONFIG_SECTION,
+        main_runtime=_main_runtime(route),
         messages=messages,
         temperature=0.2,
-        timeout=MODEL_TIMEOUT_S,
         reasoning_config=dict(MODEL_REASONING),
+        route_info=route_info,
+    )
+    logger.info(
+        "Voice brief route: requested %s/%s, served by %s/%s%s",
+        route.get("provider") or "auto", route.get("model") or "default",
+        route_info.get("provider") or "auto", route_info.get("model") or "default",
+        f" via {route_info['fallback_label']}" if route_info.get("fallback_label") else "",
     )
     return _response_text(response)
 
@@ -179,7 +214,7 @@ async def deliver_preturn_brief(
     starts the turn. Raises ``VoiceBriefError`` (user-visible) on any failure.
     """
     try:
-        raw = await asyncio.wait_for(_ask_model(route, brief_messages(message)), timeout=MODEL_TIMEOUT_S)
+        raw = await asyncio.wait_for(_ask_model(route, brief_messages(message)), timeout=_model_timeout())
     except VoiceBriefError:
         raise
     except Exception as exc:
