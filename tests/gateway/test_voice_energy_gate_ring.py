@@ -18,6 +18,7 @@ frames discarded rather than replayed.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import struct
 import sys
@@ -131,6 +132,38 @@ class _RecordingDave:
     def decrypt(self, user_id: int, media_type, data: bytes) -> bytes:
         self.calls.append((user_id, bytes(data)))
         return data
+
+
+class _InPlaceDave:
+    """A live session that re-keys itself, the way discord.py 2.7.1 does.
+
+    ``VoiceConnectionState.reinit_dave_session`` calls ``.reinit(...)`` on the *existing* object
+    (a new object only when the attribute was None), and an MLS commit (binary op 28/29/30)
+    advances the epoch without touching either ``dave_session`` or ``dave_protocol_version``.
+    """
+
+    def __init__(self, ready: bool = True) -> None:
+        self.ready = ready
+        self.epoch = 1
+        self.calls: list[tuple[int, bytes]] = []
+
+    def reinit(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def decrypt(self, user_id: int, media_type, data: bytes) -> bytes:
+        self.calls.append((user_id, bytes(data)))
+        return data
+
+
+def _drive_hook(receiver: VoiceReceiver, op: int, data: dict | None = None) -> None:
+    """Deliver one voice-ws op through the receiver's installed hook, as discord.py does.
+
+    ``DiscordVoiceWebSocket.received_message`` dispatches the op (updating ``conn``) and only
+    then calls the hook, so the fake connection is already in its post-op state here.
+    """
+    conn = receiver._vc._connection
+    receiver._install_speaking_hook(conn)
+    asyncio.run(conn.hook(None, {"op": op, "d": data or {}}))
 
 
 def _packet(nacl: _FakeNacl, receiver: VoiceReceiver, ssrc: int, seq: int = 1,
@@ -365,8 +398,10 @@ def test_the_drop_helper_reports_the_frames_it_dropped(nacl):
 
 
 def test_a_replaced_dave_session_drops_frames_held_under_the_old_one(nacl, decoders):
-    """``reinit_dave_session`` swaps the session object; held frames were captured under the old
-    ratchet and cannot be authenticated against the new one."""
+    """A session REPLACED by a new object is the one shape the credential tuple can see; the
+    comparison is kept as belt-and-braces for it.  (discord.py 2.7.1's ``reinit_dave_session``
+    does not swap the object while one exists — it ``reinit()``s it in place, which is what the
+    ws hook's ``dave_state_changed`` trigger covers; see the in-place test below.)"""
     receiver = _two_ring_receiver()
     _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"old-epoch")
     assert len(receiver._dave_pending[_SSRC_PERSON]) == 1
@@ -379,8 +414,10 @@ def test_a_replaced_dave_session_drops_frames_held_under_the_old_one(nacl, decod
     assert _decoded(decoders) == []
 
 
-def test_an_epoch_change_on_the_same_session_drops_the_ring(nacl):
-    """op 22 executing a transition bumps the protocol version without replacing the object."""
+def test_a_protocol_transition_on_the_same_session_drops_the_ring(nacl):
+    """op 22 downgrading the protocol 1→0 keeps the session object and moves
+    ``dave_protocol_version``: the replay would decrypt under plaintext rules, so the tuple's
+    version check drops and counts the held frames."""
     receiver = _two_ring_receiver()
     _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"old-epoch")
 
@@ -391,13 +428,62 @@ def test_an_epoch_change_on_the_same_session_drops_the_ring(nacl):
     assert receiver._dave_unmapped_dropped == 1
 
 
+def test_an_in_place_reinit_drops_the_ring_through_the_trigger(nacl, decoders):
+    """The epoch advance the tuple cannot see: discord.py re-keys DAVE with
+    ``DaveSession.reinit(...)`` on the *existing* object, and an MLS commit (binary op 28/29/30)
+    moves the epoch without touching ``dave_session`` or ``dave_protocol_version`` at all.  The
+    ws hook knows the trigger, so it passes ``dave_state_changed``; the held frames were captured
+    under the dead ratchet and must be dropped and counted rather than replayed."""
+    dave = _InPlaceDave()
+    receiver = _receiver(members=[_member(_OPERATOR), _member(_STRANGER), _member(_ME, True)],
+                         dave_session=dave, dave_pver=1)
+    _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"old-epoch")
+    assert len(receiver._dave_pending[_SSRC_PERSON]) == 1
+
+    dave.reinit(2)
+    receiver.refresh_credentials("voice ws op 4", dave_state_changed=True)
+
+    # Nothing the tuple compares moved — the trigger, not a state diff, is what dropped the ring.
+    assert receiver._dave_session is dave
+    assert receiver._dave_protocol_version == 1
+    assert receiver._dave_pending == {}
+    assert receiver._dave_unmapped_dropped == 1
+    assert dave.calls == []
+    assert _decoded(decoders) == []
+
+
+@pytest.mark.parametrize("op", [21, 22, 24])
+def test_the_ws_hook_flags_every_dave_trigger_op(nacl, decoders, op):
+    """The flag is wired where the trigger is: op 21/22/24 each arrive with the session object and
+    the protocol version unchanged (discord.py reinit()s in place, MLS commits never touch
+    ``conn``), so a state-diff predicate would keep the ring forever.  Through the hook, each one
+    drops and counts it."""
+    dave = _InPlaceDave()
+    receiver = _receiver(members=[_member(_OPERATOR), _member(_STRANGER), _member(_ME, True)],
+                         dave_session=dave, dave_pver=1)
+    _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"old-epoch")
+    assert len(receiver._dave_pending[_SSRC_PERSON]) == 1
+
+    dave.reinit(2)
+    _drive_hook(receiver, op, {"protocol_version": 1})
+
+    assert receiver._dave_session is dave
+    assert receiver._dave_protocol_version == 1
+    assert receiver._dave_pending == {}
+    assert receiver._dave_unmapped_dropped == 1
+    assert dave.calls == []
+    assert _decoded(decoders) == []
+
+
 def test_a_refresh_that_keeps_the_session_keeps_the_ring(nacl, decoders):
-    """op 4 rotating only the transport key must not throw held audio away."""
+    """op 4 on a live ratchet with no DAVE state change (a transport-key-only rekey, and the
+    packet path's decrypt-failure-streak refresh) must not throw held audio away."""
     receiver = _two_ring_receiver()
     _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"one")
 
     receiver._vc._connection.secret_key = b"\x11" * 32
     receiver.refresh_credentials("voice ws op 4")
+    receiver.refresh_credentials("decrypt-failure streak")
 
     assert [payload for _at, payload in receiver._dave_pending[_SSRC_PERSON]] == [b"one"]
     assert receiver._dave_unmapped_dropped == 0
@@ -405,9 +491,11 @@ def test_a_refresh_that_keeps_the_session_keeps_the_ring(nacl, decoders):
 
 def test_the_commit_that_finally_settles_dave_keeps_the_ring_for_the_ready_cut(nacl, decoders):
     """A session that never reported ``ready`` established no ratchet, so nothing it held is tied
-    to a dead one.  The swap that finally makes DAVE ready is the join's own commit: its held
-    frames belong to the deaf window, and the ready cut drops them by ARRIVAL time when the ring
-    replays — purging them here would lose them un-counted by ``pre_ready_dropped``."""
+    to a dead one.  The swap that finally makes DAVE ready is the join's own op-22 commit: it
+    passes ``dave_state_changed=True`` like every other DAVE trigger, but the ratchet guard keeps
+    the ring — the held frames belong to the deaf window, and the ready cut drops them by ARRIVAL
+    time when the ring replays.  Purging them here would lose them uncounted by
+    ``pre_ready_dropped``."""
     class _Settling:
         def __init__(self, ready: bool) -> None:
             self.ready = ready
@@ -421,7 +509,7 @@ def test_the_commit_that_finally_settles_dave_keeps_the_ring_for_the_ready_cut(n
     assert len(receiver._dave_pending[_SSRC_PERSON]) == 1
 
     receiver._vc._connection.dave_session = _Settling(ready=True)
-    receiver.refresh_credentials("voice ws op 22")
+    receiver.refresh_credentials("voice ws op 22", dave_state_changed=True)
 
     assert len(receiver._dave_pending[_SSRC_PERSON]) == 1
     assert receiver._dave_unmapped_dropped == 0
@@ -448,6 +536,28 @@ def test_the_ttl_sweep_counts_and_logs_what_it_expires(nacl, decoders, caplog):
     assert "frames=3" in caplog.text
     assert "ssrcs=2" in caplog.text
     assert _decoded(decoders) == []
+
+
+def test_the_ttl_sweep_does_not_name_an_empty_ring_as_a_dropped_ssrc(nacl, caplog):
+    """An empty ring yields no frame, so the sweep's SSRC count must not claim audio was dropped
+    for it — the log named more SSRCs than it dropped."""
+    receiver = _two_ring_receiver()
+    _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"one")
+    _packet(nacl, receiver, _SSRC_OPERATOR, seq=2, payload=b"two")
+    receiver._dave_pending[_SSRC_OPERATOR].clear()  # a ring that yielded no frame
+    for ssrc in (_SSRC_PERSON, _SSRC_OPERATOR):
+        if receiver._dave_pending[ssrc]:
+            held_at, payload = receiver._dave_pending[ssrc][-1]
+            receiver._dave_pending[ssrc][-1] = (
+                held_at - VoiceReceiver.DAVE_PENDING_TTL - 1.0, payload)
+
+    with caplog.at_level(logging.INFO):
+        assert receiver.check_silence() == []
+
+    assert receiver._dave_pending == {}
+    assert receiver._dave_unmapped_dropped == 1
+    assert "frames=1" in caplog.text
+    assert "ssrcs=1" in caplog.text
 
 
 # --- the energy gate does not hold the lock -------------------------------------------------------

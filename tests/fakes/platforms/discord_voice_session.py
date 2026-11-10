@@ -140,7 +140,7 @@ class FakeReceiver:
     def check_silence(self) -> list:
         return []
 
-    def refresh_credentials(self, _why: str) -> None:
+    def refresh_credentials(self, _why: str, *, dave_state_changed: bool = False) -> None:
         pass
 
 

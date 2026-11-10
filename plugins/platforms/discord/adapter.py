@@ -861,6 +861,14 @@ def _discord_ready_timeout_seconds() -> float:
     return 30.0
 
 
+# Voice-ws ops that announce a DAVE state change: op 4 SESSION_DESCRIPTION (a re-key once DAVE is
+# negotiated), op 21 DAVE_PREPARE_TRANSITION, op 22 DAVE_EXECUTE_TRANSITION and op 24
+# DAVE_PREPARE_EPOCH.  Each one reinitialises or advances the MLS ratchet, and discord.py does it
+# in place — neither ``dave_session`` nor ``dave_protocol_version`` moves — so the receiver needs
+# the trigger to know its held payloads' ratchet is gone (``refresh_credentials``).
+_DAVE_TRIGGER_OPS = frozenset({4, 21, 22, 24})
+
+
 class VoiceReceiver:
     """Captures voice audio from a Discord voice channel: hooks the VoiceClient socket, decrypts
     RTP (NaCl + DAVE E2EE), decodes Opus per user; a polling loop delivers utterances on silence."""
@@ -1087,13 +1095,24 @@ class VoiceReceiver:
         """
         self._dave_passthrough_until = time.monotonic() + seconds
 
-    def refresh_credentials(self, reason: str) -> None:
+    def refresh_credentials(self, reason: str, *, dave_state_changed: bool = False) -> None:
         """Re-resolve decryption state from the live connection.
 
         Cheap and idempotent (attribute reads plus one small copy), so
         callers invoke it on every trigger — session description, DAVE
         epoch prepare, a membership change in the channel, or a decrypt
         failure streak — without needing to coalesce.
+
+        ``dave_state_changed`` says the *trigger* was a DAVE state change
+        (ops 4/21/22/24, a membership change that bumps the MLS epoch), not a
+        re-key on the packet path.  It is needed because discord.py mutates the
+        existing ``DaveSession`` in place: ``reinit_dave_session`` calls
+        ``.reinit(...)`` on the live object, and an MLS commit (binary op
+        28/29/30) advances the epoch without touching ``dave_session`` or
+        ``dave_protocol_version`` at all.  Neither shows up as a diff in the
+        credential tuple, so the tuple comparison below cannot see an ordinary
+        epoch advance — only a 0↔1 protocol flip or a replaced object.  The
+        comparison stays as belt-and-braces for the transitions it can see.
         """
         if not self._running:
             return
@@ -1102,7 +1121,8 @@ class VoiceReceiver:
             previous = self._creds
             self._resolve_credentials(conn)
             if (
-                previous[1] is not self._dave_session
+                dave_state_changed
+                or previous[1] is not self._dave_session
                 or previous[2] != self._dave_protocol_version
             ):
                 # Frames held under the previous ratchet/epoch cannot be
@@ -1114,6 +1134,14 @@ class VoiceReceiver:
                 # one: those frames were heard during the join's deaf window,
                 # and the ready cut owns them — the replay skips each one by
                 # ARRIVAL time before it reaches the new generation's decrypt.
+                #
+                # The two rules compose: the outer test is TRIGGER-driven (a
+                # DAVE state change at ops 4/21/22/24 or a membership change),
+                # this one is STATE-driven (is a live ratchet being lost?).  The
+                # join's own op-22 commit passes the trigger but fails this
+                # test — previous generation not live, new one live — so the
+                # deaf window's frames reach the ready cut instead of being
+                # purged here.
                 if self._ratchet_live(previous) or not self._ratchet_live(self._creds):
                     self._drop_held_voice_payloads("dave-epoch")
             self._nacl_fail_streak = 0
@@ -1217,6 +1245,24 @@ class VoiceReceiver:
         session = creds[1]
         return session is not None and bool(getattr(session, "ready", False))
 
+    def _drop_held_voice_payloads_locked(self, reason: str) -> int:
+        """Drop every held payload and return the frame count (call under ``_lock``).
+
+        Split out of the public helper so ``discard_pending`` can clear the PCM buffers and the
+        ring in one critical section: a replay through ``_replay_dave_pending`` landing in the
+        gap would push a pre-move frame into the fresh buffer and get it stamped with the new
+        binding at flush time (#130311).
+        """
+        frames = sum(len(pending) for pending in self._dave_pending.values())
+        ssrcs = len(self._dave_pending)
+        self._dave_pending.clear()
+        self._dave_unmapped_dropped += frames
+        if frames:
+            logger.info(
+                "Discarded %d held voice payloads (%s; ssrcs=%d)", frames, reason, ssrcs,
+            )
+        return frames
+
     def _drop_held_voice_payloads(self, reason: str) -> int:
         """Drop every payload the DAVE ring is holding, and return the frame count.
 
@@ -1228,17 +1274,10 @@ class VoiceReceiver:
         ``dave_unmapped_dropped=0`` as "nothing was lost" while an utterance was.
 
         Takes ``_lock`` itself — safe from the packet thread, the ws hook and the listen loop.
+        Callers that already hold ``_lock`` use ``_drop_held_voice_payloads_locked`` instead.
         """
         with self._lock:
-            frames = sum(len(pending) for pending in self._dave_pending.values())
-            ssrcs = len(self._dave_pending)
-            self._dave_pending.clear()
-            self._dave_unmapped_dropped += frames
-        if frames:
-            logger.info(
-                "Discarded %d held voice payloads (%s; ssrcs=%d)", frames, reason, ssrcs,
-            )
-        return frames
+            return self._drop_held_voice_payloads_locked(reason)
 
     def _install_speaking_hook(self, conn):
         """Wrap the voice websocket hook to capture SPEAKING events (op 5); ``conn.hook`` is
@@ -1261,9 +1300,10 @@ class VoiceReceiver:
             # is what updates conn.secret_key / conn.dave_session /
             # conn.dave_protocol_version) BEFORE calling this hook, so the
             # refresh reads the new values:
-            #   op 4  SESSION_DESCRIPTION — new transport key, and
-            #         reinit_dave_session() may replace conn.dave_session
-            #   op 24 DAVE_PREPARE_EPOCH  — epoch 1 recreates the MLS group
+            #   op 4  SESSION_DESCRIPTION — new transport key; with DAVE
+            #         negotiated discord.py re-keys the MLS session
+            #         (reinit_dave_session reinit()s the *existing* object,
+            #         which the credential tuple cannot see — hence the flag)
             #   op 21 DAVE_PREPARE_TRANSITION with protocol_version 0 —
             #         discord.py opens a 120s plaintext passthrough window
             #         (set_passthrough_mode(True, 120)); mirror it so the
@@ -1271,26 +1311,33 @@ class VoiceReceiver:
             #   op 22 DAVE_EXECUTE_TRANSITION — the protocol version just
             #         changed; refresh, plus a 10s grace mirroring the
             #         upgrade path's set_passthrough_mode(True, 10)
+            #   op 24 DAVE_PREPARE_EPOCH  — epoch 1 recreates the MLS group
+            # Every one of them is a DAVE state change (``_DAVE_TRIGGER_OPS``), so each passes
+            # dave_state_changed: the hold ring must not outlive the ratchet it was captured
+            # under.  refresh_credentials still keeps it while no ratchet is live (the join's
+            # deaf window, which the ready cut owns) — see its docstring.
             if isinstance(msg, dict):
                 op = msg.get("op")
-                if op in (4, 24):
-                    receiver_self.refresh_credentials(f"voice ws op {op}")
-                elif op == 21:
-                    if (msg.get("d") or {}).get("protocol_version") == 0:
+                if op in _DAVE_TRIGGER_OPS:
+                    # Snapshot before the refresh: the upgrade-after-downgrade EDGE
+                    # (dave_downgraded flipping True -> False) is the only case upstream grants
+                    # the 10s passthrough grace, and same-version transitions or
+                    # unknown/duplicate ids change no state upstream.
+                    was_downgraded = receiver_self._dave_downgraded
+                    # op 4 is the only trigger that can arrive before DAVE is negotiated: with
+                    # no protocol version there is no ratchet to lose, so the join's first
+                    # SESSION_DESCRIPTION must leave the deaf-window ring for the ready cut.
+                    receiver_self.refresh_credentials(
+                        f"voice ws op {op}",
+                        dave_state_changed=op != 4 or receiver_self._dave_protocol_version > 0,
+                    )
+                    if op == 21 and (msg.get("d") or {}).get("protocol_version") == 0:
                         # Pending downgrade: upstream enables plaintext
                         # passthrough for up to 120s (set_passthrough_mode).
                         receiver_self.note_dave_passthrough_window(120.0)
-                elif op == 22:
-                    # A transition may have executed; refresh and detect the
-                    # upgrade-after-downgrade EDGE (dave_downgraded flipping
-                    # True -> False) — the only case upstream grants the 10s
-                    # passthrough grace.  Same-version transitions and
-                    # unknown/duplicate ids change no state upstream, so no
-                    # edge fires and no window opens.
-                    was_downgraded = receiver_self._dave_downgraded
-                    receiver_self.refresh_credentials("voice ws op 22")
-                    if (
-                        was_downgraded
+                    elif (
+                        op == 22
+                        and was_downgraded
                         and not receiver_self._dave_downgraded
                         and receiver_self._dave_protocol_version > 0
                     ):
@@ -1672,7 +1719,10 @@ class VoiceReceiver:
                 if not pending or now - pending[-1][0] >= self.DAVE_PENDING_TTL:
                     self._dave_pending.pop(pending_ssrc, None)
                     expired_frames += len(pending)
-                    expired_ssrcs += 1
+                    # An empty ring yielded no frame, so the log must not name
+                    # it as an SSRC whose audio was dropped.
+                    if pending:
+                        expired_ssrcs += 1
             self._dave_unmapped_dropped += expired_frames
 
             ssrc_user_map = dict(self._ssrc_to_user)
@@ -1786,13 +1836,16 @@ class VoiceReceiver:
 
     def discard_pending(self) -> None:
         """Drop buffered PCM and held DAVE payloads that no poll or flush has emitted yet."""
+        # One critical section: held payloads are captured speech too, and after a text-binding
+        # move a replay through ``_replay_dave_pending`` that landed between the two clears would
+        # push them into the fresh buffer and transcribe the old conversation into the new one
+        # (#130311).  ``_on_packet`` resolves an SSRC and replays under this same lock, so it
+        # cannot observe a cleared buffer with the ring still populated.
         with self._lock:
             self._buffers.clear()
             self._last_packet_time.clear()
             self._arrivals.clear()
-        # Held payloads are captured speech too: after a text-binding move they would be replayed
-        # into a fresh buffer and transcribed into the NEW conversation (#130311).
-        self._drop_held_voice_payloads("text-binding move")
+            self._drop_held_voice_payloads_locked("text-binding move")
 
     # --- PCM -> WAV conversion (for Whisper STT) ---
 
@@ -2313,7 +2366,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     )
                     # Any membership change in the bot's channel bumps the
                     # DAVE (E2EE) epoch — re-resolve the receiver's decryption
-                    # state so it never decodes against a stale session.
+                    # state so it never decodes against a stale session.  The
+                    # epoch bump is a DAVE state change even though neither
+                    # dave_session nor dave_protocol_version moves, so say so:
+                    # the hold ring's frames were captured under the old epoch.
                     vc = adapter_self._voice_clients.get(guild_id)
                     receiver = adapter_self._voice_receivers.get(guild_id)
                     if vc is not None and receiver is not None:
@@ -2322,7 +2378,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                             before.channel == bot_channel
                             or after.channel == bot_channel
                         ):
-                            receiver.refresh_credentials("membership change")
+                            receiver.refresh_credentials(
+                                "membership change", dave_state_changed=True
+                            )
 
                 # ------------------------------------------------------------------
                 # Leave-when-no-authorized-users: if the last tracked user left and
