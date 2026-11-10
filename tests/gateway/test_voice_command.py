@@ -3,6 +3,7 @@
 import asyncio
 import importlib.util
 import json
+import logging
 import os
 import queue
 import sys
@@ -83,6 +84,16 @@ def _make_event(text: str = "", message_type=MessageType.TEXT, chat_id="123") ->
     event = MessageEvent(text=text, message_type=message_type, source=source)
     event.message_id = "msg42"
     return event
+
+
+def _voice_like_pcm(duration_s: float, amplitude: int = 1000) -> bytes:
+    """Return deterministic 48 kHz stereo s16le PCM with sustained energy."""
+    sample_count = int(48000 * 2 * duration_s)
+    pair = (
+        int(amplitude).to_bytes(2, "little", signed=True)
+        + int(-amplitude).to_bytes(2, "little", signed=True)
+    )
+    return (pair * ((sample_count + 1) // 2))[:sample_count * 2]
 
 
 def _make_runner(tmp_path):
@@ -389,7 +400,7 @@ class TestVoiceReceiver:
         receiver.map_ssrc(100, 42)
         # 48kHz, stereo, 16-bit = 192000 bytes/sec
         # MIN_SPEECH_DURATION = 0.5s → need 96000 bytes
-        pcm_data = bytearray(b"\x00" * 96000)
+        pcm_data = bytearray(_voice_like_pcm(0.5))
         receiver._buffers[100] = pcm_data
         # Set last_packet_time far enough in the past to exceed SILENCE_THRESHOLD
         receiver._last_packet_time[100] = time.monotonic() - 3.0
@@ -401,6 +412,43 @@ class TestVoiceReceiver:
         # Buffer should be cleared after extraction
         assert len(receiver._buffers[100]) == 0
 
+    def test_check_silence_rejects_join_warmup_silence(self, caplog):
+        receiver = self._make_receiver()
+        receiver.map_ssrc(100, 42)
+        receiver._buffers[100] = bytearray(b"\x00" * 192000)
+        receiver._last_packet_time[100] = time.monotonic() - 3.0
+
+        with caplog.at_level(logging.INFO):
+            completed = receiver.check_silence()
+
+        assert completed == []
+        assert len(receiver._buffers[100]) == 0
+        assert "non-speech PCM segment" in caplog.text
+
+    def test_check_silence_rejects_join_warmup_transient(self):
+        receiver = self._make_receiver()
+        receiver.map_ssrc(100, 42)
+        transient = _voice_like_pcm(0.02, amplitude=3000)
+        receiver._buffers[100] = bytearray(
+            transient + b"\x00" * (192000 - len(transient))
+        )
+        receiver._last_packet_time[100] = time.monotonic() - 3.0
+
+        assert receiver.check_silence() == []
+
+    def test_first_and_followup_voice_segments_are_preserved(self):
+        receiver = self._make_receiver()
+        receiver.map_ssrc(100, 42)
+
+        for amplitude in (400, 1200):
+            pcm_data = _voice_like_pcm(0.6, amplitude=amplitude)
+            receiver._buffers[100] = bytearray(pcm_data)
+            receiver._last_packet_time[100] = time.monotonic() - 3.0
+
+            completed = receiver.check_silence()
+
+            assert completed == [(42, pcm_data)]
+
     def test_check_silence_ignores_short_buffer(self):
         receiver = self._make_receiver()
         receiver.map_ssrc(100, 42)
@@ -409,6 +457,33 @@ class TestVoiceReceiver:
         receiver._last_packet_time[100] = time.monotonic() - 3.0
         completed = receiver.check_silence()
         assert len(completed) == 0
+
+    def test_flush_pending_returns_recent_utterance_before_silence(self):
+        """Disconnect drains a valid utterance even before silence is detected."""
+        receiver = self._make_receiver()
+        receiver.map_ssrc(100, 42)
+        pcm_data = bytearray(_voice_like_pcm(0.5))
+        receiver._buffers[100] = pcm_data
+        receiver._last_packet_time[100] = time.monotonic()
+
+        assert receiver.flush_pending() == [(42, bytes(pcm_data))]
+        assert 100 not in receiver._buffers
+        assert 100 not in receiver._last_packet_time
+
+    def test_flush_pending_rejects_join_warmup_silence(self, caplog):
+        """The leave-time flush applies the same acoustic gate as check_silence."""
+        receiver = self._make_receiver()
+        receiver.map_ssrc(100, 42)
+        receiver._buffers[100] = bytearray(b"\x00" * 96000)
+        receiver._last_packet_time[100] = time.monotonic()
+
+        with caplog.at_level(logging.INFO):
+            completed = receiver.flush_pending()
+
+        assert completed == []
+        assert 100 not in receiver._buffers
+        assert 100 not in receiver._last_packet_time
+        assert "non-speech PCM segment" in caplog.text
 
 
     def test_ffmpeg_resolver_finds_winget_install_when_not_on_path(self, monkeypatch, tmp_path):
@@ -1236,6 +1311,84 @@ class TestVoiceChannelAwareness:
 # =====================================================================
 
 
+class TestSpeechActivityProbes:
+    """Calibration probes for the sustained-energy speech gate.
+
+    Documents which representative mic-route signals pass or are rejected
+    by ACTIVE_FRAME_RMS / MIN_ACTIVE_SPEECH_DURATION.  RMS of a full-scale
+    square wave equals its amplitude; amplitude A ≈ 20*log10(A/32768) dBFS:
+
+      - desktop/headset speech:   1000-8000  (-30 to -12 dBFS)  → pass
+      - quiet mobile/low-gain:     200-400   (-44 to -38 dBFS)  → pass
+      - gate floor:                100       (-50 dBFS)         → pass
+      - comfort noise / hiss:       10-40    (-70 to -58 dBFS)  → reject
+      - digital silence:             0                          → reject
+      - join pop/click (one frame):  any amplitude              → reject
+
+    Residual risk: a mic route delivering sustained speech below -50 dBFS
+    RMS (very low gain, heavy OS-level suppression) is rejected as
+    non-speech.  The floor stays deliberately permissive; raising it would
+    let decoded comfort noise reach STT again.
+    """
+
+    @staticmethod
+    def _gate(pcm: bytes):
+        from plugins.platforms.discord.adapter import VoiceReceiver
+        return VoiceReceiver._pcm_speech_activity(pcm)
+
+    @pytest.mark.parametrize("amplitude", [1000, 4000, 8000])
+    def test_desktop_headset_speech_passes(self, amplitude):
+        has_speech, stats = self._gate(_voice_like_pcm(0.6, amplitude))
+        assert has_speech, stats
+
+    @pytest.mark.parametrize("amplitude", [200, 400])
+    def test_quiet_mobile_low_gain_speech_passes(self, amplitude):
+        has_speech, stats = self._gate(_voice_like_pcm(0.6, amplitude))
+        assert has_speech, stats
+
+    def test_gate_floor_amplitude_passes(self):
+        has_speech, stats = self._gate(_voice_like_pcm(0.6, 100))
+        assert has_speech, stats
+
+    @pytest.mark.parametrize("amplitude", [0, 10, 40])
+    def test_comfort_noise_and_silence_rejected(self, amplitude):
+        has_speech, stats = self._gate(_voice_like_pcm(0.6, amplitude))
+        assert not has_speech, stats
+
+    @pytest.mark.parametrize("amplitude", [1000, 8000, 30000])
+    def test_single_frame_click_rejected(self, amplitude):
+        """A lone 20ms pop amid silence never reaches STT, however loud."""
+        frame = _voice_like_pcm(0.02, amplitude)
+        silence = b"\x00" * (len(_voice_like_pcm(0.6)) - len(frame))
+        has_speech, stats = self._gate(frame + silence)
+        assert not has_speech, stats
+
+    def test_scattered_active_frames_rejected(self):
+        """Sustained means contiguous: scattered frames must not pass.
+
+        Regression: five 20ms active frames at indices 0/6/12/18/24 in a
+        500ms buffer total 100ms of activity but never sustain 100ms —
+        the streak resets on every inactive frame.
+        """
+        frame = _voice_like_pcm(0.02, 1000)
+        silence_frame = b"\x00" * len(frame)
+        frames = [
+            frame if i in (0, 6, 12, 18, 24) else silence_frame
+            for i in range(25)
+        ]
+        has_speech, stats = self._gate(b"".join(frames))
+        assert not has_speech, stats
+        assert stats["active_ms"] == 100
+
+    def test_contiguous_active_frames_pass(self):
+        """100ms of uninterrupted activity satisfies the sustained gate."""
+        frame = _voice_like_pcm(0.02, 1000)
+        silence_frame = b"\x00" * len(frame)
+        pcm = silence_frame * 10 + frame * 5 + silence_frame * 10
+        has_speech, stats = self._gate(pcm)
+        assert has_speech, stats
+
+
 @pytest.mark.skipif(
     importlib.util.find_spec("nacl") is None,
     reason="PyNaCl not installed",
@@ -1262,8 +1415,7 @@ class TestVoiceReception:
     @staticmethod
     def _fill_buffer(receiver, ssrc, duration_s=1.0, age_s=3.0):
         """Add PCM data to buffer. 48kHz stereo 16-bit = 192000 bytes/sec."""
-        size = int(192000 * duration_s)
-        receiver._buffers[ssrc] = bytearray(b"\x00" * size)
+        receiver._buffers[ssrc] = bytearray(_voice_like_pcm(duration_s))
         receiver._last_packet_time[ssrc] = time.monotonic() - age_s
 
     # -- Known SSRC (normal flow) --

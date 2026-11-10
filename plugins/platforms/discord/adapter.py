@@ -869,6 +869,12 @@ class VoiceReceiver:
     MIN_SPEECH_DURATION = 0.5  # minimum seconds to process (skip noise)
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
+    PCM_FRAME_DURATION = 0.02  # Discord/Opus frame duration in seconds
+    # A deliberately permissive floor (~-50 dBFS) excludes decoded comfort
+    # noise/silence without depending on the user's microphone route or gain.
+    ACTIVE_FRAME_RMS = 100
+    # Require sustained energy so a join-time pop/click cannot reach STT.
+    MIN_ACTIVE_SPEECH_DURATION = 0.1
     REKEY_FAILURE_STREAK = 25  # consecutive NaCl failures → re-resolve creds
     # An SSRC nobody claimed (no SPEAKING, inference ambiguous) whose sender never pauses (another
     # bot's mixer sends frames continuously) never reaches silence: cap what it may buffer.
@@ -1310,6 +1316,73 @@ class VoiceReceiver:
 
     # --- Silence detection ---
 
+    @classmethod
+    def _pcm_speech_activity(cls, pcm_data: bytes) -> tuple[bool, dict]:
+        """Classify structurally valid PCM using sustained frame energy.
+
+        This is not language/transcript filtering.  It rejects only segments
+        that contain too little acoustic activity to be speech, which prevents
+        OpenAI/Whisper from inventing text for Discord's join-time Opus comfort
+        frames while preserving the first real utterance regardless of order.
+
+        "Sustained" means contiguous: the gate requires
+        MIN_ACTIVE_SPEECH_DURATION of *uninterrupted* active frames.  The
+        streak resets on every inactive frame, so scattered pops totalling
+        the same active time never pass.
+        """
+        bytes_per_frame = int(
+            cls.SAMPLE_RATE * cls.CHANNELS * 2 * cls.PCM_FRAME_DURATION
+        )
+        active_frames = 0
+        contiguous_active_frames = 0
+        max_contiguous_active_frames = 0
+        total_frames = 0
+        peak = 0
+        sum_squares = 0
+        sample_count = 0
+
+        for offset in range(0, len(pcm_data), bytes_per_frame):
+            frame = pcm_data[offset:offset + bytes_per_frame]
+            # Ignore an odd trailing byte rather than treating malformed PCM
+            # as activity. pcm_to_wav uses the same signed 16-bit LE shape.
+            frame = frame[:len(frame) - (len(frame) % 2)]
+            if not frame:
+                continue
+            frame_sum_squares = 0
+            frame_samples = 0
+            for (sample,) in struct.iter_unpack("<h", frame):
+                magnitude = abs(sample)
+                peak = max(peak, magnitude)
+                square = sample * sample
+                frame_sum_squares += square
+                sum_squares += square
+                frame_samples += 1
+                sample_count += 1
+            total_frames += 1
+            frame_rms = math.sqrt(frame_sum_squares / frame_samples)
+            if frame_rms >= cls.ACTIVE_FRAME_RMS:
+                active_frames += 1
+                contiguous_active_frames += 1
+                max_contiguous_active_frames = max(
+                    max_contiguous_active_frames, contiguous_active_frames
+                )
+            else:
+                contiguous_active_frames = 0
+
+        required_active_frames = math.ceil(
+            cls.MIN_ACTIVE_SPEECH_DURATION / cls.PCM_FRAME_DURATION
+        )
+        total_rms = (
+            math.sqrt(sum_squares / sample_count) if sample_count else 0.0
+        )
+        stats = {
+            "duration_ms": round(total_frames * cls.PCM_FRAME_DURATION * 1000),
+            "active_ms": round(active_frames * cls.PCM_FRAME_DURATION * 1000),
+            "rms": round(total_rms),
+            "peak": peak,
+        }
+        return max_contiguous_active_frames >= required_active_frames, stats
+
     def _infer_user_for_ssrc(self, ssrc: int) -> int:
         """Infer user_id for an unmapped SSRC (call under ``_lock``): after a bot rejoin Discord may
         not resend SPEAKING. Infer only when exactly ONE other member is in the channel, bots
@@ -1356,12 +1429,26 @@ class VoiceReceiver:
                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
                 if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
+                    pcm_data = bytes(buf)
+                    has_speech, stats = self._pcm_speech_activity(pcm_data)
+                    if not has_speech:
+                        logger.info(
+                            "Discarded non-speech PCM segment "
+                            "(duration_ms=%d active_ms=%d rms=%d peak=%d)",
+                            stats["duration_ms"],
+                            stats["active_ms"],
+                            stats["rms"],
+                            stats["peak"],
+                        )
+                        self._buffers[ssrc] = bytearray()
+                        self._last_packet_time.pop(ssrc, None)
+                        continue
                     user_id = ssrc_user_map.get(ssrc, 0)
                     if not user_id:
                         # SSRC unmapped (SPEAKING missing after rejoin) — infer from channel.
                         user_id = self._infer_user_for_ssrc(ssrc)
                     if user_id:
-                        completed.append((user_id, bytes(buf)))
+                        completed.append((user_id, pcm_data))
                     self._buffers[ssrc] = bytearray()
                     self._last_packet_time.pop(ssrc, None)
                 elif silence_duration >= self.SILENCE_THRESHOLD * 2:
@@ -1385,11 +1472,27 @@ class VoiceReceiver:
                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
                 if buf_duration >= self.MIN_SPEECH_DURATION:
+                    pcm_data = bytes(buf)
+                    # Same acoustic gate as the silence-flush path: a leave-time
+                    # flush must not carry comfort noise/join artifacts to STT.
+                    has_speech, stats = self._pcm_speech_activity(pcm_data)
+                    if not has_speech:
+                        logger.info(
+                            "Discarded non-speech PCM segment "
+                            "(duration_ms=%d active_ms=%d rms=%d peak=%d)",
+                            stats["duration_ms"],
+                            stats["active_ms"],
+                            stats["rms"],
+                            stats["peak"],
+                        )
+                        self._buffers.pop(ssrc, None)
+                        self._last_packet_time.pop(ssrc, None)
+                        continue
                     user_id = ssrc_user_map.get(ssrc, 0)
                     if not user_id:
                         user_id = self._infer_user_for_ssrc(ssrc)
                     if user_id:
-                        completed.append((user_id, bytes(buf)))
+                        completed.append((user_id, pcm_data))
                 self._buffers.pop(ssrc, None)
                 self._last_packet_time.pop(ssrc, None)
         return completed
