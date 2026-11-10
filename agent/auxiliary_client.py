@@ -7274,6 +7274,30 @@ class _ResolvedAuxRoute(NamedTuple):
     effective_provider: str
 
 
+def _task_stops_at_chain(task: Optional[str], resolved_provider: Optional[str]) -> bool:
+    """``auxiliary.<task>.task_chain_only`` AND a non-``auto`` resolved provider.
+
+    The key means "an explicit pin is absolute" (D-124): a task whose route the operator pinned
+    uses its own configured ``fallback_chain`` as the whole fallback policy, and never the main
+    agent's model or the built-in discovery chain. It is read at the three doors a pinned task can
+    leave its route through — the ``openrouter``/``custom`` auto re-probe in
+    ``_resolve_call_client``, the request-time main-agent net in ``_ladder_provider_fallback`` and
+    the quarantine walk's discovery rung in ``_next_fallback_after_quarantine`` — so the gate is
+    the same at each of them.
+
+    The non-``auto`` half is not a convenience: ``auto`` already means "follow the main route and
+    its chain", so the key must be inert there. The shipped ``auxiliary.voice_brief`` block sets
+    ``task_chain_only: true`` with ``provider: auto``, and an auto brief answers exactly as it
+    does without the key.
+    """
+    if not task:
+        return False
+    provider = (resolved_provider or "").strip().lower()
+    if not provider or provider == "auto":
+        return False
+    return bool(_get_auxiliary_task_config(str(task)).get("task_chain_only"))
+
+
 def _resolve_call_client(
     task: Optional[str], *, provider: Optional[str], model: Optional[str], base_url: Optional[str],
     api_key: Optional[str], resolved_provider: str, resolved_model: Optional[str],
@@ -7305,9 +7329,15 @@ def _resolve_call_client(
         effective_provider = _effective_provider_for_client(client, resolved_provider)
         if client is None:
             # Explicit provider with no credentials: honor the task fallback_chain before
-            # raising (fallback entries may use OAuth / credential-pool auth).
+            # raising (fallback entries may use OAuth / credential-pool auth). ``openrouter`` and
+            # ``custom`` join that arm when the task's route is pinned and it is task_chain_only:
+            # a pinned route asks for its OWN chain first, and only an empty/unbuildable chain
+            # bypasses the task instead of silently re-probing whatever else is logged in. An
+            # ``auto`` resolution keeps the re-probe below and its generic error.
             _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
+            _stop_at_chain = _task_stops_at_chain(task, _explicit)
+            if _explicit and _explicit != "auto" and (
+                    _explicit not in {"openrouter", "custom"} or _stop_at_chain):
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
                     task, _explicit)
                 if fb_client is None:
@@ -7693,17 +7723,18 @@ def _ladder_credential_rungs(
 
 def _next_fallback_after_quarantine(
     task: Optional[str], resolved_provider: str, is_auto: bool, route: _LadderRoute,
-    failed_model: Optional[str], failure_scope: Any, *, task_chain_only: bool = False,
+    failed_model: Optional[str], failure_scope: Any, *, stop_at_task_chain: bool = False,
 ) -> tuple[Optional[Any], Optional[str], str]:
     """Next candidate after a fallback entry was quarantined mid-request (dead credential or a
     capacity error): remaining configured entries (task chain, then main chain on auto) before the
-    discovery chain. ``task_chain_only`` (explicit-provider auth error) stops at the task chain —
-    the user never opted that task into discovery or the main model."""
+    discovery chain. ``stop_at_task_chain`` (explicit-provider auth error, or a task whose route is
+    pinned with ``task_chain_only``) stops at the task chain — the user never opted that task into
+    discovery or the main model."""
     reason = "fallback candidate unavailable"
     fb = _try_configured_fallback_chain(
         task, resolved_provider or "auto", reason=reason, failed_model=failed_model,
         failed_base_url=route.base_info, failure_scope=failure_scope)
-    if task_chain_only:
+    if stop_at_task_chain:
         return fb
     if fb[0] is None and is_auto:
         fb = _try_main_fallback_chain(
@@ -7722,7 +7753,10 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     Capacity errors (payment/quota, connection, exhausted 429, model incompatible, malformed
     response) bypass the explicit-provider gate — the provider cannot serve this request
     regardless of user intent. Auth errors from an explicit provider may only use the task's
-    own configured fallback_chain; they never imply an unconfigured provider hop."""
+    own configured fallback_chain; they never imply an unconfigured provider hop. A task pinned
+    with ``auxiliary.<task>.task_chain_only`` is the same for every failure class: its own chain
+    is the whole policy, so neither the main-agent net nor the discovery rung runs (D-124), and
+    the caller gets the primary error to bypass on."""
     task, tag, resolved_provider = route.task, route.tag, route.resolved_provider
     # Respect explicit provider choice for transient errors (auth, request validation, etc.) but fall back when
     # the provider cannot serve due to capacity: payment/quota exhaustion (a daily-token 429 like a 402, #26803),
@@ -7736,6 +7770,9 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     explicit_auth_with_task_chain = (
         reason == "auth error" and not is_auto and has_task_fallback_chain
     )
+    # A pinned task with ``task_chain_only`` stops at its own chain on capacity errors too: its
+    # operator asked for that route and nothing else (D-124).
+    stop_at_task_chain = explicit_auth_with_task_chain or _task_stops_at_chain(task, resolved_provider)
     if reason is None or not (is_auto or is_capacity_error or explicit_auth_with_task_chain):
         return None
     if reason == "payment error":
@@ -7776,7 +7813,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
             fb_client, fb_model, fb_label = _try_payment_fallback(
                 resolved_provider, task, reason=reason, failed_base_url=route.base_info,
                 failure_scope=_chain_failure_scope, main_runtime=route.main_runtime)
-    elif fb_client is None and not explicit_auth_with_task_chain:
+    elif fb_client is None and not stop_at_task_chain:
         fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
             resolved_provider, task, reason=reason, failed_model=_chain_failed_model,
             failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
@@ -7801,7 +7838,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
             return fb_resp
         fb_client, fb_model, fb_label = _next_fallback_after_quarantine(
             task, resolved_provider, is_auto, route, _chain_failed_model, _chain_failure_scope,
-            task_chain_only=explicit_auth_with_task_chain)
+            stop_at_task_chain=stop_at_task_chain)
     # All fallback layers exhausted: one user-visible warning (#26882), then the caller re-raises.
     logger.warning("Auxiliary %s%s: %s on %s and all fallbacks exhausted "
                    "(fallback_chain + main agent model). Raising the primary error.",

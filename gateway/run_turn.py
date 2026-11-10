@@ -657,9 +657,13 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         """Speak+post the pre-turn brief. ``None`` means the turn may run; a dict refuses visibly.
 
         Runs before any turn task is started. On success the canned ack slot is cleared (the brief
-        already spoke). The turn itself is not modified in any other way.
+        already spoke). A pinned brief that cannot be served posts one line naming the provider and
+        returns ``None`` — the turn still runs. The turn itself is not modified in any other way.
         """
-        from gateway.voice_brief import VoiceBriefError, brief_enabled, deliver_preturn_brief, failure_text, voice_binding
+        from gateway.voice_brief import (
+            VoiceBriefBypassed, VoiceBriefError, brief_enabled, bypassed_text,
+            deliver_preturn_brief, failure_text, voice_binding,
+        )
 
         if not brief_enabled(user_config):
             return None
@@ -684,6 +688,22 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             brief = await deliver_preturn_brief(
                 adapter=adapter, guild_id=guild_id, chat_id=chat_id, message=message, route=route,
             )
+        except VoiceBriefBypassed as exc:
+            # A pinned route that cannot serve is not a refusal (D-124): one short line naming the
+            # provider, then the turn runs on its own route. A failed post is only a warning.
+            logger.warning(
+                "Voice brief bypassed on pinned route %s (%s); running the turn without a brief",
+                exc.provider, exc.reason,
+            )
+            try:
+                sent = await adapter.send(str(chat_id), bypassed_text(exc.provider, exc.reason))
+            except Exception:
+                logger.warning("Voice brief bypass message could not be posted (chat=%s)",
+                               chat_id, exc_info=True)
+            else:
+                if not getattr(sent, "success", False):
+                    logger.warning("Voice brief bypass message was not accepted (chat=%s)", chat_id)
+            return None
         except VoiceBriefError as exc:
             return self._proxy_error_result(str(exc))
         logger.info("Voice brief delivered before the turn: %s", brief)

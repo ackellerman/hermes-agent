@@ -4,13 +4,19 @@ Opt-in per profile (``discord.voice_brief.enabled``, default off). Before a voic
 one bounded auxiliary call for the ``voice_brief`` task asks for one short sentence, in the
 model's own words, stating its understanding and what it will do next. The task route is its own
 (``auxiliary.voice_brief.*``) and defaults to ``auto``: the turn's routed provider/model, with the
-profile's fallback policy behind it. That sentence is
-synthesized with the profile's configured TTS provider, played in the turn's bound voice
-channel (awaited), and posted to the bound text channel. Only then does the turn run — exactly
-as it does without this feature: no gated tools, no muted streaming, no rewritten history.
+profile's fallback policy behind it. A configured pin is absolute instead — the brief runs on the
+pinned provider/model and its own ``fallback_chain``, never on the main agent's model. That
+sentence is synthesized with the profile's configured TTS provider, played in the turn's bound
+voice channel (awaited), and posted to the bound text channel. Only then does the turn run —
+exactly as it does without this feature: no gated tools, no muted streaming, no rewritten history.
 
-Any failure (model, TTS, playback, text post) returns a visible failure text instead of running
-the turn. The brief is never invented: a canned phrase is not a fallback.
+Two failure shapes, and the difference is deliberate. A **pinned** brief (``auxiliary.voice_brief``
+pins a provider *and* ``task_chain_only``) that cannot be served — its client cannot be built, or
+the request fails after its own chain is exhausted — raises ``VoiceBriefBypassed``: the caller posts
+one short message naming the provider and failure class, plays nothing, and runs the turn anyway.
+Every other failure (TTS, playback, text post, or any failure of an ``auto`` brief) returns visible
+failure text instead of running the turn. The brief is never invented: a canned phrase is not a
+fallback, and the bypass is not a brief.
 
 Fakes a test needs live only at the edges: the platform adapter (playback / text post), the TTS
 provider, and the model endpoint.
@@ -49,6 +55,11 @@ UNSUPPORTED_ROUTE_TEXT = (
     "I can't speak a short understanding of your request on this route: it runs work outside the "
     "normal conversation loop, so I stopped without running anything."
 )
+# One short line, no credential and no key material: what failed (provider/model) and how.
+BYPASS_TEXT = (
+    "I couldn't speak my short understanding of your request: the pinned voice-brief provider "
+    "{route} failed ({reason}). Running your request anyway."
+)
 
 _INSTRUCTIONS = (
     "In one brief, natural sentence, tell the requester what you understood, then what you'll do "
@@ -59,6 +70,19 @@ _INSTRUCTIONS = (
 
 class VoiceBriefError(Exception):
     """Delivery failed; the message is user-visible and the turn must not run."""
+
+
+class VoiceBriefBypassed(Exception):
+    """A PINNED brief could not be served; the turn runs without one and the caller says so.
+
+    ``provider`` is ``provider/model`` (what the operator pinned), ``reason`` a short failure class.
+    Neither carries credential material: this message is posted to the chat channel.
+    """
+
+    def __init__(self, provider: str, reason: str):
+        self.provider = str(provider or "")
+        self.reason = str(reason or "")
+        super().__init__(f"{self.provider} failed ({self.reason})")
 
 
 def brief_enabled(config: Optional[dict[str, Any]]) -> bool:
@@ -79,6 +103,48 @@ def failure_text(reason: str) -> str:
 
 def unsupported_route_text() -> str:
     return UNSUPPORTED_ROUTE_TEXT
+
+
+def bypassed_text(route: str, reason: str) -> str:
+    """One chat line for a bypassed pinned brief: names the provider, never a credential."""
+    return BYPASS_TEXT.format(route=route, reason=reason)
+
+
+def pinned_task_route() -> Optional[str]:
+    """``provider/model`` of the brief's OWN route when it is pinned and ``task_chain_only``.
+
+    ``None`` means "the slot is on ``auto``": the brief then follows the turn's route and that
+    route's chain, and any failure refuses the turn as it always has. The two halves are the same
+    ones the auxiliary client reads at its three doors (``_task_stops_at_chain``), so the seam and
+    the client agree on what "pinned" means.
+    """
+    from agent.auxiliary_client import _resolve_task_provider_model, _task_stops_at_chain
+
+    provider, model, _base_url, _api_key, _api_mode = _resolve_task_provider_model(CONFIG_SECTION)
+    if not _task_stops_at_chain(CONFIG_SECTION, provider):
+        return None
+    return f"{provider}/{model}" if model else str(provider)
+
+
+def failure_class(exc: Exception) -> str:
+    """Short label for the bypass message — the auxiliary client's own fallback vocabulary.
+
+    Never the exception's text: a provider's error body can echo request headers, and this line is
+    posted to a chat channel.
+    """
+    from agent import auxiliary_client
+
+    if isinstance(exc, auxiliary_client.AuxiliaryClientUnavailable):
+        return "provider unavailable"
+    for predicate, label in auxiliary_client._FALLBACK_REASONS:
+        try:
+            if predicate(exc):
+                return label
+        except Exception:
+            continue
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "request timed out"
+    return type(exc).__name__
 
 
 def voice_binding(source: Any, adapter: Any) -> Optional[tuple[int, str]]:
@@ -150,6 +216,11 @@ def _model_timeout() -> float:
     The auxiliary client applies the same configured value to the request itself, so the outer
     ``asyncio.wait_for`` reads it from the same place: a constant here would cut a configured longer
     call short, and a shorter configuration would abandon a request that is still running.
+
+    Known invariant: the two fallback defaults agree for every numeric configuration and differ only
+    when the block's ``timeout`` is absent or null — 15s here (a brief is one sentence) against the
+    router's own 30s. No ``timeout=`` kwarg is passed, precisely so there is only one source of
+    truth for the value; the outer bound is the tighter of the two by design.
     """
     from agent.auxiliary_client import _get_task_timeout
 
@@ -211,13 +282,21 @@ async def deliver_preturn_brief(
     """Model sentence → TTS → awaited playback → text post. Returns the sentence it delivered.
 
     Order is load-bearing: playback is awaited before the text post, and both before the caller
-    starts the turn. Raises ``VoiceBriefError`` (user-visible) on any failure.
+    starts the turn. Raises ``VoiceBriefError`` (user-visible) on any failure, except a failed
+    model call on a PINNED route (``pinned_task_route``), which raises ``VoiceBriefBypassed`` so the
+    caller can say so in one line and run the turn.
     """
+    pinned = pinned_task_route()
     try:
         raw = await asyncio.wait_for(_ask_model(route, brief_messages(message)), timeout=_model_timeout())
     except VoiceBriefError:
         raise
     except Exception as exc:
+        if pinned is not None:
+            # The pin and its own chain could not serve: bypass, never hop to the main model.
+            reason = failure_class(exc)
+            logger.warning("Voice brief bypassed: pinned route %s failed (%s): %s", pinned, reason, exc)
+            raise VoiceBriefBypassed(pinned, reason) from exc
         logger.warning("Voice brief model call failed: %s", exc, exc_info=True)
         raise VoiceBriefError(failure_text("model call failed")) from exc
     text = clean_brief(raw)
