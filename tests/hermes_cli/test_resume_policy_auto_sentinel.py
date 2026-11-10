@@ -105,21 +105,29 @@ def test_the_alias_provenance_still_decides_the_model_with_the_auto_pick():
         assert "-m/--model" in refusal
 
 
-def test_api_key_stays_exempt_and_every_other_flag_still_compares():
-    """A re-typed key is never a policy change; another changed flag beside an `auto` provider is
-    still refused, naming that flag alone."""
+@pytest.mark.parametrize("override, flag", [
+    ({}, None),
+    ({"reasoning": "high"}, "--reasoning"),
+    ({"base_url": "https://b.example"}, "--base-url"),
+    ({"toolsets": "browser"}, "-t/--toolsets"),
+], ids=["all-equal", "reasoning", "base_url", "toolsets"])
+def test_every_flag_beside_the_auto_provider_still_compares(override, flag):
+    """Dropping the sentinel drops the provider comparison only. Repeating the flags beside it —
+    with a re-typed `api_key`, which is never durable — is the same launch; changing one is still
+    refused, naming that flag alone."""
     import argparse
 
     from hermes_cli import gateway_chat
 
-    frozen = {"info": {"launch_request": {"source": "cli", "model": "model-a", "reasoning": "low"}}}
-    gateway_chat.check_resume_policy(
-        argparse.Namespace(resume="s", model="model-a", provider="auto", reasoning="low", api_key="sk-retyped"),
-        frozen)
-    refusal = _refusal(gateway_chat.check_resume_policy,
-                       argparse.Namespace(resume="s", model="model-a", provider="auto",
-                                          reasoning="high", api_key="sk-retyped"), frozen)
-    assert "--reasoning" in refusal
+    frozen = {"info": {"launch_request": {"source": "cli", "model": "model-a", "reasoning": "low",
+                                          "base_url": "https://a.example", "toolsets": ["file"]}}}
+    same = {"reasoning": "low", "base_url": "https://a.example", "toolsets": "file", "api_key": "sk-retyped"}
+    args = argparse.Namespace(resume="s", model="model-a", provider="auto", **{**same, **override})
+    if flag is None:
+        gateway_chat.check_resume_policy(args, frozen)
+        return
+    refusal = _refusal(gateway_chat.check_resume_policy, args, frozen)
+    assert flag in refusal
     assert "api_key" not in refusal and "-m/--model" not in refusal
 
 
@@ -134,27 +142,54 @@ def test_the_create_policy_still_carries_the_auto_pick():
     assert policy == {"model": "model-a", "provider": "auto"}
 
 
-def test_the_create_then_attach_branch_checks_no_policy():
-    """A thin-client create adopts the snapshot it just made without a policy check: the only two
-    comparison call sites in `run_gateway_chat` are the resume branches, both ahead of
-    `session.create`. (That branch is e2's, and this element leaves it alone.)"""
-    import ast
-    import inspect
+@pytest.mark.asyncio
+async def test_the_create_then_attach_branch_never_compares_the_launch_policy(monkeypatch, tmp_path):
+    """A titled create (`-c <title> --create-if-missing`) adopts the snapshot it just made, so a
+    thin-client run compares no launch policy against the row it created — even when those flags
+    judged against that frozen launch would refuse. A control for e2's branch, not a proof of this
+    element's fold: it passes with the sentinel reverted (that branch is untouched)."""
+    import argparse
+    from contextlib import asynccontextmanager
 
     from hermes_cli import gateway_chat
+    from hermes_cli.gateway_chat_view import GatewayChatView
 
-    module = ast.parse(inspect.getsource(gateway_chat))
-    create = next(node for node in ast.walk(module)
-                  if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_gateway_chat")
-    checks = [node.lineno for node in ast.walk(create)
-              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-              and node.func.id == "check_resume_policy"]
-    creates = [node.lineno for node in ast.walk(create)
-               if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-               and node.func.attr == "rpc" and node.args
-               and isinstance(node.args[0], ast.Constant) and node.args[0].value == "session.create"]
-    assert len(checks) == 2 and creates, (checks, creates)
-    assert max(checks) < min(creates)
+    adopted, calls = [], []
+    # A frozen launch the same flags would refuse on a resume: another provider, another reasoning.
+    snapshot = {"stored_session_id": "created-row", "execution_generation": 0,
+                "info": {"launch_request": {"source": "cli", "model": "model-a",
+                                            "provider": "anthropic", "reasoning": "low"}}}
+
+    class Peer:
+        async def rpc(self, method, **params):
+            calls.append((method, params))
+            if method == "runtime.describe":
+                return {"session_create": {"sources": ["cli"], "parameters": [
+                    "cwd", "model", "provider", "reasoning", "title", "request_id", "source"]}}
+            return snapshot
+
+    @asynccontextmanager
+    async def connected():
+        yield Peer()
+
+    async def rendered(self, query, *, oneshot):
+        adopted.append(self.session_id)
+        return 0
+
+    monkeypatch.setattr(gateway_chat, "connect_gateway", connected)
+    monkeypatch.setattr(GatewayChatView, "run", rendered)
+    monkeypatch.chdir(tmp_path)
+    args = argparse.Namespace(continue_last="board-round", create_if_missing=True, model="model-a",
+                              provider="openrouter", reasoning="high", query="q", quiet=True)
+    # No refusal: the run created the row and attached to it.
+    assert await gateway_chat.run_gateway_chat(args) == 0
+    sent = {method: params for method, params in calls}
+    assert "session.resume" not in sent
+    assert sent["session.create"]["provider"] == "openrouter" and sent["session.create"]["reasoning"] == "high"
+    assert adopted == ["created-row"]
+    # Not vacuous: the very same flags, judged against that launch, do refuse.
+    refusal = _refusal(gateway_chat.check_resume_policy, args, snapshot)
+    assert "--provider" in refusal and "--reasoning" in refusal
 
 
 def test_a_bare_continue_typing_no_flags_is_unchanged():
