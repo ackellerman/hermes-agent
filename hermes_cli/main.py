@@ -1334,9 +1334,6 @@ def _resolve_continue_arg(args, *, use_tui: bool) -> None:
             elif getattr(args, "create_if_missing", False):
                 # "send to this named thread, making it if needed" — without it
                 # a quiet send to a not-yet-existing session silently no-ops.
-                # --create-if-missing: no session matches the title — create a new session with that title
-                # and proceed. See #86794. The classic CLI's gateway writes it (the single writer);
-                # the TUI keeps main's local row.
                 if use_tui:
                     new_sid = _create_titled_session(continue_val)
                 else:
@@ -1677,11 +1674,7 @@ def cmd_chat(args):
         **{k: getattr(args, k, d) for k, d in _CHAT_PASSTHROUGH + (("api_key", None), ("base_url", None))},
     }
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
-    # The titled session this run minted itself (`_resolve_chat_session_args` ->
-    # `create_titled_session`'s marker): the one session whose resume may skip the frozen-policy
-    # comparison (`gateway_session_store.open_session`). Process-local: never persisted, sent or
-    # inherited, and None for every run that created nothing.
-    kwargs["created_session_id"] = getattr(args, "resume_created_here", None)
+    kwargs["created_session_id"] = getattr(args, "resume_created_here", None)  # process-local; None when this run created nothing
 
     try:
         from cli import main as cli_main
