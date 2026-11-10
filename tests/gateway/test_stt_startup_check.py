@@ -6,9 +6,10 @@ Two things are under test here:
    the resolver cannot load; ``device: cuda`` with no visible GPU), when it stays silent (a
    CPU-only host, ``device: cpu``), and that it never installs and never warms where CUDA
    cannot work.
-2. Its placement in ``gateway/run_startup.py``: a separate fire-and-forget task on an executor
-   thread. The turn-machinery warm-up it sits beside is awaited with the inbound gate shut for
-   up to 20 s, and importing ctranslate2 / loading medium must never delay gateway start.
+2. Its placement in ``gateway/run_startup.py``: a separate fire-and-forget task on a DAEMON
+   thread (not the loop's default executor, which ``asyncio.run`` joins at close). The
+   turn-machinery warm-up it sits beside is awaited with the inbound gate shut for up to 20 s, and
+   importing ctranslate2 / loading medium must never delay gateway start *or* process exit.
 """
 
 from __future__ import annotations
@@ -156,6 +157,26 @@ def test_never_installs_when_faster_whisper_is_absent(stt, caplog, monkeypatch):
     assert stt.warmed == []
 
 
+@pytest.mark.parametrize("bad_config", ["enabled", ["local"], 7])
+def test_a_non_mapping_stt_config_degrades_to_defaults(bad_config, stt, caplog):
+    """``stt: enabled`` is a str from ``_load_stt_config``; the boot probe must not die on it."""
+    with caplog.at_level(logging.INFO):
+        result = stt_startup.check_local_stt_at_startup(bad_config)
+
+    # Treated as an empty section: the default device (auto) and no exception on the way.
+    assert result["device"] == "auto"
+    assert result["action"] == "loaded"
+    assert _warnings(caplog) == []
+
+
+def test_a_non_mapping_local_section_degrades_to_defaults(stt):
+    result = stt_startup.check_local_stt_at_startup(
+        {"provider": "local", "local": "medium"})
+
+    assert result["device"] == "auto"
+    assert result["action"] == "loaded"
+
+
 def test_warms_through_warm_stt_provider_when_nothing_is_missing(stt, caplog, monkeypatch):
     with caplog.at_level(logging.INFO):
         result = stt_startup.check_local_stt_at_startup(LOCAL_CFG)
@@ -230,3 +251,117 @@ def test_startup_check_is_a_fire_and_forget_task(monkeypatch):
         await runner._startup_stt_task
 
     asyncio.run(drive())
+
+
+def test_startup_check_runs_on_a_daemon_thread(monkeypatch):
+    """Not the loop's DEFAULT executor: ``asyncio.run`` joins that at close (300 s) (r1 F2)."""
+    release = threading.Event()
+    seen: dict = {}
+
+    def probe():
+        seen["daemon"] = threading.current_thread().daemon
+        seen["name"] = threading.current_thread().name
+        release.wait(5)
+        return {"action": "skipped"}
+
+    monkeypatch.setattr(stt_startup, "check_local_stt_at_startup", probe)
+
+    async def drive():
+        runner = _Runner()
+        runner._start_startup_stt_check()
+        task = runner._startup_stt_task
+        for _ in range(200):
+            if "daemon" in seen:
+                break
+            await asyncio.sleep(0.01)
+        # Shutdown-shaped cancellation must detach the load, not wait for it.
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert task.cancelled()
+        release.set()
+
+    asyncio.run(drive())
+
+    assert seen["daemon"] is True, "an executor thread would be joined by asyncio.run at close"
+    assert seen["name"] == "startup-stt-check"
+
+
+def test_a_failed_check_is_reported_at_warning(monkeypatch, caplog):
+    """'No CUDA warning at start' must be distinguishable from 'the check died' (r1 F3)."""
+    def probe():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(stt_startup, "check_local_stt_at_startup", probe)
+
+    async def drive():
+        runner = _Runner()
+        runner._start_startup_stt_check()
+        await asyncio.gather(runner._startup_stt_task, return_exceptions=True)
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        asyncio.run(drive())
+
+    warnings = [record for record in caplog.records
+                if record.levelno == logging.WARNING
+                and "local-STT CUDA check failed" in record.getMessage()]
+    assert warnings, [record.getMessage() for record in caplog.records]
+
+
+# ---- the boot call site (review r1 F4, mutation M5) ------------------------------------------
+
+
+class _BootRunner(GatewayStartupMixin):
+    """``_start_impl`` with the pre-connect steps stubbed and ``_start_prefilter_platforms``
+    aborting right after the two boot tasks are started."""
+
+    def __init__(self):
+        self.config = types.SimpleNamespace(multiplex_profiles=False)
+        self.sequence: list[str] = []
+
+    def _start_install_faulthandler(self):
+        self.sequence.append("faulthandler")
+
+    async def _start_log_startup_environment(self):
+        self.sequence.append("log-startup-environment")
+
+    async def _abort_startup_if_shutdown_requested(self, adapter=None, platform=None):
+        return False
+
+    def _start_check_access_policy(self):
+        return False
+
+    async def _start_recover_previous_run(self):
+        self.sequence.append("recover-previous-run")
+
+    def _start_startup_warmup(self):
+        self.sequence.append("warmup")
+        self._startup_warmup_task = object()  # a stand-in: independence is what is asserted
+
+    async def _start_prefilter_platforms(self):
+        self.sequence.append("prefilter")
+        return True, 0, [], []  # aborted → `_start_impl` returns before any connect work
+
+
+def test_boot_path_starts_the_stt_check_as_its_own_task(monkeypatch):
+    """The call site itself: dropping it leaves the whole startup-warning feature absent."""
+    ran: list[str] = []
+
+    async def _check(self):
+        ran.append("stt-check")
+
+    monkeypatch.setattr(GatewayStartupMixin, "_check_startup_stt", _check)
+
+    async def drive():
+        runner = _BootRunner()
+        assert await runner._start_impl() is True
+        task = getattr(runner, "_startup_stt_task", None)
+        assert task is not None, "the boot path never started the local-STT check"
+        assert task is not runner._startup_warmup_task  # its own task, not the gate's warm-up
+        await task
+        return runner
+
+    runner = asyncio.run(drive())
+
+    assert ran == ["stt-check"]
+    assert runner.sequence == ["faulthandler", "log-startup-environment", "recover-previous-run",
+                              "warmup", "prefilter"]
