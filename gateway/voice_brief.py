@@ -286,7 +286,12 @@ async def deliver_preturn_brief(
     model call on a PINNED route (``pinned_task_route``), which raises ``VoiceBriefBypassed`` so the
     caller can say so in one line and run the turn.
     """
-    pinned = pinned_task_route()
+    try:
+        pinned = pinned_task_route()
+    except Exception:
+        # A route read that fails cannot tell a pin from auto: keep the historical refusal path.
+        logger.warning("Voice brief could not read its own task route", exc_info=True)
+        pinned = None
     try:
         raw = await asyncio.wait_for(_ask_model(route, brief_messages(message)), timeout=_model_timeout())
     except VoiceBriefError:
