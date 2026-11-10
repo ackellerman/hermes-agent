@@ -359,6 +359,63 @@ def test_frames_held_for_an_ssrc_that_turns_out_to_be_a_bot_are_discarded(nacl, 
     assert _decoded(decoders) == []
 
 
+# --- the arrival stamps follow the buffers they describe -----------------------------------------
+
+def test_a_ssrc_handed_from_a_bot_to_a_person_keeps_the_whole_post_tone_segment(nacl, decoders):
+    """An SSRC Discord reassigns is never cut with the previous owner's stamps.
+
+    Frames land before SPEAKING claims the SSRC; the mapping then says it was a bot's, so the
+    buffer is dropped — its arrival deque must go with it, or the ready cut's byte prefix deletes
+    the first frames the person speaks after the tone (integration 2a / e6 1).
+    """
+    receiver = _receiver(members=[_member(_OPERATOR), _member(_OTHER_BOT, True), _member(_ME, True)],
+                         allowed={str(_OPERATOR)})
+    _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"p")
+    _packet(nacl, receiver, _SSRC_PERSON, seq=2, payload=b"p")
+    assert len(receiver._buffers[_SSRC_PERSON]) == 2 * BYTES_PER_FRAME
+
+    receiver.map_ssrc(_SSRC_PERSON, _OTHER_BOT)          # SPEAKING: it was a bot's all along
+    assert _SSRC_PERSON not in receiver._buffers
+
+    receiver.map_ssrc(_SSRC_PERSON, _OPERATOR)           # Discord hands the SSRC to a person
+    receiver.mark_ready()                                # the tone has played
+    for seq in range(3, 33):                             # 0.6 s of speech, after the tone
+        _packet(nacl, receiver, _SSRC_PERSON, seq=seq, payload=b"p")
+    receiver._last_packet_time[_SSRC_PERSON] = time.monotonic() - 3.0
+
+    [segment] = receiver.check_silence()
+    assert segment[0] == _OPERATOR
+    assert len(segment[1]) == 30 * BYTES_PER_FRAME, "the stale prefix ate the first 40 ms"
+    assert receiver._pre_ready_dropped == 0
+
+
+def test_a_buffer_dropped_at_the_unmapped_cap_takes_its_stamps_with_it(nacl, decoders):
+    """The 15 s cap drops the buffer and its arrival deque together.
+
+    Marked ready first on purpose: the cap is the dropper here, not the pre-tone cut.  Left
+    behind, a 15 s prefix of stamps would describe bytes that no longer exist (integration 2b).
+    """
+    receiver = _receiver(members=[_member(_OPERATOR), _member(_STRANGER), _member(_ME, True)])
+    receiver.mark_ready()
+    frames = int(VoiceReceiver.MAX_UNMAPPED_SECONDS / FRAME_SECONDS) + 5   # 15.1 s, never pauses
+    for seq in range(1, frames + 1):
+        _packet(nacl, receiver, _SSRC_PERSON, seq=seq, payload=b"p")
+    assert len(receiver._buffers[_SSRC_PERSON]) == frames * BYTES_PER_FRAME
+
+    assert receiver.check_silence() == []                # nobody claims it, so the cap drops it
+    assert _SSRC_PERSON not in receiver._buffers
+    assert not receiver._arrivals.get(_SSRC_PERSON)
+
+    receiver.map_ssrc(_SSRC_PERSON, _OPERATOR)           # the next utterance is attributable
+    for seq in range(1, 31):                             # 0.6 s, transcribed whole
+        _packet(nacl, receiver, _SSRC_PERSON, seq=seq, payload=b"p")
+    receiver._last_packet_time[_SSRC_PERSON] = time.monotonic() - 3.0
+
+    [segment] = receiver.check_silence()
+    assert segment[0] == _OPERATOR
+    assert len(segment[1]) == 30 * BYTES_PER_FRAME
+
+
 # --- held audio cannot outlive the state that captured it -----------------------------------------
 
 def _two_ring_receiver() -> VoiceReceiver:

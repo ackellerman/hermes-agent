@@ -1224,6 +1224,9 @@ class VoiceReceiver:
             self._dropped_ssrcs.add(ssrc)
             self._buffers.pop(ssrc, None)
             self._last_packet_time.pop(ssrc, None)
+            # The arrival deque is a byte-exact prefix of the buffer, so it dies with it: left
+            # behind, the stale stamps cut the next owner of this SSRC's post-tone speech.
+            self._arrivals.pop(ssrc, None)
             self._discard_dave_pending_locked(ssrc)
         else:
             self._dropped_ssrcs.discard(ssrc)
@@ -1761,6 +1764,9 @@ class VoiceReceiver:
                     if not self._infer_user_for_ssrc(ssrc):
                         self._buffers.pop(ssrc, None)
                         self._last_packet_time.pop(ssrc, None)
+                        # Its arrival stamps go with its bytes: they are a prefix of THAT buffer,
+                        # and a leftover prefix would cut the speech that follows it.
+                        self._arrivals.pop(ssrc, None)
         if expired_frames:
             logger.info(
                 "Held voice payloads expired without resolution (frames=%d ssrcs=%d)",
@@ -1784,7 +1790,8 @@ class VoiceReceiver:
                         stats["rms"],
                         stats["peak"],
                     )
-                    self._arrivals.pop(ssrc, None)
+                    # No ``_arrivals`` pop here: the detached segment's stamps went with it above,
+                    # and anything appended since belongs to frames still in the buffer.
                     continue
                 user_id = ssrc_user_map.get(ssrc, 0)
                 if not user_id:
