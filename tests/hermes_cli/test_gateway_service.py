@@ -1730,6 +1730,37 @@ class TestUnitDropsInstallEnvironmentLdLibraryPaths:
         assert target_stale not in unit
         assert f'Environment="LD_LIBRARY_PATH={keep}"' in unit
 
+    def test_system_unit_drops_environment_components_under_a_symlinked_hermes_home(
+        self, monkeypatch, tmp_path
+    ):
+        """A ``HERMES_HOME`` that is a symlink to the target's ``~/.hermes`` -- and a caller whose
+        HOME is outside that tree, so the remap keeps the path verbatim -- is still the target's
+        data root: pm writes the generations under ``<target>/.hermes/installs``. The containment
+        test has to resolve both sides as ``hermes_constants._hermes_root_of`` does, or a lexical
+        one filters against ``<link>/installs`` and the stale generation survives."""
+        caller_home = tmp_path / "root"
+        target_home = tmp_path / "alice"
+        caller_home.mkdir()
+        target_hermes = target_home / ".hermes"
+        target_hermes.mkdir(parents=True)
+        link = tmp_path / "hermes-link"
+        link.symlink_to(target_hermes, target_is_directory=True)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: caller_home))
+        monkeypatch.setenv("HERMES_HOME", str(link))
+
+        stale_target = _venv_generation_lib(target_hermes / "installs", "9e8f535ea094ebf3")
+        keep = "/opt/cuda/lib64"
+        monkeypatch.setenv("LD_LIBRARY_PATH", f"{stale_target}:{keep}")
+
+        unit = self._system_unit(monkeypatch, tmp_path, target_home)
+
+        assert stale_target not in unit
+        assert "environments" not in unit
+        assert f'Environment="LD_LIBRARY_PATH={keep}"' in unit
+        # Self-checking: the target's root is a filter candidate, not just absent from the unit.
+        roots = gateway_cli._ld_library_path_install_roots(system=True, target_home_dir=str(target_home))
+        assert target_hermes / "installs" in roots
+
     def test_the_environments_dir_itself_and_lookalikes_are_kept(self, monkeypatch, tmp_path):
         """The len-2 boundary: only a path *inside* ``<root>/<key>/environments`` is a generation.
         The dir itself and lookalike names are kept."""
