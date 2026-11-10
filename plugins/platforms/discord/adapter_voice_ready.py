@@ -26,6 +26,7 @@ import logging
 import math
 import os
 import struct
+import tempfile
 import time
 import wave
 from pathlib import Path
@@ -75,15 +76,25 @@ def ready_tone_cache_path(gain: float = DEFAULT_READY_TONE_GAIN) -> str:
         sample = int(peak * envelope * 32767.0
                      * math.sin(2.0 * math.pi * TONE_HZ * index / TONE_SAMPLE_RATE))
         pcm += struct.pack("<h", sample)
-    # Write-then-rename: two joins on two seats can race on the same gain key, and a half-written
-    # WAV would hand the mixer a broken clip.
-    staging = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with wave.open(str(staging), "wb") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)
-        wav.setframerate(TONE_SAMPLE_RATE)
-        wav.writeframes(bytes(pcm))
-    os.replace(staging, path)
+    # Write-then-rename: two joins can render the same gain key at once — two seats, or two guilds
+    # on one seat process — and a pid-keyed name collides there, so one render would truncate the
+    # other's staging file mid-write.  Each render gets its own temp file in the same directory and
+    # the rename stays atomic.
+    fd, staging = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(directory))
+    os.close(fd)
+    try:
+        with wave.open(staging, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(TONE_SAMPLE_RATE)
+            wav.writeframes(bytes(pcm))
+        os.replace(staging, path)
+    finally:
+        if os.path.exists(staging):
+            try:
+                os.unlink(staging)
+            except OSError:
+                pass
     logger.debug("[Discord] rendered the ready tone (gain=%.3f) into %s", gain, path)
     return str(path)
 

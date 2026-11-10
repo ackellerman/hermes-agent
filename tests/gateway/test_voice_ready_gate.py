@@ -655,6 +655,43 @@ def test_the_tone_wav_is_rendered_at_the_configured_gain(tone_home):
     assert soft.stat().st_mtime_ns == before
 
 
+def test_two_renders_of_one_gain_never_share_a_staging_file(tone_home, monkeypatch):
+    """Two joins in one gateway process can render the same gain key at once.
+
+    The inner render runs from the outer one's first write — the interleaving a pid-keyed staging
+    name produces.  Then both open the SAME file, the second's rename takes it away, and the
+    first's ``os.replace`` has nothing left to move (or the clip it names is truncated).  Each
+    render now gets its own temp file in the cache dir, and the rename stays atomic (e6 finding 5).
+    """
+    assert ready_mod is not None
+    render = ready_mod.ready_tone_cache_path
+    real_write = wave.Wave_write.writeframes
+    inner: list[str] = []
+    inside = {"render": False}
+
+    def hooked_write(wav, data):
+        # The second join renders MID-write, not before it: that is the interleaving a pid-keyed
+        # staging name cannot survive.
+        if not inside["render"]:
+            inside["render"] = True
+            try:
+                inner.append(render(0.5))
+            finally:
+                inside["render"] = False
+        return real_write(wav, data)
+
+    monkeypatch.setattr(wave.Wave_write, "writeframes", hooked_write)
+
+    outer = Path(render(0.5))
+    assert inner == [str(outer)], "the second join never got to render"
+
+    with wave.open(str(outer)) as wav:
+        assert wav.getnframes() == int(ready_mod.TONE_SAMPLE_RATE * ready_mod.TONE_SECONDS)
+        assert wav.getnchannels() == 1
+    cache = tone_home / "cache" / "voice_fx"
+    assert [p.name for p in cache.iterdir() if p.name.endswith(".tmp")] == []
+
+
 @pytest.mark.asyncio
 async def test_the_gate_re_renders_the_tone_after_a_gain_change(monkeypatch):
     env = _env(monkeypatch, gain=0.2)
