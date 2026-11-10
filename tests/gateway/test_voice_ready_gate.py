@@ -650,6 +650,31 @@ async def test_a_packet_arriving_after_the_tone_reaches_stt(monkeypatch, nacl, d
 
 
 @pytest.mark.asyncio
+async def test_the_leave_flush_applies_the_same_cut(monkeypatch, nacl, decoders):
+    """The leave path flushes instead of polling: the cut must be applied there too."""
+    release, seen = threading.Event(), {}
+
+    def lease(name, install=False):
+        seen["called"] = True
+        release.wait(10)
+        return dict(_WARM_CPU)
+
+    env = _env(monkeypatch, lease=lease, timeout=10)
+    await _join(env)
+    receiver = env.receiver
+    receiver.map_ssrc(SSRC, OPERATOR)
+    assert await _until(lambda: seen.get("called"))
+    _speak(env, nacl, SSRC, 40)                  # 0.8 s while the model was still loading
+    release.set()
+    assert await _until(lambda: _ready(env))
+
+    # No post-tone audio at all: everything buffered arrived before t_ready and must not be flushed
+    # into the new channel's transcription.
+    assert receiver.flush_pending() == []
+    assert receiver._pre_ready_dropped == 40
+
+
+@pytest.mark.asyncio
 async def test_a_member_who_speaks_after_the_tone_is_not_cut(monkeypatch, nacl, decoders):
     env = _env(monkeypatch)
     await _join(env)
