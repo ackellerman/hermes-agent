@@ -1677,6 +1677,11 @@ def cmd_chat(args):
         **{k: getattr(args, k, d) for k, d in _CHAT_PASSTHROUGH + (("api_key", None), ("base_url", None))},
     }
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
+    # The titled session this run minted itself (`_resolve_chat_session_args` ->
+    # `create_titled_session`'s marker): the one session whose resume may skip the frozen-policy
+    # comparison (`gateway_session_store.open_session`). Process-local: never persisted, sent or
+    # inherited, and None for every run that created nothing.
+    kwargs["created_session_id"] = getattr(args, "resume_created_here", None)
 
     try:
         from cli import main as cli_main

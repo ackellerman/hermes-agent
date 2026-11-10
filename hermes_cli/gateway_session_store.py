@@ -152,9 +152,11 @@ class GatewaySessionStore:
                     return None
                 raise
             # The CLI sends a coding-posture toolset pick and an env-folded ignore_rules too; only a typed
-            # -t / --ignore-rules is checked.
+            # -t / --ignore-rules is checked. A session this invocation created itself (`_created_session_id`,
+            # set by main's titled create) needs no recheck: its frozen policy is the one just sent.
             _check_resume_launch({**(launch or {}), "toolsets": getattr(cli, "_typed_toolsets", None),
-                                  "ignore_rules": getattr(cli, "_explicit_ignore_rules", None) or None}, snapshot)
+                                  "ignore_rules": getattr(cli, "_explicit_ignore_rules", None) or None},
+                                 snapshot, created_here=getattr(cli, "_created_session_id", None))
             return self._adopt(snapshot)
         return self.create(launch)
 
@@ -517,14 +519,22 @@ def _classic_only_policy(launch):
 _RESUME_CHECKED = _LAUNCH_POLICY
 
 
-def _check_resume_launch(launch, snapshot):
+def _check_resume_launch(launch, snapshot, created_here=None):
     """Explicit launch flags on ``--resume`` / ``-c`` against the session's frozen route, as the thin
-    client checks them: the same flags again are fine, a different value is refused, never dropped."""
-    from hermes_cli.gateway_chat import check_resume_policy, resume_policy_error
+    client checks them: the same flags again are fine, a different value is refused, never dropped.
+
+    ``created_here``: the id of a session THIS invocation created (``create_titled_session``). Only
+    when the snapshot is that same session is the whole comparison skipped — including the classic
+    run-budget/verbose check below, whose frozen values this process also just sent. Any other
+    session, and no marker at all, compares exactly as before.
+    """
+    from hermes_cli.gateway_chat import check_resume_policy, created_here_matches, resume_policy_error
     fields = {key: launch.get(key) for key in _RESUME_CHECKED}
     if isinstance(fields.get("toolsets"), (list, tuple)):
         fields["toolsets"] = ",".join(str(item) for item in fields["toolsets"])
-    check_resume_policy(argparse.Namespace(**fields), snapshot)
+    check_resume_policy(argparse.Namespace(**fields), snapshot, created_here=created_here)
+    if created_here_matches(snapshot, created_here):
+        return
     frozen = ((snapshot.get("info") or {}).get("launch_request") or {})
     differs = [key for key, value in _classic_only_policy(launch).items() if frozen.get(key) != value]
     if differs:
@@ -595,8 +605,10 @@ def create_titled_session(title, args=None):
     Main's ``_create_titled_session`` minted the id and wrote the row itself, with no cwd stamp
     (``row_cwd`` ""). ``args`` is the run's parsed arguments: the caller resumes the new session
     next, and a resume sends no creation policy, so ``-t``/``-m``/... must be on this create or the
-    run gets the profile default. Returns the id, or None when the gateway refused (the caller
-    prints main's "could not be created" copy)."""
+    run gets the profile default. When the create reports that THIS call made the row, the run also
+    learns it (``args.resume_created_here``), the one session whose resume skips the frozen-policy
+    comparison. Returns the id, or None when the gateway refused (the caller prints main's "could
+    not be created" copy)."""
     params = _creation_policy(_titled_launch(args))
     params["cwd"] = _launch_cwd()
     params["source"] = "cli"  # main's titled row is `cli` (hermes_cli.main._create_titled_session)
@@ -608,4 +620,12 @@ def create_titled_session(title, args=None):
     except GatewayClientError as exc:
         logger.warning("Failed to create titled session %r on the gateway: %s", title, exc)
         return None
+    if args is not None and (snapshot.get("info") or {}).get("created") is True:
+        # This invocation staged and committed the row (``session.create``'s ``info['created']``),
+        # so the resume that follows must not re-judge the policy it just sent: the marker travels
+        # on the run object, never over the wire, and only for this id.
+        #
+        # A row the gateway resolved (``created: false`` — a title race included) and a gateway too
+        # old to report it get no marker, so their resume compares exactly as before.
+        args.resume_created_here = snapshot["stored_session_id"]
     return snapshot["stored_session_id"]

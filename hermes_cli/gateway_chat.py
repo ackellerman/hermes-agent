@@ -312,9 +312,31 @@ def _same_model_spelling(typed, frozen_model):
             and typed.replace(".", "-") == frozen_model)
 
 
-def check_resume_policy(args, snapshot):
+def created_here_matches(snapshot, created_here):
+    """True when *created_here* — the id a run's own titled create returned — is the session this
+    snapshot answers.
+
+    The exemption is that narrow on purpose: a create's reply can only speak for the row it made,
+    so a marker naming any other session (a second invocation, or a row a title race handed back)
+    matches nothing and the comparison runs.
+    """
+    if not created_here or not isinstance(snapshot, dict):
+        return False
+    return created_here in (snapshot.get("stored_session_id"), snapshot.get("session_id"))
+
+
+def check_resume_policy(args, snapshot, created_here=None):
     """A resume may repeat the flags the session was created with (scripts re-run one command
-    line); anything that would CHANGE the frozen route is refused, as before."""
+    line); anything that would CHANGE the frozen route is refused, as before.
+
+    ``created_here``: the id this process's own titled create minted (``create_titled_session``).
+    When it is the session being resumed the comparison is skipped as a whole — an early return
+    ahead of every rule below, because the frozen policy is the one this invocation just sent and
+    no mapping or re-resolution has anything to say about it. A marker for another session, a
+    resolved row (``created: false``) and a client that passes nothing all check exactly as before.
+    """
+    if created_here_matches(snapshot, created_here):
+        return
     requested = _requested_policy(args)
     if getattr(args, "in_dir", None):
         requested["cwd"] = str(Path(args.in_dir).expanduser().resolve())
