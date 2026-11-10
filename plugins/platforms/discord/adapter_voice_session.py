@@ -85,6 +85,8 @@ class DiscordVoiceSessionMixin:
     _voice_listen_tasks: dict[int, asyncio.Task]
     _voice_mixers: dict[int, Any]
     _voice_timeout_limit: Callable[[], int]
+    _cancel_voice_ready_gate: Callable[[int], None]
+    _release_voice_stt_lease: Callable[[int], None]
     _on_voice_disconnect: Optional[Callable]
     _client: Any
     _is_allowed_user: Any
@@ -275,6 +277,11 @@ class DiscordVoiceSessionMixin:
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
         finally:
+            # The ready gate dies with the session, and its STT lease goes with it: all three
+            # session-end paths funnel through here (command/auto leave, a close Discord made,
+            # shutdown), so no ``discord:voice:<guild>`` lease outlives the join (plan step 7).
+            self._cancel_voice_ready_gate(guild_id)
+            self._release_voice_stt_lease(guild_id)
             if taken is None:  # the leave raised before the take: the session still ends, once
                 taken = self._take_voice_session(guild_id, None, captured_for)
             if taken is not None:
