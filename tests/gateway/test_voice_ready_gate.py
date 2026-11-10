@@ -364,6 +364,9 @@ async def test_the_tone_waits_for_both_the_dave_commit_and_the_lease(monkeypatch
     release.set()
     assert await _until(lambda: _ready(env))
     assert len(env.calls) == 1
+    # Nothing about per-speaker mapping or the decryptor gates the tone: no packet ever arrived, so
+    # no SSRC is mapped and no decoder exists.
+    assert env.receiver._ssrc_to_user == {} and env.receiver._decoders == {}
 
 
 @pytest.mark.asyncio

@@ -263,18 +263,23 @@ class DiscordVoiceReadyMixin:
         started = time.monotonic()
         deadline = started + timeout
         reason: Optional[str] = None
-        while True:
-            state, detail = self._voice_ready_state(guild_id, lease_task=lease_task)
-            if state == "ready":
-                break
-            if state == "error":
-                reason = detail
-                break
-            if time.monotonic() >= deadline:
-                # The gate opens anyway: a join never stays deaf (plan step 9).
-                reason = f"{detail} after {timeout:g}s"
-                break
-            await asyncio.sleep(READY_POLL_SECONDS)
+        try:
+            while True:
+                state, detail = self._voice_ready_state(guild_id, lease_task=lease_task)
+                if state == "ready":
+                    break
+                if state == "error":
+                    reason = detail
+                    break
+                if time.monotonic() >= deadline:
+                    # The gate opens anyway: a join never stays deaf (plan step 9).
+                    reason = f"{detail} after {timeout:g}s"
+                    break
+                await asyncio.sleep(READY_POLL_SECONDS)
+        except Exception as exc:  # a broken check must degrade, not leave the join silent
+            logger.warning("[Discord] ready check failed (guild=%d): %s", guild_id, exc,
+                           exc_info=True)
+            reason = f"the ready check failed: {exc}"
         result = _lease_result(lease_task)
         if reason is None:
             reason = self._voice_ready_degraded_reason(result)
