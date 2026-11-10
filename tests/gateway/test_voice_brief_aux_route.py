@@ -412,7 +412,9 @@ def test_exhausted_session_route_walks_the_profiles_fallback_providers(lanes, ed
                                             ("lane-b", "modelB"), (BRIEF_OUTPUT,),
                                             (GUILD_ID, True), (CHAT_ID, BRIEF_OUTPUT)]
     logs = _model_logs(caplog)
-    assert any("served by lane-b/modelB" in line and "lane-b" in line.split("via")[-1] for line in logs), logs
+    # The whole served-by tail: "lane-b" alone is already the lane NAME and sits in the requested
+    # half of this line, so a check that ignores the " via " clause proves nothing.
+    assert any("served by lane-b/modelB via lane-b" in line for line in logs), logs
 
 
 # ---------------------------------------------------------------------------
@@ -483,13 +485,24 @@ def test_the_wait_for_bound_follows_the_configured_task_timeout(edge, monkeypatc
     async def _hang(route, messages):
         await asyncio.sleep(3)
 
+    bounds: list[float] = []
+    real_wait_for = asyncio.wait_for
+
+    async def _record(awaitable, *, timeout):
+        bounds.append(timeout)
+        return await real_wait_for(awaitable, timeout=timeout)
+
     monkeypatch.setattr(voice_brief, "_ask_model", _hang)
+    monkeypatch.setattr(voice_brief.asyncio, "wait_for", _record)
     monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: _config(timeout=0.05))
 
     started = time.monotonic()
     with pytest.raises(voice_brief.VoiceBriefError, match="model call failed"):
         _deliver(edge)
     elapsed = time.monotonic() - started
+    # The exact bound the outer wait_for received, not just "less than the 15s constant"...
+    assert bounds == [0.05], bounds
+    # ...and the call really was abandoned at it.
     assert elapsed < 1.5, f"the brief waited {elapsed:.2f}s for a 0.05s configuration"
     assert ORDER == []
 
