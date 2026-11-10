@@ -190,6 +190,24 @@ class GatewayStartupMixin:
             return
         self._startup_warmup_task = asyncio.ensure_future(self._warm_turn_prerequisites())
 
+    def _start_startup_stt_check(self) -> None:
+        """Kick off the local-STT CUDA check (+ warm) as a FIRE-AND-FORGET task.
+
+        Deliberately not part of ``_warm_turn_prerequisites``: that warm-up is awaited with the
+        inbound gate shut for up to ``HERMES_STARTUP_WARMUP_TIMEOUT`` (20 s), and importing
+        ctranslate2 plus loading medium must never delay gateway start (#stt-cuda-survives-update
+        step 4). Nothing awaits this task; it is only kept reachable and reported on failure."""
+        self._startup_stt_task = asyncio.ensure_future(self._check_startup_stt())
+        self._startup_stt_task.add_done_callback(
+            self._late_failure_callback("startup local-STT CUDA check failed", level=logging.DEBUG))
+
+    async def _check_startup_stt(self) -> None:
+        """Run the check on an executor thread inside the launch profile's scope, so ``stt.*``
+        resolves for the profile that launched the gateway (multiplex fails closed unscoped)."""
+        from tools.stt_startup import check_local_stt_at_startup
+        with _log_suppressed(logging.DEBUG, "Startup local-STT CUDA check failed", exc_info=True):
+            await self._run_boot_probe_in_launch_scope(check_local_stt_at_startup)
+
     async def _run_boot_probe_in_launch_scope(self, fn):
         """Run a boot-time probe on the default executor under the LAUNCH profile's scope when
         multiplexing (the ``_discover_gateway_mcp_tools`` shape). Boot probes (``check_fn``s) read profile-scoped secrets; an unscoped read under multiplex fails
@@ -1725,6 +1743,9 @@ class GatewayStartupMixin:
         # Fresh boot: the gate opens while the turn machinery is still cold (skeleton prompts). Warm NOW
         # to overlap the connects; _finish_startup_restore awaits it (bounded).
         self._start_startup_warmup()
+        # Local STT's CUDA check + warm is a SEPARATE fire-and-forget task: never awaited here, so a
+        # medium load cannot hold the inbound gate (plan step 4).
+        self._start_startup_stt_check()
         startup_nonretryable_errors: list[str] = []
         startup_retryable_errors: list[str] = []
         self._startup_parked_platforms = False  # fresh boot: no platform has failed yet

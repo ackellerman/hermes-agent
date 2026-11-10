@@ -26,8 +26,12 @@ instantly eligible for unload.
 from __future__ import annotations
 
 import logging
+import os
+import shutil
+import tempfile
 import threading
 import time
+import wave
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("tools.stt_lease")
@@ -35,9 +39,76 @@ logger = logging.getLogger("tools.stt_lease")
 _stt_lease_lock = threading.Lock()
 _stt_leases: set = set()
 
+# A warm-up must prove the DEVICE, not the load: ctranslate2 only dlopens cuBLAS on the first
+# inference, so one second of digital silence through ``transcribe`` is what separates a working
+# CUDA model from one that fails on the user's first clip (plan r5 F1).
+_WARM_AUDIO_SECONDS = 1.0
+_WARM_SAMPLE_RATE = 16_000
+
+
+def _warm_silence_path() -> str:
+    """~1 s of 16 kHz mono 16-bit silence as a temp WAV.
+
+    A file rather than a numpy array on purpose: numpy is not a core dependency, and the warm must
+    work anywhere faster-whisper does (its test environments included).
+    """
+    path = os.path.join(tempfile.mkdtemp(prefix="hermes-stt-warm-"), "silence.wav")
+    with wave.open(path, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(_WARM_SAMPLE_RATE)
+        wav.writeframes(b"\x00\x00" * int(_WARM_SAMPLE_RATE * _WARM_AUDIO_SECONDS))
+    return path
+
+
+def _effective_device(model: Any) -> str:
+    """The device ctranslate2 resolved for *model* (``WhisperModel.model.device``, ``auto`` already
+    resolved); ``"unknown"`` for a model object that does not expose one."""
+    for holder in (getattr(model, "model", None), model):
+        device = getattr(holder, "device", None)
+        if isinstance(device, str) and device.strip():
+            return device.strip().lower()
+    return "unknown"
+
+
+def _warm_inference(model: Any, model_name: str, stt_config: dict[str, Any]) -> tuple[str, int]:
+    """Transcribe ~1 s of silence so the effective device is proven, not assumed.
+
+    Returns ``(effective_device, transcribe_ms)``. A CUDA library error is the same failure
+    ``_transcribe_local`` retries on CPU (faster-whisper decodes lazily, so it surfaces while the
+    segments are consumed, inside the guard): evict the poisoned model exactly as
+    ``_replace_cached_model_on_cpu`` does and warm the CPU one, so the reported device is the one
+    the next clip will use.
+    """
+    from tools import transcription_tools
+    from tools.transcription_local import build_local_transcribe_kwargs
+
+    kwargs = build_local_transcribe_kwargs(stt_config)
+    # VAD would drop the whole clip and prove nothing about the decode path.
+    kwargs["vad_filter"] = False
+    kwargs.pop("vad_parameters", None)
+    warm_path = _warm_silence_path()
+    started = time.monotonic()
+    try:
+        try:
+            segments, _info = model.transcribe(warm_path, **kwargs)
+            list(segments)
+        except Exception as exc:
+            if not transcription_tools._looks_like_cuda_lib_error(exc):
+                raise
+            logger.warning("[STT] warm-up inference on '%s' failed on CUDA (%s) — evicting the "
+                           "cached model and warming CPU (int8)", model_name, exc)
+            model = transcription_tools._replace_cached_model_on_cpu(model_name)
+            segments, _info = model.transcribe(warm_path, **kwargs)
+            list(segments)
+    finally:
+        shutil.rmtree(os.path.dirname(warm_path), ignore_errors=True)
+    return _effective_device(model), int((time.monotonic() - started) * 1000)
+
 
 def warm_stt_provider(
-    stt_config: Optional[dict[str, Any]] = None, provider: Optional[str] = None
+    stt_config: Optional[dict[str, Any]] = None, provider: Optional[str] = None, *,
+    install: bool = True,
 ) -> dict[str, Any]:
     """Pre-load the configured STT engine so the next transcription starts hot.
 
@@ -47,6 +118,14 @@ def warm_stt_provider(
     shells out to an external binary and cloud providers are remote, so both
     are ``action: "noop"``. The result carries ``provider`` / ``warmed`` /
     ``action`` / ``error``.
+
+    Every local lease ends with one short inference (``_warm_inference``) so the result's
+    ``device`` is the EFFECTIVE one after any CPU fallback, plus ``model`` and
+    ``transcribe_ms`` — a cache hit is warmed too, because a cached model has not proved CUDA.
+
+    ``install=False`` skips the lazy install: boot probes and the voice-join lease must never
+    start a dependency rebuild (``transcription_local._try_lazy_install_stt``'s docstring). The
+    default keeps the desktop lease's behaviour.
     """
     from tools import transcription_tools
     from tools.transcription_local import _normalize_local_model
@@ -60,9 +139,10 @@ def warm_stt_provider(
     if name == "local_command":
         result.update(warmed=True)
         return result
-    if not transcription_tools._HAS_FASTER_WHISPER and not transcription_tools._try_lazy_install_stt():
-        result.update(action="error", error="faster-whisper not installed")
-        return result
+    if not transcription_tools._HAS_FASTER_WHISPER:
+        if not install or not transcription_tools._try_lazy_install_stt():
+            result.update(action="error", error="faster-whisper not installed")
+            return result
     local_cfg = stt_config.get("local") or {}
     # Same name transcription itself resolves (config > default, cloud-only
     # names normalized) so warm-up fills the slot the next request reads.
@@ -77,6 +157,8 @@ def warm_stt_provider(
         if model is None:  # defensive: load failed without raising
             result.update(action="error", error="Local whisper model failed to load")
             return result
+        # Prove the device, not the load: one short inference, CPU fallback on a CUDA lib error.
+        device, transcribe_ms = _warm_inference(model, model_name, stt_config)
         # A just-warmed model counts as activity: the idle-unload watcher must
         # not treat the load itself as idle time and evict it immediately.
         transcription_tools._touch_transcription_time()
@@ -94,21 +176,27 @@ def warm_stt_provider(
         result.update(action="error", error=str(exc))
         return result
     elapsed_ms = int((time.monotonic() - started) * 1000)
-    result.update(warmed=True, action="cached" if hot_before else "loaded", elapsed_ms=elapsed_ms)
-    logger.info("[STT] warm-up local model '%s': %s in %dms", model_name, result["action"], elapsed_ms)
+    result.update(warmed=True, action="cached" if hot_before else "loaded", elapsed_ms=elapsed_ms,
+                  model=model_name, device=device, transcribe_ms=transcribe_ms)
+    logger.info("[STT] warm-up local model '%s': %s in %dms (model=%s, device=%s, transcribe_ms=%d)",
+                model_name, result["action"], elapsed_ms, model_name, device, transcribe_ms)
     return result
 
 
-def acquire_stt_lease(lease: str, stt_config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """Register ``lease`` (e.g. ``"desktop:voice-input:abcd1234"``) and warm the engine.
+def acquire_stt_lease(
+    lease: str, stt_config: Optional[dict[str, Any]] = None, *, install: bool = True
+) -> dict[str, Any]:
+    """Register ``lease`` (e.g. ``desktop:voice-input:abcd1234``) and warm the engine.
 
     Re-acquiring is idempotent but still re-warms (cheap on a cache hit; heals
-    a cache the idle-unload watcher cleared meanwhile).
+    a cache the idle-unload watcher cleared meanwhile). ``install`` is forwarded to
+    :func:`warm_stt_provider`: a surface that must never start a dependency rebuild passes
+    ``install=False``.
     """
     with _stt_lease_lock:
         _stt_leases.add(lease)
         holders = len(_stt_leases)
-    return {**warm_stt_provider(stt_config), "leases": holders}
+    return {**warm_stt_provider(stt_config, install=install), "leases": holders}
 
 
 def release_stt_lease(lease: str) -> dict[str, Any]:

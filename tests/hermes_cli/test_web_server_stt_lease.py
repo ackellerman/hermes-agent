@@ -11,6 +11,7 @@ gateway/CLI surfaces in the same backend process.
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -73,6 +74,23 @@ def _local_cfg(monkeypatch, model="tiny"):
     monkeypatch.setattr(transcription_tools, "_get_provider", lambda cfg: "local")
 
 
+class _WarmModel:
+    """A loaded WhisperModel stand-in.
+
+    Every lease ends with one short inference on the model (the warm proves the effective
+    device, not just the load), so the fake has to be transcribable — ``model.model.device``
+    mirrors ``ctranslate2``'s resolved device.
+    """
+
+    def __init__(self, device="cpu"):
+        self.model = SimpleNamespace(device=device)
+        self.transcribed: list[dict] = []
+
+    def transcribe(self, audio, **kwargs):
+        self.transcribed.append(kwargs)
+        return iter([]), SimpleNamespace(language="en", duration=1.0)
+
+
 def test_active_acquires_and_warms(client, monkeypatch):
     from tools import stt_lease
 
@@ -80,7 +98,7 @@ def test_active_acquires_and_warms(client, monkeypatch):
     monkeypatch.setattr(
         stt_lease,
         "warm_stt_provider",
-        lambda cfg=None, provider=None: warmed.append(1)
+        lambda cfg=None, provider=None, install=True: warmed.append(install)
         or {"provider": "local", "warmed": True, "action": "loaded"},
     )
 
@@ -92,7 +110,9 @@ def test_active_acquires_and_warms(client, monkeypatch):
     assert body["active"] is True
     assert body["leases"] == 1
     assert body["action"] == "loaded"
-    assert warmed == [1]
+    # The desktop lease keeps the DEFAULT: it may lazy-install faster-whisper (install=False is
+    # for boot probes and the voice-join lease, which must never start a rebuild).
+    assert warmed == [True]
     assert stt_lease.stt_lease_holders() == ["desktop:voice-input:abc"]
 
 
@@ -100,7 +120,8 @@ def test_inactive_releases_without_unloading(client, monkeypatch):
     from tools import stt_lease, transcription_tools
 
     monkeypatch.setattr(
-        stt_lease, "warm_stt_provider", lambda cfg=None, provider=None: {"action": "noop", "warmed": False, "provider": "openai"}
+        stt_lease, "warm_stt_provider",
+        lambda cfg=None, provider=None, install=True: {"action": "noop", "warmed": False, "provider": "openai"}
     )
     client.post("/api/audio/stt-lease", json={"lease": "desktop:voice-input:a", "active": True})
     client.post("/api/audio/stt-lease", json={"lease": "desktop:voice-input:b", "active": True})
@@ -121,7 +142,7 @@ def test_inactive_releases_without_unloading(client, monkeypatch):
 def test_warm_failure_is_reported_not_an_http_error(client, monkeypatch):
     from tools import stt_lease
 
-    def _boom(cfg=None, provider=None):
+    def _boom(cfg=None, provider=None, install=True):
         raise RuntimeError("engine exploded")
 
     monkeypatch.setattr(stt_lease, "warm_stt_provider", _boom)
@@ -143,10 +164,11 @@ def test_warm_loads_configured_local_model_into_transcription_slot(monkeypatch):
 
     _local_cfg(monkeypatch, model="small")
     loaded = []
+    model = _WarmModel()
     monkeypatch.setattr(
         transcription_tools,
         "_get_or_load_local_model",
-        lambda name, cfg: loaded.append((name, cfg)) or object(),
+        lambda name, cfg: loaded.append((name, cfg)) or model,
     )
 
     result = stt_lease.warm_stt_provider()
@@ -158,13 +180,18 @@ def test_warm_loads_configured_local_model_into_transcription_slot(monkeypatch):
     # same loader transcription reads — not a shadow cache.
     assert loaded and loaded[0][0] == "small"
     assert "elapsed_ms" in result
+    # The lease also proves the device: one short inference, and it reports which device ran it.
+    assert model.transcribed
+    assert result["model"] == "small"
+    assert result["device"] == "cpu"
+    assert "transcribe_ms" in result
 
 
 def test_warm_reports_cached_when_model_already_resident(monkeypatch):
     from tools import stt_lease, transcription_tools
 
     _local_cfg(monkeypatch, model="tiny")
-    sentinel = object()
+    sentinel = _WarmModel()
     transcription_tools._local_model, transcription_tools._local_model_name = sentinel, "tiny"
     calls = []
     monkeypatch.setattr(
@@ -180,7 +207,12 @@ def test_warm_reports_cached_when_model_already_resident(monkeypatch):
         "warmed": True,
         "action": "cached",
         "elapsed_ms": result["elapsed_ms"],
+        "model": "tiny",
+        "device": "cpu",
+        "transcribe_ms": result["transcribe_ms"],
     }
+    # A cache hit has not proved CUDA either (critic r6 F1): the inference still runs.
+    assert sentinel.transcribed
 
 
 def test_warm_is_noop_for_cloud_providers(monkeypatch):
@@ -244,7 +276,7 @@ def test_warm_only_load_starts_idle_unload_watcher(monkeypatch):
     # Backdate the activity so the first watcher cycle (0.01s) already sees
     # the configured idle window as elapsed.
     monkeypatch.setattr(transcription_tools, "_last_transcription_time", 0.0)
-    real_model = object()
+    real_model = _WarmModel()
     monkeypatch.setattr(
         transcription_tools,
         "_get_or_load_local_model",
@@ -289,7 +321,7 @@ def test_warm_reacquire_after_eviction_restarts_watcher(monkeypatch):
         transcription_tools, "_idle_unload_thread", type("Dead", (), {"is_alive": lambda self: False})()
     )
 
-    real_model = object()
+    real_model = _WarmModel()
     monkeypatch.setattr(
         transcription_tools, "_get_or_load_local_model", lambda name, cfg: real_model
     )
