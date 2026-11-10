@@ -169,6 +169,12 @@ class DiscordVoiceReadyMixin:
     def _start_voice_ready_gate(self, guild_id: int) -> asyncio.Task:
         """Take the join's STT lease (off the event loop) and start the ready cycle."""
         self._cancel_voice_ready_gate(guild_id)
+        # A move re-arms the gate inside the same session, and the previous cycle's lease — plus
+        # the warm it may still have in flight — is released before the new one takes its place.
+        # Overwriting `_voice_lease_tasks[guild_id]` without this loses the abandoned future's
+        # done-callback, so a warm that registers `discord:voice:<guild>` after the leave keeps the
+        # name held forever (integration 2c / e6 finding 2).
+        self._release_voice_stt_lease(guild_id)
         lease = f"discord:voice:{guild_id}"
         self._ready_map("_voice_stt_leases")[guild_id] = lease
         # The warm blocks for the whole model load (cold download + medium on CPU is minutes), so it

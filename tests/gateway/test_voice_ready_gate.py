@@ -527,6 +527,65 @@ async def test_each_session_end_path_releases_the_join_lease(path, monkeypatch, 
     assert stt_lease.stt_lease_holders() == [], f"the {path} path left the join's lease held"
 
 
+@pytest.mark.asyncio
+async def test_a_move_abandons_the_first_lease_and_releases_it_when_it_finishes(
+        monkeypatch, real_lease):
+    """A move re-arms the gate, so the abandoned warm must not hold the lease afterwards.
+
+    The first worker is held BEFORE it registers (``acquire_stt_lease`` registers inside the
+    worker thread), so the move overwrites a future that never started: the leave releases the new
+    lease, and the abandoned worker's late registration has to be released by its own
+    done-callback — otherwise ``discord:voice:<guild>`` outlives the join (integration 2c, e6 2).
+    """
+    adapter = fx.make_adapter(bot_user_id=ME)
+    adapter._voice_fx_cfg = {**adapter._voice_fx_cfg, "ready_tone_enabled": False}
+    started, proceed, finished = threading.Event(), threading.Event(), threading.Event()
+    calls: list[str] = []
+
+    def lease(name, install=False):
+        calls.append(name)
+        first = len(calls) == 1
+        if first:                        # the warm the move abandons
+            started.set()
+            proceed.wait(10)
+        try:
+            return stt_lease.acquire_stt_lease(name, install=False)
+        finally:
+            if first:
+                finished.set()
+
+    adapter._voice_stt_lease_acquire = lease
+    _patch_discord(monkeypatch)
+    env = _Env(adapter, [])
+    lease_name = f"discord:voice:{GUILD}"
+
+    await _join(env)
+    assert await _until(started.is_set)
+    assert lease_name not in stt_lease.stt_lease_holders()
+
+    await _join(env, _channel(adapter, VOICE_B, members=[_member(OPERATOR)]))
+    assert env.vc.channel.id == VOICE_B
+    assert await _until(lambda: len(calls) == 2), "the move did not take a fresh lease"
+    assert calls == [lease_name, lease_name]
+    # Let the SECOND warm finish before the leave: its done-callback (if any) releases the shared
+    # name, which would mask the abandoned worker's late registration.
+    second = adapter._voice_lease_tasks[GUILD]
+    assert await _until(second.done, timeout=10)
+    assert await _until(lambda: lease_name in stt_lease.stt_lease_holders())
+
+    await adapter.leave_voice_channel(GUILD)
+    assert stt_lease.stt_lease_holders() == [], "the leave left the join's lease held"
+
+    proceed.set()                        # the abandoned warm registers and finishes now
+    assert await _until(finished.is_set, timeout=5)
+    for _ in range(20):                  # the done-callback lands on the loop, not inline
+        if stt_lease.stt_lease_holders():
+            break
+        await asyncio.sleep(0.01)
+    assert stt_lease.stt_lease_holders() == [], \
+        "the abandoned worker kept the lease after it finished"
+
+
 # --- the tone --------------------------------------------------------------------------------------
 
 
