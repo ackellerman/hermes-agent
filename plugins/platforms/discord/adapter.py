@@ -1108,8 +1108,14 @@ class VoiceReceiver:
                 # Frames held under the previous ratchet/epoch cannot be
                 # authenticated under the new one: replay would fail per frame
                 # and silently lose the utterance's opening, so drop and count
-                # them instead.
-                self._drop_held_voice_payloads("dave-epoch")
+                # them instead — but only when a ratchet is actually being
+                # lost.  A generation that never settled (DAVE still
+                # negotiating) had no ratchet, so nothing it held is tied to
+                # one: those frames were heard during the join's deaf window,
+                # and the ready cut owns them — the replay skips each one by
+                # ARRIVAL time before it reaches the new generation's decrypt.
+                if self._ratchet_live(previous) or not self._ratchet_live(self._creds):
+                    self._drop_held_voice_payloads("dave-epoch")
             self._nacl_fail_streak = 0
             logger.info(
                 "VoiceReceiver credentials refreshed (%s; bot_ssrc=%d, dave=%s)",
@@ -1199,6 +1205,17 @@ class VoiceReceiver:
         if pending:
             self._bot_audio_dropped += len(pending)
             logger.info("Discarded %d held voice payloads from bot ssrc=%d", len(pending), ssrc)
+
+    @staticmethod
+    def _ratchet_live(creds) -> bool:
+        """Whether that credential generation could authenticate a frame at all.
+
+        ``ready`` is discord.py's own ``can_encrypt`` signal on the DAVE session: a session that
+        never reported it never established a ratchet, so no frame it held is tied to one.  The
+        join's ready cut owns those frames instead (see ``refresh_credentials``).
+        """
+        session = creds[1]
+        return session is not None and bool(getattr(session, "ready", False))
 
     def _drop_held_voice_payloads(self, reason: str) -> int:
         """Drop every payload the DAVE ring is holding, and return the frame count.

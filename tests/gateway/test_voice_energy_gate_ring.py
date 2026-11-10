@@ -403,6 +403,31 @@ def test_a_refresh_that_keeps_the_session_keeps_the_ring(nacl, decoders):
     assert receiver._dave_unmapped_dropped == 0
 
 
+def test_the_commit_that_finally_settles_dave_keeps_the_ring_for_the_ready_cut(nacl, decoders):
+    """A session that never reported ``ready`` established no ratchet, so nothing it held is tied
+    to a dead one.  The swap that finally makes DAVE ready is the join's own commit: its held
+    frames belong to the deaf window, and the ready cut drops them by ARRIVAL time when the ring
+    replays — purging them here would lose them un-counted by ``pre_ready_dropped``."""
+    class _Settling:
+        def __init__(self, ready: bool) -> None:
+            self.ready = ready
+
+        def decrypt(self, user_id, media_type, data: bytes) -> bytes:
+            return data
+
+    receiver = _receiver(members=[_member(_OPERATOR), _member(_STRANGER), _member(_ME, True)],
+                         dave_session=_Settling(ready=False), dave_pver=1)
+    _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"pre-tone")
+    assert len(receiver._dave_pending[_SSRC_PERSON]) == 1
+
+    receiver._vc._connection.dave_session = _Settling(ready=True)
+    receiver.refresh_credentials("voice ws op 22")
+
+    assert len(receiver._dave_pending[_SSRC_PERSON]) == 1
+    assert receiver._dave_unmapped_dropped == 0
+    assert _decoded(decoders) == []
+
+
 def test_the_ttl_sweep_counts_and_logs_what_it_expires(nacl, decoders, caplog):
     """TTL expiry is the ordinary outcome when SPEAKING never arrives: it must be counted and named,
     or the teardown line reads ``dave_unmapped_dropped=0`` while an utterance was lost."""
