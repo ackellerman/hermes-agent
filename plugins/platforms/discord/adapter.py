@@ -865,7 +865,9 @@ def _discord_ready_timeout_seconds() -> float:
 # negotiated), op 21 DAVE_PREPARE_TRANSITION, op 22 DAVE_EXECUTE_TRANSITION and op 24
 # DAVE_PREPARE_EPOCH.  Each one reinitialises or advances the MLS ratchet, and discord.py does it
 # in place — neither ``dave_session`` nor ``dave_protocol_version`` moves — so the receiver needs
-# the trigger to know its held payloads' ratchet is gone (``refresh_credentials``).
+# the trigger to know its held payloads' ratchet is gone (``refresh_credentials``).  Binary MLS ops
+# (welcome/commit, 28-30) re-key the group too but never reach this hook; the held frames carry
+# their capture generation, so ``_replay_dave_pending`` catches those.
 _DAVE_TRIGGER_OPS = frozenset({4, 21, 22, 24})
 
 
@@ -1130,25 +1132,22 @@ class VoiceReceiver:
                 or previous[1] is not self._dave_session
                 or previous[2] != self._dave_protocol_version
             ):
-                # Frames held under the previous ratchet/epoch cannot be
-                # authenticated under the new one: replay would fail per frame
-                # and silently lose the utterance's opening, so drop and count
-                # them instead — but only when a ratchet is actually being
-                # lost.  A generation that never settled (DAVE still
-                # negotiating) had no ratchet, so nothing it held is tied to
-                # one: those frames were heard during the join's deaf window,
-                # and the ready cut owns them — the replay skips each one by
-                # ARRIVAL time before it reaches the new generation's decrypt.
+                # Frames held under a ratchet this op supersedes cannot be authenticated
+                # afterwards: replay would fail per frame and silently lose the utterance's
+                # opening, so drop and count them.
                 #
-                # The two rules compose: the outer test is TRIGGER-driven (a
-                # DAVE state change at ops 4/21/22/24 or a membership change),
-                # this one is STATE-driven (is a live ratchet being lost?).  The
-                # join's own op-22 commit passes the trigger but fails this
-                # test — previous generation not live, new one live — so the
-                # deaf window's frames reach the ready cut instead of being
-                # purged here.
-                if self._ratchet_live(previous) or not self._ratchet_live(self._creds):
-                    self._drop_held_voice_payloads("dave-epoch")
+                # WHICH frames those are is decided by the generation each one was captured
+                # under, never by the session object's current state.  ``previous`` shares the
+                # object discord.py just mutated in place, so "was a ratchet live before the op?"
+                # asked now reads the POST-op answer — at the join's own op-22 commit that is
+                # "yes", and the deaf window's frames would be purged by the very op that settles
+                # DAVE.  Held frames carry their capture generation for exactly this reason.
+                #
+                # The outer test stays TRIGGER-driven (a DAVE state change at ops 4/21/22/24 or a
+                # membership change, plus the tuple diffs it can see) because an in-place reinit
+                # changes nothing observable; the inner rule is per FRAME (see
+                # ``_drop_superseded_ratchet_locked``).
+                self._drop_superseded_ratchet("dave-epoch")
             self._nacl_fail_streak = 0
             logger.info(
                 "VoiceReceiver credentials refreshed (%s; bot_ssrc=%d, dave=%s)",
@@ -1242,21 +1241,75 @@ class VoiceReceiver:
             self._bot_audio_dropped += len(pending)
             logger.info("Discarded %d held voice payloads from bot ssrc=%d", len(pending), ssrc)
 
-    @staticmethod
-    def _ratchet_live(creds) -> bool:
-        """Whether that credential generation could authenticate a frame at all.
+    def _dave_generation(self) -> tuple:
+        """The DAVE generation a held frame is captured (and later decrypted) under.
 
-        ``ready`` is discord.py's own ``can_encrypt`` signal on the DAVE session: a session that
-        never reported it never established a ratchet, so no frame it held is tied to one.  The
-        join's ready cut owns those frames instead (see ``refresh_credentials``).
+        ``(protocol_version, session, ready, epoch)``.  The object alone cannot answer which
+        ratchet a frame belongs to: discord.py re-keys in place (``reinit_dave_session`` calls
+        ``.reinit(...)`` on the live ``DaveSession``), and an MLS commit advances ``.epoch``
+        without touching ``conn.dave_session``.  Capturing this with the frame is what lets the
+        purge and the replay decide per frame, long after the object has moved on.
         """
-        session = creds[1]
-        return session is not None and bool(getattr(session, "ready", False))
+        session = self._dave_session
+        return (
+            self._dave_protocol_version,
+            session,
+            bool(getattr(session, "ready", False)),
+            getattr(session, "epoch", None),
+        )
+
+    @staticmethod
+    def _generation_ratchet_live(generation: tuple) -> bool:
+        """Whether that generation could authenticate a frame at all.
+
+        ``ready`` is discord.py's own ``can_encrypt`` signal on the DAVE session: a generation that
+        never reported it established no ratchet, so no frame it captured is tied to one.  Those
+        frames were heard during the join's deaf window and the ready cut owns them.
+        """
+        return generation[0] > 0 and generation[1] is not None and generation[2]
+
+    @staticmethod
+    def _same_generation(left: tuple, right: tuple) -> bool:
+        """Same protocol version, same session object, same readiness, same epoch."""
+        return (left[0] == right[0] and left[1] is right[1]
+                and left[2] == right[2] and left[3] == right[3])
+
+    def _drop_superseded_ratchet_locked(self, reason: str) -> int:
+        """Drop the held frames a DAVE state change superseded (call under ``_lock``).
+
+        Per FRAME, by the generation that captured it: a frame held while a ratchet was live
+        cannot be decrypted under the one that replaced it, while a frame held before DAVE settled
+        had no ratchet to lose — that one is left for the ready cut, which drops it by arrival time
+        when the ring replays.  Returns the number of frames dropped.
+        """
+        dropped = 0
+        ssrcs = 0
+        for ssrc, pending in list(self._dave_pending.items()):
+            kept = [frame for frame in pending if not self._generation_ratchet_live(frame[2])]
+            if len(kept) == len(pending):
+                continue
+            dropped += len(pending) - len(kept)
+            ssrcs += 1
+            pending.clear()
+            pending.extend(kept)
+            if not kept:
+                self._dave_pending.pop(ssrc, None)
+        self._dave_unmapped_dropped += dropped
+        if dropped:
+            logger.info(
+                "Discarded %d held voice payloads (%s; ssrcs=%d)", dropped, reason, ssrcs,
+            )
+        return dropped
+
+    def _drop_superseded_ratchet(self, reason: str) -> int:
+        """``_drop_superseded_ratchet_locked`` taking ``_lock`` (the ws hook, the packet path)."""
+        with self._lock:
+            return self._drop_superseded_ratchet_locked(reason)
 
     def _drop_held_voice_payloads_locked(self, reason: str) -> int:
         """Drop every held payload and return the frame count (call under ``_lock``).
 
-        Split out of the public helper so ``discard_pending`` can clear the PCM buffers and the
+        Split out of the locking wrapper so ``discard_pending`` can clear the PCM buffers and the
         ring in one critical section: a replay through ``_replay_dave_pending`` landing in the
         gap would push a pre-move frame into the fresh buffer and get it stamped with the new
         binding at flush time (#130311).
@@ -1270,22 +1323,6 @@ class VoiceReceiver:
                 "Discarded %d held voice payloads (%s; ssrcs=%d)", frames, reason, ssrcs,
             )
         return frames
-
-    def _drop_held_voice_payloads(self, reason: str) -> int:
-        """Drop every payload the DAVE ring is holding, and return the frame count.
-
-        Held frames are audio *captured* for a state that no longer applies: a text-binding move
-        (replaying them would transcribe the old channel's utterance into the new one, #130311), a
-        DAVE session/epoch change (they cannot be authenticated under the new ratchet), or a
-        receiver starting up (e6's pre-``t_ready`` cut).  This is the same loss as a ring eviction,
-        so the frames land in ``_dave_unmapped_dropped``: the teardown line must never read
-        ``dave_unmapped_dropped=0`` as "nothing was lost" while an utterance was.
-
-        Takes ``_lock`` itself — safe from the packet thread, the ws hook and the listen loop.
-        Callers that already hold ``_lock`` use ``_drop_held_voice_payloads_locked`` instead.
-        """
-        with self._lock:
-            return self._drop_held_voice_payloads_locked(reason)
 
     def _install_speaking_hook(self, conn):
         """Wrap the voice websocket hook to capture SPEAKING events (op 5); ``conn.hook`` is
@@ -1322,8 +1359,11 @@ class VoiceReceiver:
             #   op 24 DAVE_PREPARE_EPOCH  — epoch 1 recreates the MLS group
             # Every one of them is a DAVE state change (``_DAVE_TRIGGER_OPS``), so each passes
             # dave_state_changed: the hold ring must not outlive the ratchet it was captured
-            # under.  refresh_credentials still keeps it while no ratchet is live (the join's
-            # deaf window, which the ready cut owns) — see its docstring.
+            # under.  The purge is per FRAME (see ``_drop_superseded_ratchet_locked``): frames
+            # captured while a ratchet was live go, frames from the join's deaf window stay for
+            # the ready cut.  The binary MLS ops that re-key the group (welcome/commit, 28-30) are
+            # consumed inside discord.py and never reach this hook, so a frame replayed across one
+            # is dropped and counted by `_replay_dave_pending` instead.
             if isinstance(msg, dict):
                 op = msg.get("op")
                 if op in _DAVE_TRIGGER_OPS:
@@ -1565,7 +1605,7 @@ class VoiceReceiver:
                 # Count it: these are the only voice bytes this path can lose.
                 self._dave_unmapped_dropped += 1
                 evicted = self._dave_unmapped_dropped
-            pending.append((held_at, payload))
+            pending.append((held_at, payload, self._dave_generation()))
         if evicted and (evicted == 1 or evicted % 50 == 0):
             logger.info(
                 "DAVE active with unresolved sender: hold ring full, "
@@ -1577,19 +1617,33 @@ class VoiceReceiver:
 
         A held frame keeps its ARRIVAL time, so the ready cut can drop it here even though it is
         released after ``t_ready``: the sender was heard before the tone, whatever the ring's timing.
+        It also keeps the DAVE generation it was captured under, so a frame whose ratchet has
+        since been replaced is dropped (and counted) rather than fed to a decrypt that can only
+        fail.
         """
         with self._lock:
             pending = self._dave_pending.pop(ssrc, None)
             ready_at = self._ready_at
+            current = self._dave_generation()
         if not pending:
             return
         logger.info(
             "Replaying held voice payloads after SSRC resolution (ssrc=%d frames=%d)",
             ssrc, len(pending),
         )
-        for held_at, payload in pending:
+        for held_at, payload, generation in pending:
             if ready_at is not None and held_at <= ready_at:
                 self._pre_ready_dropped += 1
+                continue
+            if (self._generation_ratchet_live(generation)
+                    and not self._same_generation(generation, current)):
+                # An MLS commit re-keyed the group between the hold and this replay.  The binary
+                # ops that do it (welcome/commit, 28-30) are handled inside discord.py's
+                # ``received_binary_message`` and never reach the ws hook, so the first JSON op
+                # afterwards is the only announcement — frames replayed in that gap cannot be
+                # authenticated.  Counting them here is what keeps them out of the silent,
+                # per-frame failure path ``_dave_decrypt`` would otherwise take.
+                self._dave_unmapped_dropped += 1
                 continue
             plaintext = self._dave_decrypt(ssrc, user_id, payload)
             if plaintext is None:

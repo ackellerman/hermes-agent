@@ -124,10 +124,16 @@ def _square_pcm(duration_s: float, amplitude: int) -> bytes:
 
 
 class _RecordingDave:
-    """A DAVE session that records the sender it was asked about and returns the payload."""
+    """A DAVE session that records the sender it was asked about and returns the payload.
+
+    ``ready`` is what a live session reports once the MLS group exists (discord.py's
+    ``can_encrypt``), so frames held under it are tied to a ratchet the triggers can invalidate.
+    """
 
     def __init__(self) -> None:
         self.calls: list[tuple[int, bytes]] = []
+        self.ready = True
+        self.epoch = 1
 
     def decrypt(self, user_id: int, media_type, data: bytes) -> bytes:
         self.calls.append((user_id, bytes(data)))
@@ -234,7 +240,7 @@ def test_unmapped_dave_frame_is_held_then_replayed_in_order(nacl, decoders):
 
     _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"one")
     _packet(nacl, receiver, _SSRC_PERSON, seq=2, payload=b"two")
-    assert [payload for _at, payload in receiver._dave_pending[_SSRC_PERSON]] == [b"one", b"two"]
+    assert [frame[1] for frame in receiver._dave_pending[_SSRC_PERSON]] == [b"one", b"two"]
     assert _SSRC_PERSON not in receiver._decoders
     assert dave.calls == []
 
@@ -267,9 +273,9 @@ def test_a_quiet_unresolved_ssrc_releases_its_ring(nacl, decoders):
     receiver = _receiver(members=[_member(_OPERATOR), _member(_STRANGER), _member(_ME, True)],
                          dave_session=dave, dave_pver=1)
     _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"one")
-    held_at, payload = receiver._dave_pending[_SSRC_PERSON][-1]
+    held_at, payload, generation = receiver._dave_pending[_SSRC_PERSON][-1]
     receiver._dave_pending[_SSRC_PERSON][-1] = (
-        held_at - VoiceReceiver.DAVE_PENDING_TTL - 1.0, payload)
+        held_at - VoiceReceiver.DAVE_PENDING_TTL - 1.0, payload, generation)
 
     receiver.check_silence()
 
@@ -311,7 +317,7 @@ def test_operator_plus_another_bot_is_not_inferred_but_held(nacl, decoders):
 
     assert _SSRC_OPERATOR not in receiver._ssrc_to_user
     assert dave.calls == []
-    assert [payload for _at, payload in receiver._dave_pending[_SSRC_OPERATOR]] == [b"one"]
+    assert [frame[1] for frame in receiver._dave_pending[_SSRC_OPERATOR]] == [b"one"]
 
     # SPEAKING maps it: the held frame is decrypted and replayed for the operator.
     receiver.map_ssrc(_SSRC_OPERATOR, _OPERATOR)
@@ -443,15 +449,17 @@ def test_discard_pending_drops_the_hold_ring(nacl, decoders):
 
 
 def test_the_drop_helper_reports_the_frames_it_dropped(nacl):
-    """e6 calls this helper for its pre-ready cut; the return value is what it reports."""
+    """``discard_pending`` clears buffers and ring in one critical section and reports the loss."""
     receiver = _two_ring_receiver()
     _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"one")
     _packet(nacl, receiver, _SSRC_OPERATOR, seq=2, payload=b"two")
 
-    assert receiver._drop_held_voice_payloads("pre-ready cut") == 2
+    with receiver._lock:
+        assert receiver._drop_held_voice_payloads_locked("text-binding move") == 2
     assert receiver._dave_pending == {}
     assert receiver._dave_unmapped_dropped == 2
-    assert receiver._drop_held_voice_payloads("pre-ready cut") == 0  # idempotent
+    with receiver._lock:
+        assert receiver._drop_held_voice_payloads_locked("text-binding move") == 0  # idempotent
 
 
 def test_a_replaced_dave_session_drops_frames_held_under_the_old_one(nacl, decoders):
@@ -509,29 +517,6 @@ def test_an_in_place_reinit_drops_the_ring_through_the_trigger(nacl, decoders):
     assert _decoded(decoders) == []
 
 
-@pytest.mark.parametrize("op", [21, 22, 24])
-def test_the_ws_hook_flags_every_dave_trigger_op(nacl, decoders, op):
-    """The flag is wired where the trigger is: op 21/22/24 each arrive with the session object and
-    the protocol version unchanged (discord.py reinit()s in place, MLS commits never touch
-    ``conn``), so a state-diff predicate would keep the ring forever.  Through the hook, each one
-    drops and counts it."""
-    dave = _InPlaceDave()
-    receiver = _receiver(members=[_member(_OPERATOR), _member(_STRANGER), _member(_ME, True)],
-                         dave_session=dave, dave_pver=1)
-    _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"old-epoch")
-    assert len(receiver._dave_pending[_SSRC_PERSON]) == 1
-
-    dave.reinit(2)
-    _drive_hook(receiver, op, {"protocol_version": 1})
-
-    assert receiver._dave_session is dave
-    assert receiver._dave_protocol_version == 1
-    assert receiver._dave_pending == {}
-    assert receiver._dave_unmapped_dropped == 1
-    assert dave.calls == []
-    assert _decoded(decoders) == []
-
-
 def test_a_refresh_that_keeps_the_session_keeps_the_ring(nacl, decoders):
     """op 4 on a live ratchet with no DAVE state change (a transport-key-only rekey, and the
     packet path's decrypt-failure-streak refresh) must not throw held audio away."""
@@ -542,35 +527,111 @@ def test_a_refresh_that_keeps_the_session_keeps_the_ring(nacl, decoders):
     receiver.refresh_credentials("voice ws op 4")
     receiver.refresh_credentials("decrypt-failure streak")
 
-    assert [payload for _at, payload in receiver._dave_pending[_SSRC_PERSON]] == [b"one"]
+    assert [frame[1] for frame in receiver._dave_pending[_SSRC_PERSON]] == [b"one"]
     assert receiver._dave_unmapped_dropped == 0
 
 
 def test_the_commit_that_finally_settles_dave_keeps_the_ring_for_the_ready_cut(nacl, decoders):
-    """A session that never reported ``ready`` established no ratchet, so nothing it held is tied
-    to a dead one.  The swap that finally makes DAVE ready is the join's own op-22 commit: it
-    passes ``dave_state_changed=True`` like every other DAVE trigger, but the ratchet guard keeps
-    the ring — the held frames belong to the deaf window, and the ready cut drops them by ARRIVAL
-    time when the ring replays.  Purging them here would lose them uncounted by
-    ``pre_ready_dropped``."""
-    class _Settling:
-        def __init__(self, ready: bool) -> None:
-            self.ready = ready
+    """A session that settles IN PLACE keeps the frames heard while it was settling.
 
-        def decrypt(self, user_id, media_type, data: bytes) -> bytes:
-            return data
-
+    The join's own op-22 commit is the case the hook documents: discord.py calls ``.reinit(...)``
+    on the existing ``DaveSession``, which flips ``ready`` to True on the SAME object.  A frame
+    captured before that flip had no ratchet to lose — it belongs to the deaf window, and the
+    ready cut drops it by ARRIVAL time when the ring replays.  Purging it here loses it uncounted
+    by ``pre_ready_dropped`` (and asking the object "was a ratchet live before?" now answers with
+    the post-op state, which is why the frame carries its own generation).
+    """
+    dave = _InPlaceDave(ready=False)
     receiver = _receiver(members=[_member(_OPERATOR), _member(_STRANGER), _member(_ME, True)],
-                         dave_session=_Settling(ready=False), dave_pver=1)
+                         dave_session=dave, dave_pver=1)
     _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"pre-tone")
     assert len(receiver._dave_pending[_SSRC_PERSON]) == 1
 
-    receiver._vc._connection.dave_session = _Settling(ready=True)
-    receiver.refresh_credentials("voice ws op 22", dave_state_changed=True)
+    dave.ready = True                       # the commit settles the SAME object, in place
+    _drive_hook(receiver, 22, {"protocol_version": 1})
 
+    assert receiver._dave_session is dave
     assert len(receiver._dave_pending[_SSRC_PERSON]) == 1
     assert receiver._dave_unmapped_dropped == 0
     assert _decoded(decoders) == []
+    assert [frame[1] for frame in receiver._dave_pending[_SSRC_PERSON]] == [b"pre-tone"]
+
+
+@pytest.mark.parametrize("case,op,ready_before,settles,expect_drop", [
+    ("op4-live-ratchet", 4, True, False, True),
+    ("op21-live-ratchet", 21, True, False, True),
+    ("op21-deaf-window", 21, False, False, False),
+    ("op22-settling", 22, False, True, False),
+    ("op22-live-ratchet", 22, True, True, True),
+    ("op24-live-ratchet", 24, True, True, True),
+    ("op24-deaf-window", 24, False, False, False),
+    ("membership-live-ratchet", None, True, False, True),
+    ("membership-deaf-window", None, False, False, False),
+])
+def test_the_trigger_table_drops_only_the_frames_a_live_ratchet_captured(
+        nacl, decoders, case, op, ready_before, settles, expect_drop):
+    """The op-by-op table: each DAVE trigger purges frames captured under a LIVE ratchet only.
+
+    op 4 (pver>0) re-keys in place; op 21/22/24 prepare, execute and advance the epoch; a
+    membership change bumps the epoch on the same session.  All of them arrive with
+    ``dave_session`` and ``dave_protocol_version`` unchanged, so the flag — not a state diff — is
+    the announcement.  What dies is decided per FRAME: frames held while the session reported
+    ``ready`` cannot be authenticated under the ratchet that replaced it, frames from the deaf
+    window (no ratchet yet) stay for the ready cut.
+    """
+    dave = _InPlaceDave(ready=ready_before)
+    receiver = _receiver(members=[_member(_OPERATOR), _member(_STRANGER), _member(_ME, True)],
+                         dave_session=dave, dave_pver=1)
+    _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"held")
+    assert len(receiver._dave_pending[_SSRC_PERSON]) == 1
+
+    dave.reinit(2)
+    if settles:
+        dave.ready = True
+    if op is None:
+        receiver.refresh_credentials("membership change", dave_state_changed=True)
+    else:
+        _drive_hook(receiver, op, {"protocol_version": 1})
+
+    # Nothing the credential tuple compares moved: only the trigger (and the per-frame
+    # generation) can tell these apart from a plain transport re-key.
+    assert receiver._dave_session is dave
+    assert receiver._dave_protocol_version == 1
+    assert _decoded(decoders) == []
+    if expect_drop:
+        assert receiver._dave_pending == {}, f"{case} kept a frame from a dead ratchet"
+        assert receiver._dave_unmapped_dropped == 1
+        assert dave.calls == []
+    else:
+        assert len(receiver._dave_pending[_SSRC_PERSON]) == 1, f"{case} purged the deaf window"
+        assert receiver._dave_unmapped_dropped == 0
+
+
+def test_a_replay_across_an_unannounced_mls_commit_drops_and_counts(nacl, decoders):
+    """A binary MLS commit re-keys the group without reaching the ws hook.
+
+    discord.py consumes welcome/commit (ops 28-30) inside ``received_binary_message``; the hook
+    never sees them, so no trigger fires and no purge runs.  The held frame's capture generation
+    is the only witness: the replay must drop it and count it, not hand it to a decrypt that can
+    only fail frame by frame.
+    """
+    dave = _InPlaceDave()
+    receiver = _receiver(members=[_member(_OPERATOR), _member(_STRANGER), _member(_ME, True)],
+                         dave_session=dave, dave_pver=1)
+    _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"old-epoch")
+    _packet(nacl, receiver, _SSRC_PERSON, seq=2, payload=b"old-epoch")
+    assert len(receiver._dave_pending[_SSRC_PERSON]) == 2
+
+    dave.reinit(2)                          # the commit: epoch moves, conn and hook untouched
+    assert receiver._dave_unmapped_dropped == 0
+
+    receiver.map_ssrc(_SSRC_PERSON, _OPERATOR)
+    _packet(nacl, receiver, _SSRC_PERSON, seq=3, payload=b"new-epoch")   # triggers the replay
+
+    assert receiver._dave_pending == {}
+    assert receiver._dave_unmapped_dropped == 2
+    assert dave.calls == [(_OPERATOR, b"new-epoch")], "a frame from the dead ratchet was decrypted"
+    assert _decoded(decoders) == [[b"new-epoch"]]
 
 
 def test_the_ttl_sweep_counts_and_logs_what_it_expires(nacl, decoders, caplog):
@@ -581,9 +642,9 @@ def test_the_ttl_sweep_counts_and_logs_what_it_expires(nacl, decoders, caplog):
     _packet(nacl, receiver, _SSRC_PERSON, seq=2, payload=b"two")
     _packet(nacl, receiver, _SSRC_OPERATOR, seq=3, payload=b"three")
     for ssrc in (_SSRC_PERSON, _SSRC_OPERATOR):
-        held_at, payload = receiver._dave_pending[ssrc][-1]
+        held_at, payload, generation = receiver._dave_pending[ssrc][-1]
         receiver._dave_pending[ssrc][-1] = (
-            held_at - VoiceReceiver.DAVE_PENDING_TTL - 1.0, payload)
+            held_at - VoiceReceiver.DAVE_PENDING_TTL - 1.0, payload, generation)
 
     with caplog.at_level(logging.INFO):
         assert receiver.check_silence() == []
@@ -604,9 +665,9 @@ def test_the_ttl_sweep_does_not_name_an_empty_ring_as_a_dropped_ssrc(nacl, caplo
     receiver._dave_pending[_SSRC_OPERATOR].clear()  # a ring that yielded no frame
     for ssrc in (_SSRC_PERSON, _SSRC_OPERATOR):
         if receiver._dave_pending[ssrc]:
-            held_at, payload = receiver._dave_pending[ssrc][-1]
+            held_at, payload, generation = receiver._dave_pending[ssrc][-1]
             receiver._dave_pending[ssrc][-1] = (
-                held_at - VoiceReceiver.DAVE_PENDING_TTL - 1.0, payload)
+                held_at - VoiceReceiver.DAVE_PENDING_TTL - 1.0, payload, generation)
 
     with caplog.at_level(logging.INFO):
         assert receiver.check_silence() == []
