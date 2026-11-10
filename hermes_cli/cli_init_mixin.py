@@ -62,8 +62,9 @@ def _gateway_launch(cli):
     The model and provider are ``cli._typed_launch``: the launch this command typed, captured before
     credentials normalized or replaced ``cli.model`` (see :func:`_typed_launch_flags`); ``/new``
     drops the typed ``-m``, so a cleared ``_explicit_model_override`` reports no route. ``api_key``
-    and ``base_url`` are read live: the credentials ladder never touches the explicit pair, while a
-    later ``/model`` or a resumed session's route restore does update it.
+    and ``base_url`` are read live: the pair is the credentials' own input and no policy writer
+    touches it before a create; a later ``/model`` or a mid-chat ``/resume`` may rewrite it, and those
+    are post-open.
     """
     route = {"api_key": getattr(cli, "_explicit_api_key", None),
              "base_url": getattr(cli, "_explicit_base_url", None)}
