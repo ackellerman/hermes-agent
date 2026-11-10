@@ -261,24 +261,86 @@ def _list_payload(parent_agent: Any) -> dict[str, Any]:
         )
     return payload
 
-def _handle_control_action(action: str, subagent_id: Optional[str], message: Optional[str], parent_agent: Any) -> str:
+def _no_live_subagent_error(subagent_id: str) -> str:
+    """The one refusal for a target that is not a live, owned child of this conversation."""
+    return tool_error(
+        f"No live subagent '{subagent_id}' in this conversation's spawn tree. It "
+        "may have already finished (its result arrives as a normal "
+        "completion message). Use action='list' to see live children."
+    )
+
+
+def _child_id_target(child_id: str, parent_agent: Any) -> tuple[Optional[str], Optional[str]]:
+    """``(live subagent_id, None)`` when *child_id* names a running child this conversation holds, else
+    ``(None, reason)`` with ``reason`` ``unknown`` or the row's status.
+
+    Resolution is the lineage-checked ``ChildStore.resolve`` (the same alias rule ``show`` uses), never a raw
+    table lookup, so a child held by another conversation does not resolve. The status read applies the
+    expiry/orphan rules, so a dead run answers "idle"/"expired" instead of claiming a live target.
+    """
+    from agent.prompt_cache_scope import conversation_id
+    from tools.delegate_children import IDLE, RUNNING, ChildStore
+    store = ChildStore.for_agent(parent_agent)
+    if store is None:
+        return None, "unknown"
+    conversation = conversation_id(parent_agent)
+    if not conversation:
+        return None, "unknown"
+    try:
+        resolved = store.resolve(child_id, [conversation])
+        row = store.get(resolved) if resolved else None
+    except Exception:
+        logger.debug("child_id resolution failed for %s", child_id, exc_info=True)
+        return None, "unknown"
+    if row is None:
+        return None, "unknown"
+    if row.get("status") != RUNNING:
+        return None, str(row.get("status") or IDLE)
+    subagent_id = row.get("subagent_id")
+    return (subagent_id, None) if isinstance(subagent_id, str) and subagent_id else (None, "unknown")
+
+
+def _handle_control_action(action: str, subagent_id: Optional[str], message: Optional[str], parent_agent: Any,
+                           *, child_id: Optional[str] = None) -> str:
     """Synchronous control plane for delegate_task: list/steer/stop. Runs in-turn (never backgrounded) over the same
-    registry the TUI overlay drives, scoped so a conversation can only control its own spawn tree."""
+    registry the TUI overlay drives, scoped so a conversation can only control its own spawn tree.
+
+    ``child_id`` is the stable kept-child key (its first session id, from the dispatch handle or a completion
+    result); it resolves through ``ChildStore`` to the live ``subagent_id``. ``subagent_id`` keeps its exact old
+    behaviour: a live, owned record is found directly. A ``child_id`` that does not resolve, or names a child that
+    is no longer running, is refused with a clear error — never a silent no-op."""
     if action == "list":
         return json.dumps(_list_payload(parent_agent), ensure_ascii=False)
 
-    # steer / stop need a resolvable, owned target.
-    sid = (subagent_id or "").strip()
-    if not sid:
-        return tool_error(f"action='{action}' requires subagent_id (from the spawn dispatch response or action='list').")
-    with _active_subagents_lock:
-        record = _active_subagents.get(sid)
-    if record is None or not _owns_subagent_record(record, parent_agent):
-        return tool_error(
-            f"No live subagent '{sid}' in this conversation's spawn tree. It "
-            "may have already finished (its result arrives as a normal "
-            "completion message). Use action='list' to see live children."
-        )
+    cid = (child_id or "").strip()
+    if cid:
+        sid, reason = _child_id_target(cid, parent_agent)
+        if sid is None:
+            if reason == "unknown":
+                return tool_error(
+                    f"No child with child_id '{cid}' in this conversation. Use action='list' to see the "
+                    "children this session holds."
+                )
+            return tool_error(
+                f"Child '{cid}' is not running (status={reason}), so there is nothing to {action}. Its "
+                "result arrives as a normal completion message."
+            )
+        with _active_subagents_lock:
+            record = _active_subagents.get(sid)
+        if record is None or not _owns_subagent_record(record, parent_agent):
+            return _no_live_subagent_error(sid)
+    else:
+        # steer / stop by live id: unchanged.
+        sid = (subagent_id or "").strip()
+        if not sid:
+            return tool_error(
+                f"action='{action}' requires subagent_id or child_id (from the spawn dispatch response, a "
+                "completion result, or action='list')."
+            )
+        with _active_subagents_lock:
+            record = _active_subagents.get(sid)
+        if record is None or not _owns_subagent_record(record, parent_agent):
+            return _no_live_subagent_error(sid)
     if action == "steer" and not (message or "").strip():
         return tool_error("action='steer' requires a non-empty 'message' describing the course correction.")
     outcome = _CONTROL_OUTCOMES.get(action)
@@ -287,7 +349,8 @@ def _handle_control_action(action: str, subagent_id: Optional[str], message: Opt
     status, note, failure = outcome
     ok = interrupt_subagent(sid) if action == "stop" else steer_subagent(sid, message.strip())
     if ok:
-        return json.dumps({"action": action, "subagent_id": sid, "status": status, "note": note}, ensure_ascii=False)
+        return json.dumps({"action": action, "subagent_id": sid, **({"child_id": cid} if cid else {}),
+                           "status": status, "note": note}, ensure_ascii=False)
     return tool_error(failure.format(sid=sid))
 
 # action -> (success status, success note, failure error template)

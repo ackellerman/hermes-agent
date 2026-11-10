@@ -149,21 +149,21 @@ class SessionMaintenanceMixin:
         return {sid for sid in ids if self._write_guards_reject(conn, sid, allow_closed_compression_parent=True)}
 
     @staticmethod
-    def _parents_still_needed(conn, victims: Iterable[str], kept: Optional[str],
-                              roots: Optional[str] = None) -> set[str]:
+    def _parents_still_needed(conn, victims: Iterable[str], kept: Optional[str], roots: Optional[str]) -> set[str]:
         """Victims that a retained row still points at as its stored parent. Deleting one would NULL the
         link a retained child's ownership proof walks (r1 finding 4), so such a parent is spared too.
 
         Seeded only from kept rows that are not conversation roots: a root's own parent (the pre-/reset
         session, say) sits above the chain walk, which stops at the root, so it is not spared here
-        (r3 finding 1). In the ordinary case this finds nothing — the selection guard already excludes
-        every hop of the walked chain, and a root's parent is no longer a seed — so the step is
-        load-bearing only in the residual broken-hop case (a kept row whose stored parent is not a valid
-        hop). Sparing beats NULLing: the parent link is what ``stored_child_session`` walks.
+        (r3 finding 1). ``roots`` is required (not optional): a caller that omits it would silently seed
+        from a root and restore that fail-open. In the ordinary case this finds nothing — the selection
+        guard already excludes every hop of the walked chain, and a root's parent is no longer a seed — so
+        the step is load-bearing only in the residual broken-hop case (a kept row whose stored parent is
+        not a valid hop). Sparing beats NULLing: the parent link is what ``stored_child_session`` walks.
         """
-        if not kept or not victims:
+        if not kept or not victims or not roots:
             return set()
-        not_a_root = f" AND c.id NOT IN ({roots})" if roots else ""
+        not_a_root = f" AND c.id NOT IN ({roots})"
         return {row[0] for row in conn.execute(
             f"SELECT DISTINCT c.parent_session_id FROM sessions c WHERE c.id IN ({kept}){not_a_root}"
             " AND c.parent_session_id IN (SELECT value FROM json_each(?))",

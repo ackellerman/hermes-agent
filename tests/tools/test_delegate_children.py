@@ -1680,9 +1680,12 @@ def test_prune_above_a_reset_root_does_not_spare_the_pre_reset_session(db, monke
 
 
 def test_prune_never_retires_a_row_it_spares(db, monkeypatch):
-    """r3 finding 2: the parent-sparing step runs before ``retire_prunable``, so a row that survives the
-    prune is not left half-deleted: no ``gateway.retired_session.v1`` fence, its ``gateway.api.settings``
-    row and its ``gateway_routing`` entry intact (the deleted row's own route does go)."""
+    """r3 finding 2: a row the prune SPARES is never left half-deleted — no ``gateway.retired_session.v1``
+    fence for it, its ``gateway.api.settings`` row and its ``gateway_routing`` entry intact, while the row the
+    same prune DOES delete carries its fence. (The ordering that a spared row is never fenced because the
+    parent-sparing step runs before ``retire_prunable`` is pinned by
+    ``test_prune_never_retires_the_stored_parent_it_still_needs``; here the spared root is already outside the
+    selection by the chain guard.)"""
     monkeypatch.setattr(dc, "_delegation_cfg", dict)
     _reset_lineage(db)
     _route(db, "reset-root", "agent:main:ui")
@@ -1695,6 +1698,7 @@ def test_prune_never_retires_a_row_it_spares(db, monkeypatch):
     surviving = {"reset-root", "kid"}
     assert {sid for sid in surviving if db.get_session(sid) is None} == set()
     assert not (surviving & _retire_fences(db))              # no surviving row carries a retire fence
+    assert _retire_fences(db) == {"pre-reset"}               # the deleted row's fence exists
     assert _routed(db) == {"reset-root"}                     # the spared root keeps its route, pre-reset's is gone
     assert db.get_meta("gateway.api.settings.v1.reset-root") is not None
     assert db.get_meta("gateway.api.settings.v1.pre-reset") is None
@@ -1718,3 +1722,188 @@ def test_prune_never_retires_the_stored_parent_it_still_needs(db, monkeypatch):
     assert db.get_session("kid-x")["parent_session_id"] == "stored-parent"   # not NULLed
     assert _retire_fences(db) == set()                       # no fence for a row that survived
     assert _routed(db) == {"stored-parent"}
+
+
+# ── e2: ids on creation (dispatch handle, completion results, control by child_id) ───────────────
+
+
+def _dispatch_batch(parent, children):
+    """A background ``_Batch`` over *children* (``(task_index, task, child)``), as ``delegate_task`` builds it."""
+    from tools import delegate_tool_dispatch as dd
+    tasks = [{"goal": f"goal-{i}"} for i, _, _ in children]
+    return dd, dd._Batch(
+        tasks, list(children), parent, {"model": "m"}, None, "leaf", len(children), None,
+        [None] * len(children), [], "wake", "ui", None, None, False, time.time(),
+    )
+
+
+def _stub_dispatch(monkeypatch, dd):
+    """Keep the payload path in-process: admission accepts every unit, no worker runs."""
+    from tools import delegate_tool_config
+    monkeypatch.setattr(dd, "_dispatch_unit",
+                        lambda unit, unit_id, _slot, _routing: {"status": "dispatched", "delegation_id": unit_id})
+    monkeypatch.setattr(dd, "_resolve_async_wake_sid", lambda *a, **k: "wake")
+    monkeypatch.setattr(dd, "_resolve_async_session_key", lambda *a, **k: ("key", "ui"))
+    monkeypatch.setattr(delegate_tool_config, "_get_independent_completions", lambda: False)
+
+
+def test_ids_dispatch_handle_carries_child_id_and_subagent_id_per_kept_child(db, monkeypatch):
+    """e2 red test: a kept background child's dispatch handle names it by ``child_id`` next to ``subagent_id``;
+    a child that is not kept carries no ``child_id`` key at all (absent, never a fake id)."""
+    parent = _parent(db)
+    kept, _, _, was_kept = _spawn(db, parent, start=False)  # built, not started: the handle's state
+    assert was_kept and kept._delegate_child_id == "kid-1"
+    loose = SimpleNamespace(session_id="kid-2", _subagent_id="sa-0-bbbb")
+    dd, batch = _dispatch_batch(parent, [(0, {"goal": "a"}, kept), (1, {"goal": "b"}, loose)])
+    _stub_dispatch(monkeypatch, dd)
+
+    payload = json.loads(dd._dispatch_background(batch))
+
+    assert payload["children"] == [
+        {"task_index": 0, "subagent_id": "sa-0-aaaa", "child_id": "kid-1"},
+        {"task_index": 1, "subagent_id": "sa-0-bbbb"},
+    ]
+    assert payload["subagent_ids"] == ["sa-0-aaaa", "sa-0-bbbb"]
+    assert "child_id" not in payload["children"][1]
+    assert "child_id" in payload["control_hint"]
+
+    # With no kept child the handle keeps its exact old shape (additive-only change).
+    dd, loose_only = _dispatch_batch(parent, [(0, {"goal": "a"}, loose)])
+    assert "children" not in json.loads(dd._dispatch_background(loose_only))
+
+
+def test_ids_completion_result_carries_child_id_and_the_resume_hint(db):
+    """Every completion result of a kept child carries ``child_id`` and ``subagent_id`` and a one-line
+    ``resume_hint``; the child's answer itself is left clean (the hint is parent-facing prose)."""
+    from tools.delegate_tool_results import _finalize_child_results
+    parent = _parent(db)
+    kept, _, _, was_kept = _spawn(db, parent, start=False)
+    assert was_kept
+    task = {"goal": "g"}
+    entries = [{"task_index": 0, "status": "completed", "summary": "the answer"}]
+    _finalize_child_results(entries, [task], [(0, task, kept)], parent)
+
+    entry = entries[0]
+    assert (entry["child_id"], entry["subagent_id"]) == ("kid-1", "sa-0-aaaa")
+    assert entry["resume_hint"] == dc.resume_hint("kid-1")
+    assert "action='resume'" in entry["resume_hint"] and "child_id=kid-1" in entry["resume_hint"]
+    assert entry["summary"] == "the answer"
+
+    loose = SimpleNamespace(session_id="kid-2", _subagent_id="sa-0-bbbb")
+    other = [{"task_index": 0, "status": "completed", "summary": "x"}]
+    _finalize_child_results(other, [task], [(0, task, loose)], parent)
+    assert set(other[0]).isdisjoint({"child_id", "subagent_id", "resume_hint"})
+
+
+def test_ids_completion_text_ends_with_the_resume_hint(db):
+    """The completion message the parent reads ends with the kept child's resume hint."""
+    from tools.delegate_tool_results import _finalize_child_results
+    from tools.process_registry_notifications import _format_batch_delegation
+    parent = _parent(db)
+    kept, _, _, _ = _spawn(db, parent, start=False)
+    task = {"goal": "g"}
+    entries = [{"task_index": 0, "status": "completed", "summary": "the answer"}]
+    _finalize_child_results(entries, [task], [(0, task, kept)], parent)
+    completed_at = time.time()
+    evt = {"delegation_id": "deleg-ids", "goals": ["g"], "results": entries,
+           "dispatched_at": completed_at - 1, "completed_at": completed_at}
+
+    text = _format_batch_delegation(evt, "deleg-ids", completed_at)
+
+    assert text.endswith(entries[0]["resume_hint"])
+    assert text.count(entries[0]["resume_hint"]) == 1
+
+
+def _live_child_record(subagent_id, parent, **extra):
+    """Register a live child agent under *subagent_id*, owned by *parent*'s durable session."""
+    import tools.delegate_tool_registry as dtr
+
+    class _StubChild:
+        def __init__(self):
+            self.steered = []
+
+        def steer(self, text):
+            self.steered.append(text)
+            return True
+
+    stub = _StubChild()
+    dtr._register_subagent({
+        "subagent_id": subagent_id, "agent": stub, "owner_agent_session_id": parent.session_id,
+        "started_at": time.time(), "status": "running", "accepting_steer": True, "goal": "g", **extra,
+    })
+    return dtr, stub
+
+
+def test_ids_steer_and_stop_accept_child_id_resolved_to_the_live_subagent_id(db, monkeypatch):
+    parent = _parent(db)
+    child, future, _, _ = _spawn(db, parent)  # the row exists and the run is open
+    dtr, stub = _live_child_record("sa-0-aaaa", parent)
+    try:
+        out = json.loads(dtr._handle_control_action("steer", None, "focus on X", parent, child_id="kid-1"))
+        assert (out["status"], out["subagent_id"], out["child_id"]) == ("queued", "sa-0-aaaa", "kid-1")
+        assert stub.steered == ["focus on X"]
+        interrupted = []
+        monkeypatch.setattr(dtr, "request_hard_interrupt",
+                            lambda agent, reason: interrupted.append(agent) or True)
+        out = json.loads(dtr._handle_control_action("stop", None, None, parent, child_id="kid-1"))
+        assert out["status"] == "interrupt_requested" and interrupted == [stub]
+    finally:
+        dtr._unregister_subagent("sa-0-aaaa")
+        child._delegate_children_tick.stop()
+        _finish(future)
+
+
+def test_ids_delegate_task_routes_child_id_to_the_control_plane(db, monkeypatch):
+    from tools.delegate_tool import DELEGATE_TASK_SCHEMA, delegate_task
+    assert "child_id" in DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+    parent = _parent(db)
+    child, future, _, _ = _spawn(db, parent)
+    dtr, stub = _live_child_record("sa-0-aaaa", parent)
+    try:
+        out = json.loads(delegate_task(action="steer", child_id="kid-1", message="keep going", parent_agent=parent))
+        assert (out["status"], out["subagent_id"]) == ("queued", "sa-0-aaaa")
+        assert stub.steered == ["keep going"]
+    finally:
+        dtr._unregister_subagent("sa-0-aaaa")
+        child._delegate_children_tick.stop()
+        _finish(future)
+
+
+def test_ids_unknown_child_id_is_a_clear_error(db):
+    import tools.delegate_tool_registry as dtr
+    out = dtr._handle_control_action("steer", None, "x", _parent(db), child_id="no-such-child")
+    assert "No child with child_id 'no-such-child'" in out
+
+
+def test_ids_finished_child_id_is_refused_not_a_silent_no_op(db):
+    import tools.delegate_tool_registry as dtr
+    parent = _parent(db)
+    _, future, _, _ = _spawn(db, parent)
+    _finish(future)
+    store = dc.ChildStore(db.db_path)
+    assert _wait(lambda: store.get("kid-1")["status"] == "idle")
+    out = dtr._handle_control_action("stop", None, None, parent, child_id="kid-1")
+    assert "not running (status=idle)" in out and "nothing to stop" in out
+
+
+def test_ids_child_id_held_by_another_conversation_does_not_resolve(db):
+    import tools.delegate_tool_registry as dtr
+    other = _parent(db, session_id="other")
+    _, future, _, _ = _spawn(db, other)
+    try:
+        out = dtr._handle_control_action("steer", None, "hijack", _parent(db, session_id="parent"),
+                                         child_id="kid-1")
+        assert "No child with child_id 'kid-1'" in out
+    finally:
+        _finish(future)
+
+
+# ── e1 carry-in: the parent-sparing step cannot be called without its roots ──────────────────────
+
+def test_prune_parent_sparing_requires_the_roots_argument():
+    """``roots`` has no default: a caller that omits it must fail loudly instead of silently restoring the
+    fail-open the root-seeding rule fixed (a conversation root's own parent would be spared again)."""
+    import inspect
+    from hermes_state_maintenance import SessionMaintenanceMixin
+    parameters = inspect.signature(SessionMaintenanceMixin._parents_still_needed).parameters
+    assert parameters["roots"].default is inspect.Parameter.empty

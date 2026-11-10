@@ -374,8 +374,8 @@ _BACKGROUND_NOTES = {
     ),
     "control_hint": (
         "While a child runs you can orchestrate it live with this same tool: delegate_task(action='list') to see live "
-        "children, action='steer' with subagent_id + message to redirect one, action='stop' with subagent_id to end "
-        "one early."
+        "children, action='steer' with child_id (or subagent_id) + message to redirect one, action='stop' with "
+        "child_id (or subagent_id) to end one early."
     ),
     "live_transcripts_hint": (
         "Each subagent streams a human-readable transcript of its operations to the file listed above (append-only, "
@@ -401,6 +401,18 @@ def _dispatched_payload(batch: _Batch, units: list[tuple[_Batch, str]]) -> dict:
     if any(isinstance(s, str) and s for s in sids):
         payload["subagent_ids"] = sids
         payload["control_hint"] = _BACKGROUND_NOTES["control_hint"]
+    # Per-child handles for kept children (tools/delegate_children.py): the stable ``child_id`` next to the live
+    # ``subagent_id``. A child that is not kept has no ``child_id`` key at all (never a fake id); with no kept
+    # child the handle keeps its exact old shape.
+    children = []
+    for i, _, child in batch.children:
+        entry = {"task_index": i, "subagent_id": getattr(child, "_subagent_id", None)}
+        child_id = getattr(child, "_delegate_child_id", None)
+        if isinstance(child_id, str) and child_id:
+            entry["child_id"] = child_id
+        children.append(entry)
+    if any("child_id" in entry for entry in children):
+        payload["children"] = children
     if batch.refused:
         payload["refused"] = batch.refused
     if batch.live_paths:

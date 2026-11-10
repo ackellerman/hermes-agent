@@ -586,7 +586,8 @@ def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[list[dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[dict[str, Any]] = None, images: Optional[list[str]] = None, action: Optional[str] = None,
-    subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
+    subagent_id: Optional[str] = None, child_id: Optional[str] = None, message: Optional[str] = None,
+    parent_agent=None,
     credentials_cfg: Optional[dict[str, Any]] = None, origin: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
@@ -600,7 +601,7 @@ def delegate_task(
 
     normalized_action = (action or "").strip().lower()
     if normalized_action in _CONTROL_ACTIONS:
-        return _handle_control_action(normalized_action, subagent_id, message, parent_agent)
+        return _handle_control_action(normalized_action, subagent_id, message, parent_agent, child_id=child_id)
     if normalized_action and normalized_action != "spawn":
         return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, or stop.")
 
@@ -884,6 +885,11 @@ DELEGATE_TASK_SCHEMA = {
                 enum=["spawn", "list", "steer", "stop"],
             ),
             "subagent_id": _p("string", "Target for action='steer'/'stop' (ids from the spawn response or action='list')."),
+            "child_id": _p(
+                "string",
+                "Kept-child key, also a target for action='steer'/'stop': the child_id a kept child's dispatch handle "
+                "or completion result carries. Stable across the child's own compression; preferred over subagent_id.",
+            ),
             "message": _p(
                 "string",
                 "For action='steer': the course correction, appended to "
@@ -895,7 +901,7 @@ DELEGATE_TASK_SCHEMA = {
 }
 
 
-_LIVE_CONTROL_PARAMS = frozenset({"action", "subagent_id", "message"})
+_LIVE_CONTROL_PARAMS = frozenset({"action", "subagent_id", "child_id", "message"})
 
 
 def oneshot_delegate_function(function: dict) -> dict:
@@ -962,7 +968,8 @@ registry.register(
         goal=args.get("goal"), context=args.get("context"), tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
-        images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+        images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"),
+        child_id=args.get("child_id"), message=args.get("message"),
         parent_agent=kw.get("parent_agent"),  # no origin: a plugin's ctx.dispatch_tool child is never kept
     ),
     check_fn=check_delegate_requirements,

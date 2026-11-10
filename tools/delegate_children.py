@@ -75,6 +75,16 @@ READ_WRITE_BUSY_MS = 250
 
 ORPHANED_LINE = "child kept as idle-orphaned; resumable with action='resume'"
 
+# The one line that ends a kept child's completion text: model- and user-visible prose, one sentence,
+# naming the action and the id the parent will address the child by later.
+RESUME_HINT = "This child is kept: send it a follow-up with action='resume', child_id={child_id}."
+
+
+def resume_hint(child_id: str) -> str:
+    """The resume hint for *child_id* (see ``RESUME_HINT``)."""
+    return RESUME_HINT.format(child_id=child_id)
+
+
 RUNNING, IDLE, CLOSED, EXPIRED = "running", "idle", "closed", "expired"
 COMPLETED, INTERRUPTED, ORPHANED = "completed", "interrupted", "orphaned"
 
@@ -910,10 +920,11 @@ def _kept_row_sql() -> str:
 
 def kept_conversation_roots_sql() -> str:
     """Session ids of the holder's conversations for every retained child: ``conversation_id`` plus the
-    ``prior_conversations`` of a transfer. These are the rows where each ownership walk stops — ``owns()``
-    needs the root row to exist to reach it — so the prune spares them, and it spares nothing above them.
-    The rows are also the seeds a parent-sparing step must NOT use (a root's own parent is not on the
-    chain); ``kept_sessions_sql`` reuses this fragment for its ``root`` CTE."""
+    ``prior_conversations`` of a transfer. These are the rows where each ownership walk stops, spared when the
+    walk reaches them (``owns()`` needs the root row to exist to reach it), and it spares nothing above them: a
+    root that is not on a walk is not in the guard set, so a root's own parent (the pre-/reset session, say) is
+    above the walk and stays prunable. The rows are also the seeds a parent-sparing step must NOT use (a root's
+    own parent is not on the chain); ``kept_sessions_sql`` reuses this fragment for its ``root`` CTE."""
     kept_row = _kept_row_sql()
     return (f" SELECT d.conversation_id FROM {TABLE} d WHERE {kept_row} AND d.conversation_id IS NOT NULL"
             " UNION"

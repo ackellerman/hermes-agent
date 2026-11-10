@@ -406,6 +406,25 @@ def _rollup_children_cost(parent_agent, children_cost_total: float) -> None:
     except Exception:
         logger.debug("Subagent cost rollup failed", exc_info=True)
 
+def _stamp_child_identities(results, child_by_index) -> None:
+    """Add the parent's stable handles to each kept child's completion entry: ``child_id`` (its first session
+    id, what ``steer``/``stop``/``resume`` accept) next to ``subagent_id``, plus the one-line ``resume_hint``
+    the completion text ends with. A child that is not kept gains nothing: the field is absent, never a fake id.
+    Runs after the redaction/summary passes: ids are host-owned and the hint is parent-facing prose, so neither
+    belongs in the child's summary (memory, hooks and the spill file keep the clean answer)."""
+    from tools.delegate_children import resume_hint
+    for entry in results:
+        child = child_by_index.get(entry.get("task_index"))
+        child_id = getattr(child, "_delegate_child_id", None)
+        if not (isinstance(child_id, str) and child_id):
+            continue
+        entry["child_id"] = child_id
+        subagent_id = getattr(child, "_subagent_id", None)
+        if isinstance(subagent_id, str) and subagent_id:
+            entry["subagent_id"] = subagent_id
+        entry["resume_hint"] = resume_hint(child_id)
+
+
 def _finalize_child_results(
     results: list[dict[str, Any]], task_list: list[dict[str, Any]], children: list[tuple[int, dict[str, Any], Any]],
     parent_agent,
@@ -426,6 +445,7 @@ def _finalize_child_results(
         _apply_summary_budget(results, parent_agent)
         _notify_memory_manager(results, task_list, child_by_index, parent_agent)
         _rollup_children_cost(parent_agent, _fire_subagent_stop_hooks(results, child_by_index, parent_agent))
+        _stamp_child_identities(results, child_by_index)
 
 def _run_child_lifecycle(task_index: int, goal: str, child=None, parent_agent=None) -> dict[str, Any]:
     """Run one child and apply the same host lifecycle used by delegate_task."""

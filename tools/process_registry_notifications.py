@@ -255,6 +255,9 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         if r.get("live_transcript"):
             lines.append(f"Full live transcript (complete tool/assistant trace): {r['live_transcript']}")
         lines += _process_accounting_lines(r)
+        hint = r.get("resume_hint")
+        if isinstance(hint, str) and hint.strip():
+            lines.append(hint.strip())  # the completion text ends with the kept child's resume hint
     return "\n".join(lines)
 
 
@@ -314,6 +317,9 @@ def _format_async_delegation(evt: dict) -> str:
             lines += _recovery_lines(evt)
         if summary:
             lines += ["Partial output:", summary]
+    hint = evt.get("resume_hint")
+    if isinstance(hint, str) and hint.strip():
+        lines.append(hint.strip())  # the completion text ends with the kept child's resume hint
     return "\n".join(lines)
 
 
