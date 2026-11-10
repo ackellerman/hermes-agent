@@ -1545,8 +1545,8 @@ The **Voice brief** entry picks the model that speaks the pre-turn brief on Disc
 runs, that model restates the request in one sentence, which is spoken in the bound voice channel and posted to the
 bound text channel. The feature is opt-in per profile with `discord.voice_brief.enabled: true` (off by default). Like
 every other auxiliary task the slot ships on `auto` — your main model and that route's fallback chain — but a brief is
-one sentence, so it carries a 15s timeout and no `reasoning_effort`, and it is the one task that can be told to stay
-on its own chain:
+one sentence, so it carries a 15s timeout and no `reasoning_effort`, and it is the only slot that ships
+with `task_chain_only` on:
 
 ```yaml
 auxiliary:
