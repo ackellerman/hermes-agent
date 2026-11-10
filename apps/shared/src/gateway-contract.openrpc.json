@@ -11543,6 +11543,18 @@
             ],
             "default": null,
             "title": "Config Warning"
+          },
+          "created": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Created"
           }
         },
         "required": [
