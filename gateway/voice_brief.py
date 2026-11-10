@@ -115,7 +115,7 @@ def pinned_task_route() -> Optional[str]:
 
     ``None`` means "the slot is on ``auto``": the brief then follows the turn's route and that
     route's chain, and any failure refuses the turn as it always has. The two halves are the same
-    ones the auxiliary client reads at its three doors (``_task_stops_at_chain``), so the seam and
+    ones the auxiliary client reads at its four doors (``_task_stops_at_chain``), so the seam and
     the client agree on what "pinned" means.
     """
     from agent.auxiliary_client import _resolve_task_provider_model, _task_stops_at_chain

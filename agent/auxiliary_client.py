@@ -7291,7 +7291,10 @@ def _resolve_call_client(
             model=resolved_model or model, base_url=resolved_base_url or base_url,
             api_key=resolved_api_key or api_key, async_mode=async_mode, main_runtime=main_runtime,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        # A pinned ``task_chain_only`` vision route does not re-probe ``auto`` either: the pin's
+        # own route is the whole policy (the fourth door _task_stops_at_chain is read at).
+        if (client is None and resolved_provider != "auto" and not resolved_base_url
+                and not _task_stops_at_chain(task, resolved_provider)):
             logger.warning("Vision provider %s unavailable, falling back to auto vision backends",
                            resolved_provider)
             effective_provider, client, final_model = resolve_vision_provider_client(

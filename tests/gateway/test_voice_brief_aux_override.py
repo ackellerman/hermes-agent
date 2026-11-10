@@ -1,9 +1,10 @@
-"""A pinned brief is absolute: ``task_chain_only`` stops all three escape doors, and failure bypasses.
+"""A pinned brief is absolute: ``task_chain_only`` stops all four escape doors, and failure bypasses.
 
-``auxiliary.<task>.task_chain_only`` is read at the three doors a pinned auxiliary task can take
-out of its own route — the ``openrouter``/``custom`` auto re-probe in ``_resolve_call_client``, the
-request-time main-agent net in ``_ladder_provider_fallback`` and the quarantine walk's discovery
-rung in ``_next_fallback_after_quarantine`` — through one helper,
+``auxiliary.<task>.task_chain_only`` is read at the four doors a pinned auxiliary task can take
+out of its own route — the ``openrouter``/``custom`` auto re-probe and the vision ``auto``
+re-probe in ``_resolve_call_client``, the request-time main-agent net in
+``_ladder_provider_fallback`` and the quarantine walk's discovery rung in
+``_next_fallback_after_quarantine`` — through one helper,
 ``_task_stops_at_chain(task, resolved_provider)``, which also requires a non-``auto`` resolved
 provider. So the shipped ``provider: auto`` + ``task_chain_only: true`` block on
 ``auxiliary.voice_brief`` stays inert: an auto brief keeps the e2 route (session pair, the
@@ -678,6 +679,63 @@ def test_an_auto_call_after_a_quarantine_keeps_the_main_chain_and_discovery_rung
     assert _ask(_bare_route()) == BRIEF_OUTPUT
 
     assert _model_lanes() == ["session", "lane-a", "discovery"]
+
+
+# ---------------------------------------------------------------------------
+# Door 4: the vision auto re-probe in _resolve_call_client
+#
+# Not reachable from the gateway seam — the brief's own task is ``voice_brief``, not ``vision`` —
+# so these two drive ``auxiliary_client.async_call_llm`` directly, over the same ``lanes`` edges
+# (``resolve_provider_client`` returns None for a provider whose credential is missing).
+# ---------------------------------------------------------------------------
+
+VISION_ANSWER = "auto vision answer"
+
+
+def _ask_vision() -> str:
+    async def _go():
+        return await auxiliary_client.async_call_llm(
+            task="vision", main_runtime=_route(), route_info={},
+            messages=[{"role": "user", "content": "what is in this image?"}],
+        )
+
+    return _response_text(asyncio.new_event_loop().run_until_complete(_go()))
+
+
+def _auto_vision_lane(lanes) -> None:
+    """Make the ``auto`` vision step (main provider first) servable, so the probe is observable."""
+    lane = _lane("session", SESSION_BASE_URL, text=VISION_ANSWER)
+    lanes.session = lane
+    lanes.by_provider = {SESSION_PROVIDER: (lane, SESSION_MODEL)}
+
+
+def test_a_pinned_vision_task_with_the_key_skips_the_auto_re_probe(lanes, monkeypatch):
+    """The pin cannot be built, so the route fails: the vision ``auto`` backends never serve it."""
+    lanes.unbuildable = {"pin-a"}
+    _auto_vision_lane(lanes)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: _config(aux={"vision": _pin("pin-a", "pinModelA", task_chain_only=True)}),
+    )
+
+    with pytest.raises(auxiliary_client.AuxiliaryClientUnavailable):
+        _ask_vision()
+
+    assert _model_lanes() == [], "an auto vision backend served a pinned vision task"
+
+
+def test_a_pinned_vision_task_without_the_key_keeps_the_auto_re_probe(lanes, monkeypatch):
+    """The key is what gates the vision arm: without it, today's behaviour is unchanged."""
+    lanes.unbuildable = {"pin-a"}
+    _auto_vision_lane(lanes)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: _config(aux={"vision": _pin("pin-a", "pinModelA", task_chain_only=False)}),
+    )
+
+    assert _ask_vision() == VISION_ANSWER
+
+    assert _model_lanes() == ["session"]
 
 
 # ---------------------------------------------------------------------------
