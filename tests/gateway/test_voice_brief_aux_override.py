@@ -304,7 +304,7 @@ class _EdgeAdapter:
     def get_pending_message(self, session_key):
         return None
 
-    async def play_in_voice_channel(self, guild_id, audio_path, strict=False):
+    async def play_in_voice_channel(self, guild_id, audio_path, strict=False) -> bool:
         self.played.append((guild_id, audio_path, strict, os.path.isfile(audio_path)))
         ORDER.append(("play", guild_id, os.path.isfile(audio_path)))
         return True
@@ -869,6 +869,62 @@ def test_an_auto_brief_whose_route_and_chain_all_fail_refuses_the_turn(
     assert edge.posted == []
     assert _model_lanes() == ["session", "lane-a", "lane-b"]
     _assert_turn_route_untouched(runner, seen)
+
+
+class _DeafAdapter(_EdgeAdapter):
+    """A platform edge whose playback raises."""
+
+    async def play_in_voice_channel(self, guild_id, audio_path, strict=False) -> bool:
+        ORDER.append(("play-failed", guild_id))
+        raise RuntimeError("voice connect failed")
+
+
+class _MutePlaybackAdapter(_EdgeAdapter):
+    """A platform edge whose playback returns without playing."""
+
+    async def play_in_voice_channel(self, guild_id, audio_path, strict=False) -> bool:
+        ORDER.append(("play-incomplete", guild_id))
+        return False
+
+
+@pytest.mark.parametrize(
+    ("leg", "reason"),
+    [("synthesis", "synthesis failed"), ("playback", "playback failed"),
+     ("playback incomplete", "playback did not complete"), ("text post", "text post failed")],
+)
+def test_a_pinned_brief_whose_delivery_fails_still_refuses_the_turn(
+    lanes, monkeypatch, tmp_path, leg, reason,
+):
+    """Only the MODEL call bypasses a pinned brief: a delivery failure keeps the refusal.
+
+    The pin is served (the sentence exists), so the failure is downstream of the route the key
+    governs. Synthesis, playback and the text post are the three delivery legs; none of them may
+    turn into ``VoiceBriefBypassed``, or a brief the operator asked to be absolute would post a
+    bypass line and run the turn with no spoken understanding.
+    """
+    lanes.session = _lane("session", SESSION_BASE_URL, text="turn route answer")
+    lanes.by_provider = {"pin-a": (_lane("pin-a", "http://127.0.0.1:9/v1", text=BRIEF_OUTPUT), "pinModelA")}
+    adapter = {
+        "playback": _DeafAdapter, "playback incomplete": _MutePlaybackAdapter,
+        "text post": _MuteAdapter,
+    }.get(leg, _EdgeAdapter)()
+    _install_edges(monkeypatch, adapter)
+    if leg == "synthesis":
+        from tools import tts_tool
+
+        monkeypatch.setattr(tts_tool, "text_to_speech_tool",
+                            lambda **kwargs: json.dumps({"success": False, "error": "tts down"}))
+    _wire(monkeypatch, tmp_path, _config(aux={"voice_brief": _pin("pin-a", "pinModelA")}))
+    runner = _make_runner(adapter=adapter)
+
+    result = _run(runner)
+
+    # The pinned route served the sentence; the delivery leg failed afterwards.
+    assert _model_lanes() == ["pin-a"], "the delivery test did not travel the pinned route"
+    assert voice_brief.failure_text(reason) in result["final_response"]
+    assert "Running your request anyway" not in result["final_response"]
+    assert "turn" not in [step[0] for step in ORDER]
+    assert adapter.posted == [], "a bypass line was posted for a delivery failure"
 
 
 # ---------------------------------------------------------------------------

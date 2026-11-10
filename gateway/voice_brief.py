@@ -12,7 +12,7 @@ exactly as it does without this feature: no gated tools, no muted streaming, no 
 
 Two failure shapes, and the difference is deliberate. A **pinned** brief (``auxiliary.voice_brief``
 pins a provider *and* ``task_chain_only``) that cannot be served — its client cannot be built, or
-the request fails after its own chain is exhausted — raises ``VoiceBriefBypassed``: the caller posts
+the pin cannot serve the request — raises ``VoiceBriefBypassed``: the caller posts
 one short message naming the provider and failure class, plays nothing, and runs the turn anyway.
 Every other failure (TTS, playback, text post, or any failure of an ``auto`` brief) returns visible
 failure text instead of running the turn. The brief is never invented: a canned phrase is not a
