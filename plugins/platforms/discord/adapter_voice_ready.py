@@ -158,18 +158,26 @@ class DiscordVoiceReadyMixin:
     def _voice_ready_cfg(self) -> dict[str, Any]:
         return getattr(self, "_voice_fx_cfg", None) or {}
 
+    def _ready_map(self, field: str) -> dict:
+        """A per-guild map of the cycle, created on demand.
+
+        ``DiscordAdapter.__init__`` seeds them; a fixture that builds a bare adapter with
+        ``object.__new__`` (older voice tests do) must still be able to leave a guild.
+        """
+        return self.__dict__.setdefault(field, {})
+
     def _start_voice_ready_gate(self, guild_id: int) -> asyncio.Task:
         """Take the join's STT lease (off the event loop) and start the ready cycle."""
         self._cancel_voice_ready_gate(guild_id)
         lease = f"discord:voice:{guild_id}"
-        self._voice_stt_leases[guild_id] = lease
+        self._ready_map("_voice_stt_leases")[guild_id] = lease
         # The warm blocks for the whole model load (cold download + medium on CPU is minutes), so it
         # must never run on the loop that keeps the gateway answering. ``install=False``: a voice
         # join must never start a dependency rebuild (plan step 7).
         lease_task = asyncio.ensure_future(asyncio.to_thread(self._voice_acquire_stt_lease, lease))
-        self._voice_lease_tasks[guild_id] = lease_task
+        self._ready_map("_voice_lease_tasks")[guild_id] = lease_task
         task = asyncio.ensure_future(self._voice_ready_gate(guild_id, lease_task=lease_task))
-        self._voice_ready_tasks[guild_id] = task
+        self._ready_map("_voice_ready_tasks")[guild_id] = task
         return task
 
     def _voice_acquire_stt_lease(self, lease: str) -> dict[str, Any]:
@@ -178,10 +186,10 @@ class DiscordVoiceReadyMixin:
         return acquire(lease, install=False)
 
     def _cancel_voice_ready_gate(self, guild_id: int) -> None:
-        task = self._voice_ready_tasks.pop(guild_id, None)
+        task = self._ready_map("_voice_ready_tasks").pop(guild_id, None)
         if task is not None and task is not asyncio.current_task():
             task.cancel()
-        self._voice_ready_info.pop(guild_id, None)
+        self._ready_map("_voice_ready_info").pop(guild_id, None)
 
     def _release_voice_stt_lease(self, guild_id: int) -> None:
         """Drop the guild's lease, and again when a still-running warm finishes.
@@ -190,8 +198,8 @@ class DiscordVoiceReadyMixin:
         before the thread starts would otherwise leave ``discord:voice:<guild>`` held forever by a
         model load nobody is waiting for.
         """
-        lease = self._voice_stt_leases.pop(guild_id, None)
-        task = self._voice_lease_tasks.pop(guild_id, None)
+        lease = self._ready_map("_voice_stt_leases").pop(guild_id, None)
+        task = self._ready_map("_voice_lease_tasks").pop(guild_id, None)
         if not lease:
             return
         release_stt_lease(lease)
@@ -288,7 +296,7 @@ class DiscordVoiceReadyMixin:
         mark_ready = getattr(receiver, "mark_ready", None)
         if callable(mark_ready):
             mark_ready(ready_at)
-        self._voice_ready_info[guild_id] = {
+        self._ready_map("_voice_ready_info")[guild_id] = {
             "t_ready": ready_at, "reason": reason, "degraded": reason is not None,
             "device": result.get("device"), "model": result.get("model"),
         }
