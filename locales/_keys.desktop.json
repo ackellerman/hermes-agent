@@ -2089,6 +2089,7 @@
     "messaging.revoke",
     "messaging.revokeAria",
     "messaging.revokeDesc",
+    "messaging.revokeSurvives",
     "messaging.revokeTitle",
     "messaging.revokedUser",
     "messaging.revoking",

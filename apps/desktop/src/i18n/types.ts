@@ -2336,6 +2336,7 @@ export interface Translations extends NoticeTranslations {
     approvedUser: (name: string) => string
     approvedHint: string
     revokedUser: (name: string) => string
+    revokeSurvives: (location: string) => string
     failedApprove: (name: string) => string
     failedRevoke: (name: string) => string
     pairingLockedOut: string

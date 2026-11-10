@@ -1272,7 +1272,7 @@ export const api = {
       }),
     }),
   revokePairing: (platform: string, user_id: string) =>
-    fetchJSON<{ ok: boolean }>("/api/pairing/revoke", {
+    fetchJSON<PairingRevokeResult>("/api/pairing/revoke", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1745,6 +1745,25 @@ export interface PairingUser {
 export interface PairingResponse {
   pending: PairingUser[];
   approved: PairingUser[];
+}
+
+/** One place that still names a revoked user (gateway/access_grants.py). `authorizes_now` is
+ *  null when the source cannot be evaluated offline (role list, username entry, unreadable file). */
+export interface PairingGrantSource {
+  kind: string;
+  location: string;
+  chat_scope: string;
+  entry: string;
+  removable: boolean;
+  reason: string;
+  authorizes_now: boolean | null;
+}
+
+export interface PairingRevokeResult {
+  ok: boolean;
+  revoked: boolean;
+  removed: PairingGrantSource[];
+  still_authorized_by: PairingGrantSource[];
 }
 
 export interface WebhookRoute {

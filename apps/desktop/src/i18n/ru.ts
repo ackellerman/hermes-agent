@@ -1881,6 +1881,8 @@ export const ruOverrides = {
     approvedUser: name => `${name} одобрен`,
     approvedHint: 'Они распознаются автоматически начиная с их следующего сообщения.',
     revokedUser: name => `${name} отозван`,
+    revokeSurvives: location =>
+      `Запись сопряжения отозвана, но ${location} по-прежнему разрешает этого пользователя`,
     failedApprove: name => `Не удалось одобрить ${name}`,
     failedRevoke: name => `Не удалось отозвать ${name}`,
     pairingLockedOut: 'Слишком много неудачных одобрений — эта платформа заблокирована. Попробуйте позже.',
