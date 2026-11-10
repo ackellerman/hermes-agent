@@ -903,6 +903,24 @@ def orphaned_unit_note(conn: sqlite3.Connection, delegation_id: str,
 
 # ── session pruning ─────────────────────────────────────────────────────────
 
+def _kept_row_sql() -> str:
+    """The ``delegate_children`` rows whose protection is live: retained (``kept``) and still running/idle."""
+    return f"d.kept = 1 AND d.status IN ('{RUNNING}', '{IDLE}')"
+
+
+def kept_conversation_roots_sql() -> str:
+    """Session ids of the holder's conversations for every retained child: ``conversation_id`` plus the
+    ``prior_conversations`` of a transfer. These are the rows where each ownership walk stops — ``owns()``
+    needs the root row to exist to reach it — so the prune spares them, and it spares nothing above them.
+    The rows are also the seeds a parent-sparing step must NOT use (a root's own parent is not on the
+    chain); ``kept_sessions_sql`` reuses this fragment for its ``root`` CTE."""
+    kept_row = _kept_row_sql()
+    return (f" SELECT d.conversation_id FROM {TABLE} d WHERE {kept_row} AND d.conversation_id IS NOT NULL"
+            " UNION"
+            f" SELECT j.value FROM {TABLE} d, json_each(CASE WHEN json_valid(d.prior_conversations)"
+            f" THEN d.prior_conversations ELSE '[]' END) j WHERE {kept_row} AND j.type = 'text'")
+
+
 def kept_sessions_sql(continuation_edge_sql: str) -> str:
     """Session ids that must outlive a prune because a kept child still needs them.
 
@@ -915,15 +933,16 @@ def kept_sessions_sql(continuation_edge_sql: str) -> str:
       ``_lineage_reader`` walks it: a hop is the row's ``_delegate_from`` naming its own parent (a
       delegate hop) or a compression continuation (``p.end_reason = 'compression'`` and the row is not
       an explicit fork/delegate/reset/tool child). The walk stops at the holder's conversation roots
-      (``conversation_id`` plus ``prior_conversations``), which are spared too: ``owns()`` needs the root
-      row to exist to reach it. Above the root nothing is spared.
+      (``kept_conversation_roots_sql``: ``conversation_id`` plus ``prior_conversations``), which are
+      spared too: ``owns()`` needs the root row to exist to reach it. A root's own parent — the
+      pre-/reset session, say — is above the walk and is NOT spared.
 
     Nothing here decides ownership; it only widens what prune must not delete (and must not orphan by
     NULLing ``parent_session_id``). Protection ends with the row's status: an expired or closed child
     contributes neither set, so the chain it shared becomes prunable again.
     """
     from hermes_state_common import _sql_json_extract
-    kept_row = f"d.kept = 1 AND d.status IN ('{RUNNING}', '{IDLE}')"
+    kept_row = _kept_row_sql()
     hop = f"({_sql_json_extract('c.model_config', '$._delegate_from')} = p.id OR ({continuation_edge_sql}))"
     return ("WITH RECURSIVE kept_child(id) AS ("
             f" SELECT d.child_id FROM {TABLE} d WHERE {kept_row}"
@@ -934,10 +953,7 @@ def kept_sessions_sql(continuation_edge_sql: str) -> str:
             " SELECT c.id FROM kept_child k JOIN sessions p ON p.id = k.id JOIN sessions c ON c.parent_session_id = p.id"
             f" WHERE {continuation_edge_sql}"
             "), root(id) AS ("
-            f" SELECT d.conversation_id FROM {TABLE} d WHERE {kept_row} AND d.conversation_id IS NOT NULL"
-            " UNION"
-            f" SELECT j.value FROM {TABLE} d, json_each(CASE WHEN json_valid(d.prior_conversations)"
-            f" THEN d.prior_conversations ELSE '[]' END) j WHERE {kept_row} AND j.type = 'text'"
+            f"{kept_conversation_roots_sql()}"
             "), chain(id) AS ("
             " SELECT p.id FROM kept_child k JOIN sessions c ON c.id = k.id JOIN sessions p ON p.id = c.parent_session_id"
             f" WHERE {hop} AND NOT EXISTS (SELECT 1 FROM root r WHERE r.id = k.id)"

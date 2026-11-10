@@ -149,19 +149,23 @@ class SessionMaintenanceMixin:
         return {sid for sid in ids if self._write_guards_reject(conn, sid, allow_closed_compression_parent=True)}
 
     @staticmethod
-    def _parents_still_needed(conn, victims: Iterable[str], kept: Optional[str]) -> set[str]:
-        """Victims that a guarded row still points at as its parent. Deleting one would NULL the link a
-        retained child's chain row proves ownership with (r1 finding 4), so such a parent is spared too.
+    def _parents_still_needed(conn, victims: Iterable[str], kept: Optional[str],
+                              roots: Optional[str] = None) -> set[str]:
+        """Victims that a retained row still points at as its stored parent. Deleting one would NULL the
+        link a retained child's ownership proof walks (r1 finding 4), so such a parent is spared too.
 
-        Every parent on a kept child's ownership chain is already excluded by the selection guard; this
-        catches the residual case — a kept row whose stored parent is not a valid hop — once per prune
-        rather than once per id chunk. Sparing beats NULLing: the parent link is what
-        ``stored_child_session`` walks, and the ``sessions.parent_session_id`` foreign key refuses the
-        delete anyway."""
+        Seeded only from kept rows that are not conversation roots: a root's own parent (the pre-/reset
+        session, say) sits above the chain walk, which stops at the root, so it is not spared here
+        (r3 finding 1). In the ordinary case this finds nothing — the selection guard already excludes
+        every hop of the walked chain, and a root's parent is no longer a seed — so the step is
+        load-bearing only in the residual broken-hop case (a kept row whose stored parent is not a valid
+        hop). Sparing beats NULLing: the parent link is what ``stored_child_session`` walks.
+        """
         if not kept or not victims:
             return set()
+        not_a_root = f" AND c.id NOT IN ({roots})" if roots else ""
         return {row[0] for row in conn.execute(
-            f"SELECT DISTINCT c.parent_session_id FROM sessions c WHERE c.id IN ({kept})"
+            f"SELECT DISTINCT c.parent_session_id FROM sessions c WHERE c.id IN ({kept}){not_a_root}"
             " AND c.parent_session_id IN (SELECT value FROM json_each(?))",
             (json.dumps(sorted(victims)),)).fetchall()}
 
@@ -281,12 +285,19 @@ class SessionMaintenanceMixin:
         root), which prune spares while ``delegation.keep_protects_transcripts`` is on (default) in the
         config of the profile that owns this database. None only when off or the table is absent (nothing
         kept); any error propagates, so the prune fails instead of deleting kept transcripts."""
-        from tools.delegate_children import TABLE, kept_sessions_sql, protects_transcripts_for
+        return self._kept_children_sqls()[0]
+
+    def _kept_children_sqls(self) -> tuple[Optional[str], Optional[str]]:
+        """``(kept ids, the retained children's conversation roots)``, both from one config/table check.
+        The roots are where each ownership walk stops — the rows above them are not on the chain, so a
+        step that spares kept rows' stored parents must not be seeded with them (r3 finding 1). Either
+        element is None when protection is off or the table is absent (nothing kept)."""
+        from tools.delegate_children import TABLE, kept_conversation_roots_sql, kept_sessions_sql, protects_transcripts_for
         if not protects_transcripts_for(self.db_path):
-            return None
+            return None, None
         if self._read_one("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)) is None:
-            return None
-        return kept_sessions_sql(_CONTINUATION_EDGE_SQL)
+            return None, None
+        return kept_sessions_sql(_CONTINUATION_EDGE_SQL), kept_conversation_roots_sql()
 
     def _prune_where(self, older_than_days, source, filters, *, whole_lineages: bool = False,
                      kept_sql: Any = _UNSET) -> tuple[str, list]:
@@ -423,7 +434,7 @@ class SessionMaintenanceMixin:
             # Deletion is not reversible, so the ended-session guard is structural here: the
             # archive-only escape hatch (#139597) must never reach the delete path.
             raise ValueError("prune_sessions() never deletes open sessions: include_open is archive-only")
-        kept = self._kept_children_sql()  # built once: the selection AND the parent-sparing step use it
+        kept, roots = self._kept_children_sqls()  # built once: the selection AND the parent-sparing step use them
         where, where_params = self._prune_where(older_than_days, source, filters, whole_lineages=True, kept_sql=kept)
         removed_ids: list[str] = []
         def _do(conn):
@@ -431,15 +442,15 @@ class SessionMaintenanceMixin:
             session_ids = {row["id"] for row in cursor.fetchall()}
             if exclude_active_write_guards:
                 session_ids -= self._guarded_ids(conn, session_ids)
+            # A row a retained child still needs keeps its parent: never NULL that link, never delete the
+            # parent out from under it (r1 finding 4). Seeded from the kept rows that are not conversation
+            # roots, so the one row above a conversation root is not spared by this (r3 finding 1), and run
+            # on the selection BEFORE anything is retired, so a spared row is never fenced as deleted while
+            # it survives (r3 finding 2). One query per prune, not one per id chunk.
+            session_ids -= self._parents_still_needed(conn, session_ids, kept, roots)
             from hermes_state_mutation_retirement import prune_retired_tombstones, retire_prunable
             session_ids = retire_prunable(conn, sorted(session_ids))
             prune_retired_tombstones(conn)  # every prune pass also reclaims expired deletion tombstones
-            # A row a retained child still needs keeps its parent: never NULL that link, never delete the
-            # parent out from under it. Usually a no-op (the guard spares the whole chain); it costs one
-            # query per prune, not one per id chunk, and it cannot orphan or fail on a broken-hop chain.
-            needed = self._parents_still_needed(conn, session_ids, kept)
-            if needed:
-                session_ids = [sid for sid in session_ids if sid not in needed]
             if not session_ids:
                 return 0
             # Batched: a cron-heavy store prunes tens of thousands of ids in one call.

@@ -1429,10 +1429,13 @@ def test_prune_chain_spares_a_compression_ancestor_above_the_delegate_hop(db, mo
 
 
 def test_prune_chain_spares_two_compression_hops_above_the_delegate_hop(db, monkeypatch):
+    """Two compression hops above the delegate hop are spared, and the row above the conversation root —
+    the pre-/reset session, which the walk stops below — is NOT (r3 finding 1: the parent-sparing step must
+    not reach past the root, so the prune actually deletes it)."""
     from tools.delegate_tool_sessions import stored_child_session
     monkeypatch.setattr(dc, "_delegation_cfg", dict)
-    _ended(db, "conv-prev", end="compression")   # above the conversation root: the walk stops below it
-    _ended(db, "conv-0", parent="conv-prev", end="compression")
+    _ended(db, "conv-prev", end="reset")          # above the conversation root: the walk stops below it
+    _ended(db, "conv-0", parent="conv-prev", end="compression", model_config={"_reset_from": "conv-prev"})
     _ended(db, "conv-1", parent="conv-0", end="compression")
     _ended(db, "conv-2", parent="conv-1")
     _child_session(db, "kid-1", "conv-2", "sa-0-cccc")
@@ -1443,7 +1446,8 @@ def test_prune_chain_spares_two_compression_hops_above_the_delegate_hop(db, monk
     guarded = {row["id"] for row in db._read_all(f"SELECT id FROM ({db._kept_children_sql()})", ())}
     assert {"conv-0", "conv-1", "conv-2", "kid-1"} <= guarded
     assert "conv-prev" not in guarded        # the root (conversation_id) ends the walk
-    assert db.prune_sessions(older_than_days=90) == 0
+    assert db.prune_sessions(older_than_days=90) == 1     # what the prune DID, not only the guard set
+    assert db.get_session("conv-prev") is None            # above the root: not spared by anything
     for sid in ("conv-0", "conv-1", "conv-2", "kid-1"):
         assert db.get_session(sid) is not None, sid
     assert db.get_session("conv-1")["parent_session_id"] == "conv-0"  # links intact, not NULLed
@@ -1593,7 +1597,7 @@ def test_prune_chain_survives_a_corrupt_prior_conversations_value(db, monkeypatc
 def test_prune_never_orphans_a_retained_row_whose_stored_parent_is_not_a_valid_hop(db, monkeypatch):
     """Requirement 2, residual case: a kept row whose ``_delegate_from`` names some other session is not on a
     walkable chain, so its parent is not spared by the chain guard — the prune still must not delete it and
-    NULL the link the ownership proof needs (the schema's own foreign key refuses that delete anyway)."""
+    NULL the link the ownership proof needs."""
     monkeypatch.setattr(dc, "_delegation_cfg", dict)
     _ended(db, "stored-parent")
     db.create_session("kid-x", source="subagent", parent_session_id="stored-parent",
@@ -1605,3 +1609,112 @@ def test_prune_never_orphans_a_retained_row_whose_stored_parent_is_not_a_valid_h
     assert db.prune_sessions(older_than_days=90) == 0
     assert db.get_session("stored-parent") is not None
     assert db.get_session("kid-x")["parent_session_id"] == "stored-parent"
+
+
+# ── review round 5 (plan delegate-resume, e1 r5: r3 review findings 1 and 2) ───────────────────
+
+def _reset_lineage(db, subagent_id="sa-0-r5"):
+    """A /reset conversation root, with a retained child delegated from it:
+
+    ``pre-reset`` --(_reset_from)--> ``reset-root`` (the holder's conversation root, ``conversation_id``)
+    --(_delegate_from)--> ``kid``. The ownership walk stops at ``reset-root``, so ``pre-reset`` — an ordinary
+    row above the root, the user's previous conversation — is not on the chain.
+    """
+    _ended(db, "pre-reset", end="reset")
+    _ended(db, "reset-root", parent="pre-reset", model_config={"_reset_from": "pre-reset"})
+    _child_session(db, "kid", "reset-root", subagent_id)
+    db.end_session("kid", "user_exit")
+    store = _kept(db, "kid", subagent_id, "reset-root", "reset-root")
+    _age(db)
+    return store
+
+
+def _route(db, sid, key="agent:main:ui"):
+    """A ``gateway_routing`` row naming *sid*, as the gateway keeps for a live conversation."""
+    conn = sqlite3.connect(db.db_path)
+    try:
+        conn.execute("INSERT INTO gateway_routing(scope, session_key, entry_json, updated_at)"
+                     " VALUES('main', ?, ?, ?)", (key, json.dumps({"session_id": sid, "source": "cli"}), time.time()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _routed(db):
+    """The session ids the store's ``gateway_routing`` rows still name."""
+    conn = sqlite3.connect(db.db_path)
+    try:
+        return {json.loads(row[0]).get("session_id") for row in conn.execute("SELECT entry_json FROM gateway_routing")}
+    finally:
+        conn.close()
+
+
+def _retire_fences(db):
+    """The ``gateway.retired_session.v1.*`` markers the store holds: written for ids being deleted."""
+    conn = sqlite3.connect(db.db_path)
+    try:
+        return {row[0].split("gateway.retired_session.v1.", 1)[1] for row in
+                conn.execute("SELECT key FROM state_meta WHERE key LIKE 'gateway.retired_session.v1.%'")}
+    finally:
+        conn.close()
+
+
+def test_prune_above_a_reset_root_does_not_spare_the_pre_reset_session(db, monkeypatch):
+    """r3 finding 1: a /reset root's ``parent_session_id`` names the previous conversation, which the walk
+    deliberately stops below. The parent-sparing step must not be seeded with a conversation root, or it
+    spares that row too and the prune skips a deletion it should make."""
+    from tools.delegate_tool_sessions import stored_child_session
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
+    store = _reset_lineage(db)
+
+    assert {row["id"] for row in db._read_all(f"SELECT id FROM ({db._kept_children_sql()})", ())} == {"kid", "reset-root"}
+
+    assert db.prune_sessions(older_than_days=90) == 1        # the pre-reset session, not 0
+    assert db.get_session("pre-reset") is None               # above the root: not spared
+    assert db.get_session("reset-root") is not None          # the root anchors the alias
+    assert db.get_session("kid") is not None
+    assert db.get_session("kid")["parent_session_id"] == "reset-root"   # the link the proof walks survives
+
+    assert stored_child_session(db, "sa-0-r5", ["reset-root"]) == "kid"
+    assert store.take_fence("kid").ok is True
+
+
+def test_prune_never_retires_a_row_it_spares(db, monkeypatch):
+    """r3 finding 2: the parent-sparing step runs before ``retire_prunable``, so a row that survives the
+    prune is not left half-deleted: no ``gateway.retired_session.v1`` fence, its ``gateway.api.settings``
+    row and its ``gateway_routing`` entry intact (the deleted row's own route does go)."""
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
+    _reset_lineage(db)
+    _route(db, "reset-root", "agent:main:ui")
+    _route(db, "pre-reset", "agent:main:cli")
+    db.set_meta("gateway.api.settings.v1.reset-root", '{"model": "m"}')
+    db.set_meta("gateway.api.settings.v1.pre-reset", '{"model": "m"}')
+
+    assert db.prune_sessions(older_than_days=90) == 1
+
+    surviving = {"reset-root", "kid"}
+    assert {sid for sid in surviving if db.get_session(sid) is None} == set()
+    assert not (surviving & _retire_fences(db))              # no surviving row carries a retire fence
+    assert _routed(db) == {"reset-root"}                     # the spared root keeps its route, pre-reset's is gone
+    assert db.get_meta("gateway.api.settings.v1.reset-root") is not None
+    assert db.get_meta("gateway.api.settings.v1.pre-reset") is None
+
+
+def test_prune_never_retires_the_stored_parent_it_still_needs(db, monkeypatch):
+    """The step's load-bearing case (r1 finding 4 residual): a kept row whose stored parent is not a valid
+    hop keeps that parent — spared, and (r3 finding 2) spared before retirement, so no fence is written for
+    it and its routing entry survives."""
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
+    _ended(db, "stored-parent")
+    db.create_session("kid-x", source="subagent", parent_session_id="stored-parent",
+                      model_config={"_delegate_from": "elsewhere", "_subagent_id": "sa-0-hh"})
+    db.end_session("kid-x", "user_exit")
+    _kept(db, "kid-x", "sa-0-hh", "stored-parent", "stored-parent")
+    _route(db, "stored-parent")
+    _age(db)
+
+    assert db.prune_sessions(older_than_days=90) == 0
+    assert db.get_session("stored-parent") is not None
+    assert db.get_session("kid-x")["parent_session_id"] == "stored-parent"   # not NULLed
+    assert _retire_fences(db) == set()                       # no fence for a row that survived
+    assert _routed(db) == {"stored-parent"}
