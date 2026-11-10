@@ -334,6 +334,11 @@ def check_resume_policy(args, snapshot, created_here=None):
     ahead of every rule below, because the frozen policy is the one this invocation just sent and
     no mapping or re-resolution has anything to say about it. A marker for another session, a
     resolved row (``created: false``) and a client that passes nothing all check exactly as before.
+
+    ``provider: auto`` is the create side's own "no pick" sentinel — every launch policy is built
+    through ``_without_auto_pick`` — so a caller re-typing the word the workboard's argv carries
+    asks for no route change and is not compared. The sentinel is imported, never re-spelled: the
+    two sides of the comparison must agree on what "no pick" is.
     """
     if created_here_matches(snapshot, created_here):
         return
@@ -357,8 +362,12 @@ def check_resume_policy(args, snapshot, created_here=None):
         from hermes_constants import get_hermes_home
         flags = {key: requested[key] for key in ("model", "provider", "base_url", "api_key") if key in requested}
         requested["model"] = resolve_launch_route(flags, load_user_config_effective(get_hermes_home() / "config.yaml"))["model"]
-    # api_key is never durable; a repeated key is not a policy change.
-    differs = [key for key, value in requested.items() if key != "api_key" and frozen.get(key) != value]
+    # api_key is never durable; a repeated key is not a policy change. `provider: auto` is the
+    # create's own sentinel, so it is dropped for the comparison — shared with the policy builder,
+    # not spelled here a second time — while `model` beside it keeps its comparison.
+    from gateway.session_policy import _without_auto_pick
+    compared = _without_auto_pick(requested)
+    differs = [key for key, value in compared.items() if key != "api_key" and frozen.get(key) != value]
     if differs:
         raise resume_policy_error(differs)
 

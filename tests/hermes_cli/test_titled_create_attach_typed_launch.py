@@ -324,13 +324,13 @@ def test_a_genuine_change_of_a_launch_flag_still_refuses(monkeypatch):
 
 
 def test_a_typed_provider_auto_stays_no_pick(monkeypatch):
-    """`--provider auto` is the client's "no pick" and still is not launch policy. Nothing here
-    changes the thin client's literal `auto` comparison on resume (that is element e3's); this
-    element only keeps the classic launch free of it."""
+    """`--provider auto` is the client's "no pick" and is not launch policy on either side of the
+    comparison: the classic launch carries no provider (this element), and the thin client's resume
+    drops the same word through the create's own sentinel (element e3), so re-running the identical
+    argv attaches instead of refusing `--provider differs`."""
     import argparse
 
     from hermes_cli.cli_init_mixin import _gateway_launch
-    from hermes_cli.gateway_client import GatewayClientError
     from hermes_cli.gateway_chat import check_resume_policy
     from hermes_cli.gateway_session_store import _check_resume_launch
 
@@ -340,10 +340,9 @@ def test_a_typed_provider_auto_stays_no_pick(monkeypatch):
     _check_resume_launch(_gateway_launch(host),
                          {"info": {"launch_request": {"model": "claude-opus-5-5"}}})
 
-    # Unchanged by this element: a re-typed `auto` is still compared literally by the thin client.
-    with pytest.raises(GatewayClientError, match="--provider differs"):
-        check_resume_policy(argparse.Namespace(model="claude-opus-5-5", provider="auto"),
-                            {"info": {"launch_request": {"model": "claude-opus-5-5"}}})
+    # The workboard's argv re-typed on a resume: the sentinel is no pick, so it is not compared.
+    check_resume_policy(argparse.Namespace(model="claude-opus-5-5", provider="auto"),
+                        {"info": {"launch_request": {"model": "claude-opus-5-5"}}})
 
 
 def test_new_session_drops_the_typed_route_and_rederives_from_config(monkeypatch):
