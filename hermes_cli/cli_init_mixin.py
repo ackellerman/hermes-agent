@@ -38,14 +38,46 @@ def _adopt_gateway_toolsets(cli, store):
         cli._console_print(f"[bold red]{_t('cli.startup.unknown_toolsets', names=names)}[/]")
 
 
-def _gateway_launch(cli):
-    """This run's explicit launch flags as gateway ``session.create`` policy (main handed them to AIAgent)."""
+def _typed_launch_flags(cli):
+    """The model route this command typed, as launch policy — captured at construction.
+
+    ``_ensure_runtime_credentials`` later rewrites ``cli.model``: ``_normalize_model_for_provider``
+    respells it for the resolved provider (dot→hyphen for ``anthropic``) and, on a primary
+    ``AuthError``, ``_resolve_fallback_runtime`` replaces it with the fallback entry's. A resume
+    compares the launch the user asked for, so the policy side must not be read after either.
+    ``api_key``/``base_url`` are already the resolved ones (a URL-bearing startup alias carries its
+    own credential), which is what ``open_session`` binds as ``launch_api_key``.
+    """
     explicit_model = getattr(cli, "_explicit_model_override", False)
     provider = getattr(cli, "_explicit_provider", None)
-    return {"model": cli.model if explicit_model else None,
+    return {"model": getattr(cli, "model", None) if explicit_model else None,
             "provider": provider if explicit_model and provider not in {None, "", "auto"} else None,
             "api_key": getattr(cli, "_explicit_api_key", None),
-            "base_url": getattr(cli, "_explicit_base_url", None),
+            "base_url": getattr(cli, "_explicit_base_url", None)}
+
+
+def _gateway_launch(cli):
+    """This run's explicit launch flags as gateway ``session.create`` policy (main handed them to AIAgent).
+
+    The model and provider are ``cli._typed_launch``: the launch this command typed, captured before
+    credentials normalized or replaced ``cli.model`` (see :func:`_typed_launch_flags`); ``/new``
+    drops the typed ``-m``, so a cleared ``_explicit_model_override`` reports no route. ``api_key``
+    and ``base_url`` are read live: the credentials ladder never touches the explicit pair, while a
+    later ``/model`` or a resumed session's route restore does update it.
+    """
+    route = {"api_key": getattr(cli, "_explicit_api_key", None),
+             "base_url": getattr(cli, "_explicit_base_url", None)}
+    typed = getattr(cli, "_typed_launch", None)
+    if typed is None:  # a host that never ran _init_model_and_provider (a test stand-in)
+        explicit_model = getattr(cli, "_explicit_model_override", False)
+        provider = getattr(cli, "_explicit_provider", None)
+        route["model"] = cli.model if explicit_model else None
+        route["provider"] = provider if explicit_model and provider not in {None, "", "auto"} else None
+    elif getattr(cli, "_explicit_model_override", False):
+        route["model"], route["provider"] = typed.get("model"), typed.get("provider")
+    else:
+        route["model"] = route["provider"] = None
+    return {**route,
             # Only a typed -t; the gateway resolves the profile default and the coding posture (#138670).
             "toolsets": getattr(cli, "enabled_toolsets", None) if getattr(cli, "_explicit_toolsets", False) else None,
             "reasoning": getattr(cli, "_explicit_reasoning", None),
@@ -258,6 +290,11 @@ class CLIInitMixin:
         # Only a provider the command line chose is gateway launch policy: the config default is the
         # gateway's to resolve, and a resume compares launch policy against the session's frozen route.
         self._explicit_provider = _moa_provider_override or provider or _startup_provider_override or None
+        # The launch this command typed, captured here — after the startup route resolution (so a
+        # URL-bearing alias's own key and endpoint are in it) and before `_ensure_runtime_credentials`
+        # normalizes `self.model` for the resolved provider (#651) or the fallback ladder replaces it.
+        # A resume compares the launch the user asked for, not the route that ended up serving it.
+        self._typed_launch = _typed_launch_flags(self)
         # `--provider <custom>` without `-m` uses that entry's default_model, else the global
         # default goes to the custom endpoint and the compressor gets the wrong context length.
         # Explicit `-m` still wins. See #86978.

@@ -296,6 +296,22 @@ def _requested_policy(args):
     return policy
 
 
+def _same_model_spelling(typed, frozen_model):
+    """True when *frozen_model* is the provider's dot→hyphen spelling of the typed model — the id a
+    plain (untitled) create on a build that had no typed launch froze.
+
+    ``_normalize_model_for_provider`` runs inside ``_ensure_runtime_credentials`` and rewrites
+    ``cli.model`` for the resolved provider (``_dots_to_hyphens`` for ``anthropic``:
+    ``deepseek-v4.1-flash:cloud`` → ``deepseek-v4-1-flash:cloud``), and a create then froze that
+    rewritten id with neither ``model_requested`` nor a provider. The same command line must keep
+    resuming those rows. Provider-free on purpose — no config, no provider argument — so it cannot
+    re-open the client/owner alias divergence, and strictly narrower than normalizing: only dots
+    become hyphens, so any other difference still differs.
+    """
+    return (isinstance(typed, str) and isinstance(frozen_model, str) and typed != frozen_model
+            and typed.replace(".", "-") == frozen_model)
+
+
 def check_resume_policy(args, snapshot):
     """A resume may repeat the flags the session was created with (scripts re-run one command
     line); anything that would CHANGE the frozen route is refused, as before."""
@@ -310,6 +326,8 @@ def check_resume_policy(args, snapshot):
         frozen["cwd"] = info["cwd"]
     if "model" in requested and requested["model"] == frozen.get("model_requested"):
         requested["model"] = frozen.get("model")  # the alias the owner resolved at creation
+    elif "model" in requested and _same_model_spelling(requested["model"], frozen.get("model")):
+        requested["model"] = frozen.get("model")  # a row frozen with the provider's spelling
     elif "model" in requested and requested["model"] != frozen.get("model") and "model_requested" not in frozen:
         # The owner froze the resolved id of a `-m <alias>`; the same alias again is the same route.
         from gateway.session_local_route import resolve_launch_route
