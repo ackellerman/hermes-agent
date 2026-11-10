@@ -280,7 +280,8 @@ class DiscordVoiceReadyMixin:
             logger.warning("[Discord] ready check failed (guild=%d): %s", guild_id, exc,
                            exc_info=True)
             reason = f"the ready check failed: {exc}"
-        result = _lease_result(lease_task)
+        # A lease still loading when the bound expired reports no device — don't ask a pending future.
+        result = _lease_result(lease_task) if lease_task is not None and lease_task.done() else {}
         if reason is None:
             reason = self._voice_ready_degraded_reason(result)
         if reason:
