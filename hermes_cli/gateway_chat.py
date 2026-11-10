@@ -335,10 +335,10 @@ def check_resume_policy(args, snapshot, created_here=None):
     no mapping or re-resolution has anything to say about it. A marker for another session, a
     resolved row (``created: false``) and a client that passes nothing all check exactly as before.
 
-    ``provider: auto`` is the create side's own "no pick" sentinel — every launch policy is built
-    through ``_without_auto_pick`` — so a caller re-typing the word the workboard's argv carries
-    asks for no route change and is not compared. The sentinel is imported, never re-spelled: the
-    two sides of the comparison must agree on what "no pick" is.
+    ``provider: auto`` is the create side's own "no pick" sentinel — every launch *route* is built
+    through ``_without_auto_pick``, and the request echo is folded only for the comparison — so a
+    caller re-typing the word the workboard's argv carries asks for no route change and is not
+    compared. The sentinel is imported, never re-spelled: the two sides must agree on "no pick".
     """
     if created_here_matches(snapshot, created_here):
         return
