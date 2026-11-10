@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import time
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -247,6 +248,37 @@ def test_warm_never_raises_on_engine_failure(monkeypatch):
     assert result["warmed"] is False
     assert result["action"] == "error"
     assert "CUDA exploded" in result["error"]
+
+
+@pytest.mark.parametrize("scalar_via", ["config", "argument"])
+def test_a_scalar_stt_section_never_raises_on_the_lease_path(scalar_via, monkeypatch):
+    """``stt: enabled`` in config.yaml must not break a mic-open.
+
+    The lease loads the section itself (``warm_stt_provider(None)``) or takes the caller's, then
+    calls ``_get_provider`` → ``.get``. r1 F3 guarded only the boot probe, so this path raised
+    ``AttributeError: 'str' object has no attribute 'get'`` on every desktop lease (review r2 F3).
+    """
+    from tools import stt_lease, transcription_tools
+
+    # The REAL loader runs (the coercion lives in it), reading a config with a scalar ``stt``.
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: {"stt": "enabled"})
+    # Coerced to an empty section: no local backend, no usable cloud provider → provider "none",
+    # deterministically, instead of depending on whatever keys this machine happens to export.
+    monkeypatch.setattr(transcription_tools, "_detect_local_backend", lambda: None)
+    monkeypatch.setattr(
+        transcription_tools, "_CLOUD_PROVIDER_SPECS",
+        {name: (probe, lambda: False, warning, message)
+         for name, (probe, _available, warning, message)
+         in transcription_tools._CLOUD_PROVIDER_SPECS.items()})
+
+    stt_config: Any = "enabled" if scalar_via == "argument" else None
+    result = stt_lease.acquire_stt_lease("desktop:voice-input:scalar", stt_config)
+
+    assert transcription_tools._load_stt_config() == {}  # coerced at the loader, not by luck
+    assert result["provider"] == "none"
+    assert result["action"] == "noop"
+    assert result["warmed"] is False
+    assert result["leases"] == 1
 
 
 def test_warm_only_load_starts_idle_unload_watcher(monkeypatch):

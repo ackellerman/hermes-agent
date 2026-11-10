@@ -188,6 +188,16 @@ def preload_cuda_libraries() -> tuple[str, ...]:
     already-loaded copy satisfies it. Reporting those hosts as "missing" was a silent GPU→CPU
     downgrade under the default ``device: auto`` (review r1 F1). The name stays pinned to
     ``.so.12``, so a cu13 tree is never picked up either way.
+
+    COST: ``ctypes.CDLL`` does not release the GIL, so each ``dlopen`` below freezes every Python
+    thread in the process for as long as it runs — with the real ``nvidia-*`` wheels (581 MB +
+    717 MB packages) that is seconds, once per process. The daemon-thread hop at
+    ``gateway.run_startup`` moves the *load* and the *inference* off the loop; this call is the part
+    that still blocks it, deliberately (review r2 F1, accepted rather than bounded): a failed
+    ``dlopen`` is already cheap — the loader searches a handful of directories and gives up — while
+    the expensive case is a wheel that is present and must be mapped, so a presence prefilter
+    would remove no measurable stall and could only mis-report the ``LD_LIBRARY_PATH`` hosts that
+    ``find_library`` does not see.
     """
     lib_dir = cuda_library_dir()
     missing: list[str] = []

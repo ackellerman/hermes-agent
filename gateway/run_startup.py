@@ -217,6 +217,10 @@ class GatewayStartupMixin:
         closed, so routing overrides resolve as absent and default routing applies. ``copy_context``
         carries the contextvars across the hop; single-profile keeps environ semantics.
 
+        "Off the event loop" is about the loop's THREAD, not the GIL: the probe's own work can still
+        hold the interpreter lock (``transcription_local.preload_cuda_libraries`` and its
+        ``ctypes.CDLL`` calls do), which freezes the loop for that call even from this thread.
+
         ``daemon=True`` runs the probe on a daemon ``threading.Thread`` instead of the loop's
         DEFAULT executor (review r1 F2). ``asyncio.run`` joins that executor at close
         (``shutdown_default_executor`` with ``THREAD_JOIN_TIMEOUT`` = 300 s) and cancelling a
@@ -237,13 +241,22 @@ class GatewayStartupMixin:
             from gateway.run import _async_profile_runtime_scope
             from hermes_constants import get_hermes_home
             try:
-                async with _async_profile_runtime_scope(get_hermes_home()):
-                    return await _run_probe()
+                # ONLY the scope entry is guarded: an ``async with`` around the probe would let a
+                # probe body's exception land in ``except Exception`` and re-run the probe at the
+                # bottom, outside the launch profile — two CUDA warnings, two model loads, the
+                # second one reading ``stt.*`` from the wrong profile (review r2 F2).
+                scope = _async_profile_runtime_scope(get_hermes_home())
+                await scope.__aenter__()
             except Exception:
                 # Same fallback as load_gateway_config_for_runner: a scope that cannot be built must not
                 # abort startup; the probe runs unscoped as it did before.
                 logger.debug("multiplex launch-scope entry failed for boot probe %s; running unscoped",
                              getattr(fn, "__name__", fn), exc_info=True)
+            else:
+                try:
+                    return await _run_probe()
+                finally:
+                    await scope.__aexit__(None, None, None)
         return await _run_probe()
 
     @staticmethod
