@@ -26,7 +26,7 @@ import threading
 import time
 import traceback
 import weakref
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import nullcontext, suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
@@ -875,6 +875,12 @@ class VoiceReceiver:
     ACTIVE_FRAME_RMS = 100
     # Require sustained energy so a join-time pop/click cannot reach STT.
     MIN_ACTIVE_SPEECH_DURATION = 0.1
+    # Post-NaCl payloads held per SSRC that DAVE cannot attribute yet:
+    # ~2 s of 20 ms frames.  Long enough to cover a late SPEAKING event,
+    # short enough that a phantom SSRC cannot grow without bound.
+    DAVE_PENDING_MAX_FRAMES = 100
+    # Forget a held ring whose SSRC has stayed quiet this long.
+    DAVE_PENDING_TTL = 5.0
     REKEY_FAILURE_STREAK = 25  # consecutive NaCl failures → re-resolve creds
     # An SSRC nobody claimed (no SPEAKING, inference ambiguous) whose sender never pauses (another
     # bot's mixer sends frames continuously) never reaches silence: cap what it may buffer.
@@ -913,6 +919,10 @@ class VoiceReceiver:
         self._last_packet_time: dict[int, float] = {}
         # Opus decoder per SSRC (each user needs own decoder state)
         self._decoders: dict[int, object] = {}
+        # Post-NaCl payloads held while DAVE is active and the sender SSRC
+        # is neither mapped nor inferable.  (monotonic_ts, payload) entries
+        # so the ring can expire on its own; replayed once the SSRC resolves.
+        self._dave_pending: dict[int, deque] = {}
         # Pause flag: don't capture while bot is playing TTS
         self._paused = False
         # Debug logging counter (instance-level to avoid cross-instance races)
@@ -1036,6 +1046,7 @@ class VoiceReceiver:
             self._decoders.clear()
             self._ssrc_to_user.clear()
             self._dropped_ssrcs.clear()
+            self._dave_pending.clear()
         logger.info(
             "VoiceReceiver stopped (frames ok=%d, decrypt_failed=%d, "
             "dave_unmapped_dropped=%d, bot_audio_dropped=%d)",
@@ -1083,8 +1094,20 @@ class VoiceReceiver:
             self._dropped_ssrcs.add(ssrc)
             self._buffers.pop(ssrc, None)
             self._last_packet_time.pop(ssrc, None)
+            self._discard_dave_pending_locked(ssrc)
         else:
             self._dropped_ssrcs.discard(ssrc)
+
+    def _discard_dave_pending_locked(self, ssrc: int) -> None:
+        """Drop payloads held for an SSRC that resolved to a bot (call under ``_lock``).
+
+        Bot audio never leaves the ring: replaying it would hand another bot's speech to STT, or to
+        whoever the ring was waiting to attribute it to.
+        """
+        pending = self._dave_pending.pop(ssrc, None)
+        if pending:
+            self._bot_audio_dropped += len(pending)
+            logger.info("Discarded %d held voice payloads from bot ssrc=%d", len(pending), ssrc)
 
     def _install_speaking_hook(self, conn):
         """Wrap the voice websocket hook to capture SPEAKING events (op 5); ``conn.hook`` is
@@ -1263,18 +1286,20 @@ class VoiceReceiver:
                     # was already talking — try the sole-member inference
                     # before giving up on this frame.
                     user_id = self._infer_user_for_ssrc(ssrc)
+                # Inference may have just proven this SSRC is a bot's: bot
+                # audio is dropped, never held.
+                bot_owned = ssrc in self._dropped_ssrcs
             if user_id:
-                try:
-                    import davey
-                    decrypted = dave_session.decrypt(
-                        user_id, davey.MediaType.audio, decrypted
-                    )
-                except Exception as e:
-                    # Unencrypted passthrough — use NaCl-decrypted data as-is
-                    if "Unencrypted" not in str(e):
-                        if self._packet_debug_count <= 10:
-                            logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
-                        return
+                # Resolved — anything held for this SSRC predates this packet:
+                # replay it first so the utterance keeps its temporal order.
+                self._replay_dave_pending(ssrc, user_id)
+                plaintext = self._dave_decrypt(ssrc, user_id, decrypted)
+                if plaintext is None:
+                    return
+                decrypted = plaintext
+            elif bot_owned:
+                self._bot_audio_dropped += 1
+                return
             elif (
                 dave_pver > 0
                 and time.monotonic() >= self._dave_passthrough_until
@@ -1282,28 +1307,89 @@ class VoiceReceiver:
                 # E2EE is actively on (protocol > 0, no passthrough window),
                 # so an unmapped SSRC's payload is still ciphertext.  Opus
                 # will happily "decode" it (producing shredded audio and
-                # poisoning decoder state), so drop the frame until a
-                # SPEAKING event maps the SSRC — bounded loss beats corrupt
-                # audio.  A non-null session alone is NOT this predicate: the
-                # session object survives protocol downgrades to 0 and
-                # passthrough transitions, where plaintext is legitimate and
-                # must fall through to opus below.
-                self._dave_unmapped_dropped += 1
-                if (
-                    self._packet_debug_count <= 10
-                    or self._dave_unmapped_dropped % 250 == 1
-                ):
-                    logger.debug(
-                        "Dropping DAVE frame for unmapped ssrc=%d (dropped=%d)",
-                        ssrc, self._dave_unmapped_dropped,
-                    )
+                # poisoning decoder state), so hold the bytes in a bounded
+                # ring until SPEAKING maps the SSRC — bounded loss beats
+                # corrupt audio, and replaying keeps the utterance's opening.
+                # No decoder is created, so a later mapping starts clean.
+                # A non-null session alone is NOT this predicate: the session
+                # object survives protocol downgrades to 0 and passthrough
+                # transitions, where plaintext is legitimate and must fall
+                # through to opus below.
+                self._hold_dave_payload(ssrc, decrypted)
                 return
 
         # --- Opus decode -> PCM ---
+        self._decode_into_buffer(ssrc, decrypted)
+
+    def _dave_decrypt(self, ssrc: int, user_id: int, payload: bytes) -> Optional[bytes]:
+        """DAVE-decrypt one payload on behalf of a resolved sender.
+
+        Returns the Opus payload to decode, or None when the packet must be
+        discarded.  An "Unencrypted" failure is passthrough, not corruption:
+        the NaCl-decrypted bytes are already the Opus payload and are used
+        as-is.
+        """
+        session = self._dave_session
+        if session is None:
+            # Callers only reach here inside `if self._dave_session:`.  Stay
+            # explicit anyway: without a session the payload is already the
+            # Opus payload, and swallowing an AttributeError below would
+            # drop the packet with no usable diagnostic.
+            return payload
+        try:
+            import davey
+            return session.decrypt(
+                user_id, davey.MediaType.audio, payload
+            )
+        except Exception as e:
+            if "Unencrypted" in str(e):
+                return payload
+            if self._packet_debug_count <= 10:
+                logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
+            return None
+
+    def _hold_dave_payload(self, ssrc: int, payload: bytes) -> None:
+        """Hold a post-NaCl payload from an as-yet unattributable SSRC."""
+        evicted = 0
+        with self._lock:
+            pending = self._dave_pending.get(ssrc)
+            if pending is None:
+                pending = deque(maxlen=self.DAVE_PENDING_MAX_FRAMES)
+                self._dave_pending[ssrc] = pending
+            if len(pending) == pending.maxlen:
+                # The ring was full, so appending discards the oldest frame.
+                # Count it: these are the only voice bytes this path can lose.
+                self._dave_unmapped_dropped += 1
+                evicted = self._dave_unmapped_dropped
+            pending.append((time.monotonic(), payload))
+        if evicted and (evicted == 1 or evicted % 50 == 0):
+            logger.info(
+                "DAVE active with unresolved sender: hold ring full, "
+                "evicting oldest frames (ssrc=%d evicted=%d)", ssrc, evicted,
+            )
+
+    def _replay_dave_pending(self, ssrc: int, user_id: int) -> None:
+        """Decode payloads held while this SSRC was unresolved, in order."""
+        with self._lock:
+            pending = self._dave_pending.pop(ssrc, None)
+        if not pending:
+            return
+        logger.info(
+            "Replaying held voice payloads after SSRC resolution (ssrc=%d frames=%d)",
+            ssrc, len(pending),
+        )
+        for _held_at, payload in pending:
+            plaintext = self._dave_decrypt(ssrc, user_id, payload)
+            if plaintext is None:
+                continue
+            self._decode_into_buffer(ssrc, plaintext)
+
+    def _decode_into_buffer(self, ssrc: int, payload: bytes):
+        """Opus-decode one payload and append the PCM to the SSRC buffer."""
         try:
             if ssrc not in self._decoders:
                 self._decoders[ssrc] = discord.opus.Decoder()
-            pcm = self._decoders[ssrc].decode(decrypted)
+            pcm = self._decoders[ssrc].decode(payload)
             self._decode_ok += 1
             with self._lock:
                 self._buffers[ssrc].extend(pcm)
@@ -1312,7 +1398,6 @@ class VoiceReceiver:
             with self._lock:
                 self._decoders.pop(ssrc, None)
             logger.debug("Opus decode error for SSRC %s; reset decoder: %s", ssrc, e)
-            return
 
     # --- Silence detection ---
 
@@ -1420,6 +1505,12 @@ class VoiceReceiver:
         now = time.monotonic()
         completed = []
         with self._lock:
+            # Forget held payloads whose SSRC went quiet without ever being
+            # attributed — otherwise a phantom SSRC holds its ring until stop().
+            for pending_ssrc, pending in list(self._dave_pending.items()):
+                if not pending or now - pending[-1][0] >= self.DAVE_PENDING_TTL:
+                    self._dave_pending.pop(pending_ssrc, None)
+
             ssrc_user_map = dict(self._ssrc_to_user)
             ssrc_list = list(self._buffers.keys())
             for ssrc in ssrc_list:

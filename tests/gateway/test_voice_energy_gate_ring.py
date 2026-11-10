@@ -62,6 +62,15 @@ def nacl(monkeypatch):
     return aead
 
 
+@pytest.fixture(autouse=True)
+def fake_davey(monkeypatch):
+    """davey ships with the voice extra, not the test env; only ``MediaType.audio`` is needed."""
+    mod = types.ModuleType("davey")
+    mod.MediaType = SimpleNamespace(audio="audio")
+    monkeypatch.setitem(sys.modules, "davey", mod)
+    return mod
+
+
 @pytest.fixture
 def decoders(monkeypatch):
     """Opus decoders that record the payloads they were handed, so replay order is observable."""
@@ -101,7 +110,7 @@ def _receiver(*, members=(), allowed=(), dave_session=None, dave_pver=0, fleet=(
                          channel=SimpleNamespace(members=list(members)),
                          user=SimpleNamespace(id=_ME))
     receiver = VoiceReceiver(vc, allowed_user_ids=set(allowed), fleet_bot_ids=lambda: set(fleet))
-    receiver._running = True
+    receiver.start()  # resolves the credential tuple from the connection, as the real join does
     return receiver
 
 

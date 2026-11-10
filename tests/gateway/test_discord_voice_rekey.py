@@ -217,8 +217,9 @@ class TestWebsocketHookTrigger:
 class TestDaveUnmappedDrop:
     def test_unmapped_ssrc_never_reaches_opus(self, fake_nacl):
         """With E2EE actively on (protocol > 0, no passthrough window), an
-        unmapped SSRC's payload is ciphertext — it must be dropped, not fed
-        to the opus decoder."""
+        unmapped SSRC's payload is ciphertext — it must never reach the opus
+        decoder.  It is held in the bounded DAVE ring instead, so a late
+        SPEAKING event can still replay it."""
         conn = _make_conn(
             dave_session=MagicMock(name="DaveSession"), dave_protocol_version=1
         )
@@ -229,7 +230,8 @@ class TestDaveUnmappedDrop:
         with patch("discord.opus.Decoder") as decoder_cls:
             receiver._on_packet(_rtp_packet(ssrc=555))
             decoder_cls.assert_not_called()
-        assert receiver._dave_unmapped_dropped == 1
+        assert len(receiver._dave_pending[555]) == 1
+        assert receiver._dave_unmapped_dropped == 0  # held, not dropped
         assert 555 not in receiver._decoders
 
     def test_downgraded_protocol_zero_decodes_unmapped_plaintext(self, fake_nacl):
@@ -265,7 +267,7 @@ class TestDaveUnmappedDrop:
             decoder_cls.assert_called_once()
         assert receiver._dave_unmapped_dropped == 0
 
-    def test_expired_passthrough_window_drops_again(self, fake_nacl):
+    def test_expired_passthrough_window_holds_again(self, fake_nacl):
         conn = _make_conn(
             dave_session=MagicMock(name="DaveSession"), dave_protocol_version=1
         )
@@ -276,7 +278,7 @@ class TestDaveUnmappedDrop:
         with patch("discord.opus.Decoder") as decoder_cls:
             receiver._on_packet(_rtp_packet(ssrc=555))
             decoder_cls.assert_not_called()
-        assert receiver._dave_unmapped_dropped == 1
+        assert len(receiver._dave_pending[555]) == 1
 
     def test_op21_downgrade_opens_window_and_op22_refreshes(self):
         conn = _make_conn(
