@@ -24,6 +24,7 @@ import pytest
 
 from tools import stt_startup
 from gateway.run_startup import GatewayStartupMixin
+from tests.waiting import async_wait_until
 
 LOCAL_CFG = {"local": {"model": "medium", "device": "auto"}}
 BOTH_SONAMES = ("libcublasLt.so.12", "libcublas.so.12")
@@ -235,9 +236,10 @@ def test_startup_check_runs_off_the_event_loop(monkeypatch):
 
 
 def test_startup_check_is_a_fire_and_forget_task(monkeypatch):
-    release = threading.Event()
+    release, entered = threading.Event(), threading.Event()
 
     def probe():
+        entered.set()
         release.wait(5)
         return {"action": "skipped"}
 
@@ -248,7 +250,7 @@ def test_startup_check_is_a_fire_and_forget_task(monkeypatch):
         runner._start_startup_stt_check()          # sync entry point: returns without awaiting
         assert runner._startup_stt_task is not None
         assert getattr(runner, "_startup_warmup_task", None) is None  # not the boot-gate warm-up
-        await asyncio.sleep(0.05)
+        await async_wait_until(entered.is_set, what="the STT probe to start")
         assert not runner._startup_stt_task.done()  # still loading; nothing waits on it
         release.set()
         await runner._startup_stt_task

@@ -107,7 +107,7 @@ def _cuda_extra_selected() -> bool:
         from tools.transcription_local import cuda_library_dir
 
         return cuda_library_dir() is not None
-    except Exception:
+    except (ImportError, AttributeError):  # no local-STT module, or a tree without the resolver
         return False
 
 
@@ -117,7 +117,7 @@ def _cuda_device_visible() -> bool:
         from hermes_cli.tools_config_post_setup import _nvidia_gpu_present
 
         return bool(_nvidia_gpu_present())
-    except Exception:
+    except (ImportError, OSError, AttributeError):  # the probe lives outside the plugin tree
         return False
 
 
@@ -133,7 +133,7 @@ def _lease_result(task: Any) -> dict[str, Any]:
         return {"action": "error", "error": "the STT warm-up was cancelled"}
     try:
         result = task.result()
-    except Exception as exc:  # the thread's exception, re-raised here by future.result()
+    except Exception as exc:  # health: allow BLE001 -- future.result() re-raises whatever the worker raised; every one of them becomes action="error" so the gate opens
         return {"action": "error", "error": str(exc) or exc.__class__.__name__}
     return result if isinstance(result, dict) else {"action": "error", "error": "unusable lease result"}
 
@@ -254,7 +254,7 @@ class DiscordVoiceReadyMixin:
 
             local = (_load_stt_config() or {}).get("local") or {}
             return str(local.get("device") or "auto").strip().lower()
-        except Exception:
+        except (ImportError, AttributeError):  # no config module, or a non-mapping `stt.local`
             return "auto"
 
     async def _voice_ready_gate(self, guild_id: int, *, lease_task: Any) -> None:
@@ -293,7 +293,7 @@ class DiscordVoiceReadyMixin:
             try:
                 path = ready_tone_cache_path(cfg.get("ready_tone_gain", DEFAULT_READY_TONE_GAIN))
                 await self.play_in_voice_channel(guild_id, path, strict=True)
-            except Exception as exc:
+            except Exception as exc:  # health: allow BLE001 -- an unrenderable/unplayable tone degrades to a silent ready; it must never fail the join
                 logger.warning("[Discord] ready tone failed to play (guild=%d): %s", guild_id, exc)
             # t_ready is when the play call RETURNED, success or failure: the tone has been heard
             # for exactly as long as it took.

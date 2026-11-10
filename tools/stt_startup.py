@@ -50,7 +50,9 @@ def _cuda_device_count() -> int:
     try:
         import ctranslate2
         return int(ctranslate2.get_cuda_device_count())
-    except Exception:
+    except (ImportError, OSError, RuntimeError, ValueError):
+        # No ctranslate2, a library the loader cannot open, or a driver query that fails:
+        # all of them mean "no CUDA device this interpreter can use", never a failed check.
         return 0
 
 

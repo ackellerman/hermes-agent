@@ -1,4 +1,4 @@
-# health: allow FILE_LINES -- platform-tables refactor: core's PLATFORM_HINTS/_PLATFORM_DEFAULTS rows for this platform moved onto its register() call (hint text lives in adapter_hint.py); the growth is only those kwargs
+# health: allow FILE_LINES -- platform-tables refactor: core's PLATFORM_HINTS/_PLATFORM_DEFAULTS rows for this platform moved onto its register() call (hint text lives in adapter_hint.py); this branch's addition is the DAVE hold ring and the voice receive path, which must drive the adapter's own receiver lifecycle
 from __future__ import annotations
 
 """
@@ -1484,7 +1484,7 @@ class VoiceReceiver:
             return session.decrypt(
                 user_id, davey.MediaType.audio, payload
             )
-        except Exception as e:
+        except Exception as e:  # health: allow BLE001 -- any decrypt failure drops this one packet and is logged; it must never kill the receive loop
             if "Unencrypted" in str(e):
                 return payload
             if self._packet_debug_count <= 10:
@@ -1551,7 +1551,7 @@ class VoiceReceiver:
                 self._buffers[ssrc].extend(pcm)
                 self._last_packet_time[ssrc] = time.monotonic()
                 self._arrivals[ssrc].append((arrived, len(pcm)))
-        except Exception as e:
+        except Exception as e:  # health: allow BLE001 -- any Opus/decoder failure drops this frame and resets the decoder; it must never kill the receive loop
             with self._lock:
                 self._decoders.pop(ssrc, None)
             logger.debug("Opus decode error for SSRC %s; reset decoder: %s", ssrc, e)

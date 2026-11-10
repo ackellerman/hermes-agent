@@ -13,10 +13,8 @@ import faulthandler
 import logging
 import os
 import signal
-import threading
 import time
 from contextlib import nullcontext, suppress
-from contextvars import copy_context
 from pathlib import Path
 from agent.i18n import t
 from gateway.config import Platform
@@ -27,6 +25,8 @@ from gateway.session import SessionSource, build_session_key
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_FATAL_CONFIG_EXIT_CODE, is_global_startup_conflict
 )
+from gateway.run_startup_probe import GatewayStartupProbeMixin
+from gateway.run_startup_stt import GatewayStartupSttMixin
 from gateway.run_shutdown import _log_suppressed, _send_error
 from hermes_cli.observability.shared_metrics_busy import note_running_chat_owner
 from gateway.shutdown_watchdog import (
@@ -82,7 +82,7 @@ def _own_policy_envs(platform) -> Optional[tuple]:
     return (*own, authz_field(platform.value, "allow_all_env", entry))
 
 
-class GatewayStartupMixin:
+class GatewayStartupMixin(GatewayStartupSttMixin, GatewayStartupProbeMixin):
     """Startup sequence, resume/restore and handoff methods for GatewayRunner."""
 
     @staticmethod
@@ -190,111 +190,6 @@ class GatewayStartupMixin:
             self._startup_warmup_task = None
             return
         self._startup_warmup_task = asyncio.ensure_future(self._warm_turn_prerequisites())
-
-    def _start_startup_stt_check(self) -> None:
-        """Kick off the local-STT CUDA check (+ warm) as a FIRE-AND-FORGET task.
-
-        Deliberately not part of ``_warm_turn_prerequisites``: that warm-up is awaited with the
-        inbound gate shut for up to ``HERMES_STARTUP_WARMUP_TIMEOUT`` (20 s), and importing
-        ctranslate2 plus loading medium must never delay gateway start (#stt-cuda-survives-update
-        step 4). Nothing awaits this task; it is only kept reachable and reported on failure —
-        and a failure is a WARNING, because "no CUDA warning at start" (e4's acceptance line) must
-        not be indistinguishable from "the check died"."""
-        self._startup_stt_task = asyncio.ensure_future(self._check_startup_stt())
-        self._startup_stt_task.add_done_callback(
-            self._late_failure_callback("startup local-STT CUDA check failed"))
-
-    async def _check_startup_stt(self) -> None:
-        """Run the check on a daemon thread inside the launch profile's scope, so ``stt.*``
-        resolves for the profile that launched the gateway (multiplex fails closed unscoped)."""
-        from tools.stt_startup import check_local_stt_at_startup
-        with _log_suppressed(logging.WARNING, "Startup local-STT CUDA check failed", exc_info=True):
-            await self._run_boot_probe_in_launch_scope(check_local_stt_at_startup, daemon=True)
-
-    async def _run_boot_probe_in_launch_scope(self, fn, *, daemon: bool = False):
-        """Run a boot-time probe off the event loop under the LAUNCH profile's scope when
-        multiplexing (the ``_discover_gateway_mcp_tools`` shape). Boot probes (``check_fn``s) read profile-scoped secrets; an unscoped read under multiplex fails
-        closed, so routing overrides resolve as absent and default routing applies. ``copy_context``
-        carries the contextvars across the hop; single-profile keeps environ semantics.
-
-        "Off the event loop" is about the loop's THREAD, not the GIL: the probe's own work can still
-        hold the interpreter lock (``transcription_local.preload_cuda_libraries`` and its
-        ``ctypes.CDLL`` calls do), which freezes the loop for that call even from this thread.
-
-        ``daemon=True`` runs the probe on a daemon ``threading.Thread`` instead of the loop's
-        DEFAULT executor (review r1 F2). ``asyncio.run`` joins that executor at close
-        (``shutdown_default_executor`` with ``THREAD_JOIN_TIMEOUT`` = 300 s) and cancelling a
-        ``run_in_executor`` future does not stop its thread, so a cold first-time model download
-        (~1.5 GB) behind the STT check would hold ``hermes gateway stop`` and the ``hermes update``
-        restart for minutes. A daemon thread is never joined, dies with the interpreter, and still
-        carries the copied context — the probe is awaited for its result, just not on a thread the
-        loop owns."""
-        if daemon:
-            async def _run_probe():
-                return await self._run_probe_on_daemon_thread(fn)
-        else:
-            loop = asyncio.get_running_loop()
-
-            async def _run_probe():
-                return await loop.run_in_executor(None, copy_context().run, fn)
-        if getattr(self.config, "multiplex_profiles", False):
-            from gateway.run import _async_profile_runtime_scope
-            from hermes_constants import get_hermes_home
-            try:
-                # ONLY the scope entry is guarded: an ``async with`` around the probe would let a
-                # probe body's exception land in ``except Exception`` and re-run the probe at the
-                # bottom, outside the launch profile — two CUDA warnings, two model loads, the
-                # second one reading ``stt.*`` from the wrong profile (review r2 F2).
-                scope = _async_profile_runtime_scope(get_hermes_home())
-                await scope.__aenter__()
-            except Exception:
-                # Same fallback as load_gateway_config_for_runner: a scope that cannot be built must not
-                # abort startup; the probe runs unscoped as it did before.
-                logger.debug("multiplex launch-scope entry failed for boot probe %s; running unscoped",
-                             getattr(fn, "__name__", fn), exc_info=True)
-            else:
-                try:
-                    return await _run_probe()
-                finally:
-                    await scope.__aexit__(None, None, None)
-        return await _run_probe()
-
-    @staticmethod
-    async def _run_probe_on_daemon_thread(fn):
-        """Run *fn* on a daemon thread carrying the calling thread's contextvars; await the result.
-
-        Not joined at loop close, so process exit never waits for the probe (see
-        ``_run_boot_probe_in_launch_scope``). Cancellation of the awaiting task detaches it: the
-        thread finishes on its own and the result is dropped.
-        """
-        loop = asyncio.get_running_loop()
-        context = copy_context()  # copied HERE: the probe must run in the launch profile's scope
-        done: asyncio.Future = loop.create_future()
-
-        def _resolve(error, value):
-            if done.done():  # cancelled by shutdown — nothing is listening any more
-                return
-            if error is not None:
-                done.set_exception(error)
-            else:
-                done.set_result(value)
-
-        def _target():
-            error = None
-            value = None
-            try:
-                value = context.run(fn)
-            except BaseException as exc:  # every failure belongs to the awaiter, not this thread
-                error = exc
-            try:
-                loop.call_soon_threadsafe(_resolve, error, value)
-            except RuntimeError:
-                # Loop already closed: a shutdown raced the probe. Nothing to report to.
-                logger.debug("Boot probe %s finished after the event loop closed",
-                             getattr(fn, "__name__", fn))
-
-        threading.Thread(target=_target, name="startup-stt-check", daemon=True).start()
-        return await done
 
     async def _warm_turn_prerequisites(self) -> None:
         """Initialize turn machinery on an executor thread before the gate opens. Never raises: a

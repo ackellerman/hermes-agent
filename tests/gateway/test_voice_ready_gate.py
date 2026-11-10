@@ -358,6 +358,8 @@ async def test_the_tone_waits_for_both_the_dave_commit_and_the_lease(monkeypatch
 
     await _deliver_commit(env, _Daveless(ready=True))   # DAVE done, the lease still loading
     for _ in range(5):
+        if env.calls:                                    # a tone without the lease: the bug
+            break
         await asyncio.sleep(0.02)                        # the loop keeps ticking: not blocked
     assert env.calls == []
 
@@ -387,6 +389,7 @@ async def test_the_join_acquires_its_lease_off_the_event_loop(monkeypatch):
     assert seen["thread"] != loop_thread
     ticks = 0
     for _ in range(5):
+        # health: allow HX013 -- the tick IS the measurement: five loop turns while the lease's worker is blocked prove the loop was not stalled behind the model load
         await asyncio.sleep(0.01)
         ticks += 1
     assert ticks == 5, "the event loop stalled behind the model load"
@@ -759,6 +762,8 @@ async def test_a_re_epoch_does_not_rearm_the_gate(monkeypatch):
     env.conn.dave_protocol_version = 1
     await env.conn.hook(None, {"op": 4, "d": {}})
     for _ in range(5):
+        if len(env.calls) > 1:                            # a second tone: the bug under test
+            break
         await asyncio.sleep(0.02)
 
     assert len(env.calls) == 1, "a re-epoch must not play another tone"

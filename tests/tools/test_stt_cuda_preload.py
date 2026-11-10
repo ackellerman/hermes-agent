@@ -210,6 +210,7 @@ def test_resolver_serializes_concurrent_callers(tmp_path, monkeypatch):
     load = fake.CDLL
 
     def _slow_load(path, mode=0):
+        # health: allow HX013 -- the delay IS the fixture: it holds the loader inside the lock so the other seven callers actually pile up on it
         time.sleep(0.02)  # widen the window the lock exists to close
         return load(path, mode)
 

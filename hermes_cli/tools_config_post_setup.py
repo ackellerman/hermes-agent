@@ -116,7 +116,7 @@ def _nvidia_gpu_present() -> bool:
             return False
         count = ctypes.c_int(0)
         return cuda.cuDeviceGetCount(ctypes.byref(count)) == 0 and count.value > 0
-    except Exception:  # any ctypes failure means "no usable GPU", never a failed setup
+    except (OSError, AttributeError, RuntimeError, ctypes.ArgumentError):  # libcuda absent, or a ctypes/driver call the probe cannot use
         return False
 
 
@@ -147,7 +147,7 @@ def _gpu_extra_wanted(extra: str | None) -> bool:
 
             if not lazy_installs_allowed():
                 return False
-    except Exception:
+    except Exception:  # health: allow BLE001 -- the hook's contract is that a policy read it cannot complete leaves the opt-in extra OUT; re-raising would sink the base provider's sync
         return False
     return _nvidia_gpu_present()
 
