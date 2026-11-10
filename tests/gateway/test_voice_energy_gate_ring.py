@@ -18,6 +18,7 @@ frames discarded rather than replayed.
 """
 from __future__ import annotations
 
+import logging
 import struct
 import sys
 import time
@@ -323,3 +324,147 @@ def test_frames_held_for_an_ssrc_that_turns_out_to_be_a_bot_are_discarded(nacl, 
     assert receiver._bot_audio_dropped == 2
     assert dave.calls == []
     assert _decoded(decoders) == []
+
+
+# --- held audio cannot outlive the state that captured it -----------------------------------------
+
+def _two_ring_receiver() -> VoiceReceiver:
+    """A DAVE receiver with no inferable sender: any unmapped SSRC is held."""
+    return _receiver(members=[_member(_OPERATOR), _member(_STRANGER), _member(_ME, True)],
+                     dave_session=_RecordingDave(), dave_pver=1)
+
+
+def test_discard_pending_drops_the_hold_ring(nacl, decoders):
+    """A text-binding move already drops buffered PCM; held DAVE audio is captured speech too, and
+    replaying it after the move transcribes the old channel's utterance into the new one."""
+    dave = _RecordingDave()
+    receiver = _receiver(members=[_member(_OPERATOR), _member(_STRANGER), _member(_ME, True)],
+                         dave_session=dave, dave_pver=1)
+    _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"one")
+    _packet(nacl, receiver, _SSRC_PERSON, seq=2, payload=b"two")
+    assert len(receiver._dave_pending[_SSRC_PERSON]) == 2
+
+    receiver.discard_pending()  # what adapter_voice_info._bind_voice_text_channel calls
+
+    assert receiver._dave_pending == {}
+    assert receiver._dave_unmapped_dropped == 2  # counted, not silently lost
+    assert dave.calls == []
+    assert _decoded(decoders) == []
+
+
+def test_the_drop_helper_reports_the_frames_it_dropped(nacl):
+    """e6 calls this helper for its pre-ready cut; the return value is what it reports."""
+    receiver = _two_ring_receiver()
+    _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"one")
+    _packet(nacl, receiver, _SSRC_OPERATOR, seq=2, payload=b"two")
+
+    assert receiver._drop_held_voice_payloads("pre-ready cut") == 2
+    assert receiver._dave_pending == {}
+    assert receiver._dave_unmapped_dropped == 2
+    assert receiver._drop_held_voice_payloads("pre-ready cut") == 0  # idempotent
+
+
+def test_a_replaced_dave_session_drops_frames_held_under_the_old_one(nacl, decoders):
+    """``reinit_dave_session`` swaps the session object; held frames were captured under the old
+    ratchet and cannot be authenticated against the new one."""
+    receiver = _two_ring_receiver()
+    _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"old-epoch")
+    assert len(receiver._dave_pending[_SSRC_PERSON]) == 1
+
+    receiver._vc._connection.dave_session = _RecordingDave()
+    receiver.refresh_credentials("voice ws op 24")
+
+    assert receiver._dave_pending == {}
+    assert receiver._dave_unmapped_dropped == 1
+    assert _decoded(decoders) == []
+
+
+def test_an_epoch_change_on_the_same_session_drops_the_ring(nacl):
+    """op 22 executing a transition bumps the protocol version without replacing the object."""
+    receiver = _two_ring_receiver()
+    _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"old-epoch")
+
+    receiver._vc._connection.dave_protocol_version = 0
+    receiver.refresh_credentials("voice ws op 22")
+
+    assert receiver._dave_pending == {}
+    assert receiver._dave_unmapped_dropped == 1
+
+
+def test_a_refresh_that_keeps_the_session_keeps_the_ring(nacl, decoders):
+    """op 4 rotating only the transport key must not throw held audio away."""
+    receiver = _two_ring_receiver()
+    _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"one")
+
+    receiver._vc._connection.secret_key = b"\x11" * 32
+    receiver.refresh_credentials("voice ws op 4")
+
+    assert [payload for _at, payload in receiver._dave_pending[_SSRC_PERSON]] == [b"one"]
+    assert receiver._dave_unmapped_dropped == 0
+
+
+def test_the_ttl_sweep_counts_and_logs_what_it_expires(nacl, decoders, caplog):
+    """TTL expiry is the ordinary outcome when SPEAKING never arrives: it must be counted and named,
+    or the teardown line reads ``dave_unmapped_dropped=0`` while an utterance was lost."""
+    receiver = _two_ring_receiver()
+    _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"one")
+    _packet(nacl, receiver, _SSRC_PERSON, seq=2, payload=b"two")
+    _packet(nacl, receiver, _SSRC_OPERATOR, seq=3, payload=b"three")
+    for ssrc in (_SSRC_PERSON, _SSRC_OPERATOR):
+        held_at, payload = receiver._dave_pending[ssrc][-1]
+        receiver._dave_pending[ssrc][-1] = (
+            held_at - VoiceReceiver.DAVE_PENDING_TTL - 1.0, payload)
+
+    with caplog.at_level(logging.INFO):
+        assert receiver.check_silence() == []
+
+    assert receiver._dave_pending == {}
+    assert receiver._dave_unmapped_dropped == 3
+    assert "frames=3" in caplog.text
+    assert "ssrcs=2" in caplog.text
+    assert _decoded(decoders) == []
+
+
+# --- the energy gate does not hold the lock -------------------------------------------------------
+
+def _lock_free_gate(receiver, monkeypatch):
+    """Install a gate probe that records whether ``_lock`` was free while it ran."""
+    real_gate = VoiceReceiver._pcm_speech_activity
+    lock_free: list[bool] = []
+
+    def probe(pcm_data):
+        got = receiver._lock.acquire(blocking=False)
+        lock_free.append(got)
+        if got:
+            receiver._lock.release()
+        return real_gate(pcm_data)
+
+    monkeypatch.setattr(receiver, "_pcm_speech_activity", probe)
+    return lock_free
+
+
+def test_check_silence_classifies_outside_the_lock(monkeypatch):
+    receiver = _receiver(members=[_member(_OPERATOR, True)], allowed={str(_OPERATOR)})
+    receiver.map_ssrc(_SSRC_PERSON, _OPERATOR)
+    pcm = _square_pcm(0.5, 0) + _square_pcm(0.1, 1000) + _square_pcm(0.4, 0)
+    receiver._buffers[_SSRC_PERSON] = bytearray(pcm)
+    receiver._last_packet_time[_SSRC_PERSON] = time.monotonic() - 3.0
+    lock_free = _lock_free_gate(receiver, monkeypatch)
+
+    assert receiver.check_silence() == [(_OPERATOR, pcm)]  # verdict unchanged
+    assert lock_free == [True]  # ... and the gate ran with the lock free
+
+
+def test_flush_pending_classifies_outside_the_lock(monkeypatch, caplog):
+    receiver = _receiver(members=[_member(_OPERATOR, True)], allowed={str(_OPERATOR)})
+    receiver.map_ssrc(_SSRC_PERSON, _OPERATOR)
+    receiver._buffers[_SSRC_PERSON] = bytearray(_square_pcm(1.0, 30))
+    receiver._last_packet_time[_SSRC_PERSON] = time.monotonic()
+    lock_free = _lock_free_gate(receiver, monkeypatch)
+
+    with caplog.at_level(logging.INFO):
+        assert receiver.flush_pending() == []  # verdict unchanged: comfort noise still rejected
+
+    assert lock_free == [True]
+    assert "non-speech PCM segment" in caplog.text
+    assert _SSRC_PERSON not in receiver._buffers
