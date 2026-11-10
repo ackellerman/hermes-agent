@@ -1,6 +1,7 @@
 """Tests for gateway service management helpers."""
 
 import json
+import logging
 import os
 import plistlib
 import re
@@ -1513,6 +1514,161 @@ class TestSystemUnitHermesHome:
 
         hermes_home = str(gateway_cli.get_hermes_home().resolve())
         assert f'HERMES_HOME={hermes_home}' in unit
+
+
+def _venv_generation_lib(installs_root: Path, install_key: str, generation: str = "9fff708538934e1299733edf9ef711c2") -> str:
+    """A lib dir inside a dependency generation: the next sync deletes it (#14613's failure)."""
+    return str(
+        Path(installs_root)
+        / install_key
+        / "environments"
+        / generation
+        / "venv/lib/python3.14/site-packages/nvidia/cublas/lib"
+    )
+
+
+class TestUnitDropsInstallEnvironmentLdLibraryPaths:
+    """A regenerated unit must not carry a dependency generation's lib dir: ``hermes update``
+    replaces the generation, so the path is dead the moment CUDA needs it -- and once baked in,
+    every start/restart/status regeneration keeps it (stt-cuda-survives-update, element e3)."""
+
+    def _user_unit(self, monkeypatch, tmp_path, hermes_home: Path) -> str:
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        # The absent-env branch falls back to the installed unit: keep the host's real one out.
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_unit_path", lambda system=False: tmp_path / "hermes-gateway.service"
+        )
+        return gateway_cli.generate_systemd_unit(system=False)
+
+    def test_user_unit_drops_environment_components_built_through_the_default_root(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        from pm.environments import installs_root
+
+        hermes_home = tmp_path / ".hermes"
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        root = installs_root()
+        assert root == hermes_home / "installs"
+
+        stale = _venv_generation_lib(root, "9e8f535ea094ebf3")
+        # Merely missing on disk: an unmounted volume is not stale, so it stays.
+        missing = str(tmp_path / "mnt" / "unmounted-cuda" / "lib")
+        keep = "/opt/cuda/lib64"
+        monkeypatch.setenv("LD_LIBRARY_PATH", ":".join([stale, keep, missing]))
+
+        with caplog.at_level(logging.INFO, logger="hermes_cli.gateway"):
+            unit = self._user_unit(monkeypatch, tmp_path, hermes_home)
+
+        assert not Path(missing).exists()
+        assert "environments" not in unit
+        assert stale not in unit
+        # The surviving value still comes from the installer's inherited env, order intact.
+        assert f'Environment="LD_LIBRARY_PATH={keep}:{missing}"' in unit
+        drops = [r for r in caplog.records if stale in r.getMessage()]
+        assert drops, [r.getMessage() for r in caplog.records]
+        assert drops[0].levelno == logging.INFO
+        assert "environments" in drops[0].getMessage()
+
+    def test_user_unit_drops_environment_components_built_through_a_custom_root(self, monkeypatch, tmp_path):
+        from pm.environments import installs_root
+
+        custom_home = tmp_path / "srv" / "hermes-data"
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("HERMES_HOME", str(custom_home))
+        root = installs_root()
+        assert root == custom_home / "installs"
+
+        stale = _venv_generation_lib(root, "0d5a1c9b7e3f4a26")
+        keep = "/opt/cuda/lib64"
+        missing = str(tmp_path / "mnt" / "gone" / "lib")
+        monkeypatch.setenv("LD_LIBRARY_PATH", ":".join([keep, stale, missing]))
+
+        unit = self._user_unit(monkeypatch, tmp_path, custom_home)
+
+        assert stale not in unit
+        assert f'Environment="LD_LIBRARY_PATH={keep}:{missing}"' in unit
+
+    def test_user_unit_drops_environment_components_from_the_installed_unit_fallback(
+        self, monkeypatch, tmp_path
+    ):
+        from pm.environments import installs_root
+
+        hermes_home = tmp_path / ".hermes"
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        stale = _venv_generation_lib(installs_root(), "9e8f535ea094ebf3")
+        keep = "/opt/cuda/lib64"
+        unit_path = tmp_path / "hermes-gateway.service"
+        unit_path.write_text(
+            f'[Service]\nEnvironment="LD_LIBRARY_PATH={stale}:{keep}"\n', encoding="utf-8"
+        )
+        monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
+        monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+
+        assert stale not in unit
+        assert f'Environment="LD_LIBRARY_PATH={keep}"' in unit
+
+    def test_user_unit_drops_the_line_when_every_component_is_an_environment(
+        self, monkeypatch, tmp_path
+    ):
+        from pm.environments import installs_root
+
+        hermes_home = tmp_path / ".hermes"
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv(
+            "LD_LIBRARY_PATH",
+            ":".join(
+                [
+                    _venv_generation_lib(installs_root(), "9e8f535ea094ebf3"),
+                    _venv_generation_lib(installs_root(), "0d5a1c9b7e3f4a26"),
+                ]
+            ),
+        )
+
+        unit = self._user_unit(monkeypatch, tmp_path, hermes_home)
+
+        assert "LD_LIBRARY_PATH" not in unit
+
+    def test_system_unit_drops_environment_components_for_the_target_users_home(
+        self, monkeypatch, tmp_path
+    ):
+        """Under sudo the caller's install root is remapped to the target user's; the filter must
+        follow that remap instead of comparing against the caller's ``installs_root()``."""
+        caller_home = tmp_path / "root"
+        target_home = tmp_path / "alice"
+        caller_home.mkdir()
+        target_home.mkdir()
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: caller_home))
+        monkeypatch.setenv("HERMES_HOME", str(caller_home / ".hermes"))
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", str(target_home), 1001),
+        )
+        monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", list)
+        monkeypatch.setattr(gateway_cli, "_build_user_local_paths", lambda home, existing: [])
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda name: None)
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_unit_path", lambda system=False: tmp_path / "hermes-gateway.service"
+        )
+
+        target_installs = target_home / ".hermes" / "installs"
+        caller_installs = caller_home / ".hermes" / "installs"
+        stale_target = _venv_generation_lib(target_installs, "9e8f535ea094ebf3")
+        remapped_caller = _venv_generation_lib(caller_installs, "9e8f535ea094ebf3")
+        keep = "/opt/cuda/lib64"
+        missing = str(tmp_path / "mnt" / "gone" / "lib")
+        monkeypatch.setenv("LD_LIBRARY_PATH", ":".join([remapped_caller, stale_target, keep, missing]))
+
+        unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
+
+        assert "environments" not in unit
+        assert f'Environment="LD_LIBRARY_PATH={keep}:{missing}"' in unit
 
 
 class TestSystemUnitRefreshSyncsHermesHome:
