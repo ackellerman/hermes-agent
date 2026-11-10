@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
@@ -15,6 +16,9 @@ from hermes_startup_watchdog import report_startup_progress
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
+
+# "Not computed yet" for a caller-supplied SQL fragment (None is a real value: no guard).
+_UNSET = object()
 
 _LAST_ACTIVE_SQL = _sql_session_last_active("s")
 _TOKENS_SQL = "(COALESCE(s.input_tokens, 0) + COALESCE(s.output_tokens, 0))"
@@ -144,6 +148,23 @@ class SessionMaintenanceMixin:
         parents are closed, not live, so they are not guarded (prune and delete share this)."""
         return {sid for sid in ids if self._write_guards_reject(conn, sid, allow_closed_compression_parent=True)}
 
+    @staticmethod
+    def _parents_still_needed(conn, victims: Iterable[str], kept: Optional[str]) -> set[str]:
+        """Victims that a guarded row still points at as its parent. Deleting one would NULL the link a
+        retained child's chain row proves ownership with (r1 finding 4), so such a parent is spared too.
+
+        Every parent on a kept child's ownership chain is already excluded by the selection guard; this
+        catches the residual case — a kept row whose stored parent is not a valid hop — once per prune
+        rather than once per id chunk. Sparing beats NULLing: the parent link is what
+        ``stored_child_session`` walks, and the ``sessions.parent_session_id`` foreign key refuses the
+        delete anyway."""
+        if not kept or not victims:
+            return set()
+        return {row[0] for row in conn.execute(
+            f"SELECT DISTINCT c.parent_session_id FROM sessions c WHERE c.id IN ({kept})"
+            " AND c.parent_session_id IN (SELECT value FROM json_each(?))",
+            (json.dumps(sorted(victims)),)).fetchall()}
+
     def _write_guards_reject(self, conn, sid: str, **kwargs) -> bool:
         """True when a live turn lease / compression lock protects ``sid``; expired or
         dead-holder guards are reclaimed and fenced as a side effect."""
@@ -255,10 +276,11 @@ class SessionMaintenanceMixin:
         return " AND ".join(clauses), params
 
     def _kept_children_sql(self) -> Optional[str]:
-        """Sessions of kept delegated children (``tools.delegate_children``) and their continuations, which prune
-        spares while ``delegation.keep_protects_transcripts`` is on (default) in the config of the profile that owns
-        this database. None only when off or the table is absent (nothing kept); any error propagates, so the
-        prune fails instead of deleting kept transcripts."""
+        """Sessions of kept delegated children (``tools.delegate_children``), their continuations and the
+        ownership chain above them (the parent, its compression ancestors and the holder's conversation
+        root), which prune spares while ``delegation.keep_protects_transcripts`` is on (default) in the
+        config of the profile that owns this database. None only when off or the table is absent (nothing
+        kept); any error propagates, so the prune fails instead of deleting kept transcripts."""
         from tools.delegate_children import TABLE, kept_sessions_sql, protects_transcripts_for
         if not protects_transcripts_for(self.db_path):
             return None
@@ -266,10 +288,14 @@ class SessionMaintenanceMixin:
             return None
         return kept_sessions_sql(_CONTINUATION_EDGE_SQL)
 
-    def _prune_where(self, older_than_days, source, filters, *, whole_lineages: bool = False) -> tuple[str, list]:
+    def _prune_where(self, older_than_days, source, filters, *, whole_lineages: bool = False,
+                     kept_sql: Any = _UNSET) -> tuple[str, list]:
         """Translate the legacy age window into the shared activity filter, then build WHERE.
-        ``whole_lineages`` (prune) keeps a compression ancestor while any continuation after it
-        is unmatched."""
+        ``whole_lineages`` (prune) keeps a kept child's rows AND the ownership chain above them (so
+        ``stored_child_session`` still proves ownership after the prune; see
+        ``delegate_children.kept_sessions_sql``), and a compression ancestor while any continuation
+        after it is unmatched. ``kept_sql`` lets a caller that already built that (expensive) predicate
+        hand it in, so one run builds it once for the selection and the parent-sparing step alike."""
         if (older_than_days is not None and filters.get("last_active_before") is None
                 and filters.get("started_before") is None):
             if older_than_days < 0:
@@ -280,7 +306,8 @@ class SessionMaintenanceMixin:
         where, params = self._prune_filter_where(source=source, **filters)
         if not whole_lineages:
             return where, params
-        if kept := self._kept_children_sql():
+        kept = self._kept_children_sql() if kept_sql is _UNSET else kept_sql
+        if kept:
             where = f"{where} AND s.id NOT IN ({kept})"
         # A compressed-away segment ages with its conversation, not on its own: while any later
         # segment stays, deleting it would cut the start off a chat that is still in use.
@@ -396,7 +423,8 @@ class SessionMaintenanceMixin:
             # Deletion is not reversible, so the ended-session guard is structural here: the
             # archive-only escape hatch (#139597) must never reach the delete path.
             raise ValueError("prune_sessions() never deletes open sessions: include_open is archive-only")
-        where, where_params = self._prune_where(older_than_days, source, filters, whole_lineages=True)
+        kept = self._kept_children_sql()  # built once: the selection AND the parent-sparing step use it
+        where, where_params = self._prune_where(older_than_days, source, filters, whole_lineages=True, kept_sql=kept)
         removed_ids: list[str] = []
         def _do(conn):
             cursor = conn.execute(f"SELECT s.id FROM sessions s WHERE {where}", where_params)
@@ -406,6 +434,12 @@ class SessionMaintenanceMixin:
             from hermes_state_mutation_retirement import prune_retired_tombstones, retire_prunable
             session_ids = retire_prunable(conn, sorted(session_ids))
             prune_retired_tombstones(conn)  # every prune pass also reclaims expired deletion tombstones
+            # A row a retained child still needs keeps its parent: never NULL that link, never delete the
+            # parent out from under it. Usually a no-op (the guard spares the whole chain); it costs one
+            # query per prune, not one per id chunk, and it cannot orphan or fail on a broken-hop chain.
+            needed = self._parents_still_needed(conn, session_ids, kept)
+            if needed:
+                session_ids = [sid for sid in session_ids if sid not in needed]
             if not session_ids:
                 return 0
             # Batched: a cron-heavy store prunes tens of thousands of ids in one call.

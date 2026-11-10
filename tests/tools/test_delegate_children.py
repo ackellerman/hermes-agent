@@ -764,10 +764,11 @@ def test_prune_spares_a_kept_childs_sessions_and_continuation(db, monkeypatch):
     _old_lineage(db)
     candidates = {r["id"] for r in db.list_prune_candidates(older_than_days=None, whole_lineages=True,
                                                             last_active_before=time.time() + 60)}
-    assert {"kid-1", "kid-2"}.isdisjoint(candidates) and {"parent", "loose"} <= candidates
+    # r4/D-003: the delegating parent is on the child's ownership chain, so the dry run spares it too.
+    assert {"kid-1", "kid-2", "parent"}.isdisjoint(candidates) and "loose" in candidates
     _prune_all(db)
     assert db.get_session("kid-1") is not None and db.get_session("kid-2") is not None
-    assert db.get_session("loose") is None and db.get_session("parent") is None
+    assert db.get_session("loose") is None and db.get_session("parent") is not None
 
 
 def test_prune_without_protection_deletes_kept_transcripts(db, tmp_path):
@@ -1348,3 +1349,259 @@ def test_record_holder_is_read_when_the_worker_starts(db):
     row = _rows(db.db_path)[0]
     assert (row["holder_session_id"], row["conversation_id"]) == ("after-new", "after-new")
     _finish(future)
+
+
+# ── review round 4 (plan delegate-resume, e1 r4 / D-003 option 1) ────────────
+
+def _ended(db, sid, *, parent=None, end="user_exit", source="cli", model_config=None):
+    """A stored session row that ended (prune only deletes ended rows)."""
+    db.create_session(sid, source=source, parent_session_id=parent, model_config=model_config)
+    if end:
+        db.end_session(sid, end)
+    return sid
+
+
+def _kept(db, child_sid, subagent_id, holder, conversation):
+    """The ``delegate_children`` row of an idle (retained) child, as a spawn + worker start leave it."""
+    store = dc.ChildStore(db.db_path)
+    token = store.record_run_start(child_id=child_sid, subagent_id=subagent_id, holder_session_id=holder,
+                                   conversation_id=conversation, brief={"goal": "g"})
+    assert token
+    assert store.finish_run(child_sid, token, "completed")
+    return store
+
+
+def _age(db, days=400):
+    """Push every session row well past a 90-day retention window (the child's own row stays fresh)."""
+    conn = sqlite3.connect(db.db_path)
+    conn.execute("UPDATE sessions SET started_at = started_at - ? * 86400,"
+                 " ended_at = COALESCE(ended_at, started_at) - ? * 86400", (days, days))
+    conn.commit()
+    conn.close()
+
+
+def test_prune_chain_keeps_the_parent_and_the_alias_still_resolves(db, monkeypatch):
+    """r1 finding 4 / D-003: pruning the delegating parent must not cut the child off from the conversation.
+
+    A prune whose age takes the parent spares the whole chain, so the ``subagent_id`` alias still resolves
+    through ``stored_child_session``, ``latest_session_id`` is right and the resume precondition holds."""
+    from tools.delegate_tool_sessions import stored_child_session
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
+    _ended(db, "parent")                                    # the holder's conversation, aged past the window
+    _child_session(db, "kid-1", "parent", "sa-0-aaaa")       # the kept child's first segment
+    db.end_session("kid-1", "compression")
+    db.create_session("kid-2", source="subagent", parent_session_id="kid-1",
+                      model_config={"_delegate_from": "parent", "_subagent_id": "sa-0-aaaa"})
+    db.end_session("kid-2", "user_exit")
+    _ended(db, "unrelated")                                 # expired, unprotected: must still go
+    store = _kept(db, "kid-1", "sa-0-aaaa", "parent", "parent")
+    _age(db)
+
+    assert db.prune_sessions(older_than_days=90) == 1        # the unrelated session only
+    assert db.get_session("unrelated") is None
+    assert db.get_session("parent") is not None              # spared with the chain it anchors
+    assert db.get_session("kid-1")["parent_session_id"] == "parent"  # not orphaned by a partial prune
+    assert db.get_session("kid-2")["parent_session_id"] == "kid-1"
+
+    assert stored_child_session(db, "sa-0-aaaa", ["parent"]) == "kid-2"
+    assert store.refresh_latest("kid-1") == "kid-2"
+    assert store.resolve("sa-0-aaaa", ["parent"]) == "kid-1"
+    assert store.show("kid-1", ["parent"])["latest_session_id"] == "kid-2"
+    assert store.take_fence("kid-1").ok is True              # resume precondition (e2) holds after the prune
+
+
+def test_prune_chain_spares_a_compression_ancestor_above_the_delegate_hop(db, monkeypatch):
+    """The parent rotated before it delegated: its own compression ancestors are on the child's chain."""
+    from tools.delegate_tool_sessions import stored_child_session
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
+    _ended(db, "conv-0", end="compression")                 # the conversation root (holder's lineage)
+    _ended(db, "conv-1", parent="conv-0")                   # its rotation: where the child delegated from
+    _child_session(db, "kid-1", "conv-1", "sa-0-bbbb")
+    db.end_session("kid-1", "user_exit")
+    store = _kept(db, "kid-1", "sa-0-bbbb", "conv-1", "conv-0")
+    _age(db)
+
+    db.prune_sessions(older_than_days=90)
+    assert db.get_session("conv-1") is not None and db.get_session("conv-0") is not None
+    assert db.get_session("kid-1")["parent_session_id"] == "conv-1"
+    assert stored_child_session(db, "sa-0-bbbb", ["conv-0"]) == "kid-1"
+    assert store.refresh_latest("kid-1") == "kid-1"
+
+
+def test_prune_chain_spares_two_compression_hops_above_the_delegate_hop(db, monkeypatch):
+    from tools.delegate_tool_sessions import stored_child_session
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
+    _ended(db, "conv-prev", end="compression")   # above the conversation root: the walk stops below it
+    _ended(db, "conv-0", parent="conv-prev", end="compression")
+    _ended(db, "conv-1", parent="conv-0", end="compression")
+    _ended(db, "conv-2", parent="conv-1")
+    _child_session(db, "kid-1", "conv-2", "sa-0-cccc")
+    db.end_session("kid-1", "user_exit")
+    store = _kept(db, "kid-1", "sa-0-cccc", "conv-2", "conv-0")
+    _age(db)
+
+    guarded = {row["id"] for row in db._read_all(f"SELECT id FROM ({db._kept_children_sql()})", ())}
+    assert {"conv-0", "conv-1", "conv-2", "kid-1"} <= guarded
+    assert "conv-prev" not in guarded        # the root (conversation_id) ends the walk
+    assert db.prune_sessions(older_than_days=90) == 0
+    for sid in ("conv-0", "conv-1", "conv-2", "kid-1"):
+        assert db.get_session(sid) is not None, sid
+    assert db.get_session("conv-1")["parent_session_id"] == "conv-0"  # links intact, not NULLed
+    assert stored_child_session(db, "sa-0-cccc", ["conv-0"]) == "kid-1"
+    assert store.take_fence("kid-1").ok is True
+
+
+def test_prune_chain_shared_parent_spared_while_either_child_is_retained(db, monkeypatch):
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
+    _ended(db, "parent")
+    _child_session(db, "kid-a", "parent", "sa-0-a")
+    _child_session(db, "kid-b", "parent", "sa-0-b")
+    for sid in ("kid-a", "kid-b"):
+        db.end_session(sid, "user_exit")
+    _kept(db, "kid-a", "sa-0-a", "parent", "parent")
+    _kept(db, "kid-b", "sa-0-b", "parent", "parent")
+    _age(db)
+    _set(db.db_path, "kid-b", status="expired")   # b's protection is over, a still holds the parent
+    _pruned = db.prune_sessions(older_than_days=90)
+
+    assert db.get_session("parent") is not None and db.get_session("kid-a") is not None
+    assert db.get_session("kid-b") is None and _pruned == 1
+
+    _set(db.db_path, "kid-a", status="expired")   # nobody is retained any more: an ordinary prune applies
+    assert db.prune_sessions(older_than_days=90) == 2
+    assert db.get_session("parent") is None and db.get_session("kid-a") is None
+
+
+def test_prune_chain_releases_the_parent_and_its_ancestors_after_the_last_child_expires(db, monkeypatch):
+    """Requirement 3: protection ends with the child; the chain is not kept alive and keep_idle_days is not
+    stretched — the child's own row expires on its usual clock and the next prune takes parent and ancestors."""
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
+    _ended(db, "conv-0", end="compression")
+    _ended(db, "conv-1", parent="conv-0")
+    _child_session(db, "kid-1", "conv-1", "sa-0-dd")
+    db.end_session("kid-1", "user_exit")
+    store = _kept(db, "kid-1", "sa-0-dd", "conv-1", "conv-0")
+    _age(db)
+
+    db.prune_sessions(older_than_days=90)
+    for sid in ("conv-0", "conv-1", "kid-1"):
+        assert db.get_session(sid) is not None, sid
+    # Expiry, not the prune, ends protection: 7 days + 1 s after its last run the child is gone.
+    assert store.get("kid-1", now=time.time() + 8 * DAY)["status"] == "expired"
+    assert db.prune_sessions(older_than_days=90) == 3
+    assert [sid for sid in ("conv-0", "conv-1", "kid-1") if db.get_session(sid) is not None] == []
+
+
+def test_prune_parent_null_step_still_orphans_an_unprotected_child(db, monkeypatch):
+    """The parent link survives only where a retained chain needs it: an ordinary out-of-window child of a
+    pruned session is still NULLed, not cascade-deleted."""
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
+    _ended(db, "old-parent")
+    _child_session(db, "kid-1", "old-parent", "sa-0-e")  # the retained child: keeps old-parent through the chain
+    db.end_session("kid-1", "user_exit")
+    _ended(db, "young-child", parent="old-parent")   # nobody's chain: younger than the window, so spared
+    _kept(db, "kid-1", "sa-0-e", "old-parent", "old-parent")
+    _age(db)
+    conn = sqlite3.connect(db.db_path)
+    conn.execute("UPDATE sessions SET started_at = started_at + 399 * 86400,"
+                 " ended_at = ended_at + 399 * 86400 WHERE id = 'young-child'")
+    conn.commit()
+    conn.close()
+
+    assert db.prune_sessions(older_than_days=90) == 0
+    assert db.get_session("old-parent") is not None          # spared as the retained child's conversation
+    assert db.get_session("young-child")["parent_session_id"] == "old-parent"
+
+    _set(db.db_path, "kid-1", status="expired")              # the chain is released with the last child
+    assert db.prune_sessions(older_than_days=90) == 2
+    assert db.get_session("old-parent") is None and db.get_session("kid-1") is None
+    assert db.get_session("young-child")["parent_session_id"] is None
+
+
+def test_prune_chain_of_a_grandchild_includes_its_parent_childs_rows(db, monkeypatch):
+    """A nested child's walk crosses a delegate hop, the parent child's compression rotation, then another
+    delegate hop: only the grandchild is retained, yet the child's own rows are on its chain."""
+    from tools.delegate_tool_sessions import stored_child_session
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
+    _ended(db, "parent")
+    _child_session(db, "kid-1", "parent", "sa-0-kid")   # the child itself is not kept
+    db.end_session("kid-1", "compression")
+    db.create_session("kid-2", source="subagent", parent_session_id="kid-1",
+                      model_config={"_delegate_from": "parent", "_subagent_id": "sa-0-kid"})
+    db.end_session("kid-2", "compression")
+    _child_session(db, "grand-1", "kid-2", "sa-0-grand")
+    db.end_session("grand-1", "user_exit")
+    store = _kept(db, "grand-1", "sa-0-grand", "kid-2", "parent")  # the child itself is not kept
+    _age(db)
+
+    db.prune_sessions(older_than_days=90)
+    for sid in ("parent", "kid-1", "kid-2", "grand-1"):
+        assert db.get_session(sid) is not None, sid
+    assert stored_child_session(db, "sa-0-grand", ["parent"]) == "grand-1"
+    assert store.take_fence("grand-1").ok is True
+
+    _set(db.db_path, "grand-1", status="expired")   # release: every row on the chain becomes prunable
+    assert db.prune_sessions(older_than_days=90) == 4
+
+
+@pytest.mark.parametrize("door", ["manual", "auto"])
+def test_prune_chain_is_honoured_by_the_manual_and_the_auto_maintenance_paths(tmp_path, monkeypatch, capsys, door):
+    """``hermes sessions prune`` (the live profiles' main path) and the startup auto-maintenance both spare
+    the retained child's chain, not only its own rows."""
+    import argparse
+    from hermes_state import SessionDB
+    from hermes_cli import sessions_cmd
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
+    handle = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        _ended(handle, "conv-0", end="compression")
+        _ended(handle, "conv-1", parent="conv-0")
+        _child_session(handle, "kid-1", "conv-1", "sa-0-ff")
+        handle.end_session("kid-1", "user_exit")
+        _ended(handle, "gone")  # unrelated and expired: still pruned by both doors
+        _kept(handle, "kid-1", "sa-0-ff", "conv-1", "conv-0")
+        _age(handle)
+        if door == "auto":
+            handle.maybe_auto_prune_and_vacuum(retention_days=90, vacuum=False)
+        else:
+            monkeypatch.setattr(sessions_cmd, "_sessions_dir", lambda: tmp_path / "sessions")
+            assert sessions_cmd._cmd_prune_or_archive(
+                handle, argparse.Namespace(yes=True, dry_run=False), "prune") is None
+            assert "Pruned" in capsys.readouterr().out
+        for sid in ("conv-0", "conv-1", "kid-1"):
+            assert handle.get_session(sid) is not None, sid
+        assert handle.get_session("gone") is None
+    finally:
+        handle.close()
+
+
+def test_prune_chain_survives_a_corrupt_prior_conversations_value(db, monkeypatch):
+    """A malformed ``prior_conversations`` must neither break the prune statement nor widen what it spares:
+    it is read as "no prior conversation", exactly as the resolver's own decode does."""
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
+    _ended(db, "parent")
+    _child_session(db, "kid-1", "parent", "sa-0-gg")
+    db.end_session("kid-1", "user_exit")
+    _kept(db, "kid-1", "sa-0-gg", "parent", "parent")
+    _set(db.db_path, "kid-1", prior_conversations="{not json")
+    _age(db)
+    assert db.prune_sessions(older_than_days=90) == 0
+    assert db.get_session("parent") is not None and db.get_session("kid-1") is not None
+
+
+def test_prune_never_orphans_a_retained_row_whose_stored_parent_is_not_a_valid_hop(db, monkeypatch):
+    """Requirement 2, residual case: a kept row whose ``_delegate_from`` names some other session is not on a
+    walkable chain, so its parent is not spared by the chain guard — the prune still must not delete it and
+    NULL the link the ownership proof needs (the schema's own foreign key refuses that delete anyway)."""
+    monkeypatch.setattr(dc, "_delegation_cfg", dict)
+    _ended(db, "stored-parent")
+    db.create_session("kid-x", source="subagent", parent_session_id="stored-parent",
+                      model_config={"_delegate_from": "elsewhere", "_subagent_id": "sa-0-hh"})
+    db.end_session("kid-x", "user_exit")
+    _kept(db, "kid-x", "sa-0-hh", "stored-parent", "stored-parent")
+    _age(db)
+
+    assert db.prune_sessions(older_than_days=90) == 0
+    assert db.get_session("stored-parent") is not None
+    assert db.get_session("kid-x")["parent_session_id"] == "stored-parent"

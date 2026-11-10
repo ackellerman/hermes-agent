@@ -904,14 +904,44 @@ def orphaned_unit_note(conn: sqlite3.Connection, delegation_id: str,
 # ── session pruning ─────────────────────────────────────────────────────────
 
 def kept_sessions_sql(continuation_edge_sql: str) -> str:
-    """Session ids a kept child owns: its first session, its recorded latest segment, and every compression
-    continuation after them (``continuation_edge_sql`` relates child ``c`` to parent ``p``)."""
+    """Session ids that must outlive a prune because a kept child still needs them.
+
+    Two sets, one recursive CTE (the predicate runs inside the prune's own statement, so it must stay
+    set-based and fail closed on its own):
+
+    * ``kept_child`` — the child's own rows: its first session, its recorded latest segment, and every
+      compression continuation after them (``continuation_edge_sql`` relates child ``c`` to parent ``p``).
+    * ``chain`` — the ownership chain above them, walked exactly as ``tools.delegate_tool_sessions``
+      ``_lineage_reader`` walks it: a hop is the row's ``_delegate_from`` naming its own parent (a
+      delegate hop) or a compression continuation (``p.end_reason = 'compression'`` and the row is not
+      an explicit fork/delegate/reset/tool child). The walk stops at the holder's conversation roots
+      (``conversation_id`` plus ``prior_conversations``), which are spared too: ``owns()`` needs the root
+      row to exist to reach it. Above the root nothing is spared.
+
+    Nothing here decides ownership; it only widens what prune must not delete (and must not orphan by
+    NULLing ``parent_session_id``). Protection ends with the row's status: an expired or closed child
+    contributes neither set, so the chain it shared becomes prunable again.
+    """
+    from hermes_state_common import _sql_json_extract
+    kept_row = f"d.kept = 1 AND d.status IN ('{RUNNING}', '{IDLE}')"
+    hop = f"({_sql_json_extract('c.model_config', '$._delegate_from')} = p.id OR ({continuation_edge_sql}))"
     return ("WITH RECURSIVE kept_child(id) AS ("
-            f" SELECT d.child_id FROM {TABLE} d WHERE d.kept = 1 AND d.status IN ('{RUNNING}', '{IDLE}')"
+            f" SELECT d.child_id FROM {TABLE} d WHERE {kept_row}"
             " UNION"
-            f" SELECT d.latest_session_id FROM {TABLE} d WHERE d.kept = 1 AND d.status IN ('{RUNNING}', '{IDLE}')"
+            f" SELECT d.latest_session_id FROM {TABLE} d WHERE {kept_row}"
             " AND d.latest_session_id IS NOT NULL"
             " UNION"
             " SELECT c.id FROM kept_child k JOIN sessions p ON p.id = k.id JOIN sessions c ON c.parent_session_id = p.id"
             f" WHERE {continuation_edge_sql}"
-            ") SELECT id FROM kept_child")
+            "), root(id) AS ("
+            f" SELECT d.conversation_id FROM {TABLE} d WHERE {kept_row} AND d.conversation_id IS NOT NULL"
+            " UNION"
+            f" SELECT j.value FROM {TABLE} d, json_each(CASE WHEN json_valid(d.prior_conversations)"
+            f" THEN d.prior_conversations ELSE '[]' END) j WHERE {kept_row} AND j.type = 'text'"
+            "), chain(id) AS ("
+            " SELECT p.id FROM kept_child k JOIN sessions c ON c.id = k.id JOIN sessions p ON p.id = c.parent_session_id"
+            f" WHERE {hop} AND NOT EXISTS (SELECT 1 FROM root r WHERE r.id = k.id)"
+            " UNION"
+            " SELECT p.id FROM chain ch JOIN sessions c ON c.id = ch.id JOIN sessions p ON p.id = c.parent_session_id"
+            f" WHERE {hop} AND NOT EXISTS (SELECT 1 FROM root r WHERE r.id = ch.id)"
+            ") SELECT id FROM kept_child UNION SELECT id FROM chain")
