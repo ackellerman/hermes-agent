@@ -3063,10 +3063,12 @@ def _installs_root_for_hermes_home(
     ``profiles`` dir itself — belongs to that native home, which is where pm puts the generations
     (``hermes_constants._hermes_root_of``'s containment rule; the path shape alone gets
     ``~/.hermes/subdir`` wrong). Only a home outside it is its own root, and then a profile lives
-    under its data root."""
+    under its data root. The containment test resolves both sides, as ``_hermes_root_of`` does, so
+    a ``HERMES_HOME`` that is a symlink into the native home counts as inside it; the root returned
+    is still the lexical native home, matching the lexical components the unit carries."""
     home = Path(hermes_home)
     native_home = (Path(target_home_dir) if target_home_dir is not None else Path.home()) / ".hermes"
-    if home.is_relative_to(native_home):
+    if home.resolve(strict=False).is_relative_to(native_home.resolve(strict=False)):
         return native_home / "installs"
     root = home.parent.parent if home.parent.name == "profiles" else home
     return root / "installs"
