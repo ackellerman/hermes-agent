@@ -119,6 +119,13 @@ VALID_HOOKS: set[str] = {
     # {"action": "continue", "message"} (or Claude-Code Stop {"decision": "block", "reason"}) to keep
     # going; anything else finishes. Bounded by agent.max_verify_nudges.
     "pre_verify", "pre_api_request", "post_api_request", "api_request_error",
+    # pre_final_stop: after every other stop gate, on any text stop (edits or not). Kwargs:
+    # session_id, turn_id, platform, calls (tuple of frozen PreFinalToolCall: tool_name, call_id,
+    # turn_id, status, error_type, error_message; no args/results), complete (every dispatched call
+    # has exactly one post_tool_call event), continuation_available. Return {"action": "continue",
+    # "message"} for the turn's single continuation, {"action": "stop"} or None to finish; an
+    # optional "diagnostic" str is shown. Grants no authority. Python plugins only.
+    "pre_final_stop",
     # pre/post_auxiliary_call: once per physical provider attempt of an auxiliary LLM call
     # (agent/auxiliary_hooks.py — titling, compression, MoA, vision, approval, ...). Same payload
     # shape as pre/post_api_request plus ``aux_task``; distinct events so turn-scoped
@@ -203,7 +210,9 @@ VALID_HOOKS: set[str] = {
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
 # the shell-hook allow-list, so these are refused loudly instead of having output silently ignored.
-SHELL_UNSUPPORTED_HOOKS: set[str] = {"transform_api_error_classification"}
+# pre_final_stop is also kept off shell hooks deliberately: its payload carries raw tool error text and
+# its directive steers the turn, so it stays with in-process plugins.
+SHELL_UNSUPPORTED_HOOKS: set[str] = {"transform_api_error_classification", "pre_final_stop"}
 
 _env_enabled = env_var_enabled  # imported by plugins/memory
 

@@ -119,6 +119,18 @@ _DEFAULT_PAYLOADS = {
         "attempt": 0, "final_response": "All done — the change is applied.",
         "changed_paths": ["src/app.tsx"],
     },
+    # Python-plugin-only (SHELL_UNSUPPORTED_HOOKS): shown for its runtime shape. ``calls`` entries are
+    # frozen PreFinalToolCall objects at runtime; no tool arguments or results are ever included.
+    "pre_final_stop": {
+        "session_id": "test-session", "turn_id": "test-session:test-task:0a1b2c3d", "platform": "discord",
+        "calls": [
+            {"tool_name": "terminal", "call_id": "call_1", "turn_id": "test-session:test-task:0a1b2c3d",
+             "status": "ok", "error_type": None, "error_message": None},
+            {"tool_name": "patch", "call_id": "call_2", "turn_id": "test-session:test-task:0a1b2c3d",
+             "status": "error", "error_type": "tool_error", "error_message": "old_string not found"},
+        ],
+        "complete": True, "continuation_available": True,
+    },
     "on_session_start": {"session_id": "test-session"},
     "on_session_end": {
         "session_id": "test-session", "task_id": "test-task", "turn_id": "test-turn",

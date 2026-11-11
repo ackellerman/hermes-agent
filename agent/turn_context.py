@@ -670,6 +670,9 @@ _PER_TURN_RESET_STATE: tuple[tuple[str, Any], ...] = (
     ("_iteration_budget_warning_injected", False),
     ("_run_budget_wrapup_injected", False), ("_verification_stop_nudges", 0),
     ("_pre_verify_nudges", 0), ("_lsp_turn_end_notes", 0),
+    # pre_final_stop seam: its one continuation and this turn's own call list (a tuple: rebound,
+    # never mutated, so the shared default cannot carry calls across turns).
+    ("_pre_final_stop_continuations", 0), ("_pre_final_dispatched_calls", ()),
 )
 
 
