@@ -1067,14 +1067,13 @@ async def test_a_move_inside_the_tone_does_not_stamp_the_rearmed_receiver(
 
         await _join(env, _channel(env.adapter, VOICE_B, members=[_member(OPERATOR)]))
         assert env.receiver is receiver and env.vc.channel.id == VOICE_B
+        assert await _until(new_warm_started.is_set), "the new cycle never took its own warm"
         assert await _until(gate.done), "the cancelled gate never unwound"
-        for _ in range(10):               # a stamp written by the finally has long since landed
-            await asyncio.sleep(0.01)
 
+        # ``done`` means the cancelled gate's ``finally`` has already run: a stamp would be here.
         assert receiver.ready_at is None, \
             "the cancelled gate stamped the receiver the move had just re-armed"
         assert "t_ready" not in env.info(), "the cancelled cycle wrote the new room's ready info"
-        assert await _until(new_warm_started.is_set), "the new cycle never took its own warm"
 
         # The new room's pre-ready speech is cut, as it was before the landed round.
         receiver.map_ssrc(SSRC, OPERATOR)
