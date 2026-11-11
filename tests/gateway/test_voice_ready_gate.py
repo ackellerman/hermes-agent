@@ -594,11 +594,10 @@ async def test_a_move_abandons_the_first_lease_and_releases_it_when_it_finishes(
 
     proceed.set()                        # the abandoned warm registers and finishes now
     assert await _until(finished.is_set, timeout=5)
-    for _ in range(20):                  # the done-callback lands on the loop, not inline
-        if stt_lease.stt_lease_holders():
-            break
-        await asyncio.sleep(0.01)
-    assert stt_lease.stt_lease_holders() == [], \
+    # The release rides the loop's next turn (``add_done_callback`` schedules with ``call_soon``),
+    # so wait FOR the empty set — waiting for the name to APPEAR leaves in the very gap where the
+    # assertion below then fails.
+    assert await _until(lambda: stt_lease.stt_lease_holders() == [], timeout=1), \
         "the abandoned worker kept the lease after it finished"
 
 
