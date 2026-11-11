@@ -483,7 +483,9 @@ def test_the_brief_keeps_the_sessions_api_mode(lanes, edge, monkeypatch, tmp_pat
 
 def test_the_wait_for_bound_follows_the_configured_task_timeout(edge, monkeypatch):
     async def _hang(route, messages):
-        await asyncio.sleep(3)
+        # Never completes, and never sleeps: an Event nobody sets. The outer wait_for's own
+        # 0.05s bound is what ends the call, so the test measures the bound, not the clock.
+        await asyncio.Event().wait()
 
     bounds: list[float] = []
     real_wait_for = asyncio.wait_for
