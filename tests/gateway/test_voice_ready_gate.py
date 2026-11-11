@@ -13,6 +13,7 @@ way discord.py drives it, not through a free-standing flag.
 from __future__ import annotations
 
 import asyncio
+import logging
 import struct
 import sys
 import threading
@@ -432,6 +433,53 @@ async def test_a_dave_commit_that_never_arrives_opens_the_gate_degraded(monkeypa
     assert len(env.calls) == 1                       # never deaf: the tone still plays
     assert env.text.send.await_count == 1
     assert "voice ready (degraded: DAVE" in str(env.text.send.await_args.args[0])
+
+
+@pytest.mark.asyncio
+async def test_a_raising_device_probe_degrades_to_a_ready_join_not_a_deaf_one(
+        monkeypatch, nacl, decoders, caplog):
+    """The gate's tail is guarded like its poll loop (landing fix r1, finding 1).
+
+    ``_voice_stt_requested_device`` swallows only ImportError/AttributeError, so a ValueError from
+    ``_load_stt_config`` used to end the fire-and-forget gate task between the loop and
+    ``mark_ready``.  With ``ready_at is None`` meaning "cut everything", the joined receiver was
+    then deaf for the rest of the join — and, since the crash came before the ``voice ready`` line,
+    silently so.
+    """
+    started, release = threading.Event(), threading.Event()
+
+    def lease(name, install=False):
+        started.set()
+        release.wait(10)
+        return dict(_WARM_CPU)
+
+    env = _env(monkeypatch, lease=lease, timeout=10, tone=False)
+    await _join(env)
+    assert await _until(started.is_set)
+
+    def boom() -> dict:
+        raise ValueError("stt.local is not a mapping")
+
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr("tools.transcription_tools._load_stt_config", boom)  # after the join
+    release.set()                                    # the gate reaches its tail and raises there
+
+    assert await _until(lambda: _ready(env)), "the gate died before it stamped ready_at"
+    assert env.info()["degraded"] is True
+    assert "the ready check failed" in (env.info()["reason"] or "")
+    assert [r for r in caplog.records if "ready check failed" in r.getMessage()], \
+        "the broken check was not reported anywhere"
+    assert await _until(lambda: env.text.send.await_count == 1), \
+        "the degraded voice ready line was never posted"
+
+    # Not deaf: the speech that follows the (degraded) open reaches STT as usual.
+    receiver = env.receiver
+    receiver.map_ssrc(SSRC, OPERATOR)
+    _speak(env, nacl, SSRC, 40)
+    _quiet(env)
+    segments = receiver.check_silence()
+    assert receiver._pre_ready_dropped == 0, "audio that arrived after the stamp was cut"
+    assert [uid for uid, _pcm in segments] == [OPERATOR], "the join stayed deaf after the gate died"
 
 
 # --- degraded is only the GPU the host was set up for ----------------------------------------------

@@ -298,27 +298,43 @@ class DiscordVoiceReadyMixin:
                            exc_info=True)
             reason = f"the ready check failed: {exc}"
         # A lease still loading when the bound expired reports no device — don't ask a pending future.
-        result = _lease_result(lease_task) if lease_task is not None and lease_task.done() else {}
-        if reason is None:
-            reason = self._voice_ready_degraded_reason(result)
-        if reason:
-            logger.warning("[Discord] voice ready (degraded: %s) (guild=%d)", reason, guild_id)
-        # When the ready condition held: with the tone silenced (D-016) this IS t_ready, and the
-        # cut still applies — only the clip is gone.
-        ready_at = time.monotonic()
-        if bool(cfg.get("ready_tone_enabled", True)):
-            try:
-                path = ready_tone_cache_path(cfg.get("ready_tone_gain", DEFAULT_READY_TONE_GAIN))
-                await self.play_in_voice_channel(guild_id, path, strict=True)
-            except Exception as exc:  # health: allow BLE001 -- an unrenderable/unplayable tone degrades to a silent ready; it must never fail the join
-                logger.warning("[Discord] ready tone failed to play (guild=%d): %s", guild_id, exc)
-            # t_ready is when the play call RETURNED, success or failure: the tone has been heard
-            # for exactly as long as it took.
+        result: dict[str, Any] = {}
+        ready_at: Optional[float] = None
+        try:
+            if lease_task is not None and lease_task.done():
+                result = _lease_result(lease_task)
+            if reason is None:
+                reason = self._voice_ready_degraded_reason(result)
+            if reason:
+                logger.warning("[Discord] voice ready (degraded: %s) (guild=%d)", reason, guild_id)
+            # When the ready condition held: with the tone silenced (D-016) this IS t_ready, and the
+            # cut still applies — only the clip is gone.
             ready_at = time.monotonic()
-        receiver = self._voice_receivers.get(guild_id)
-        mark_ready = getattr(receiver, "mark_ready", None)
-        if callable(mark_ready):
-            mark_ready(ready_at)
+            if bool(cfg.get("ready_tone_enabled", True)):
+                try:
+                    path = ready_tone_cache_path(cfg.get("ready_tone_gain", DEFAULT_READY_TONE_GAIN))
+                    await self.play_in_voice_channel(guild_id, path, strict=True)
+                except Exception as exc:  # health: allow BLE001 -- an unrenderable/unplayable tone degrades to a silent ready; it must never fail the join
+                    logger.warning("[Discord] ready tone failed to play (guild=%d): %s", guild_id, exc)
+                # t_ready is when the play call RETURNED, success or failure: the tone has been heard
+                # for exactly as long as it took.
+                ready_at = time.monotonic()
+        except Exception as exc:  # health: allow BLE001 -- a broken config/GPU probe must degrade to a silent ready; an un-stamped receiver is deaf for the rest of the join
+            # The tail is guarded for the same reason the poll loop is, and one more: `ready_at is
+            # None` now means "cut everything" (adapter.py's `_cut_pre_ready_locked`), so a raise
+            # here would leave a joined, still-listening receiver deaf for the rest of the join with
+            # no `voice ready` line at all.  Degrade instead, and say so.
+            logger.warning("[Discord] ready check failed (guild=%d): %s", guild_id, exc,
+                           exc_info=True)
+            reason = f"the ready check failed: {exc}"
+        finally:
+            # Stamped on BOTH paths, the degraded one included: a join never stays deaf (plan step 9).
+            if ready_at is None:
+                ready_at = time.monotonic()
+            receiver = self._voice_receivers.get(guild_id)
+            mark_ready = getattr(receiver, "mark_ready", None)
+            if callable(mark_ready):
+                mark_ready(ready_at)
         self._ready_map("_voice_ready_info")[guild_id] = {
             "t_ready": ready_at, "reason": reason, "degraded": reason is not None,
             "device": result.get("device"), "model": result.get("model"),
