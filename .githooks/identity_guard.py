@@ -60,6 +60,8 @@ GIT_ENV = dict(os.environ, GIT_NO_LAZY_FETCH="1", GIT_NO_REPLACE_OBJECTS="1",
 IDENT_RE = re.compile(rb"(author|committer) ([^<>\n]+) <([^<>\n]+)> ([0-9]+) ([+-][0-9]{4})")
 EMAIL_SHAPE = re.compile(r"[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+")
 UTF8_NAMES = {b"utf-8", b"utf8"}
+KNOWN_HEADERS = {b"tree", b"parent", b"author", b"committer", b"encoding", b"mergetag", b"gpgsig",
+                 b"gpgsig-sha256"}
 
 
 class GuardError(Exception):
@@ -345,7 +347,9 @@ def _extra_headers(lines: list[bytes], match: Matchers) -> list[str]:
             label = "an unparseable header"  # never echo the token: it may be a private value
             problems.append("malformed header: an unparseable header line")
         else:
-            label = f"'{key.decode()}' header"
+            # Only a known git header name is ever printed: any other key-shaped token may be a
+            # word of a private value.
+            label = f"'{key.decode()}' header" if key in KNOWN_HEADERS else "an unknown header"
             if key in seen or key in {b"tree", b"parent", b"author", b"committer"}:
                 problems.append(f"malformed header: duplicate or misplaced {label}")
         seen.add(key)
@@ -397,7 +401,7 @@ def read_objects(oids: list[str], clock: Clock):
         except (BrokenPipeError, OSError):
             pass
 
-    writer = threading.Thread(target=feed, daemon=True)
+    writer = threading.Thread(target=feed, daemon=True)  # health: allow HX012 -- standalone hook subprocess, no profile scope
     writer.start()
     try:
         for n, oid in enumerate(oids):

@@ -184,10 +184,19 @@ class Pushed:
         self.rc, self.stderr, self.before = rc, stderr, before
 
 
-def assert_no_private(text: str):
+PRIVATE_WORDS = [re.compile(rf"\b{re.escape(w)}\b") for w in PERSONAL[0].lower().split()]
+
+
+def assert_no_private(text: str, said: str | None = None):
+    """No full deny-list value anywhere in stderr; and, in what the hook itself printed (`said`:
+    git's own lines dropped, root masked), not even one word of the synthetic name. Word-bounded,
+    so the hook's fixed text ("pattern") cannot satisfy it; neither word occurs in that text."""
     low = text.lower()
     for value in (PERSONAL[0].lower(), PERSONAL[1].lower(), "pat\nexample"):
         assert value not in low, f"diagnostic disclosed a private deny-list value: {text}"
+    said_low = (said or "").lower()
+    for word in PRIVATE_WORDS if said is not None else ():
+        assert not word.search(said_low), f"diagnostic disclosed a private name word: {said}"
 
 
 def assert_refused(forge: Forge, res: Pushed, needle: str):
@@ -196,7 +205,7 @@ def assert_refused(forge: Forge, res: Pushed, needle: str):
     assert forge.remote_refs() == res.before, "a refused push still moved the remote"
     said = forge.said(res.stderr)
     assert needle in said, f"refused, but not for {needle!r}; the hook said:\n{said}"
-    assert_no_private(res.stderr)
+    assert_no_private(res.stderr, said)
 
 
 def assert_hook_refused(forge: Forge, rc: int, stderr: str, needle: str):
@@ -353,6 +362,22 @@ def test_unparseable_header_never_echoes_its_token(forge, line):
 def test_duplicated_non_core_header_refuses(forge, key, extra):
     forge.raw_commit(forge.header(forge.base) + extra + b"\nmsg\n", "refs/heads/main")
     assert_refused(forge, forge.push("main"), f"malformed header: duplicate or misplaced '{key}' header")
+
+
+@pytest.mark.parametrize("extra,needle", [
+    (b"pat example\n", "an unknown header matches the private deny-list"),
+    (b"pat one\npat two\n", "malformed header: duplicate or misplaced an unknown header"),
+], ids=["single", "duplicated"])
+def test_unknown_header_key_is_never_printed(forge, extra, needle):
+    """A key-shaped token that is not a git header name may be a word of a private value."""
+    forge.raw_commit(forge.header(forge.base) + extra + b"\nmsg\n", "refs/heads/main")
+    assert_refused(forge, forge.push("main"), needle)
+
+
+def test_continuation_line_without_a_header_refuses(forge):
+    forge.raw_commit(forge.header(forge.base) + b" x\n\nmsg\n", "refs/heads/main")
+    assert_refused(forge, forge.push("main"),
+                   "malformed header: a continuation line without a header")
 
 
 # ── refs: multi-ref, new ref, update range, tags, deletion ─────────────────────────────────
@@ -621,6 +646,29 @@ def test_policy_owner_is_checked_on_the_opened_dir_and_file(root):
     pdir.symlink_to(moved)
     with pytest.raises(guard.GuardError, match=r"identity-policy is a symlink"):
         guard.open_policy_dir(str(common), me)
+
+
+def test_run_checks_policy_ownership_against_the_process_euid(root, monkeypatch):
+    """run() itself must pass os.geteuid() to the loader: with a different euid, a real
+    0700/0600 policy tree owned by this user is refused."""
+    env = isolated_env(root)
+    for key in [k for k in os.environ if k.startswith("GIT_")]:
+        monkeypatch.delenv(key)
+    for key in ("HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"):
+        monkeypatch.setenv(key, env[key])
+    repo = root / "e"
+    subprocess.run(["git", "init", "-q", str(repo)], env=env, check=True, timeout=60)
+    pdir = repo / ".git" / "identity-policy"
+    pdir.mkdir()
+    pdir.chmod(0o700)
+    (pdir / "policy.json").write_text(json.dumps(POLICY))
+    (pdir / "policy.json").chmod(0o600)
+    monkeypatch.chdir(repo)
+    guard = load_guard()
+    other = os.geteuid() + 1
+    monkeypatch.setattr(guard.os, "geteuid", lambda: other)
+    with pytest.raises(guard.GuardError, match=r"identity-policy is owned by uid"):
+        guard.run(["--block-patterns", str(HOOKS_SRC / "patterns" / "block.ere")], b"")
 
 
 def test_policy_beside_tracked_hook_is_not_trusted(root):
