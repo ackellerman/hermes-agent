@@ -1,6 +1,7 @@
 """Tests for gateway service management helpers."""
 
 import json
+import logging
 import os
 import plistlib
 import re
@@ -1935,17 +1936,6 @@ class TestProfileArg:
         assert gateway_cli._installed_service_kind_for(lambda: False) is None
 
 
-class TestRemapPathForUser:
-    """Unit tests for _remap_path_for_user()."""
-
-    def test_remaps_path_under_current_home(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(Path, "home", lambda: tmp_path / "root")
-        (tmp_path / "root").mkdir()
-        result = gateway_cli._remap_path_for_user(
-            str(tmp_path / "root" / ".hermes" / "hermes-agent"),
-            str(tmp_path / "alice"),
-        )
-        assert result == str(tmp_path / "alice" / ".hermes" / "hermes-agent")
 
 
 class TestSystemUnitPathRemapping:

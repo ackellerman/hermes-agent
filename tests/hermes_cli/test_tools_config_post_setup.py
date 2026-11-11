@@ -79,6 +79,8 @@ def test_importable_sdk_does_not_bypass_pm_constraints(monkeypatch, capsys, key,
     sdk = ModuleType(key)
     sdk.__version__ = "0.0.0"
     monkeypatch.setitem(sys.modules, key, sdk)
+    # A GPU host adds the opt-in CUDA extra to Local Whisper (test_stt_cuda_selection.py).
+    monkeypatch.setattr("hermes_cli.tools_config_post_setup._nvidia_gpu_present", lambda: False)
     error = pm.InstallError("venv", "outside frozen feature set") if refused else None
     with patch("pm.sync_venv", side_effect=error) as sync:
         _run_post_setup(key)

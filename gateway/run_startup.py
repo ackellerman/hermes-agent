@@ -15,7 +15,6 @@ import os
 import signal
 import time
 from contextlib import nullcontext, suppress
-from contextvars import copy_context
 from pathlib import Path
 from agent.i18n import t
 from gateway.config import Platform
@@ -26,6 +25,8 @@ from gateway.session import SessionSource, build_session_key
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_FATAL_CONFIG_EXIT_CODE, is_global_startup_conflict
 )
+from gateway.run_startup_probe import GatewayStartupProbeMixin
+from gateway.run_startup_stt import GatewayStartupSttMixin
 from gateway.run_shutdown import _log_suppressed, _send_error
 from hermes_cli.observability.shared_metrics_busy import note_running_chat_owner
 from gateway.shutdown_watchdog import (
@@ -81,7 +82,7 @@ def _own_policy_envs(platform) -> Optional[tuple]:
     return (*own, authz_field(platform.value, "allow_all_env", entry))
 
 
-class GatewayStartupMixin:
+class GatewayStartupMixin(GatewayStartupSttMixin, GatewayStartupProbeMixin):
     """Startup sequence, resume/restore and handoff methods for GatewayRunner."""
 
     @staticmethod
@@ -189,25 +190,6 @@ class GatewayStartupMixin:
             self._startup_warmup_task = None
             return
         self._startup_warmup_task = asyncio.ensure_future(self._warm_turn_prerequisites())
-
-    async def _run_boot_probe_in_launch_scope(self, fn):
-        """Run a boot-time probe on the default executor under the LAUNCH profile's scope when
-        multiplexing (the ``_discover_gateway_mcp_tools`` shape). Boot probes (``check_fn``s) read profile-scoped secrets; an unscoped read under multiplex fails
-        closed, so routing overrides resolve as absent and default routing applies. ``copy_context``
-        carries the contextvars across the executor hop; single-profile keeps environ semantics."""
-        loop = asyncio.get_running_loop()
-        if getattr(self.config, "multiplex_profiles", False):
-            from gateway.run import _async_profile_runtime_scope
-            from hermes_constants import get_hermes_home
-            try:
-                async with _async_profile_runtime_scope(get_hermes_home()):
-                    return await loop.run_in_executor(None, copy_context().run, fn)
-            except Exception:
-                # Same fallback as load_gateway_config_for_runner: a scope that cannot be built must not
-                # abort startup; the probe runs unscoped as it did before.
-                logger.debug("multiplex launch-scope entry failed for boot probe %s; running unscoped",
-                             getattr(fn, "__name__", fn), exc_info=True)
-        return await loop.run_in_executor(None, copy_context().run, fn)
 
     async def _warm_turn_prerequisites(self) -> None:
         """Initialize turn machinery on an executor thread before the gate opens. Never raises: a
@@ -1725,6 +1707,9 @@ class GatewayStartupMixin:
         # Fresh boot: the gate opens while the turn machinery is still cold (skeleton prompts). Warm NOW
         # to overlap the connects; _finish_startup_restore awaits it (bounded).
         self._start_startup_warmup()
+        # Local STT's CUDA check + warm is a SEPARATE fire-and-forget task: never awaited here, so a
+        # medium load cannot hold the inbound gate (plan step 4).
+        self._start_startup_stt_check()
         startup_nonretryable_errors: list[str] = []
         startup_retryable_errors: list[str] = []
         self._startup_parked_platforms = False  # fresh boot: no platform has failed yet

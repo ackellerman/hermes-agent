@@ -1,4 +1,4 @@
-# health: allow FILE_LINES -- platform-tables refactor: core's PLATFORM_HINTS/_PLATFORM_DEFAULTS rows for this platform moved onto its register() call (hint text lives in adapter_hint.py); the growth is only those kwargs
+# health: allow FILE_LINES -- platform-tables refactor: core's PLATFORM_HINTS/_PLATFORM_DEFAULTS rows for this platform moved onto its register() call (hint text lives in adapter_hint.py); this branch's addition is the DAVE hold ring and the voice receive path, which must drive the adapter's own receiver lifecycle
 from __future__ import annotations
 
 """
@@ -26,7 +26,7 @@ import threading
 import time
 import traceback
 import weakref
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import nullcontext, suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
@@ -861,6 +861,16 @@ def _discord_ready_timeout_seconds() -> float:
     return 30.0
 
 
+# Voice-ws ops that announce a DAVE state change: op 4 SESSION_DESCRIPTION (a re-key once DAVE is
+# negotiated), op 21 DAVE_PREPARE_TRANSITION, op 22 DAVE_EXECUTE_TRANSITION and op 24
+# DAVE_PREPARE_EPOCH.  Each one reinitialises or advances the MLS ratchet, and discord.py does it
+# in place — neither ``dave_session`` nor ``dave_protocol_version`` moves — so the receiver needs
+# the trigger to know its held payloads' ratchet is gone (``refresh_credentials``).  Binary MLS ops
+# (welcome/commit, 28-30) re-key the group too but never reach this hook; the held frames carry
+# their capture generation, so ``_replay_dave_pending`` catches those.
+_DAVE_TRIGGER_OPS = frozenset({4, 21, 22, 24})
+
+
 class VoiceReceiver:
     """Captures voice audio from a Discord voice channel: hooks the VoiceClient socket, decrypts
     RTP (NaCl + DAVE E2EE), decodes Opus per user; a polling loop delivers utterances on silence."""
@@ -869,6 +879,18 @@ class VoiceReceiver:
     MIN_SPEECH_DURATION = 0.5  # minimum seconds to process (skip noise)
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
+    PCM_FRAME_DURATION = 0.02  # Discord/Opus frame duration in seconds
+    # A deliberately permissive floor (~-50 dBFS) excludes decoded comfort
+    # noise/silence without depending on the user's microphone route or gain.
+    ACTIVE_FRAME_RMS = 100
+    # Require sustained energy so a join-time pop/click cannot reach STT.
+    MIN_ACTIVE_SPEECH_DURATION = 0.1
+    # Post-NaCl payloads held per SSRC that DAVE cannot attribute yet:
+    # ~2 s of 20 ms frames.  Long enough to cover a late SPEAKING event,
+    # short enough that a phantom SSRC cannot grow without bound.
+    DAVE_PENDING_MAX_FRAMES = 100
+    # Forget a held ring whose SSRC has stayed quiet this long.
+    DAVE_PENDING_TTL = 5.0
     REKEY_FAILURE_STREAK = 25  # consecutive NaCl failures → re-resolve creds
     # An SSRC nobody claimed (no SPEAKING, inference ambiguous) whose sender never pauses (another
     # bot's mixer sends frames continuously) never reaches silence: cap what it may buffer.
@@ -905,8 +927,19 @@ class VoiceReceiver:
         self._lock = threading.Lock()
         self._buffers: dict[int, bytearray] = defaultdict(bytearray)
         self._last_packet_time: dict[int, float] = {}
+        # The join's ready cut (plan step 10): ``_ready_at`` is stamped when the ready tone's play
+        # call returned, and any PCM whose frames ARRIVED at or before it is discarded. ``_arrivals``
+        # holds each decoded frame's arrival stamp so the cut can be applied at flush time, when the
+        # segment is assembled — arrival time, never decode or release time.
+        self._ready_at: Optional[float] = None
+        self._arrivals: dict[int, deque] = defaultdict(deque)
+        self._pre_ready_dropped = 0
         # Opus decoder per SSRC (each user needs own decoder state)
         self._decoders: dict[int, object] = {}
+        # Post-NaCl payloads held while DAVE is active and the sender SSRC
+        # is neither mapped nor inferable.  (monotonic_ts, payload) entries
+        # so the ring can expire on its own; replayed once the SSRC resolves.
+        self._dave_pending: dict[int, deque] = {}
         # Pause flag: don't capture while bot is playing TTS
         self._paused = False
         # Debug logging counter (instance-level to avoid cross-instance races)
@@ -980,6 +1013,83 @@ class VoiceReceiver:
     def _dave_downgraded(self) -> bool:
         return self._creds[3]
 
+    # --- the join's ready gate (the adapter's cycle stamps it; the cut reads it) ---
+
+    @property
+    def dave_settled(self) -> bool:
+        """DAVE is done negotiating, so speech can be decrypted.
+
+        ``_dave_protocol_version == 0`` is the plaintext passthrough case — a session object survives
+        a downgrade with the protocol at 0 and senders emit plaintext. Above 0 the session must report
+        ``ready``: discord.py's own send path trusts exactly that (``VoiceConnectionState.can_encrypt``)
+        before it encrypts our audio, and the op-22/24 commit that calls ``refresh_credentials`` is
+        what puts a newly ready session into ``_creds``.
+        """
+        if self._dave_protocol_version == 0:
+            return True
+        session = self._dave_session
+        return session is not None and bool(getattr(session, "ready", False))
+
+    @property
+    def ready_at(self) -> Optional[float]:
+        """Monotonic time the join's ready tone returned; ``None`` until the gate opens."""
+        return self._ready_at
+
+    def mark_ready(self, at: Optional[float] = None) -> None:
+        """Stamp ``t_ready`` once per join (the adapter's ready gate), so the cut can be applied."""
+        with self._lock:
+            if self._ready_at is None:
+                self._ready_at = time.monotonic() if at is None else float(at)
+
+    def rearm_ready_gate(self) -> None:
+        """Start a new ready cycle for a new room (a ``move_to``): fresh cut, fresh tone.
+
+        Audio buffered for the old channel is dropped too — the new room's binding is not where it
+        was spoken. A reconnect inside the same session never calls this.
+        """
+        with self._lock:
+            self._ready_at = None
+            self._arrivals.clear()
+            self._buffers.clear()
+            self._last_packet_time.clear()
+        self.refresh_credentials("ready gate re-armed")
+
+    def _cut_pre_ready_locked(self, ssrc: int) -> int:
+        """Drop the PCM whose frames ARRIVED before the join was ready (call under ``_lock``).
+
+        The arrival stamps, not the flush time, decide: a frame held back by the DAVE ring or by a
+        slow poll still counts as heard before the tone.  ``_ready_at is None`` means the gate has
+        not opened yet (the deaf window: a cold model load, a DAVE negotiation, or a move's
+        re-arm), so every arrival stamped so far is pre-tone and the whole prefix goes — a flush
+        inside that window must not hand STT the audio the plan forbids.  Returns the number of
+        frames removed.
+        """
+        ready_at = self._ready_at
+        arrivals = self._arrivals.get(ssrc)
+        if not arrivals:
+            return 0
+        cutoff = time.monotonic() if ready_at is None else ready_at
+        cut_bytes = 0
+        cut_frames = 0
+        while arrivals and arrivals[0][0] <= cutoff:
+            _arrived_at, nbytes = arrivals.popleft()
+            cut_bytes += nbytes
+            cut_frames += 1
+        if cut_frames:
+            buf = self._buffers.get(ssrc)
+            if buf:
+                # Clamp to the buffer: the deque is a byte-exact prefix of it only while the two
+                # stay in step, and deleting past the end would take live post-tone speech with it.
+                del buf[:min(cut_bytes, len(buf))]
+            self._pre_ready_dropped += cut_frames
+            logger.debug(
+                "Discarded %d pre-tone PCM frame(s) (ssrc=%d, %d bytes)",
+                cut_frames, ssrc, cut_bytes,
+            )
+        if not arrivals:
+            self._arrivals.pop(ssrc, None)
+        return cut_frames
+
     def note_dave_passthrough_window(self, seconds: float) -> None:
         """Open a plaintext-passthrough grace window for unmapped SSRCs.
 
@@ -992,19 +1102,52 @@ class VoiceReceiver:
         """
         self._dave_passthrough_until = time.monotonic() + seconds
 
-    def refresh_credentials(self, reason: str) -> None:
+    def refresh_credentials(self, reason: str, *, dave_state_changed: bool = False) -> None:
         """Re-resolve decryption state from the live connection.
 
         Cheap and idempotent (attribute reads plus one small copy), so
         callers invoke it on every trigger — session description, DAVE
         epoch prepare, a membership change in the channel, or a decrypt
         failure streak — without needing to coalesce.
+
+        ``dave_state_changed`` says the *trigger* was a DAVE state change
+        (ops 4/21/22/24, a membership change that bumps the MLS epoch), not a
+        re-key on the packet path.  It is needed because discord.py mutates the
+        existing ``DaveSession`` in place: ``reinit_dave_session`` calls
+        ``.reinit(...)`` on the live object, and an MLS commit (binary op
+        28/29/30) advances the epoch without touching ``dave_session`` or
+        ``dave_protocol_version`` at all.  Neither shows up as a diff in the
+        credential tuple, so the tuple comparison below cannot see an ordinary
+        epoch advance — only a 0↔1 protocol flip or a replaced object.  The
+        comparison stays as belt-and-braces for the transitions it can see.
         """
         if not self._running:
             return
         try:
             conn = self._vc._connection
+            previous = self._creds
             self._resolve_credentials(conn)
+            if (
+                dave_state_changed
+                or previous[1] is not self._dave_session
+                or previous[2] != self._dave_protocol_version
+            ):
+                # Frames held under a ratchet this op supersedes cannot be authenticated
+                # afterwards: replay would fail per frame and silently lose the utterance's
+                # opening, so drop and count them.
+                #
+                # WHICH frames those are is decided by the generation each one was captured
+                # under, never by the session object's current state.  ``previous`` shares the
+                # object discord.py just mutated in place, so "was a ratchet live before the op?"
+                # asked now reads the POST-op answer — at the join's own op-22 commit that is
+                # "yes", and the deaf window's frames would be purged by the very op that settles
+                # DAVE.  Held frames carry their capture generation for exactly this reason.
+                #
+                # The outer test stays TRIGGER-driven (a DAVE state change at ops 4/21/22/24 or a
+                # membership change, plus the tuple diffs it can see) because an in-place reinit
+                # changes nothing observable; the inner rule is per FRAME (see
+                # ``_drop_superseded_ratchet_locked``).
+                self._drop_superseded_ratchet("dave-epoch")
             self._nacl_fail_streak = 0
             logger.info(
                 "VoiceReceiver credentials refreshed (%s; bot_ssrc=%d, dave=%s)",
@@ -1027,16 +1170,19 @@ class VoiceReceiver:
         with self._lock:
             self._buffers.clear()
             self._last_packet_time.clear()
+            self._arrivals.clear()
             self._decoders.clear()
             self._ssrc_to_user.clear()
             self._dropped_ssrcs.clear()
+            self._dave_pending.clear()
         logger.info(
             "VoiceReceiver stopped (frames ok=%d, decrypt_failed=%d, "
-            "dave_unmapped_dropped=%d, bot_audio_dropped=%d)",
+            "dave_unmapped_dropped=%d, bot_audio_dropped=%d, pre_ready_dropped=%d)",
             self._decode_ok,
             self._decode_failed,
             self._dave_unmapped_dropped,
             self._bot_audio_dropped,
+            self._pre_ready_dropped,
         )
 
     def pause(self):
@@ -1077,8 +1223,106 @@ class VoiceReceiver:
             self._dropped_ssrcs.add(ssrc)
             self._buffers.pop(ssrc, None)
             self._last_packet_time.pop(ssrc, None)
+            # The arrival deque is a byte-exact prefix of the buffer, so it dies with it: left
+            # behind, the stale stamps cut the next owner of this SSRC's post-tone speech.
+            self._arrivals.pop(ssrc, None)
+            self._discard_dave_pending_locked(ssrc)
         else:
             self._dropped_ssrcs.discard(ssrc)
+
+    def _discard_dave_pending_locked(self, ssrc: int) -> None:
+        """Drop payloads held for an SSRC that resolved to a bot (call under ``_lock``).
+
+        Bot audio never leaves the ring: replaying it would hand another bot's speech to STT, or to
+        whoever the ring was waiting to attribute it to.
+        """
+        pending = self._dave_pending.pop(ssrc, None)
+        if pending:
+            self._bot_audio_dropped += len(pending)
+            logger.info("Discarded %d held voice payloads from bot ssrc=%d", len(pending), ssrc)
+
+    def _dave_generation(self) -> tuple:
+        """The DAVE generation a held frame is captured (and later decrypted) under.
+
+        ``(protocol_version, session, ready, epoch)``.  The object alone cannot answer which
+        ratchet a frame belongs to: discord.py re-keys in place (``reinit_dave_session`` calls
+        ``.reinit(...)`` on the live ``DaveSession``), and an MLS commit advances ``.epoch``
+        without touching ``conn.dave_session``.  Capturing this with the frame is what lets the
+        purge and the replay decide per frame, long after the object has moved on.
+        """
+        session = self._dave_session
+        return (
+            self._dave_protocol_version,
+            session,
+            bool(getattr(session, "ready", False)),
+            getattr(session, "epoch", None),
+        )
+
+    @staticmethod
+    def _generation_ratchet_live(generation: tuple) -> bool:
+        """Whether that generation could authenticate a frame at all.
+
+        ``ready`` is discord.py's own ``can_encrypt`` signal on the DAVE session: a generation that
+        never reported it established no ratchet, so no frame it captured is tied to one.  Those
+        frames were heard during the join's deaf window and the ready cut owns them.
+        """
+        return generation[0] > 0 and generation[1] is not None and generation[2]
+
+    @staticmethod
+    def _same_generation(left: tuple, right: tuple) -> bool:
+        """Same protocol version, same session object, same readiness, same epoch."""
+        return (left[0] == right[0] and left[1] is right[1]
+                and left[2] == right[2] and left[3] == right[3])
+
+    def _drop_superseded_ratchet_locked(self, reason: str) -> int:
+        """Drop the held frames a DAVE state change superseded (call under ``_lock``).
+
+        Per FRAME, by the generation that captured it: a frame held while a ratchet was live
+        cannot be decrypted under the one that replaced it, while a frame held before DAVE settled
+        had no ratchet to lose — that one is left for the ready cut, which drops it by arrival time
+        when the ring replays.  Returns the number of frames dropped.
+        """
+        dropped = 0
+        ssrcs = 0
+        for ssrc, pending in list(self._dave_pending.items()):
+            kept = [frame for frame in pending if not self._generation_ratchet_live(frame[2])]
+            if len(kept) == len(pending):
+                continue
+            dropped += len(pending) - len(kept)
+            ssrcs += 1
+            pending.clear()
+            pending.extend(kept)
+            if not kept:
+                self._dave_pending.pop(ssrc, None)
+        self._dave_unmapped_dropped += dropped
+        if dropped:
+            logger.info(
+                "Discarded %d held voice payloads (%s; ssrcs=%d)", dropped, reason, ssrcs,
+            )
+        return dropped
+
+    def _drop_superseded_ratchet(self, reason: str) -> int:
+        """``_drop_superseded_ratchet_locked`` taking ``_lock`` (the ws hook, the packet path)."""
+        with self._lock:
+            return self._drop_superseded_ratchet_locked(reason)
+
+    def _drop_held_voice_payloads_locked(self, reason: str) -> int:
+        """Drop every held payload and return the frame count (call under ``_lock``).
+
+        Split out of the locking wrapper so ``discard_pending`` can clear the PCM buffers and the
+        ring in one critical section: a replay through ``_replay_dave_pending`` landing in the
+        gap would push a pre-move frame into the fresh buffer and get it stamped with the new
+        binding at flush time (#130311).
+        """
+        frames = sum(len(pending) for pending in self._dave_pending.values())
+        ssrcs = len(self._dave_pending)
+        self._dave_pending.clear()
+        self._dave_unmapped_dropped += frames
+        if frames:
+            logger.info(
+                "Discarded %d held voice payloads (%s; ssrcs=%d)", frames, reason, ssrcs,
+            )
+        return frames
 
     def _install_speaking_hook(self, conn):
         """Wrap the voice websocket hook to capture SPEAKING events (op 5); ``conn.hook`` is
@@ -1101,9 +1345,10 @@ class VoiceReceiver:
             # is what updates conn.secret_key / conn.dave_session /
             # conn.dave_protocol_version) BEFORE calling this hook, so the
             # refresh reads the new values:
-            #   op 4  SESSION_DESCRIPTION — new transport key, and
-            #         reinit_dave_session() may replace conn.dave_session
-            #   op 24 DAVE_PREPARE_EPOCH  — epoch 1 recreates the MLS group
+            #   op 4  SESSION_DESCRIPTION — new transport key; with DAVE
+            #         negotiated discord.py re-keys the MLS session
+            #         (reinit_dave_session reinit()s the *existing* object,
+            #         which the credential tuple cannot see — hence the flag)
             #   op 21 DAVE_PREPARE_TRANSITION with protocol_version 0 —
             #         discord.py opens a 120s plaintext passthrough window
             #         (set_passthrough_mode(True, 120)); mirror it so the
@@ -1111,26 +1356,36 @@ class VoiceReceiver:
             #   op 22 DAVE_EXECUTE_TRANSITION — the protocol version just
             #         changed; refresh, plus a 10s grace mirroring the
             #         upgrade path's set_passthrough_mode(True, 10)
+            #   op 24 DAVE_PREPARE_EPOCH  — epoch 1 recreates the MLS group
+            # Every one of them is a DAVE state change (``_DAVE_TRIGGER_OPS``), so each passes
+            # dave_state_changed: the hold ring must not outlive the ratchet it was captured
+            # under.  The purge is per FRAME (see ``_drop_superseded_ratchet_locked``): frames
+            # captured while a ratchet was live go, frames from the join's deaf window stay for
+            # the ready cut.  The binary MLS ops that re-key the group (welcome/commit, 28-30) are
+            # consumed inside discord.py and never reach this hook, so a frame replayed across one
+            # is dropped and counted by `_replay_dave_pending` instead.
             if isinstance(msg, dict):
                 op = msg.get("op")
-                if op in (4, 24):
-                    receiver_self.refresh_credentials(f"voice ws op {op}")
-                elif op == 21:
-                    if (msg.get("d") or {}).get("protocol_version") == 0:
+                if op in _DAVE_TRIGGER_OPS:
+                    # Snapshot before the refresh: the upgrade-after-downgrade EDGE
+                    # (dave_downgraded flipping True -> False) is the only case upstream grants
+                    # the 10s passthrough grace, and same-version transitions or
+                    # unknown/duplicate ids change no state upstream.
+                    was_downgraded = receiver_self._dave_downgraded
+                    # op 4 is the only trigger that can arrive before DAVE is negotiated: with
+                    # no protocol version there is no ratchet to lose, so the join's first
+                    # SESSION_DESCRIPTION must leave the deaf-window ring for the ready cut.
+                    receiver_self.refresh_credentials(
+                        f"voice ws op {op}",
+                        dave_state_changed=op != 4 or receiver_self._dave_protocol_version > 0,
+                    )
+                    if op == 21 and (msg.get("d") or {}).get("protocol_version") == 0:
                         # Pending downgrade: upstream enables plaintext
                         # passthrough for up to 120s (set_passthrough_mode).
                         receiver_self.note_dave_passthrough_window(120.0)
-                elif op == 22:
-                    # A transition may have executed; refresh and detect the
-                    # upgrade-after-downgrade EDGE (dave_downgraded flipping
-                    # True -> False) — the only case upstream grants the 10s
-                    # passthrough grace.  Same-version transitions and
-                    # unknown/duplicate ids change no state upstream, so no
-                    # edge fires and no window opens.
-                    was_downgraded = receiver_self._dave_downgraded
-                    receiver_self.refresh_credentials("voice ws op 22")
-                    if (
-                        was_downgraded
+                    elif (
+                        op == 22
+                        and was_downgraded
                         and not receiver_self._dave_downgraded
                         and receiver_self._dave_protocol_version > 0
                     ):
@@ -1149,6 +1404,11 @@ class VoiceReceiver:
     # --- Packet handler (called from SocketReader thread) ---
 
     def _on_packet(self, data: bytes):
+        # The arrival stamp is taken HERE, on receipt, and carried through the transport decrypt,
+        # the DAVE hold and the decode: everything downstream can be slow (a cold model load
+        # holding the GIL, a ring replay), and a frame heard before `t_ready` must be cut by when
+        # it was HEARD, not by when this thread got round to decoding it.
+        arrived = time.monotonic()
         if not self._running or self._paused:
             return
 
@@ -1257,18 +1517,23 @@ class VoiceReceiver:
                     # was already talking — try the sole-member inference
                     # before giving up on this frame.
                     user_id = self._infer_user_for_ssrc(ssrc)
+                # Inference may have just proven this SSRC is a bot's: bot
+                # audio is dropped, never held.
+                bot_owned = ssrc in self._dropped_ssrcs
             if user_id:
-                try:
-                    import davey
-                    decrypted = dave_session.decrypt(
-                        user_id, davey.MediaType.audio, decrypted
-                    )
-                except Exception as e:
-                    # Unencrypted passthrough — use NaCl-decrypted data as-is
-                    if "Unencrypted" not in str(e):
-                        if self._packet_debug_count <= 10:
-                            logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
-                        return
+                # Resolved — anything held for this SSRC predates this packet:
+                # replay it first so the utterance keeps its temporal order.
+                self._replay_dave_pending(ssrc, user_id)
+                # The session captured for THIS packet, not a fresh read: a
+                # refresh between the NaCl and DAVE steps must not split the
+                # credential generation.
+                plaintext = self._dave_decrypt(ssrc, user_id, decrypted, session=dave_session)
+                if plaintext is None:
+                    return
+                decrypted = plaintext
+            elif bot_owned:
+                self._bot_audio_dropped += 1
+                return
             elif (
                 dave_pver > 0
                 and time.monotonic() >= self._dave_passthrough_until
@@ -1276,39 +1541,209 @@ class VoiceReceiver:
                 # E2EE is actively on (protocol > 0, no passthrough window),
                 # so an unmapped SSRC's payload is still ciphertext.  Opus
                 # will happily "decode" it (producing shredded audio and
-                # poisoning decoder state), so drop the frame until a
-                # SPEAKING event maps the SSRC — bounded loss beats corrupt
-                # audio.  A non-null session alone is NOT this predicate: the
-                # session object survives protocol downgrades to 0 and
-                # passthrough transitions, where plaintext is legitimate and
-                # must fall through to opus below.
-                self._dave_unmapped_dropped += 1
-                if (
-                    self._packet_debug_count <= 10
-                    or self._dave_unmapped_dropped % 250 == 1
-                ):
-                    logger.debug(
-                        "Dropping DAVE frame for unmapped ssrc=%d (dropped=%d)",
-                        ssrc, self._dave_unmapped_dropped,
-                    )
+                # poisoning decoder state), so hold the bytes in a bounded
+                # ring until SPEAKING maps the SSRC — bounded loss beats
+                # corrupt audio, and replaying keeps the utterance's opening.
+                # No decoder is created, so a later mapping starts clean.
+                # A non-null session alone is NOT this predicate: the session
+                # object survives protocol downgrades to 0 and passthrough
+                # transitions, where plaintext is legitimate and must fall
+                # through to opus below.
+                self._hold_dave_payload(ssrc, decrypted, arrived_at=arrived)
                 return
 
         # --- Opus decode -> PCM ---
+        self._decode_into_buffer(ssrc, decrypted, arrived_at=arrived)
+
+    def _dave_decrypt(self, ssrc: int, user_id: int, payload: bytes,
+                      session=None) -> Optional[bytes]:
+        """DAVE-decrypt one payload on behalf of a resolved sender.
+
+        Returns the Opus payload to decode, or None when the packet must be
+        discarded.  An "Unencrypted" failure is passthrough, not corruption:
+        the NaCl-decrypted bytes are already the Opus payload and are used
+        as-is.
+
+        ``session`` is the credential generation the caller captured for this
+        packet: ``_on_packet`` snapshots one generation per packet, so a refresh
+        landing mid-packet must not hand the DAVE step a session from a
+        different generation than the transport key.  The replay path omits it
+        and gets the current session, which is the intent there.
+        """
+        if session is None:
+            # Replay path: the current session is the intent.  With no session
+            # at all the payload is already the Opus payload (the packet path
+            # is guarded by `if dave_session:`); stay explicit anyway, since
+            # swallowing an AttributeError below would drop the packet with no
+            # usable diagnostic.
+            session = self._dave_session
+            if session is None:
+                return payload
+        try:
+            import davey
+            return session.decrypt(
+                user_id, davey.MediaType.audio, payload
+            )
+        except Exception as e:  # health: allow BLE001 -- any decrypt failure drops this one packet and is logged; it must never kill the receive loop
+            if "Unencrypted" in str(e):
+                return payload
+            if self._packet_debug_count <= 10:
+                logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
+            return None
+
+    def _hold_dave_payload(self, ssrc: int, payload: bytes, *, arrived_at: Optional[float] = None) -> None:
+        """Hold a post-NaCl payload from an as-yet unattributable SSRC, stamped with its arrival."""
+        evicted = 0
+        held_at = time.monotonic() if arrived_at is None else arrived_at
+        with self._lock:
+            pending = self._dave_pending.get(ssrc)
+            if pending is None:
+                pending = deque(maxlen=self.DAVE_PENDING_MAX_FRAMES)
+                self._dave_pending[ssrc] = pending
+            if len(pending) == pending.maxlen:
+                # The ring was full, so appending discards the oldest frame.
+                # Count it: a held frame the ring drops must never read as a zero.
+                self._dave_unmapped_dropped += 1
+                evicted = self._dave_unmapped_dropped
+            pending.append((held_at, payload, self._dave_generation()))
+        if evicted and (evicted == 1 or evicted % 50 == 0):
+            logger.info(
+                "DAVE active with unresolved sender: hold ring full, "
+                "evicting oldest frames (ssrc=%d evicted=%d)", ssrc, evicted,
+            )
+
+    def _replay_dave_pending(self, ssrc: int, user_id: int) -> None:
+        """Decode payloads held while this SSRC was unresolved, in order.
+
+        A held frame keeps its ARRIVAL time, so the ready cut can drop it here even though it is
+        released after ``t_ready``: the sender was heard before the tone, whatever the ring's timing.
+        It also keeps the DAVE generation it was captured under, so a frame whose ratchet has
+        since been replaced is dropped (and counted) rather than fed to a decrypt that can only
+        fail.
+        """
+        with self._lock:
+            pending = self._dave_pending.pop(ssrc, None)
+            ready_at = self._ready_at
+            current = self._dave_generation()
+        if not pending:
+            return
+        logger.info(
+            "Replaying held voice payloads after SSRC resolution (ssrc=%d frames=%d)",
+            ssrc, len(pending),
+        )
+        for held_at, payload, generation in pending:
+            if ready_at is not None and held_at <= ready_at:
+                self._pre_ready_dropped += 1
+                continue
+            if (self._generation_ratchet_live(generation)
+                    and not self._same_generation(generation, current)):
+                # An MLS commit re-keyed the group between the hold and this replay.  The binary
+                # ops that do it (welcome/commit, 28-30) are handled inside discord.py's
+                # ``received_binary_message`` and never reach the ws hook, so the first JSON op
+                # afterwards is the only announcement — frames replayed in that gap cannot be
+                # authenticated.  Counting them here is what keeps them out of the silent,
+                # per-frame failure path ``_dave_decrypt`` would otherwise take.
+                self._dave_unmapped_dropped += 1
+                continue
+            plaintext = self._dave_decrypt(ssrc, user_id, payload)
+            if plaintext is None:
+                # Still ciphertext: the ring replayed this frame before DAVE settled (a deaf-window
+                # frame, held at pver>0 with no ready session), so it leaves the ring without ever
+                # reaching the ready cut.  Count it — a held frame the ring loses must not read as
+                # a zero in both counters.
+                self._dave_unmapped_dropped += 1
+                continue
+            self._decode_into_buffer(ssrc, plaintext, arrived_at=held_at)
+
+    def _decode_into_buffer(self, ssrc: int, payload: bytes, *, arrived_at: Optional[float] = None):
+        """Opus-decode one payload and append the PCM to the SSRC buffer.
+
+        ``arrived_at`` is when the packet reached the socket; the ready cut compares that, not the
+        moment this decode ran (a ring replay can decode long after arrival).
+        """
+        arrived = time.monotonic() if arrived_at is None else arrived_at
         try:
             if ssrc not in self._decoders:
                 self._decoders[ssrc] = discord.opus.Decoder()
-            pcm = self._decoders[ssrc].decode(decrypted)
+            pcm = self._decoders[ssrc].decode(payload)
             self._decode_ok += 1
             with self._lock:
                 self._buffers[ssrc].extend(pcm)
                 self._last_packet_time[ssrc] = time.monotonic()
-        except Exception as e:
+                self._arrivals[ssrc].append((arrived, len(pcm)))
+        except Exception as e:  # health: allow BLE001 -- any Opus/decoder failure drops this frame and resets the decoder; it must never kill the receive loop
             with self._lock:
                 self._decoders.pop(ssrc, None)
             logger.debug("Opus decode error for SSRC %s; reset decoder: %s", ssrc, e)
-            return
 
     # --- Silence detection ---
+
+    @classmethod
+    def _pcm_speech_activity(cls, pcm_data: bytes) -> tuple[bool, dict]:
+        """Classify structurally valid PCM using sustained frame energy.
+
+        This is not language/transcript filtering.  It rejects only segments
+        that contain too little acoustic activity to be speech, which prevents
+        OpenAI/Whisper from inventing text for Discord's join-time Opus comfort
+        frames while preserving the first real utterance regardless of order.
+
+        "Sustained" means contiguous: the gate requires
+        MIN_ACTIVE_SPEECH_DURATION of *uninterrupted* active frames.  The
+        streak resets on every inactive frame, so scattered pops totalling
+        the same active time never pass.
+        """
+        bytes_per_frame = int(
+            cls.SAMPLE_RATE * cls.CHANNELS * 2 * cls.PCM_FRAME_DURATION
+        )
+        active_frames = 0
+        contiguous_active_frames = 0
+        max_contiguous_active_frames = 0
+        total_frames = 0
+        peak = 0
+        sum_squares = 0
+        sample_count = 0
+
+        for offset in range(0, len(pcm_data), bytes_per_frame):
+            frame = pcm_data[offset:offset + bytes_per_frame]
+            # Ignore an odd trailing byte rather than treating malformed PCM
+            # as activity. pcm_to_wav uses the same signed 16-bit LE shape.
+            frame = frame[:len(frame) - (len(frame) % 2)]
+            if not frame:
+                continue
+            frame_sum_squares = 0
+            frame_samples = 0
+            for (sample,) in struct.iter_unpack("<h", frame):
+                magnitude = abs(sample)
+                peak = max(peak, magnitude)
+                square = sample * sample
+                frame_sum_squares += square
+                sum_squares += square
+                frame_samples += 1
+                sample_count += 1
+            total_frames += 1
+            frame_rms = math.sqrt(frame_sum_squares / frame_samples)
+            if frame_rms >= cls.ACTIVE_FRAME_RMS:
+                active_frames += 1
+                contiguous_active_frames += 1
+                max_contiguous_active_frames = max(
+                    max_contiguous_active_frames, contiguous_active_frames
+                )
+            else:
+                contiguous_active_frames = 0
+
+        required_active_frames = math.ceil(
+            cls.MIN_ACTIVE_SPEECH_DURATION / cls.PCM_FRAME_DURATION
+        )
+        total_rms = (
+            math.sqrt(sum_squares / sample_count) if sample_count else 0.0
+        )
+        stats = {
+            "duration_ms": round(total_frames * cls.PCM_FRAME_DURATION * 1000),
+            "active_ms": round(active_frames * cls.PCM_FRAME_DURATION * 1000),
+            "rms": round(total_rms),
+            "peak": peak,
+        }
+        return max_contiguous_active_frames >= required_active_frames, stats
 
     def _infer_user_for_ssrc(self, ssrc: int) -> int:
         """Infer user_id for an unmapped SSRC (call under ``_lock``): after a bot rejoin Discord may
@@ -1345,60 +1780,149 @@ class VoiceReceiver:
     def check_silence(self) -> list:
         """Return list of (user_id, pcm_bytes) for completed utterances."""
         now = time.monotonic()
-        completed = []
+        ready: list[tuple[int, bytes]] = []
+        expired_frames = 0
+        expired_ssrcs = 0
         with self._lock:
+            # Forget held payloads whose SSRC went quiet without ever being
+            # attributed — otherwise a phantom SSRC holds its ring until stop().
+            # Count them: TTL expiry is the ordinary loss when SPEAKING never
+            # arrives at all, so a zero counter must not read as "nothing lost".
+            for pending_ssrc, pending in list(self._dave_pending.items()):
+                if not pending or now - pending[-1][0] >= self.DAVE_PENDING_TTL:
+                    self._dave_pending.pop(pending_ssrc, None)
+                    expired_frames += len(pending)
+                    # An empty ring yielded no frame, so the log must not name
+                    # it as an SSRC whose audio was dropped.
+                    if pending:
+                        expired_ssrcs += 1
+            self._dave_unmapped_dropped += expired_frames
+
             ssrc_user_map = dict(self._ssrc_to_user)
             ssrc_list = list(self._buffers.keys())
             for ssrc in ssrc_list:
+                # Everything that arrived before the join's tone goes, before the segment is judged:
+                # the cut is by arrival time, and a hold-ring replay can land here after `t_ready`.
+                self._cut_pre_ready_locked(ssrc)
                 last_time = self._last_packet_time.get(ssrc, now)
                 silence_duration = now - last_time
                 buf = self._buffers[ssrc]
                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
                 if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
-                    user_id = ssrc_user_map.get(ssrc, 0)
-                    if not user_id:
-                        # SSRC unmapped (SPEAKING missing after rejoin) — infer from channel.
-                        user_id = self._infer_user_for_ssrc(ssrc)
-                    if user_id:
-                        completed.append((user_id, bytes(buf)))
+                    # Detach the segment here, classify it after the lock is
+                    # released: the gate is O(samples) pure Python, and holding
+                    # _lock through it stalls the event loop and the packet
+                    # thread for hundreds of ms on a long segment.
+                    ready.append((ssrc, bytes(buf)))
                     self._buffers[ssrc] = bytearray()
                     self._last_packet_time.pop(ssrc, None)
+                    self._arrivals.pop(ssrc, None)
                 elif silence_duration >= self.SILENCE_THRESHOLD * 2:
                     # Stale buffer with no valid user — discard
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
+                    self._arrivals.pop(ssrc, None)
                 elif buf_duration >= self.MAX_UNMAPPED_SECONDS and not ssrc_user_map.get(ssrc):
                     # A sender that never pauses and that nobody claims: keep trying to place
                     # it, else drop what it buffered rather than grow without bound.
                     if not self._infer_user_for_ssrc(ssrc):
                         self._buffers.pop(ssrc, None)
                         self._last_packet_time.pop(ssrc, None)
+                        # Its arrival stamps go with its bytes: they are a prefix of THAT buffer,
+                        # and a leftover prefix would cut the speech that follows it.
+                        self._arrivals.pop(ssrc, None)
+        if expired_frames:
+            logger.info(
+                "Held voice payloads expired without resolution (frames=%d ssrcs=%d)",
+                expired_frames, expired_ssrcs,
+            )
+
+        verdicts = []
+        for ssrc, pcm_data in ready:
+            has_speech, stats = self._pcm_speech_activity(pcm_data)
+            verdicts.append((ssrc, pcm_data, has_speech, stats))
+
+        completed = []
+        with self._lock:
+            for ssrc, pcm_data, has_speech, stats in verdicts:
+                if not has_speech:
+                    logger.info(
+                        "Discarded non-speech PCM segment "
+                        "(duration_ms=%d active_ms=%d rms=%d peak=%d)",
+                        stats["duration_ms"],
+                        stats["active_ms"],
+                        stats["rms"],
+                        stats["peak"],
+                    )
+                    # No ``_arrivals`` pop here: the detached segment's stamps went with it above,
+                    # and anything appended since belongs to frames still in the buffer.
+                    continue
+                user_id = ssrc_user_map.get(ssrc, 0)
+                if not user_id:
+                    # SSRC unmapped (SPEAKING missing after rejoin) — infer from channel.
+                    user_id = self._infer_user_for_ssrc(ssrc)
+                if user_id:
+                    completed.append((user_id, pcm_data))
         return completed
 
     def flush_pending(self) -> list:
         """Return buffered utterances that have not yet reached silence."""
-        completed = []
+        ready: list[tuple[int, bytes]] = []
         with self._lock:
-            ssrc_user_map = dict(self._ssrc_to_user)
             for ssrc, buf in list(self._buffers.items()):
+                # The leave path flushes too, so the ready cut has to apply here as well.
+                self._cut_pre_ready_locked(ssrc)
+                buf = self._buffers.get(ssrc) or bytearray()
                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
                 if buf_duration >= self.MIN_SPEECH_DURATION:
-                    user_id = ssrc_user_map.get(ssrc, 0)
-                    if not user_id:
-                        user_id = self._infer_user_for_ssrc(ssrc)
-                    if user_id:
-                        completed.append((user_id, bytes(buf)))
+                    ready.append((ssrc, bytes(buf)))
                 self._buffers.pop(ssrc, None)
                 self._last_packet_time.pop(ssrc, None)
+                self._arrivals.pop(ssrc, None)
+
+        # Same acoustic gate as the silence-flush path, also outside the lock: a
+        # leave-time flush must not carry comfort noise/join artifacts to STT,
+        # and must not stall the receiver while it decides.
+        verdicts = []
+        for ssrc, pcm_data in ready:
+            has_speech, stats = self._pcm_speech_activity(pcm_data)
+            verdicts.append((ssrc, pcm_data, has_speech, stats))
+
+        completed = []
+        with self._lock:
+            ssrc_user_map = dict(self._ssrc_to_user)
+            for ssrc, pcm_data, has_speech, stats in verdicts:
+                if not has_speech:
+                    logger.info(
+                        "Discarded non-speech PCM segment "
+                        "(duration_ms=%d active_ms=%d rms=%d peak=%d)",
+                        stats["duration_ms"],
+                        stats["active_ms"],
+                        stats["rms"],
+                        stats["peak"],
+                    )
+                    continue
+                user_id = ssrc_user_map.get(ssrc, 0)
+                if not user_id:
+                    user_id = self._infer_user_for_ssrc(ssrc)
+                if user_id:
+                    completed.append((user_id, pcm_data))
         return completed
 
     def discard_pending(self) -> None:
-        """Drop buffered PCM that no poll or flush has emitted yet."""
+        """Drop buffered PCM and held DAVE payloads that no poll or flush has emitted yet."""
+        # One critical section: held payloads are captured speech too, and after a text-binding
+        # move a replay through ``_replay_dave_pending`` that landed between the two clears would
+        # push them into the fresh buffer and transcribe the old conversation into the new one
+        # (#130311).  ``_on_packet`` resolves an SSRC and replays under this same lock, so it
+        # cannot observe a cleared buffer with the ring still populated.
         with self._lock:
             self._buffers.clear()
             self._last_packet_time.clear()
+            self._arrivals.clear()
+            self._drop_held_voice_payloads_locked("text-binding move")
 
     # --- PCM -> WAV conversion (for Whisper STT) ---
 
@@ -1441,11 +1965,12 @@ from plugins.platforms.discord.adapter_authorization import DiscordAuthorization
 from plugins.platforms.discord.adapter_slash_auth import DiscordSlashAuthMixin
 from plugins.platforms.discord.adapter_thread_titles import DiscordThreadTitlesMixin, SemanticThreadRenames
 from plugins.platforms.discord.adapter_voice_info import DiscordVoiceInfoMixin
+from plugins.platforms.discord.adapter_voice_ready import DiscordVoiceReadyMixin
 from plugins.platforms.discord.adapter_voice_session import DiscordVoiceSessionMixin
 
 
 class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceInfoMixin,
-                     DiscordVoiceSessionMixin, DiscordSlashAuthMixin, BasePlatformAdapter):
+                     DiscordVoiceSessionMixin, DiscordVoiceReadyMixin, DiscordSlashAuthMixin, BasePlatformAdapter):
     """Discord bot adapter: guild/DM messages, threads, slash commands, button approvals, reactions."""
 
     MAX_MESSAGE_LENGTH = 2000
@@ -1498,6 +2023,15 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         self._playback_timeout_seconds = self._load_playback_timeout()
         self._voice_receivers: dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
         self._voice_listen_tasks: dict[int, asyncio.Task] = {}  # guild_id -> listen loop
+        # Ready gate (adapter_voice_ready.py): the join's STT lease, its worker future, the gate task,
+        # and the last cycle's outcome (device, t_ready, degraded reason) for logs and tests.
+        self._voice_stt_leases: dict[int, str] = {}
+        self._voice_lease_tasks: dict[int, asyncio.Future] = {}
+        # How many live acquisitions still claim each lease name (a move abandons one without
+        # ending its warm; the name goes only when the last of them is done).
+        self._voice_lease_claims: dict[str, int] = {}
+        self._voice_ready_tasks: dict[int, asyncio.Task] = {}
+        self._voice_ready_info: dict[int, dict] = {}
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
         # Voice sessions (adapter_voice_session.py): guild -> record; the end handler set by run.py.
@@ -1912,7 +2446,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     )
                     # Any membership change in the bot's channel bumps the
                     # DAVE (E2EE) epoch — re-resolve the receiver's decryption
-                    # state so it never decodes against a stale session.
+                    # state so it never decodes against a stale session.  The
+                    # epoch bump is a DAVE state change even though neither
+                    # dave_session nor dave_protocol_version moves, so say so:
+                    # the hold ring's frames were captured under the old epoch.
                     vc = adapter_self._voice_clients.get(guild_id)
                     receiver = adapter_self._voice_receivers.get(guild_id)
                     if vc is not None and receiver is not None:
@@ -1921,7 +2458,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                             before.channel == bot_channel
                             or after.channel == bot_channel
                         ):
-                            receiver.refresh_credentials("membership change")
+                            receiver.refresh_credentials(
+                                "membership change", dave_state_changed=True
+                            )
 
                 # ------------------------------------------------------------------
                 # Leave-when-no-authorized-users: if the last tracked user left and
@@ -4028,6 +4567,11 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                                      # voice socket's warm-up doesn't clip the first word
             "ack_enabled": True,     # speak a short phrase before tool calls
             "ack_phrases": None,     # None = the localized defaults (``_default_voice_ack_phrases``)
+            # The join's ready gate (adapter_voice_ready.py, D-015/D-016/D-017). Disabling the tone
+            # only silences it: readiness and the pre-tone cut always apply.
+            "ready_tone_enabled": True,
+            "ready_tone_gain": 0.5,  # baked into the rendered WAV; 0..1
+            "ready_timeout_s": 15,   # a join waits at most this long for ready, then opens degraded
         }
         try:
             if cfg is None:
@@ -4604,6 +5148,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             if existing and existing.is_connected():
                 if existing.channel.id != channel.id:
                     await existing.move_to(channel)
+                    # A move is a new room: the ready gate re-arms and its tone plays again. A
+                    # reconnect inside the same session (below) never does (plan step 10).
+                    self._rearm_voice_ready_gate(guild_id)
                 self._reset_voice_timeout(guild_id)
                 self._bind_voice_text_channel(guild_id, text_channel_id, source)
                 return True
@@ -4634,6 +5181,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     await self._install_voice_mixer(guild_id, vc)
                 except Exception as e:
                     logger.warning("Voice mixer failed to start: %s", e)
+            # The join's ready gate (adapter_voice_ready.py): warm STT + a settled DAVE session, then
+            # one tone, then the arrival-time cut. Fire-and-forget so the join itself never blocks on
+            # a cold model load; the gate opens degraded if it cannot become ready in time.
+            self._start_voice_ready_gate(guild_id)
             return True
 
     async def play_in_voice_channel(

@@ -70,6 +70,7 @@ from hermes_cli.setup import (
 )
 from hermes_cli.colors import Colors, color
 from hermes_cli.gateway_profile_lifecycle import owned_gateway_pid as _owned_gateway_pid
+from hermes_cli.gateway_install_paths import _ld_library_path_line, _remap_path_for_user
 logger = logging.getLogger(__name__)
 
 # Shared ``subprocess.run`` kwargs for text-mode probes (stdout/stderr captured, decode-tolerant).
@@ -2987,46 +2988,6 @@ def _build_wsl_interop_paths(path_entries: list[str]) -> list[str]:
             seen.add(entry)
             result.append(entry)
     return result
-
-
-def _remap_path_for_user(path: str, target_home_dir: str) -> str:
-    """Swap the ``Path.home()`` prefix of *path* for *target_home_dir*; other paths return unchanged.
-    Intentionally does NOT resolve symlinks."""
-    current_home = Path.home()
-    p = Path(path).expanduser()
-    try:
-        relative = p.relative_to(current_home)
-        return str(Path(target_home_dir) / relative)
-    except ValueError:
-        return str(p)
-
-
-
-
-def _systemd_env_line(name: str, value: str) -> str:
-    """One ``Environment="NAME=value"`` line: ``\\`` and ``"`` escaped for systemd's quoting, ``%``
-    doubled so specifier expansion leaves the value alone."""
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
-    return f'Environment="{name}={escaped}"\n'
-
-
-def _installed_unit_ld_library_path(system: bool) -> str:
-    """``LD_LIBRARY_PATH`` baked into the installed unit; ``""`` when absent."""
-    return _unit_environment_value(get_systemd_unit_path(system=system), "LD_LIBRARY_PATH") or ""
-
-
-def _ld_library_path_line(system: bool, target_home_dir: str | None = None) -> str:
-    """Carry the installer's LD_LIBRARY_PATH into the unit (glibc reads it only at process start, so
-    ~/.hermes/.env is too late for CUDA libs — #14613); system units remap caller-home components.
-
-    The installed unit is the fallback source: the unit is regenerated and compared on every
-    start/restart/status, and a shell without the export (ssh, cron, ``sudo`` strips ``LD_*``)
-    must not be able to "repair" the line away."""
-    raw = os.environ.get("LD_LIBRARY_PATH", "") or _installed_unit_ld_library_path(system)
-    components = [p for p in raw.split(":") if p]
-    if target_home_dir is not None:
-        components = [_remap_path_for_user(p, target_home_dir) for p in components]
-    return _systemd_env_line("LD_LIBRARY_PATH", ":".join(components)) if components else ""
 
 
 def _hermes_home_for_target_user(target_home_dir: str) -> str:

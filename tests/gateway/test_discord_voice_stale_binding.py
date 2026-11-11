@@ -76,9 +76,13 @@ _SSRC, _BYTES_PER_SECOND = 7, 48000 * 2 * 2
 
 
 def _speak(receiver: VoiceReceiver, seconds: float) -> None:
-    """Decoded PCM arriving for one speaker, as the packet hook appends it."""
+    """Decoded PCM arriving for one speaker, as the packet hook appends it.
+
+    ``0x0400`` per sample (≈-30 dBFS) clears the receiver's sustained-energy gate; a DC ramp of a few
+    LSBs would be rejected as non-speech before it ever reached STT.
+    """
     with receiver._lock:
-        receiver._buffers[_SSRC].extend(b"\x01\x00" * int(seconds * _BYTES_PER_SECOND / 2))
+        receiver._buffers[_SSRC].extend(b"\x00\x04" * int(seconds * _BYTES_PER_SECOND / 2))
         receiver._last_packet_time[_SSRC] = time.monotonic()
 
 

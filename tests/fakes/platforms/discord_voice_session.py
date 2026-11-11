@@ -8,6 +8,7 @@ real ``on_voice_state_update`` closure can be driven.
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import AsyncMock
@@ -90,14 +91,34 @@ class FakeVoiceChannel:
 
 
 class FakeReceiver:
-    """``VoiceReceiver`` stand-in: ``pending`` is what the leave's final flush returns."""
+    """``VoiceReceiver`` stand-in: ``pending`` is what the leave's final flush returns.
+
+    The ready gate's receiver side is mirrored too (``dave_settled`` / ``mark_ready`` /
+    ``rearm_ready_gate`` / ``ready_at``), so a join's gate cycle runs against the same API the real
+    receiver offers.
+    """
 
     instances: list[FakeReceiver] = []
 
     def __init__(self, vc: Any, allowed_user_ids: Any = None, **_bot_exclusion: Any) -> None:
         self.vc, self.pending, self.stopped, self._running = vc, [], False, True
         self.bot_exclusion = dict(_bot_exclusion)  # drop_bot_audio / fleet_bot_ids, as the join wired them
+        self.ready_at: Optional[float] = None
+        self.rearms = 0
         FakeReceiver.instances.append(self)
+
+    @property
+    def dave_settled(self) -> bool:
+        """These fakes never negotiate DAVE; the gate's DAVE condition is tested on the real receiver."""
+        return True
+
+    def mark_ready(self, at: Optional[float] = None) -> None:
+        if self.ready_at is None:
+            self.ready_at = time.monotonic() if at is None else float(at)
+
+    def rearm_ready_gate(self) -> None:
+        self.ready_at = None
+        self.rearms += 1
 
     @staticmethod
     def pcm_to_wav(pcm: bytes, path: str) -> None:
@@ -119,7 +140,7 @@ class FakeReceiver:
     def check_silence(self) -> list:
         return []
 
-    def refresh_credentials(self, _why: str) -> None:
+    def refresh_credentials(self, _why: str, *, dave_state_changed: bool = False) -> None:
         pass
 
 
@@ -128,8 +149,13 @@ def make_guild(client: Any, gid: int = GUILD) -> Any:
     return guild
 
 
-def make_adapter(*, owner: Optional[str] = None, bot_user_id: int = 999) -> DiscordAdapter:
-    """A real ``DiscordAdapter`` on a fake client: one guild, one text channel, voice timers off."""
+def make_adapter(*, owner: Optional[str] = None, bot_user_id: int = 999,
+                 stt_device: str = "cpu") -> DiscordAdapter:
+    """A real ``DiscordAdapter`` on a fake client: one guild, one text channel, voice timers off.
+
+    ``stt_device`` is the device the canned warm lease reports; the default (``cpu``) is what a
+    host without a usable GPU sees, and a GPU-path test can vary it.
+    """
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token=f"fake-{bot_user_id}"))
     if owner:
         adapter.set_owner_profile(owner)
@@ -143,6 +169,14 @@ def make_adapter(*, owner: Optional[str] = None, bot_user_id: int = 999) -> Disc
     adapter._voice_timeout_seconds = 0
     adapter._is_allowed_user = lambda uid, guild=None, is_dm=False: True
     adapter.handle_message = AsyncMock()
+    # The ready gate is not what these tests are about: a canned warm lease keeps the real STT
+    # engine out of a fake join, and the tone stays off so no clip is rendered or played. Tests of
+    # the gate itself (tests/gateway/test_voice_ready_gate.py) set their own lease and cfg.
+    adapter._voice_stt_lease_acquire = lambda lease, install=False: {
+        "provider": "local", "warmed": True, "action": "cached", "device": stt_device,
+        "model": "tiny",
+    }
+    adapter._voice_fx_cfg = {**adapter._voice_fx_cfg, "ready_tone_enabled": False}
     adapter._fake_guild, adapter._fake_text = guild, text
     return adapter
 

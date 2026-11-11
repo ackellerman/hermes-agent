@@ -8,12 +8,14 @@ stay in ``transcription_tools`` (module state) and are read from it lazily.
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import platform
 import shlex
 import subprocess
 import tempfile
+import threading
 import importlib.util as _ilu
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -130,6 +132,129 @@ def _looks_like_cuda_lib_error(exc: BaseException) -> bool:
     return any(marker in str(exc) for marker in _CUDA_LIB_ERROR_MARKERS)
 
 
+# ---- CUDA 12 preload -----------------------------------------------------
+# ctranslate2's CUDA backend dlopens these at the FIRST inference, not at model construction, so a
+# model built with ``device="auto"`` on a GPU host proves nothing about CUDA (plan r5 F1). The
+# wheels arrive as the opt-in ``stt-whisper-cuda`` extra and ``hermes update`` keeps them; the only
+# thing that must not survive is a hardcoded LD_LIBRARY_PATH into a deleted venv, so the libraries
+# are found and loaded here, at runtime, from the interpreter's own site-packages.
+_CUDA12_CUBLAS_SONAMES: tuple[str, ...] = ("libcublasLt.so.12", "libcublas.so.12")  # Lt first
+_PRELOADED_CUDA_SONAMES: set[str] = set()
+# Two threads can reach the loader at once (a lease warm and the boot check), and the docstring's
+# idempotency is only true for a serial caller: the probe-then-load pair has to be atomic.
+_CUDA_PRELOAD_LOCK = threading.Lock()
+
+
+def cuda_library_dir(package: str = "nvidia.cublas") -> Optional[Path]:
+    """The ``lib/`` dir of *package* for THIS interpreter (the one that imported ctranslate2).
+
+    Resolved with ``find_spec`` on the exact wheel package: taking any ``nvidia/*/lib`` directory
+    would hand back the CUDA 13 tree (``nvidia/cudnn``'s ``.so.9``, a cuBLAS 13 ``.so.13``), which
+    ctranslate2 cannot use. ``None`` when the wheel is not installed here at all.
+
+    The layout is the LINUX wheel one (``nvidia/<pkg>/lib``). Windows wheels put the DLLs in
+    ``nvidia/<pkg>/bin``, so this resolver would report everything missing there — out of scope
+    because the ``stt-whisper-cuda`` extra is gated ``sys_platform == 'linux'``
+    (``[tool.hermes.extras-platforms]``), and ctranslate2's CUDA backend is not on macOS at all.
+    """
+    try:
+        spec = _ilu.find_spec(package)
+    except (ImportError, ValueError):
+        return None
+    if spec is None:
+        return None
+    roots = list(spec.submodule_search_locations or ())
+    if not roots and spec.origin:
+        roots = [str(Path(spec.origin).parent)]
+    for root in roots:
+        lib_dir = Path(root) / "lib"
+        if lib_dir.is_dir():
+            return lib_dir
+    return None
+
+
+def preload_cuda_libraries() -> tuple[str, ...]:
+    """Load the CUDA 12 libraries ctranslate2 needs; return the sonames still missing.
+
+    Empty tuple means every soname is loaded. Idempotent and thread-safe: a soname already loaded
+    in this process is skipped, so a second call returns ``()`` without touching the loader, and a
+    partially populated tree reports only the names it could not load (a later call retries those
+    alone, which is how a mid-flight install heals itself). ``RTLD_GLOBAL`` is required —
+    ctranslate2's extension resolves these symbols through the global scope.
+
+    The wheel is the PRIMARY source, not the only one. ctranslate2 dlopens the bare soname
+    (``strings … libctranslate2 | grep libcublas`` → ``libcublas.so.12``, no path), so the loader's
+    own search decides: a distro package, a kept ``LD_LIBRARY_PATH``, a system CUDA 12 toolkit or an
+    already-loaded copy satisfies it. Reporting those hosts as "missing" was a silent GPU→CPU
+    downgrade under the default ``device: auto`` (review r1 F1). The name stays pinned to
+    ``.so.12``, so a cu13 tree is never picked up either way.
+
+    COST: ``ctypes.CDLL`` does not release the GIL, so each ``dlopen`` below freezes every Python
+    thread in the process for as long as it runs — with the real ``nvidia-*`` wheels (581 MB +
+    717 MB packages) that is seconds, once per process. The daemon-thread hop at
+    ``gateway.run_startup`` moves the *load* and the *inference* off the loop; this call is the part
+    that still blocks it, deliberately (review r2 F1, accepted rather than bounded): a failed
+    ``dlopen`` is already cheap — the loader searches a handful of directories and gives up — while
+    the expensive case is a wheel that is present and must be mapped, so a presence prefilter
+    would remove no measurable stall and could only mis-report the ``LD_LIBRARY_PATH`` hosts that
+    ``find_library`` does not see.
+    """
+    lib_dir = cuda_library_dir()
+    missing: list[str] = []
+    with _CUDA_PRELOAD_LOCK:
+        for soname in _CUDA12_CUBLAS_SONAMES:
+            if soname in _PRELOADED_CUDA_SONAMES:
+                continue
+            path = lib_dir / soname if lib_dir is not None else None
+            if path is not None and path.is_file():
+                try:
+                    ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+                except OSError as exc:
+                    # A broken/unloadable wheel file is not the end: the loader may still have a
+                    # usable copy on its search path.
+                    logger.debug("Preloading CUDA library %s failed: %s", path, exc)
+                else:
+                    _PRELOADED_CUDA_SONAMES.add(soname)
+                    continue
+            try:
+                ctypes.CDLL(soname, mode=ctypes.RTLD_GLOBAL)
+            except OSError as exc:
+                logger.debug("CUDA library %s is not resolvable by the loader: %s", soname, exc)
+                missing.append(soname)
+                continue
+            logger.debug("CUDA library %s resolved by the dynamic loader", soname)
+            _PRELOADED_CUDA_SONAMES.add(soname)
+    return tuple(missing)
+
+
+def _preload_for_requested_device(device: str) -> tuple[str, ...]:
+    """Preload CUDA 12 sonames for ``auto``/``cuda``; nothing for an explicit CPU pin.
+
+    Under ``auto`` a missing tree means the device picker would have committed to a CUDA model that
+    dies on the first clip (the journal's mid-transcribe cuBLAS error), so the caller builds the
+    CPU model straight away. Under a pinned ``cuda`` this is a CUDA failure, not a reason to switch
+    device silently: the load is attempted, the load-time/inference fallbacks apply, and the warm
+    inference reports the effective device — what the ready gate calls degraded.
+    """
+    requested = (device or "auto").strip().lower()
+    if requested not in {"auto", "cuda"}:
+        return ()
+    missing = preload_cuda_libraries()
+    if not missing:
+        return ()
+    if requested == "auto":
+        logger.info(
+            "faster-whisper: CUDA 12 libraries are missing (%s) — loading on CPU (int8). The "
+            "gateway start log warns once and names the fix (`hermes pm install --extra "
+            "stt-whisper-cuda`).", ", ".join(missing))
+    else:
+        logger.info(
+            "faster-whisper: stt.local.device is 'cuda' but CUDA 12 libraries are missing (%s) — "
+            "the first inference will fall back to CPU (degraded). The gateway start log names "
+            "the fix (`hermes pm install --extra stt-whisper-cuda`).", ", ".join(missing))
+    return missing
+
+
 def _sysctl_value(name: str) -> str:
     """Return a sysctl value, or an empty string when unavailable."""
     try:
@@ -205,15 +330,22 @@ def _load_local_whisper_model(model_name: str, device: str = "auto", compute_typ
 
     ``device`` / ``compute_type`` default to ``"auto"`` so the historical behaviour is unchanged; pass
     explicit values from ``stt.local.device`` / ``stt.local.compute_type`` to pin a configuration (#9088).
+
+    For ``auto``/``cuda`` the CUDA 12 wheels' sonames are preloaded first (``preload_cuda_libraries``):
+    under ``auto`` a missing tree means the model is built on CPU immediately (a CUDA model would
+    only fail on its first clip); a pinned ``cuda`` still attempts CUDA, and the fallbacks plus the
+    warm inference report the effective device.
     """
     force_cpu = _should_force_faster_whisper_cpu()
     if force_cpu:
         # Importing ctranslate2 can itself abort on Apple Silicon/Rosetta when
         # multiple Intel OpenMP runtimes are loaded — set before the import.
         os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-    if force_cpu:
         logger.info("Apple Silicon/Rosetta detected — loading faster-whisper on CPU "
                     "(int8) to avoid native device autodetection crashes")
+        return _create_whisper_model(model_name, device="cpu", compute_type="int8")
+    requested_device = (device or "auto").strip().lower()
+    if _preload_for_requested_device(requested_device) and requested_device == "auto":
         return _create_whisper_model(model_name, device="cpu", compute_type="int8")
     try:
         return _create_whisper_model(model_name, device=device, compute_type=compute_type)

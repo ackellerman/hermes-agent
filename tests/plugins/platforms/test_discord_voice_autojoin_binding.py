@@ -63,6 +63,10 @@ class _Stub:
     _leave_voice_locked = DiscordAdapter._leave_voice_locked
     _take_voice_session = DiscordAdapter._take_voice_session
     _emit_voice_session_end = DiscordAdapter._emit_voice_session_end
+    # The leave releases the join's ready gate and its STT lease now (element e6).
+    _ready_map = DiscordAdapter._ready_map
+    _cancel_voice_ready_gate = DiscordAdapter._cancel_voice_ready_gate
+    _release_voice_stt_lease = DiscordAdapter._release_voice_stt_lease
 
     def __init__(self, channels=(), *, env_home=None, config_home=None):
         self._by_id = {ch.id: ch for ch in channels}

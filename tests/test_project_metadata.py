@@ -117,6 +117,7 @@ def test_lazy_installable_extras_excluded_from_all():
         "edge-tts", "tts-premium",
         "voice",  # faster-whisper / sounddevice / numpy (composes stt-whisper + audio-io)
         "stt-whisper",
+        "stt-whisper-cuda",  # CUDA 12 cuBLAS for local STT; explicit opt-in only (D-014)
         "modal", "daytona", "vercel",
         "messaging", "slack", "matrix", "dingtalk", "feishu",
         "telegram", "discord",
@@ -126,6 +127,8 @@ def test_lazy_installable_extras_excluded_from_all():
         "mistral",  # mistralai — Voxtral STT/TTS, lazy-installed (stt.mistral / tts.mistral)
     }
     all_extra_specs = optional_dependencies["all"]
+    undeclared = sorted(lazy_covered_extras - set(optional_dependencies))
+    assert not undeclared, f"lazy_covered_extras names undeclared extras: {undeclared}"
     for extra in lazy_covered_extras:
         offending = [
             spec for spec in all_extra_specs
@@ -136,6 +139,37 @@ def test_lazy_installable_extras_excluded_from_all():
             f"Remove it from [all] in pyproject.toml — it lazy-installs "
             f"at first use. Found in [all]: {offending}"
         )
+
+
+def test_stt_whisper_cuda_is_a_gated_opt_in_extra_outside_stt_whisper():
+    """D-014: the CUDA 12 cuBLAS wheel (~670 MB with its nvrtc dependency) is its own opt-in extra.
+
+    ctranslate2 4.8.1 dlopens libcublas.so.12 / libcublasLt.so.12 at the first
+    GPU inference (no cuDNN, audited with LD_DEBUG=libs), and a CUDA 13 host
+    has neither. The extra exact-pins the wheel, is gated to linux/x86_64 in
+    [tool.hermes.extras-platforms], and stays out of [all], [voice] and
+    [stt-whisper] so a CPU-only host never downloads it. Bundles build with
+    --all-extras minus [tool.hermes] opt-in-extras, so it must be listed there
+    too, or every linux x86_64 bundle ships the wheel.
+    """
+    from packaging.markers import Marker
+    from packaging.requirements import Requirement
+
+    root = Path(__file__).resolve().parents[1]
+    metadata = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8-sig"))
+    optional = metadata["project"]["optional-dependencies"]
+    gates = metadata["tool"]["hermes"]["extras-platforms"]
+    assert "stt-whisper-cuda" in optional
+    reqs = [Requirement(spec) for spec in optional["stt-whisper-cuda"]]
+    assert {req.name for req in reqs} == {"nvidia-cublas-cu12"}
+    (spec,) = reqs[0].specifier
+    assert spec.operator == "==" and spec.version.startswith("12.")
+    gate = "sys_platform == 'linux' and platform_machine == 'x86_64'"
+    assert Marker(gates["stt-whisper-cuda"]) == Marker(gate)
+    assert all(req.marker == Marker(gate) for req in reqs)
+    for carrier in ("all", "voice", "stt-whisper"):
+        assert not any("cu12" in spec or "stt-whisper-cuda" in spec for spec in optional[carrier]), carrier
+    assert "stt-whisper-cuda" in metadata["tool"]["hermes"].get("opt-in-extras", [])
 
 
 def _exact_pins(specs):

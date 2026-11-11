@@ -896,9 +896,16 @@ discord:
       - "Let me look into that."
       - "One moment."
       - "Checking on that now."
+    ready_tone_enabled: true  # play a short soft chime once per join, when the join is ready
+    ready_tone_gain: 0.5      # chime loudness (0.0–1.0); the clip is rendered with it baked in
+    ready_timeout_s: 15       # how long a join may wait for ready before opening degraded
 ```
 
 Notes:
+- The **ready tone** marks the moment the bot can actually hear the channel: the voice connection is up, DAVE has finished negotiating, and the speech-to-text model is warm on the device it will really use. It plays once per join — a move into another voice channel counts as a new join; a reconnect does not.
+- Everything a member says **before** the tone ends is discarded — whether it is still buffered or was held back waiting for the sender to be identified — so a cold model load or a DAVE negotiation never leaks a half-heard clip into a reply. Audio captured under a DAVE key that a later re-key replaced is dropped rather than decrypted with the new one, and the count appears in the receiver's teardown log line (`dave_unmapped_dropped=`).
+- If the join cannot become ready within `ready_timeout_s`, the gate still opens: the tone plays and one `voice ready (degraded: …)` line goes to the bound text channel. The line names whichever condition blocked — the voice connection never came up, DAVE did not settle, or speech-to-text failed or never warmed. The same line also reports a wrong **device**: the host was set up for a GPU (`stt.local.device: cuda`, or `auto` with the `stt-whisper-cuda` extra installed *and* an NVIDIA device visible) and the model warmed on CPU instead.
+- `ready_tone_enabled: false` only silences the chime. The ready condition and the pre-tone cut still apply, so no pre-ready speech reaches transcription.
 - Set `voice_channel_inactivity_timeout_seconds: 0` if you want the bot to remain in the voice channel until an explicit `/voice leave` or manual disconnect. The default preserves the historical 300-second idle auto-leave.
 - `voice_playback_timeout_seconds` is a floor, not a hard cap for long TTS. Hermes probes the generated audio duration and waits for `duration + 30s` when that is longer than the configured floor.
 - The acknowledgement fires at most once per turn, only when the bot is in a voice channel and the mixer is active. It uses your configured TTS provider.
