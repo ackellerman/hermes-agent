@@ -1029,6 +1029,68 @@ async def test_a_move_to_another_channel_rearms_the_gate(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_move_inside_the_tone_does_not_stamp_the_rearmed_receiver(
+        monkeypatch, nacl, decoders):
+    """A cancelled gate must not re-stamp the receiver the move just cleared (r2 finding A).
+
+    The stamp taken BEFORE the tone is the old join's.  If the gate's ``finally`` writes it after
+    ``rearm_ready_gate`` cleared ``_ready_at``, the new room's cut point becomes the old join's
+    pre-tone moment and its pre-ready speech reaches STT for as long as the new cycle takes to
+    open — the exact deaf window this branch exists to close.  On e0c8b752d02 the same move cut
+    all 40 frames.
+    """
+    warmed, new_warm_started = threading.Event(), threading.Event()
+    acquisitions = {"n": 0}
+
+    def lease(name, install=False):
+        acquisitions["n"] += 1
+        if acquisitions["n"] == 1:
+            return dict(_WARM_CPU)
+        new_warm_started.set()            # the new room's warm stays in flight for the assertion
+        warmed.wait(10)
+        return dict(_WARM_CPU)
+
+    env = _env(monkeypatch, lease=lease, timeout=30)
+    tone_entered, tone_held = asyncio.Event(), asyncio.Event()
+
+    async def held_tone(guild_id, audio_path, strict=False):
+        tone_entered.set()
+        await tone_held.wait()            # the move lands while the gate is inside the tone
+
+    monkeypatch.setattr(env.adapter, "play_in_voice_channel", held_tone)
+
+    try:
+        await _join(env, _channel(env.adapter, VOICE_A, members=[_member(OPERATOR)]))
+        assert await _until(tone_entered.is_set), "the gate never reached its tone"
+        receiver, gate = env.receiver, env.adapter._voice_ready_tasks[GUILD]
+        assert receiver.ready_at is None, "only the gate's tail stamps the receiver"
+
+        await _join(env, _channel(env.adapter, VOICE_B, members=[_member(OPERATOR)]))
+        assert env.receiver is receiver and env.vc.channel.id == VOICE_B
+        assert await _until(gate.done), "the cancelled gate never unwound"
+        for _ in range(10):               # a stamp written by the finally has long since landed
+            await asyncio.sleep(0.01)
+
+        assert receiver.ready_at is None, \
+            "the cancelled gate stamped the receiver the move had just re-armed"
+        assert "t_ready" not in env.info(), "the cancelled cycle wrote the new room's ready info"
+        assert await _until(new_warm_started.is_set), "the new cycle never took its own warm"
+
+        # The new room's pre-ready speech is cut, as it was before the landed round.
+        receiver.map_ssrc(SSRC, OPERATOR)
+        _speak(env, nacl, SSRC, 40)
+        _quiet(env)
+        assert receiver.check_silence() == [], "pre-ready speech from the new room reached STT"
+        assert receiver._pre_ready_dropped == 40
+    finally:
+        tone_held.set()
+        warmed.set()
+        for task in list(getattr(env.adapter, "_voice_ready_tasks", {}).values()):
+            task.cancel()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
 async def test_a_reconnect_does_not_rearm_the_gate(monkeypatch):
     env = _env(monkeypatch)
     await _join(env)

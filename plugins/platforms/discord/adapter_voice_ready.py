@@ -26,6 +26,7 @@ import logging
 import math
 import os
 import struct
+import sys
 import tempfile
 import time
 import wave
@@ -352,13 +353,19 @@ class DiscordVoiceReadyMixin:
                            exc_info=True)
             reason = f"the ready check failed: {exc}"
         finally:
-            # Stamped on BOTH paths, the degraded one included: a join never stays deaf (plan step 9).
-            if ready_at is None:
-                ready_at = time.monotonic()
-            receiver = self._voice_receivers.get(guild_id)
-            mark_ready = getattr(receiver, "mark_ready", None)
-            if callable(mark_ready):
-                mark_ready(ready_at)
+            # Stamped on both normal paths, the degraded one included: a join never stays deaf
+            # (plan step 9).  A CANCELLED gate is not this join any more — a move re-arms the
+            # receiver (clears `_ready_at`) and then cancels this task, so the stamp taken before
+            # the tone would mark the NEW room ready with the old join's time and let its
+            # pre-ready speech through unchecked.  Let the CancelledError propagate: no stamp, and
+            # no `_voice_ready_info` write either (the new cycle owns both).
+            if not isinstance(sys.exc_info()[1], asyncio.CancelledError):
+                if ready_at is None:
+                    ready_at = time.monotonic()
+                receiver = self._voice_receivers.get(guild_id)
+                mark_ready = getattr(receiver, "mark_ready", None)
+                if callable(mark_ready):
+                    mark_ready(ready_at)
         self._ready_map("_voice_ready_info")[guild_id] = {
             "t_ready": ready_at, "reason": reason, "degraded": reason is not None,
             "device": result.get("device"), "model": result.get("model"),
