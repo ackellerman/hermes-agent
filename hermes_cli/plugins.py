@@ -121,10 +121,15 @@ VALID_HOOKS: set[str] = {
     "pre_verify", "pre_api_request", "post_api_request", "api_request_error",
     # pre_final_stop: after every other stop gate, on any text stop (edits or not). Kwargs:
     # session_id, turn_id, platform, calls (tuple of frozen PreFinalToolCall: tool_name, call_id,
-    # turn_id, status, error_type, error_message; no args/results), complete (every dispatched call
-    # has exactly one post_tool_call event), continuation_available. Return {"action": "continue",
-    # "message"} for the turn's single continuation, {"action": "stop"} or None to finish; an
-    # optional "diagnostic" str is shown. Grants no authority. Python plugins only.
+    # turn_id, status, error_type, error_message; no args/results; error_message capped at 2000
+    # chars), complete (True only when every call this turn dispatched has exactly one post_tool_call
+    # event, no event names an undispatched or empty call id, the turn's event ledger neither
+    # overflowed nor was evicted, and the ledger was filled: it fills only while a pre_final_stop
+    # callback is registered AND post_tool_call is consumed, so a plugin that needs complete=True
+    # registers its own post_tool_call callback before the turn starts), continuation_available.
+    # Return {"action": "continue", "message"} for the turn's single continuation, {"action": "stop"}
+    # or None to finish; an optional "diagnostic" str is shown, as is a raise or timeout (which
+    # finishes). Grants no authority. Python plugins only.
     "pre_final_stop",
     # pre/post_auxiliary_call: once per physical provider attempt of an auxiliary LLM call
     # (agent/auxiliary_hooks.py — titling, compression, MoA, vision, approval, ...). Same payload

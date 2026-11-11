@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -50,9 +51,16 @@ _TODO_DEF = {
 }
 
 
-def _make_agent(session_id, max_iterations):
+_READ_FILE_DEF = {
+    "type": "function",
+    "function": {"name": "read_file", "description": "read",
+                 "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}},
+}
+
+
+def _make_agent(session_id, max_iterations, tool_defs=(_TODO_DEF,)):
     with (
-        patch("model_tools.get_tool_definitions", return_value=[_TODO_DEF]),
+        patch("model_tools.get_tool_definitions", return_value=list(tool_defs)),
         patch("model_tools.check_toolset_requirements", return_value={}),
         patch("agent.process_bootstrap.OpenAI"),
     ):
@@ -237,7 +245,9 @@ def test_anything_but_an_explicit_continue_finishes_the_turn(make_agent, plugins
 
     assert len(sent) == 1
     assert result["final_response"] == "final"
-    if outcome in ("bare-string", "no-message", "unknown-action"):
+    if outcome == "raise":
+        assert any("raised or timed out" in line for line in agent.diagnostics), agent.diagnostics
+    elif outcome != "none":
         assert any("pre_final_stop" in line for line in agent.diagnostics), agent.diagnostics
 
 
@@ -425,3 +435,163 @@ def test_shell_hooks_are_refused_and_the_hooks_test_payload_matches_runtime(make
     assert set(sample) == set(runtime) - {"telemetry_schema_version"}
     [runtime_call] = runtime["calls"]
     assert set(sample["calls"][0]) == {f.name for f in dataclasses.fields(runtime_call)}
+
+
+def test_a_hung_hook_is_bounded_and_finishes_the_turn_visibly(make_agent, plugins, monkeypatch):
+    import hermes_cli.plugins as plugins_mod
+    from agent.turn_stop_gates import PRE_FINAL_STOP_HOOK
+
+    monkeypatch.setattr(plugins_mod, "_resolve_hook_callback_timeout", lambda: 0.2)
+    never_set = threading.Event()
+
+    def hung(**_kw):
+        never_set.wait()  # never returns: only the hook bound can release the turn
+        return {"action": "continue", "message": NUDGE}
+
+    plugins.register(PRE_FINAL_STOP_HOOK, hung)
+    agent = make_agent("seam-timeout", 6)
+    sent = _script(agent, _text("final"), _text("never requested"))
+    outcome = {}
+    turn = threading.Thread(target=lambda: outcome.update(agent.run_conversation("plan the thing")), daemon=True)
+
+    turn.start()
+    turn.join(timeout=60)  # returns as soon as the turn ends; an unbounded hook holds it forever
+
+    assert not turn.is_alive(), "a hung pre_final_stop callback held the final answer"
+    assert len(sent) == 1 and outcome["final_response"] == "final"
+    assert any("raised or timed out" in line for line in agent.diagnostics), agent.diagnostics
+
+
+def test_a_failing_seam_dispatch_finishes_the_turn_visibly(make_agent, plugins, monkeypatch):
+    from agent.turn_stop_gates import PRE_FINAL_STOP_HOOK
+
+    plugins.register(PRE_FINAL_STOP_HOOK, _always_continue([]))
+    real_invoke = plugins.manager.invoke_hook
+
+    def invoke(hook_name, **kwargs):
+        if hook_name == PRE_FINAL_STOP_HOOK:
+            raise RuntimeError("dispatch broke")
+        return real_invoke(hook_name, **kwargs)
+
+    monkeypatch.setattr(plugins.manager, "invoke_hook", invoke)
+    agent = make_agent("seam-dispatch-broke", 6)
+    sent = _script(agent, _text("final"), _text("never requested"))
+
+    result = agent.run_conversation("plan the thing")
+
+    assert len(sent) == 1 and result["final_response"] == "final"
+    assert any("pre_final_stop: hook check failed" in line for line in agent.diagnostics), agent.diagnostics
+
+
+def test_interrupt_suppresses_the_seam(make_agent, plugins):
+    from agent.turn_stop_gates import PRE_FINAL_STOP_HOOK
+
+    seen = []
+    plugins.register(PRE_FINAL_STOP_HOOK, _always_continue(seen))
+    agent = make_agent("seam-interrupt", 6)
+
+    def interrupted_answer(agent_):
+        agent_._interrupt_requested = True
+        return _text("interrupted answer")
+
+    sent = _script(agent, interrupted_answer, _text("never requested"))
+
+    agent.run_conversation("plan the thing")
+
+    assert seen == []
+    assert len(sent) == 1
+
+
+def test_the_event_ledger_stays_empty_while_no_pre_final_stop_callback_is_registered(make_agent, plugins):
+    from hermes_cli.plugins_dispatch import post_tool_events
+
+    turns = []
+    plugins.register("post_tool_call", lambda **kw: turns.append((kw["session_id"], kw["turn_id"])))
+    agent = make_agent("seam-ledger-off", 6)
+    _script(agent, _tool_calls(("call-1", "todo_list", {"todos": []})), _text("done"))
+
+    agent.run_conversation("track it")
+
+    [(session_id, turn_id)] = turns
+    assert post_tool_events(session_id, turn_id) == ((), False)
+
+
+def test_parallel_calls_through_the_concurrent_executor_are_witnessed(make_agent, plugins, tmp_path):
+    from agent.turn_stop_gates import PRE_FINAL_STOP_HOOK
+
+    first, second = tmp_path / "a.txt", tmp_path / "b.txt"
+    first.write_text("a")
+    second.write_text("b")
+    seen = []
+    plugins.register("post_tool_call", lambda **kw: None)
+    plugins.register(PRE_FINAL_STOP_HOOK, lambda **kw: seen.append(kw))
+    agent = make_agent("seam-parallel", 6, tool_defs=(_READ_FILE_DEF,))
+    _script(agent, _tool_calls(("p1", "read_file", {"path": str(first)}), ("p2", "read_file", {"path": str(second)})),
+            _text("done"))
+
+    agent.run_conversation("read both")
+
+    [payload] = seen
+    assert payload["complete"] is True
+    assert [(c.call_id, c.status) for c in payload["calls"]] == [("p1", "ok"), ("p2", "ok")]
+
+
+@pytest.fixture
+def ledger(monkeypatch):
+    """A fresh post-tool event ledger, plus ``complete(dispatched, events)`` for one session turn."""
+    import hermes_cli.plugins_dispatch as dispatch
+    from agent.turn_stop_gates import _pre_final_call_outcomes
+
+    monkeypatch.setattr(dispatch, "_tool_events", {})
+    monkeypatch.setattr(dispatch, "_tool_events_overflowed", set())
+
+    def note(turn_id, call_id, **fields):
+        dispatch._note_post_tool_event(
+            {"session_id": "S", "turn_id": turn_id, "tool_call_id": call_id, "tool_name": "t", "status": "ok", **fields})
+
+    def complete(dispatched, events, turn_id="T"):
+        for call_id in events:
+            note(turn_id, call_id)
+        agent = SimpleNamespace(_pre_final_dispatched_calls=tuple((c, "t", turn_id) for c in dispatched))
+        return _pre_final_call_outcomes(agent, "S", turn_id)[1]
+
+    return SimpleNamespace(module=dispatch, note=note, complete=complete)
+
+
+@pytest.mark.parametrize("dispatched,events,expected", [
+    (["c1", "c2"], ["c1", "c2"], True),
+    (["c1", "c2"], ["c1"], False),        # a missed event
+    (["c1"], ["c1", "c1"], False),        # two events for one call
+    (["c1"], ["c1", "c-other"], False),   # an event naming a call this turn did not dispatch
+    ([""], [""], False),                  # a call without an id cannot be witnessed
+], ids=["exact", "missed", "duplicate", "unknown-call", "empty-id"])
+def test_complete_needs_exactly_one_event_per_dispatched_call(ledger, dispatched, events, expected):
+    assert ledger.complete(dispatched, events) is expected
+
+
+def test_a_turn_whose_events_overflowed_the_ledger_is_incomplete(ledger, monkeypatch):
+    monkeypatch.setattr(ledger.module, "_TOOL_EVENT_MAX_PER_TURN", 2)
+
+    # The third event is dropped; without the overflow flag the two kept events would match.
+    assert ledger.complete(["c1", "c2"], ["c1", "c2", "c1"]) is False
+    assert ledger.module.post_tool_events("S", "T")[1] is True
+
+
+def test_a_turn_evicted_from_the_ledger_reads_incomplete(ledger, monkeypatch):
+    monkeypatch.setattr(ledger.module, "_TOOL_EVENT_MAX_TURNS", 3)
+
+    assert ledger.complete(["c1"], ["c1"], turn_id="T0") is True
+    for n in range(4):
+        ledger.note(f"later-{n}", "z")
+
+    assert ledger.complete(["c1"], [], turn_id="T0") is False
+
+
+def test_a_stored_error_message_is_capped(ledger):
+    ledger.note("T", "c-long", status="error", error_message="x" * 50_000)
+    ledger.note("T", "c-short", status="error", error_message="old_string not found")
+
+    long_event, short_event = ledger.module.post_tool_events("S", "T")[0]
+    assert long_event["error_message"].startswith("x" * 2000)
+    assert len(long_event["error_message"]) <= 2100 and "truncated" in long_event["error_message"]
+    assert short_event["error_message"] == "old_string not found"

@@ -83,6 +83,11 @@ STREAM_HOLDING_HOOK = "transform_llm_output"
 _TOOL_EVENT_FIELDS = ("tool_name", "tool_call_id", "turn_id", "status", "error_type", "error_message")
 _TOOL_EVENT_MAX_TURNS = 256  # an evicted turn reads as incomplete (unknown), never as complete
 _TOOL_EVENT_MAX_PER_TURN = 1024
+_TOOL_EVENT_MAX_ERROR_CHARS = 2000  # stored error_message is cut here, marker appended
+_TOOL_EVENT_TRUNCATED_MARKER = " …[truncated]"
+# Stands in for a pre_final_stop callback that raised, timed out or was skipped: finish, visibly.
+_PRE_FINAL_STOP_FAILED_RESULT = {
+    "action": "stop", "diagnostic": "pre_final_stop: a plugin callback raised or timed out; finishing the turn"}
 _tool_events: dict[tuple[str, str], list[dict[str, Any]]] = {}  # (session_id, turn_id), oldest first
 _tool_events_overflowed: set[tuple[str, str]] = set()
 _tool_events_lock = threading.Lock()
@@ -101,7 +106,11 @@ def _note_post_tool_event(payload: Mapping[str, Any]) -> None:
         if len(events) >= _TOOL_EVENT_MAX_PER_TURN:
             _tool_events_overflowed.add(key)
         else:
-            events.append({f: payload.get(f) for f in _TOOL_EVENT_FIELDS})
+            event = {f: payload.get(f) for f in _TOOL_EVENT_FIELDS}
+            message = event["error_message"]
+            if isinstance(message, str) and len(message) > _TOOL_EVENT_MAX_ERROR_CHARS:
+                event["error_message"] = message[:_TOOL_EVENT_MAX_ERROR_CHARS] + _TOOL_EVENT_TRUNCATED_MARKER
+            events.append(event)
 
 
 def post_tool_events(session_id: str, turn_id: str) -> tuple[tuple[Mapping[str, Any], ...], bool]:
@@ -334,6 +343,10 @@ class PluginDispatchMixin:
             kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         if hook_name == "post_tool_call" and self._hooks.get("pre_final_stop"):
             _note_post_tool_event(kwargs)
+        if hook_name == "pre_final_stop":  # a raised or timed-out callback is shown, not only logged
+            failed: list[Any] = []
+            results = self._run_hook_callbacks(hook_name, self._hooks.get(hook_name, []), kwargs, failed)
+            return results + [dict(_PRE_FINAL_STOP_FAILED_RESULT) for _cb in failed]
         return self._run_hook_callbacks(hook_name, self._hooks.get(hook_name, []), kwargs)
 
     def invoke_hook_attributed(

@@ -95,6 +95,7 @@ def _pre_final_stop_nudge(agent) -> Optional[str]:
         )
     except Exception:
         logger.warning("pre_final_stop hook check failed; finishing the turn", exc_info=True)
+        agent._emit_diagnostic_status("⚠️ pre_final_stop: hook check failed; finishing the turn")
         return None
     message = _read_pre_final_results(agent, results)
     if message and not available:
