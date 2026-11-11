@@ -137,7 +137,9 @@ def failure_class(exc: Exception) -> str:
     if isinstance(exc, auxiliary_client.AuxiliaryClientUnavailable):
         return "provider unavailable"
     # The predicates are pure functions of the exception, so they run unguarded: a blind
-    # ``except`` here would swallow a real predicate bug as "unclassified".
+    # ``except`` here would swallow a real predicate bug as "unclassified". They cannot raise
+    # for the shapes the auxiliary client produces; a pathological exception (a non-dict
+    # ``ResponseMetadata``, a raising ``__str__``) would propagate instead of being labelled.
     for predicate, label in auxiliary_client._FALLBACK_REASONS:
         if predicate(exc):
             return label
