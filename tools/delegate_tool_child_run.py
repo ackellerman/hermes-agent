@@ -983,7 +983,10 @@ class _ChildRun:
         # sent bare.
         _history = getattr(child, "_delegate_continue_history", None)
         resume = {"conversation_history": _history} if isinstance(_history, list) else {}
-        user_message: Any = _build_child_goal_message(self.goal, _images, child) if _images else self.goal
+        from tools.delegate_tool_progress import child_task_message
+        _brief = child_task_message(self.goal, getattr(child, "_delegate_context", None))
+        task_text = self.goal if resume else _brief
+        user_message: Any = _build_child_goal_message(task_text, _images, child) if _images else task_text
 
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()
