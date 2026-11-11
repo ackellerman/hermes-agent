@@ -344,11 +344,13 @@ class DiscordVoiceReadyMixin:
                 # t_ready is when the play call RETURNED, success or failure: the tone has been heard
                 # for exactly as long as it took.
                 ready_at = time.monotonic()
-        except Exception as exc:  # health: allow BLE001 -- a broken config/GPU probe must degrade to a silent ready; an un-stamped receiver is deaf for the rest of the join
+        except Exception as exc:
             # The tail is guarded for the same reason the poll loop is, and one more: `ready_at is
             # None` now means "cut everything" (adapter.py's `_cut_pre_ready_locked`), so a raise
-            # here would leave a joined, still-listening receiver deaf for the rest of the join with
-            # no `voice ready` line at all.  Degrade instead, and say so.
+            # here would leave a joined, still-listening receiver deaf for the rest of the join.
+            # It therefore degrades to an ANNOUNCED ready — a WARNING with traceback here and a
+            # `voice ready (degraded: …)` line after the stamp — not a silent one: an un-stamped
+            # receiver is deaf for the rest of the join.
             logger.warning("[Discord] ready check failed (guild=%d): %s", guild_id, exc,
                            exc_info=True)
             reason = f"the ready check failed: {exc}"
