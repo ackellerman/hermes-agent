@@ -1602,7 +1602,7 @@ class VoiceReceiver:
                 self._dave_pending[ssrc] = pending
             if len(pending) == pending.maxlen:
                 # The ring was full, so appending discards the oldest frame.
-                # Count it: these are the only voice bytes this path can lose.
+                # Count it: a held frame the ring drops must never read as a zero.
                 self._dave_unmapped_dropped += 1
                 evicted = self._dave_unmapped_dropped
             pending.append((held_at, payload, self._dave_generation()))
@@ -1647,6 +1647,11 @@ class VoiceReceiver:
                 continue
             plaintext = self._dave_decrypt(ssrc, user_id, payload)
             if plaintext is None:
+                # Still ciphertext: the ring replayed this frame before DAVE settled (a deaf-window
+                # frame, held at pver>0 with no ready session), so it leaves the ring without ever
+                # reaching the ready cut.  Count it — a held frame the ring loses must not read as
+                # a zero in both counters.
+                self._dave_unmapped_dropped += 1
                 continue
             self._decode_into_buffer(ssrc, plaintext, arrived_at=held_at)
 

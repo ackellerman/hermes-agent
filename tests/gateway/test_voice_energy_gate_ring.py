@@ -161,6 +161,22 @@ class _InPlaceDave:
         return data
 
 
+class _SettlingDave(_InPlaceDave):
+    """A session that is still negotiating: ``pver`` is already 1, but it cannot decrypt yet.
+
+    This is the join's deaf window as discord.py drives it — op 4 sets the protocol version before
+    op 22/24 settles the session, so a frame held in between carries a generation with no ratchet.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(ready=False)
+
+    def decrypt(self, user_id: int, media_type, data: bytes) -> bytes:
+        if not self.ready:
+            raise RuntimeError("the DAVE session has no ratchet yet")
+        return super().decrypt(user_id, media_type, data)
+
+
 def _drive_hook(receiver: VoiceReceiver, op: int, data: dict | None = None) -> None:
     """Deliver one voice-ws op through the receiver's installed hook, as discord.py does.
 
@@ -632,6 +648,31 @@ def test_a_replay_across_an_unannounced_mls_commit_drops_and_counts(nacl, decode
     assert receiver._dave_unmapped_dropped == 2
     assert dave.calls == [(_OPERATOR, b"new-epoch")], "a frame from the dead ratchet was decrypted"
     assert _decoded(decoders) == [[b"new-epoch"]]
+
+
+def test_a_deaf_window_frame_replayed_before_dave_settles_is_counted(nacl, decoders):
+    """A held frame the ring replays while DAVE is still settling leaves without plaintext.
+
+    It cannot wait for the ready cut — the replay takes it out of the ring first — and
+    ``_dave_decrypt`` returns None on the failure without touching a counter, so the loss read as
+    ``dave_unmapped_dropped=0`` AND ``pre_ready_dropped=0``.  One of the two has to move.
+    """
+    dave = _SettlingDave()
+    # Two humans: inference cannot place the unknown SSRC, so the ring holds the frame.
+    receiver = _receiver(members=[_member(_OPERATOR), _member(_STRANGER), _member(_ME, True)],
+                         dave_session=dave, dave_pver=1)
+    _packet(nacl, receiver, _SSRC_PERSON, seq=1, payload=b"deaf-window")
+    assert len(receiver._dave_pending[_SSRC_PERSON]) == 1
+    assert receiver._ready_at is None
+
+    receiver.map_ssrc(_SSRC_PERSON, _OPERATOR)
+    _packet(nacl, receiver, _SSRC_PERSON, seq=2, payload=b"still-ciphertext")   # triggers the replay
+
+    assert receiver._dave_pending == {}, "the ring kept a frame it had already replayed"
+    assert _decoded(decoders) == [], "a frame the session could not decrypt reached Opus"
+    assert dave.calls == [], "the replay recorded a decrypt that could not have succeeded"
+    assert receiver._dave_unmapped_dropped == 1, "the lost held frame moved no counter"
+    assert receiver._pre_ready_dropped == 0
 
 
 def test_the_ttl_sweep_counts_and_logs_what_it_expires(nacl, decoders, caplog):
