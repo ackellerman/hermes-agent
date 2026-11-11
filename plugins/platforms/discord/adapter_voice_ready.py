@@ -157,6 +157,7 @@ class DiscordVoiceReadyMixin:
     _voice_text_channels: dict[int, Any]
     _voice_stt_leases: dict[int, str]
     _voice_lease_tasks: dict[int, asyncio.Future]
+    _voice_lease_claims: dict[str, int]
     _voice_ready_tasks: dict[int, asyncio.Task]
     _voice_ready_info: dict[int, dict[str, Any]]
     # Swap seam: the fakes replace the lease worker so a fake join never loads a model.
@@ -188,6 +189,11 @@ class DiscordVoiceReadyMixin:
         self._release_voice_stt_lease(guild_id)
         lease = f"discord:voice:{guild_id}"
         self._ready_map("_voice_stt_leases")[guild_id] = lease
+        # A claim per acquisition: `release_stt_lease` is a plain set discard, so the abandoned
+        # warm of a move finishing after a NEW join took the same name must not take the live
+        # join's lease with it (the mirror of the leak above).
+        claims = self._ready_map("_voice_lease_claims")
+        claims[lease] = claims.get(lease, 0) + 1
         # The warm blocks for the whole model load (cold download + medium on CPU is minutes), so it
         # must never run on the loop that keeps the gateway answering. ``install=False``: a voice
         # join must never start a dependency rebuild (plan step 7).
@@ -209,19 +215,37 @@ class DiscordVoiceReadyMixin:
         self._ready_map("_voice_ready_info").pop(guild_id, None)
 
     def _release_voice_stt_lease(self, guild_id: int) -> None:
-        """Drop the guild's lease, and again when a still-running warm finishes.
+        """Drop the guild's claim on its lease, and again when a still-running warm finishes.
 
         ``acquire_stt_lease`` registers the holder inside the worker thread, so a leave that lands
         before the thread starts would otherwise leave ``discord:voice:<guild>`` held forever by a
         model load nobody is waiting for.
+
+        This join is the live holder, so the name goes now; a warm that has not registered yet
+        re-adds it inside its thread, and its own discharge removes it again. The NAME, though, is
+        only dropped for good by the LAST claim on it — ``release_stt_lease`` discards from a plain
+        set with no refcount, so an abandoned warm finishing while a new join holds the same name
+        must not release the live join's lease (finding 3; the mirror of the leak fixed above).
         """
         lease = self._ready_map("_voice_stt_leases").pop(guild_id, None)
         task = self._ready_map("_voice_lease_tasks").pop(guild_id, None)
         if not lease:
             return
-        release_stt_lease(lease)
         if task is not None and not task.done():
-            task.add_done_callback(lambda _f, _lease=lease: release_stt_lease(_lease))
+            task.add_done_callback(lambda _f, _lease=lease: self._drop_voice_lease_claim(_lease))
+        else:
+            self._drop_voice_lease_claim(lease)
+        release_stt_lease(lease)
+
+    def _drop_voice_lease_claim(self, lease: str) -> None:
+        """Retire one acquisition's claim on *lease*; the last one out releases the name."""
+        claims = self._ready_map("_voice_lease_claims")
+        remaining = claims.get(lease, 0) - 1
+        if remaining > 0:
+            claims[lease] = remaining
+            return
+        claims.pop(lease, None)
+        release_stt_lease(lease)
 
     def _rearm_voice_ready_gate(self, guild_id: int) -> None:
         """A move into another channel is a new room: the cut re-arms and the tone plays again."""

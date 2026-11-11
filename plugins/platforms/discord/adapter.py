@@ -2022,6 +2022,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         # and the last cycle's outcome (device, t_ready, degraded reason) for logs and tests.
         self._voice_stt_leases: dict[int, str] = {}
         self._voice_lease_tasks: dict[int, asyncio.Future] = {}
+        # How many live acquisitions still claim each lease name (a move abandons one without
+        # ending its warm; the name goes only when the last of them is done).
+        self._voice_lease_claims: dict[str, int] = {}
         self._voice_ready_tasks: dict[int, asyncio.Task] = {}
         self._voice_ready_info: dict[int, dict] = {}
         self._voice_input_callback: Optional[Callable] = None  # set by run.py

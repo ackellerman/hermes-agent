@@ -649,6 +649,58 @@ async def test_a_move_abandons_the_first_lease_and_releases_it_when_it_finishes(
         "the abandoned worker kept the lease after it finished"
 
 
+@pytest.mark.asyncio
+async def test_an_abandoned_warm_finishing_keeps_the_live_joins_lease(monkeypatch, real_lease):
+    """The mirror of the leak: the abandoned warm must not release the name a NEW join holds.
+
+    ``release_stt_lease`` discards from a plain set with no refcount, so the done-callback of the
+    warm a move abandoned used to remove ``discord:voice:<guild>`` while the second join was still
+    live.  A claim per acquisition fixes that: the name goes only when the last one ends.
+    """
+    adapter = fx.make_adapter(bot_user_id=ME)
+    adapter._voice_fx_cfg = {**adapter._voice_fx_cfg, "ready_tone_enabled": False}
+    started, proceed, finished = threading.Event(), threading.Event(), threading.Event()
+    calls: list[str] = []
+
+    def lease(name, install=False):
+        calls.append(name)
+        first = len(calls) == 1
+        if first:
+            started.set()
+            proceed.wait(10)
+        try:
+            return stt_lease.acquire_stt_lease(name, install=False)
+        finally:
+            if first:
+                finished.set()
+
+    adapter._voice_stt_lease_acquire = lease
+    _patch_discord(monkeypatch)
+    env = _Env(adapter, [])
+    lease_name = f"discord:voice:{GUILD}"
+
+    await _join(env)
+    assert await _until(started.is_set)
+    await _join(env, _channel(adapter, VOICE_B, members=[_member(OPERATOR)]))
+    assert await _until(lambda: len(calls) == 2), "the move did not take a fresh lease"
+    second = adapter._voice_lease_tasks[GUILD]
+    assert await _until(second.done, timeout=10)
+    assert await _until(lambda: lease_name in stt_lease.stt_lease_holders())
+
+    proceed.set()                        # the abandoned warm registers and finishes now
+    assert await _until(finished.is_set, timeout=5)
+    # Its claim being discharged is what proves the callback ran; the name must survive it.
+    assert await _until(lambda: adapter._voice_lease_claims.get(lease_name) == 1, timeout=1), \
+        "the abandoned warm's claim was never discharged"
+    assert lease_name in stt_lease.stt_lease_holders(), \
+        "the abandoned warm released the lease the live join holds"
+
+    # And the leave still ends it: the last claim out releases the name.
+    await adapter.leave_voice_channel(GUILD)
+    assert await _until(lambda: stt_lease.stt_lease_holders() == [], timeout=1), \
+        "the leave left the last claim's name held"
+
+
 # --- the tone --------------------------------------------------------------------------------------
 
 
