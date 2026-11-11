@@ -1,9 +1,12 @@
 """Behaviour contract for the fork pre-push identity gate (`.githooks/pre-push` + helper).
 
-Every push here is a real `git push` into a disposable bare remote under the pytest tmp dir,
+Every push here is a real `git push` into a disposable bare remote under a pytest tmp dir,
 through a hook copied from this checkout's `.githooks/` into a disposable clone, with a
 synthetic private policy bundle in that clone's common dir. Refusals are asserted on the push
-status AND on the remote's refs, which must not move.
+status, on the remote's refs (which must not move) and on a reason phrase that only the gate
+prints for that reason. The phrase is searched in the hook's own lines only: git's own
+`error:`/`hint:`/`To` lines and the disposable root path are removed first, and the roots
+have neutral names, so a path or a test name can never satisfy a needle.
 
 The identity gate fails closed for every non-`sim` author or committer at this checkpoint:
 verified-upstream snapshots and reviewed cherry-picks are later elements. All deny-list values
@@ -15,9 +18,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
-import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -35,6 +39,33 @@ POLICY = {"version": 1, "names": ["Pat Example"], "emails": ["pat@example.invali
 DATE = "1700000000 +0000"
 # Built at runtime so this file's own text never matches the public block pattern.
 HOST_PATH = "/" + "mnt" + "/" + "work" + "/projects/x"
+GIT_OWN_LINE = re.compile(r"(error|fatal|hint|warning|remote): |To ")
+
+AUTHOR_NOT_SIM = "author is not the fork identity sim"
+COMMITTER_NOT_SIM = "committer is not the fork identity sim"
+POLICY_MISSING = "private identity policy is missing"
+
+
+def isolated_env(root: Path) -> dict:
+    """Environment for every git process here: no GIT_* leak-in, no ~/.gitconfig, no system."""
+    home = root / "home"
+    home.mkdir(exist_ok=True)
+    gcfg = root / "gitconfig"
+    gcfg.touch()
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("GIT_") and k != "HERMES_ALLOW_HOST_PATHS"}
+    env.update(HOME=str(home), GIT_CONFIG_GLOBAL=str(gcfg), GIT_CONFIG_NOSYSTEM="1",
+               GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_DATE=DATE, GIT_COMMITTER_DATE=DATE)
+    return env
+
+
+def load_guard():
+    """Import the helper from this checkout (it is not a package module)."""
+    spec = importlib.util.spec_from_file_location("identity_guard", HOOKS_SRC / "identity_guard.py")
+    assert spec is not None and spec.loader is not None
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    return guard
 
 
 class Forge:
@@ -42,14 +73,7 @@ class Forge:
 
     def __init__(self, root: Path, layout: str = "copied", policy: dict | None = POLICY):
         self.root = root
-        home = root / "home"
-        home.mkdir()
-        gcfg = root / "gitconfig"
-        gcfg.write_text("")
-        self.env = {k: v for k, v in os.environ.items()
-                    if not k.startswith("GIT_") and k != "HERMES_ALLOW_HOST_PATHS"}
-        self.env.update(HOME=str(home), GIT_CONFIG_GLOBAL=str(gcfg), GIT_CONFIG_NOSYSTEM="1",
-                        GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_DATE=DATE, GIT_COMMITTER_DATE=DATE)
+        self.env = isolated_env(root)
         self.remote = root / "remote.git"
         self.repo = root / "local"
         self.git("init", "-q", "--bare", "-b", "main", str(self.remote), cwd=root)
@@ -149,6 +173,11 @@ class Forge:
                              check=False)
         return res.returncode, res.stderr.decode(errors="replace")
 
+    def said(self, stderr: str) -> str:
+        """What the hook itself printed: no git lines, and the disposable root path masked."""
+        text = stderr.replace(str(self.root), "<root>")
+        return "\n".join(ln for ln in text.splitlines() if not GIT_OWN_LINE.match(ln))
+
 
 class Pushed:
     def __init__(self, rc, stderr, before):
@@ -161,13 +190,20 @@ def assert_no_private(text: str):
         assert value not in low, f"diagnostic disclosed a private deny-list value: {text}"
 
 
-def assert_refused(forge: Forge, res: Pushed, *needles: str):
+def assert_refused(forge: Forge, res: Pushed, needle: str):
     assert res.rc != 0, (f"push was ACCEPTED (rc 0); remote refs moved from {res.before} to "
                          f"{forge.remote_refs()}; stderr:\n{res.stderr}")
     assert forge.remote_refs() == res.before, "a refused push still moved the remote"
-    for needle in needles:
-        assert needle in res.stderr, f"expected {needle!r} in the refusal:\n{res.stderr}"
+    said = forge.said(res.stderr)
+    assert needle in said, f"refused, but not for {needle!r}; the hook said:\n{said}"
     assert_no_private(res.stderr)
+
+
+def assert_hook_refused(forge: Forge, rc: int, stderr: str, needle: str):
+    """For crafted stdin that a real push cannot produce (the hook is run directly)."""
+    assert rc != 0, f"the hook accepted crafted input:\n{stderr}"
+    said = forge.said(stderr)
+    assert needle in said, f"refused, but not for {needle!r}; the hook said:\n{said}"
 
 
 def assert_accepted(forge: Forge, res: Pushed, ref: str, oid: str):
@@ -176,25 +212,51 @@ def assert_accepted(forge: Forge, res: Pushed, ref: str, oid: str):
 
 
 @pytest.fixture
-def forge(tmp_path):
-    return Forge(tmp_path)
+def root(tmp_path_factory):
+    """A disposable root with a neutral name (never the test's name)."""
+    return tmp_path_factory.mktemp("r")
+
+
+@pytest.fixture
+def forge(root):
+    return Forge(root)
+
+
+def tool_dir(root: Path, python3: str | None) -> Path:
+    """A PATH holding only the tools the hook needs, with `python3` absent or replaced."""
+    tools = ["git", "bash", "sh", "env", "cat", "md5sum", "sha256sum", "cut", "mktemp", "rm",
+             "sort", "wc", "tr", "timeout", "sed", "awk", "grep", "head", "dirname", "uname"]
+    found = {t: shutil.which(t) for t in tools}
+    missing = [t for t, p in found.items() if p is None]
+    if missing:
+        pytest.skip(f"host lacks {missing}")
+    bindir = root / "bin"
+    bindir.mkdir()
+    for name, path in found.items():
+        assert path is not None
+        (bindir / name).symlink_to(path)
+    if python3 is not None:
+        fake = bindir / "python3"
+        fake.write_text(python3)
+        fake.chmod(0o755)
+    return bindir
 
 
 # ── the defect: a personal author hidden behind a sim merge ─────────────────────────────────
 @pytest.mark.parametrize("layout", ["copied", "tracked"])
-def test_hidden_merge_personal_author_refuses(tmp_path, layout):
-    f = Forge(tmp_path, layout=layout)
+def test_hidden_merge_personal_author_refuses(root, layout):
+    f = Forge(root, layout=layout)
     mainline = f.commit("mainline", [f.base], files={"a.txt": "a\n"})
     side = f.commit("side work", [f.base], author=PERSONAL, committer=PERSONAL,
                     files={"b.txt": "b\n"})
     merge = f.commit("merge side", [mainline, side], ref="refs/heads/main")
     assert merge
-    assert_refused(f, f.push("main"), "author")
+    assert_refused(f, f.push("main"), AUTHOR_NOT_SIM)
 
 
 @pytest.mark.parametrize("layout", ["copied", "tracked"])
-def test_sim_push_passes(tmp_path, layout):
-    f = Forge(tmp_path, layout=layout)
+def test_sim_push_passes(root, layout):
+    f = Forge(root, layout=layout)
     one = f.commit("one", [f.base], files={"a.txt": "a\n"})
     side = f.commit("side", [f.base], files={"b.txt": "b\n"})
     merge = f.commit("merge", [one, side], ref="refs/heads/main")
@@ -206,20 +268,20 @@ def test_personal_author_on_second_parent_of_octopus_refuses(forge):
     b = forge.commit("b", [forge.base], files={"b.txt": "b\n"})
     c = forge.commit("c", [forge.base], author=PERSONAL, files={"c.txt": "c\n"})
     forge.commit("octopus", [a, b, c], ref="refs/heads/main")
-    assert_refused(forge, forge.push("main"), "author")
+    assert_refused(forge, forge.push("main"), AUTHOR_NOT_SIM)
 
 
 @pytest.mark.parametrize("committer", [PERSONAL, UPSTREAM, ("Sim", SIM[1]), ("sim", "sim@example.invalid")])
 def test_non_sim_committer_refuses(forge, committer):
     forge.commit("work", [forge.base], committer=committer, files={"a.txt": "a\n"},
                  ref="refs/heads/main")
-    assert_refused(forge, forge.push("main"), "committer")
+    assert_refused(forge, forge.push("main"), COMMITTER_NOT_SIM)
 
 
 def test_upstream_author_fails_closed_at_this_checkpoint(forge):
     forge.commit("upstream work", [forge.base], author=UPSTREAM, files={"a.txt": "a\n"},
                  ref="refs/heads/main")
-    assert_refused(forge, forge.push("main"), "author")
+    assert_refused(forge, forge.push("main"), AUTHOR_NOT_SIM)
 
 
 # ── messages ───────────────────────────────────────────────────────────────────────────────
@@ -231,7 +293,7 @@ def test_upstream_author_fails_closed_at_this_checkpoint(forge):
 ])
 def test_message_deny_list_hit_refuses_without_disclosure(forge, message):
     forge.commit(message, [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
-    assert_refused(forge, forge.push("main"), "message")
+    assert_refused(forge, forge.push("main"), "message matches the private deny-list")
 
 
 def test_message_tokens_are_word_bounded_not_substrings(forge):
@@ -242,7 +304,55 @@ def test_message_tokens_are_word_bounded_not_substrings(forge):
 
 def test_message_public_block_pattern_refuses_even_with_host_path_override(forge):
     forge.commit(f"see {HOST_PATH}", [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
-    assert_refused(forge, forge.push("main", env={"HERMES_ALLOW_HOST_PATHS": "1"}), "message")
+    assert_refused(forge, forge.push("main", env={"HERMES_ALLOW_HOST_PATHS": "1"}),
+                   "message matches the public block pattern")
+
+
+# ── extra headers: mergetag, gpgsig and any other header after committer ──────────────────
+def _mergetag(base: str, tagger: tuple, note: str) -> bytes:
+    return (f"mergetag object {base}\n type commit\n tag v1\n"
+            f" tagger {tagger[0]} <{tagger[1]}> {DATE}\n \n {note}\n").encode()
+
+
+def _gpgsig(comment: bytes) -> bytes:
+    return (b"gpgsig -----BEGIN PGP SIGNATURE-----\n " + comment
+            + b"\n \n iQEzBAABCAAdFiEE\n -----END PGP SIGNATURE-----\n")
+
+
+@pytest.mark.parametrize("extra,needle", [
+    (lambda b: _mergetag(b, PERSONAL, "release"), "'mergetag' header matches the private deny-list"),
+    (lambda b: _mergetag(b, SIM, "tagged for Pat Example"),
+     "'mergetag' header matches the private deny-list"),
+    (lambda b: _gpgsig(b"Comment: pat@example.invalid"),
+     "'gpgsig' header matches the private deny-list"),
+    (lambda b: _gpgsig(b"Comment: \xff\xfe"), "'gpgsig' header is not valid UTF-8"),
+], ids=["mergetag-tagger", "mergetag-message", "gpgsig-email", "gpgsig-not-utf8"])
+def test_extra_header_text_is_audited(forge, extra, needle):
+    forge.raw_commit(forge.header(forge.base) + extra(forge.base) + b"\nmerge\n",
+                     "refs/heads/main")
+    assert_refused(forge, forge.push("main"), needle)
+
+
+def test_clean_mergetag_and_gpgsig_pass(forge):
+    raw = (forge.header(forge.base) + _mergetag(forge.base, SIM, "release")
+           + _gpgsig(b"Comment: signed") + b"\nmerge\n")
+    oid = forge.raw_commit(raw, "refs/heads/main")
+    assert_accepted(forge, forge.push("main"), "refs/heads/main", oid)
+
+
+@pytest.mark.parametrize("line", [b"pat@example.invalid x", b"Pat Example x"])
+def test_unparseable_header_never_echoes_its_token(forge, line):
+    forge.raw_commit(forge.header(forge.base) + line + b"\n\nmsg\n", "refs/heads/main")
+    assert_refused(forge, forge.push("main"), "malformed header: an unparseable header line")
+
+
+@pytest.mark.parametrize("key,extra", [
+    ("encoding", b"encoding UTF-8\nencoding UTF-8\n"),
+    ("gpgsig", _gpgsig(b"Comment: one") + _gpgsig(b"Comment: two")),
+])
+def test_duplicated_non_core_header_refuses(forge, key, extra):
+    forge.raw_commit(forge.header(forge.base) + extra + b"\nmsg\n", "refs/heads/main")
+    assert_refused(forge, forge.push("main"), f"malformed header: duplicate or misplaced '{key}' header")
 
 
 # ── refs: multi-ref, new ref, update range, tags, deletion ─────────────────────────────────
@@ -251,7 +361,7 @@ def test_multi_ref_push_refuses_all_refs_when_one_is_bad(forge):
     forge.commit("bad", [forge.base], author=PERSONAL, files={"b.txt": "b\n"},
                  ref="refs/heads/side")
     res = forge.push("main", "side")
-    assert_refused(forge, res, "author")
+    assert_refused(forge, res, AUTHOR_NOT_SIM)
     assert forge.remote_refs().get("refs/heads/main") != good
 
 
@@ -260,7 +370,7 @@ def test_new_ref_audits_full_ancestry_without_tracking_ref_exclusion(forge):
                        files={"a.txt": "a\n"}, ref="refs/heads/main")
     forge.git("push", "-q", "--no-verify", "origin", "main")  # already on the remote
     forge.commit("feature", [bad], files={"b.txt": "b\n"}, ref="refs/heads/feature")
-    assert_refused(forge, forge.push("feature"), "author")
+    assert_refused(forge, forge.push("feature"), AUTHOR_NOT_SIM)
 
 
 def test_update_audits_only_commits_beyond_the_advertised_old_tip(forge):
@@ -280,12 +390,12 @@ def test_annotated_tag_refuses_at_this_checkpoint(forge):
     forge.commit("tagged", [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
     forge.git("tag", "-a", "v1", "-m", "release", "main",
               env={"GIT_COMMITTER_NAME": SIM[0], "GIT_COMMITTER_EMAIL": SIM[1]})
-    assert_refused(forge, forge.push("refs/tags/v1"), "annotated tag")
+    assert_refused(forge, forge.push("refs/tags/v1"), "is an annotated tag; annotated tags are refused")
 
 
 def test_non_commit_object_refuses(forge):
     blob = forge.out("hash-object", "-w", "--stdin", input=b"payload\n")
-    assert_refused(forge, forge.push(f"{blob}:refs/tags/blob"), "not a commit")
+    assert_refused(forge, forge.push(f"{blob}:refs/tags/blob"), f"{blob} is a blob, not a commit")
 
 
 def test_deletion_passes_with_valid_policy(forge):
@@ -298,14 +408,13 @@ def test_deletion_passes_with_valid_policy(forge):
 def test_deletion_only_push_still_validates_policy(forge):
     forge.git("push", "-q", "--no-verify", "origin", f"{forge.base}:refs/heads/old")
     shutil.rmtree(forge.common / "identity-policy")
-    assert_refused(forge, forge.push(":refs/heads/old"), "policy")
+    assert_refused(forge, forge.push(":refs/heads/old"), POLICY_MISSING)
 
 
 def test_empty_input_still_validates_policy(forge):
     shutil.rmtree(forge.common / "identity-policy")
     rc, err = forge.run_hook(b"")
-    assert rc != 0, f"empty input accepted without a policy:\n{err}"
-    assert "policy" in err
+    assert_hook_refused(forge, rc, err, POLICY_MISSING)
 
 
 # ── caps, limits and missing data ──────────────────────────────────────────────────────────
@@ -314,21 +423,46 @@ def test_commit_cap_refuses(forge):
     for i in range(3):
         tip = forge.commit(f"c{i}", [tip], files={f"{i}.txt": "x\n"})
     forge.git("update-ref", "refs/heads/main", tip)
-    assert_refused(forge, forge.push("main", config=["identityguard.maxCommits=2"]), "commit cap")
+    assert_refused(forge, forge.push("main", config=["identityguard.maxCommits=2"]),
+                   "more than 2 commits to audit exceeds the commit cap")
 
 
 def test_time_limit_refuses(forge):
     forge.commit("one", [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
     res = forge.push("main", config=["identityguard.timeoutSeconds=0.000001"])
-    assert_refused(forge, res, "time limit")
+    assert_refused(forge, res, "time limit was exceeded")
 
 
-@pytest.mark.parametrize("knob", ["identityguard.maxCommits=abc", "identityguard.maxCommits=0",
-                                  "identityguard.timeoutSeconds=-1",
-                                  "identityguard.timeoutSeconds=nan"])
-def test_malformed_limit_knob_refuses(forge, knob):
+@pytest.mark.parametrize("knob,needle", [
+    ("identityguard.maxCommits=abc", "identityguard.maxCommits must be a positive integer"),
+    ("identityguard.maxCommits=0", "identityguard.maxCommits must be a positive integer"),
+    ("identityguard.timeoutSeconds=-1", "identityguard.timeoutSeconds must be a positive number"),
+    ("identityguard.timeoutSeconds=nan", "identityguard.timeoutSeconds must be a positive number"),
+])
+def test_malformed_limit_knob_refuses(forge, knob, needle):
     forge.commit("one", [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
-    assert_refused(forge, forge.push("main", config=[knob]), "identityguard")
+    assert_refused(forge, forge.push("main", config=[knob]), needle)
+
+
+@pytest.mark.parametrize("knobs,expected", [
+    ({"maxCommits": "999999999", "timeoutSeconds": "99999"}, (250_000, 180.0)),
+    ({"maxCommits": "7", "timeoutSeconds": "2.5"}, (7, 2.5)),
+    ({}, (250_000, 180.0)),
+], ids=["above-default", "below-default", "unset"])
+def test_limit_knobs_can_only_lower_the_defaults(root, monkeypatch, knobs, expected):
+    env = isolated_env(root)
+    for key in [k for k in os.environ if k.startswith("GIT_")]:
+        monkeypatch.delenv(key)
+    for key in ("HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"):
+        monkeypatch.setenv(key, env[key])
+    repo = root / "k"
+    subprocess.run(["git", "init", "-q", str(repo)], env=env, check=True, timeout=60)
+    for name, value in knobs.items():
+        subprocess.run(["git", "-C", str(repo), "config", f"identityguard.{name}", value],
+                       env=env, check=True, timeout=60)
+    monkeypatch.chdir(repo)
+    guard = load_guard()
+    assert guard.read_limits(guard.Clock(guard.TIME_LIMIT, time.monotonic())) == expected
 
 
 def test_missing_parent_object_refuses(forge):
@@ -337,26 +471,27 @@ def test_missing_parent_object_refuses(forge):
     loose = forge.common / "objects" / a[:2] / a[2:]
     loose.chmod(0o600)
     loose.unlink()
-    assert_refused(forge, forge.push("feature"), "missing")
+    assert_refused(forge, forge.push("feature"), "missing or unreadable")
 
 
-def test_unknown_advertised_old_tip_refuses(forge, tmp_path):
-    other = tmp_path / "other"
-    forge.git("clone", "-q", str(forge.remote), str(other), cwd=tmp_path)
+def test_unknown_advertised_old_tip_refuses(forge, root):
+    other = root / "other"
+    forge.git("clone", "-q", str(forge.remote), str(other), cwd=root)
     (other / "z.txt").write_text("z\n")
     forge.git("add", "-A", cwd=other)
     forge.git("-c", f"user.name={SIM[0]}", "-c", f"user.email={SIM[1]}", "commit", "-q",
               "-m", "elsewhere", cwd=other)
     forge.git("push", "-q", "--no-verify", "origin", "main", cwd=other)
     forge.commit("mine", [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
-    assert_refused(forge, forge.push("main", force=True), "fetch")
+    assert_refused(forge, forge.push("main", force=True),
+                   "is not a commit in this repository; fetch first (git fetch origin)")
 
 
-def test_shallow_clone_refuses(forge, tmp_path):
+def test_shallow_clone_refuses(forge, root):
     forge.commit("two", [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
     forge.git("push", "-q", "--no-verify", "origin", "main")
-    shallow = tmp_path / "shallow"
-    forge.git("clone", "-q", "--depth=1", f"file://{forge.remote}", str(shallow), cwd=tmp_path)
+    shallow = root / "shallow"
+    forge.git("clone", "-q", "--depth=1", f"file://{forge.remote}", str(shallow), cwd=root)
     shutil.copytree(forge.common / "hooks", shallow / ".git" / "hooks", dirs_exist_ok=True)
     forge.write_policy(POLICY, at=shallow / ".git")
     (shallow / "c.txt").write_text("c\n")
@@ -364,25 +499,27 @@ def test_shallow_clone_refuses(forge, tmp_path):
     forge.git("-c", f"user.name={SIM[0]}", "-c", f"user.email={SIM[1]}", "commit", "-q",
               "-m", "three", cwd=shallow)
     res = forge.push("main", cwd=shallow)
-    assert_refused(forge, res, "shallow")
+    assert_refused(forge, res, "this is a shallow repository")
 
 
 # ── raw metadata and malformed objects ─────────────────────────────────────────────────────
 def test_non_utf8_message_refuses(forge):
     # commit-tree transcodes invalid bytes as Latin-1, so write the raw object.
     forge.raw_commit(forge.header(forge.base) + b"\nbad bytes \xff\xfe here\n", "refs/heads/main")
-    assert_refused(forge, forge.push("main"), "UTF-8")
+    assert_refused(forge, forge.push("main"), "message is not valid UTF-8")
 
 
 @pytest.mark.parametrize("mutate,needle", [
-    (lambda h: h + b"\nmessage with \x00 nul\n", "message"),
+    (lambda h: h + b"\nmessage with \x00 nul\n", "message contains a NUL byte"),
     (lambda h: h.replace(b"author sim <sim@hermes-agent.nousresearch.com>",
-                         b"author sim sim@hermes-agent.nousresearch.com") + b"\nmsg\n", "malformed"),
-    (lambda h: h + h.splitlines(keepends=True)[2] + b"\nmsg\n", "malformed"),
+                         b"author sim sim@hermes-agent.nousresearch.com") + b"\nmsg\n",
+     "malformed or missing author header"),
+    (lambda h: h + h.splitlines(keepends=True)[2] + b"\nmsg\n",
+     "malformed header: duplicate or misplaced 'author' header"),
     (lambda h: b"".join(l for l in h.splitlines(keepends=True) if not l.startswith(b"committer"))
-     + b"\nmsg\n", "malformed"),
-    (lambda h: h + b"encoding ISO-8859-1\n\nmsg\n", "encoding"),
-])
+     + b"\nmsg\n", "malformed or missing committer header"),
+    (lambda h: h + b"encoding ISO-8859-1\n\nmsg\n", "declares a non-UTF-8 encoding header"),
+], ids=["nul", "author-shape", "author-twice", "no-committer", "latin1-encoding"])
 def test_malformed_commit_object_refuses(forge, mutate, needle):
     forge.raw_commit(mutate(forge.header(forge.base)), "refs/heads/main")
     assert_refused(forge, forge.push("main"), needle)
@@ -398,8 +535,7 @@ def test_malformed_commit_object_refuses(forge, mutate, needle):
 ])
 def test_malformed_hook_input_refuses(forge, stdin):
     rc, err = forge.run_hook(stdin)
-    assert rc != 0, f"malformed pre-push input accepted:\n{err}"
-    assert "input" in err
+    assert_hook_refused(forge, rc, err, "malformed pre-push input (line 1")
 
 
 # ── private policy bundle ──────────────────────────────────────────────────────────────────
@@ -419,60 +555,83 @@ def _symlinked_dir(f: Forge):
 
 
 POLICY_BREAKAGE = {
-    "missing": lambda f: shutil.rmtree(f.common / "identity-policy"),
-    "symlinked file": _symlinked_file,
-    "symlinked dir": _symlinked_dir,
-    "group-writable file": lambda f: (f.common / "identity-policy" / "policy.json").chmod(0o620),
-    "world-writable dir": lambda f: (f.common / "identity-policy").chmod(0o707),
-    "duplicate keys": lambda f: f.write_policy(None, raw=(
+    "missing": (lambda f: shutil.rmtree(f.common / "identity-policy"), POLICY_MISSING),
+    "symlinked file": (_symlinked_file, "policy.json is a symlink"),
+    "symlinked dir": (_symlinked_dir, "identity-policy is a symlink"),
+    "group-writable file": (lambda f: (f.common / "identity-policy" / "policy.json").chmod(0o620),
+                            "policy.json is group- or world-writable"),
+    "world-writable dir": (lambda f: (f.common / "identity-policy").chmod(0o707),
+                           "identity-policy is group- or world-writable"),
+    "duplicate keys": (lambda f: f.write_policy(None, raw=(
         b'{"version": 1, "names": ["Pat Example"], "emails": ["pat@example.invalid"], '
-        b'"emails": ["other@example.invalid"]}')),
-    "unknown key": lambda f: f.write_policy({**POLICY, "snapshots": []}),
-    "other version": lambda f: f.write_policy({**POLICY, "version": 2}),
-    "bool version": lambda f: f.write_policy({**POLICY, "version": True}),
-    "no names": lambda f: f.write_policy({"version": 1, "emails": POLICY["emails"]}),
-    "empty emails": lambda f: f.write_policy({**POLICY, "emails": []}),
-    "single-word name": lambda f: f.write_policy({**POLICY, "names": ["Pat"]}),
-    "bad email": lambda f: f.write_policy({**POLICY, "emails": ["not-an-email"]}),
-    "invalid json": lambda f: f.write_policy(None, raw=b'{"version": 1, '),
-    "not utf-8": lambda f: f.write_policy(None, raw=b'{"version": 1, "names": ["\xff"]}'),
+        b'"emails": ["other@example.invalid"]}')), "has a duplicate JSON key"),
+    "unknown key": (lambda f: f.write_policy({**POLICY, "snapshots": []}),
+                    "has unknown key(s) ['snapshots']"),
+    "other version": (lambda f: f.write_policy({**POLICY, "version": 2}), "version is not 1"),
+    "bool version": (lambda f: f.write_policy({**POLICY, "version": True}), "version is not 1"),
+    "no names": (lambda f: f.write_policy({"version": 1, "emails": POLICY["emails"]}),
+                 "lacks key(s) ['names']"),
+    "empty emails": (lambda f: f.write_policy({**POLICY, "emails": []}),
+                     "'emails' must be a list of 1..32 entries"),
+    "single-word name": (lambda f: f.write_policy({**POLICY, "names": ["Pat"]}),
+                         "names[0] is not a full name"),
+    "bad email": (lambda f: f.write_policy({**POLICY, "emails": ["not-an-email"]}),
+                  "emails[0] is not an email"),
+    "invalid json": (lambda f: f.write_policy(None, raw=b'{"version": 1, '),
+                     "is not valid UTF-8 JSON"),
+    "not utf-8": (lambda f: f.write_policy(None, raw=b'{"version": 1, "names": ["\xff"]}'),
+                  "is not valid UTF-8 JSON"),
 }
 
 
 @pytest.mark.parametrize("breakage", sorted(POLICY_BREAKAGE))
 def test_broken_policy_refuses_a_clean_sim_push(forge, breakage):
     forge.commit("clean", [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
-    POLICY_BREAKAGE[breakage](forge)
-    assert_refused(forge, forge.push("main"), "policy")
+    breaker, needle = POLICY_BREAKAGE[breakage]
+    breaker(forge)
+    assert_refused(forge, forge.push("main"), needle)
 
 
-def test_policy_ownership_check_refuses_a_foreign_owner(tmp_path):
-    """Unprivileged tests cannot chown, so the ownership rule is driven with an injected euid."""
-    spec = importlib.util.spec_from_file_location("identity_guard", HOOKS_SRC / "identity_guard.py")
-    assert spec is not None and spec.loader is not None
-    guard = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(guard)
-    node = tmp_path / "policy.json"
-    node.write_text("{}")
-    node.chmod(0o600)
-    st = os.lstat(node)
-    guard.check_private_node(node, st, euid=st.st_uid, want="file")
-    with pytest.raises(guard.GuardError, match="owned"):
-        guard.check_private_node(node, st, euid=st.st_uid + 1, want="file")
-    node.chmod(0o640 | stat.S_IWGRP)
-    with pytest.raises(guard.GuardError, match="writable"):
-        guard.check_private_node(node, os.lstat(node), euid=st.st_uid, want="file")
+def test_policy_owner_is_checked_on_the_opened_dir_and_file(root):
+    """Unprivileged tests cannot chown (and this host has no subuid user namespaces), so the
+    ownership rule is driven through the real loader with an injected euid on a real tree."""
+    guard = load_guard()
+    common = root / "common"
+    pdir = common / "identity-policy"
+    pdir.mkdir(parents=True)
+    pdir.chmod(0o700)
+    pfile = pdir / "policy.json"
+    pfile.write_text(json.dumps(POLICY))
+    pfile.chmod(0o600)
+    me, other = os.geteuid(), os.geteuid() + 1
+    assert guard.load_policy(str(common), me) == (POLICY["names"], POLICY["emails"])
+    # the opened directory (fstat after O_NOFOLLOW open)
+    with pytest.raises(guard.GuardError, match=r"identity-policy is owned by uid"):
+        guard.load_policy(str(common), other)
+    # the opened file, inside a directory that passed for its owner
+    dfd = guard.open_policy_dir(str(common), me)
+    try:
+        with pytest.raises(guard.GuardError, match=r"policy\.json is owned by uid"):
+            guard.read_policy_file(dfd, str(pfile), other)
+    finally:
+        os.close(dfd)
+    # the pre-open lstat: a symlinked dir is never opened, whatever the euid
+    moved = root / "moved"
+    pdir.rename(moved)
+    pdir.symlink_to(moved)
+    with pytest.raises(guard.GuardError, match=r"identity-policy is a symlink"):
+        guard.open_policy_dir(str(common), me)
 
 
-def test_policy_beside_tracked_hook_is_not_trusted(tmp_path):
-    f = Forge(tmp_path, layout="tracked", policy=None)
+def test_policy_beside_tracked_hook_is_not_trusted(root):
+    f = Forge(root, layout="tracked", policy=None)
     f.write_policy(POLICY, at=f.repo / ".githooks")
     f.commit("clean", [f.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
-    assert_refused(f, f.push("main"), "policy")
+    assert_refused(f, f.push("main"), POLICY_MISSING)
 
 
-def test_linked_worktree_uses_common_dir_hooks_and_policy(forge, tmp_path):
-    wt = tmp_path / "wt"
+def test_linked_worktree_uses_common_dir_hooks_and_policy(forge, root):
+    wt = root / "wt"
     forge.git("worktree", "add", "-q", "-b", "topic", str(wt), forge.base)
     (wt / "w.txt").write_text("w\n")
     forge.git("add", "-A", cwd=wt)
@@ -482,9 +641,9 @@ def test_linked_worktree_uses_common_dir_hooks_and_policy(forge, tmp_path):
     assert_accepted(forge, forge.push("topic", cwd=wt), "refs/heads/topic", tip)
 
 
-def test_policy_only_in_linked_worktree_refuses(tmp_path):
-    f = Forge(tmp_path, policy=None)
-    wt = tmp_path / "wt"
+def test_policy_only_in_linked_worktree_refuses(root):
+    f = Forge(root, policy=None)
+    wt = root / "wt"
     f.git("worktree", "add", "-q", "-b", "topic", str(wt), f.base)
     f.write_policy(POLICY, at=Path(f.out("rev-parse", "--absolute-git-dir", cwd=wt)))
     f.write_policy(POLICY, at=wt)
@@ -492,14 +651,14 @@ def test_policy_only_in_linked_worktree_refuses(tmp_path):
     f.git("add", "w.txt", cwd=wt)
     f.git("-c", f"user.name={SIM[0]}", "-c", f"user.email={SIM[1]}", "commit", "-q",
           "-m", "from worktree", cwd=wt)
-    assert_refused(f, f.push("topic", cwd=wt), "policy")
+    assert_refused(f, f.push("topic", cwd=wt), POLICY_MISSING)
 
 
 # ── helper discovery and integrity ─────────────────────────────────────────────────────────
 def test_missing_helper_refuses(forge):
     (forge.hook_dir / "identity_guard.py").unlink(missing_ok=True)
     forge.commit("clean", [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
-    assert_refused(forge, forge.push("main"), "identity_guard.py")
+    assert_refused(forge, forge.push("main"), "identity helper not found beside this hook")
 
 
 def test_modified_helper_refuses(forge):
@@ -507,30 +666,29 @@ def test_modified_helper_refuses(forge):
     with helper.open("a") as fh:
         fh.write("\n# locally modified\n")
     forge.commit("clean", [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
-    assert_refused(forge, forge.push("main"), "identity_guard.py")
+    assert_refused(forge, forge.push("main"), "does not match its published sha256")
 
 
-def test_missing_python_refuses_with_install_diagnostic(forge, tmp_path):
-    tools = ["git", "bash", "sh", "env", "cat", "md5sum", "sha256sum", "cut", "mktemp", "rm",
-             "sort", "wc", "tr", "timeout", "sed", "awk", "grep", "head", "dirname", "uname"]
-    found = {t: shutil.which(t) for t in tools}
-    missing = [t for t, p in found.items() if p is None]
-    if missing:
-        pytest.skip(f"host lacks {missing}")
-    bindir = tmp_path / "nopython"
-    bindir.mkdir()
-    for name, path in found.items():
-        (bindir / name).symlink_to(path)
+def test_missing_python_refuses_with_install_diagnostic(forge, root):
+    bindir = tool_dir(root, python3=None)
     forge.commit("clean", [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
     res = forge.push("main", env={"PATH": str(bindir)})
-    assert_refused(forge, res, "Python 3.10")
+    assert_refused(forge, res, "Python 3.10 or newer is required")
+
+
+def test_python_older_than_310_refuses_with_install_diagnostic(forge, root):
+    # Stands in for an old interpreter: it fails the hook's version probe like Python < 3.10.
+    bindir = tool_dir(root, python3="#!/bin/sh\nexit 1\n")
+    forge.commit("clean", [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
+    res = forge.push("main", env={"PATH": str(bindir)})
+    assert_refused(forge, res, "Python 3.10 or newer is required")
 
 
 # ── host-path content gate stays separate ──────────────────────────────────────────────────
 def test_host_path_content_still_refuses(forge):
     forge.commit("add notes", [forge.base], files={"notes.md": f"lives in {HOST_PATH}\n"},
                  ref="refs/heads/main")
-    assert_refused(forge, forge.push("main"), "host-path")
+    assert_refused(forge, forge.push("main"), "the push adds host-path / personal-info literals")
 
 
 def test_host_path_override_bypasses_only_the_content_gate(forge):
@@ -544,4 +702,4 @@ def test_host_path_override_never_bypasses_identity(forge):
     forge.commit("personal", [forge.base], author=PERSONAL, committer=PERSONAL,
                  files={"a.txt": "a\n"}, ref="refs/heads/main")
     res = forge.push("main", env={"HERMES_ALLOW_HOST_PATHS": "1"})
-    assert_refused(forge, res, "author")
+    assert_refused(forge, res, AUTHOR_NOT_SIM)

@@ -16,7 +16,8 @@ never excluding tracking refs), and checks each raw commit object:
   * names, emails and the whole message are scanned with the public block pattern and the
     private deny-list. Headers refuse on the operator email token; messages refuse on the full
     name (case-insensitive, word-bounded phrase) or the email token, never on substrings.
-    Matched values are never printed.
+    Every header after committer (mergetag, gpgsig, ...) must be UTF-8 and its whole text,
+    continuation lines included, is scanned like the message. Matched values are never printed.
 
 The private deny-list lives ONLY in `<git common dir>/identity-policy/policy.json` (never a
 worktree or hook-directory copy): schema v1 is exactly
@@ -117,13 +118,19 @@ def read_limits(clock: Clock) -> tuple[int, float]:
 
 
 # ── private policy bundle ──────────────────────────────────────────────────────────────────
-def check_private_node(path, st: os.stat_result, *, euid: int, want: str) -> None:
+def check_node_type(path, st: os.stat_result, want: str) -> None:
+    """Pre-open lstat check: no symlink, and the right type (never open a FIFO or device)."""
     if stat.S_ISLNK(st.st_mode):
         raise GuardError(f"private identity policy path {path} is a symlink; refusing")
     if want == "dir" and not stat.S_ISDIR(st.st_mode):
         raise GuardError(f"private identity policy path {path} is not a directory; refusing")
     if want == "file" and not stat.S_ISREG(st.st_mode):
         raise GuardError(f"private identity policy path {path} is not a regular file; refusing")
+
+
+def check_private_node(path, st: os.stat_result, *, euid: int, want: str) -> None:
+    """Post-open fstat check of what was actually opened: type, owner and mode."""
+    check_node_type(path, st, want)
     if st.st_uid != euid:
         raise GuardError(f"private identity policy path {path} is owned by uid {st.st_uid}, "
                          f"not by the pushing user (uid {euid}); refusing")
@@ -196,39 +203,53 @@ def parse_policy(raw: bytes) -> tuple[list[str], list[str]]:
     return names, emails
 
 
-def load_policy(common: str, euid: int) -> tuple[list[str], list[str]]:
+def open_policy_dir(common: str, euid: int) -> int:
+    """Open <common>/identity-policy without following a symlink; return the checked dir fd."""
     pdir = os.path.join(common, "identity-policy")
-    pfile = os.path.join(pdir, "policy.json")
     try:
-        check_private_node(pdir, os.lstat(pdir), euid=euid, want="dir")
+        check_node_type(pdir, os.lstat(pdir), "dir")
         dfd = os.open(pdir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except FileNotFoundError:
-        raise GuardError(f"private identity policy is missing: {pfile}\n  The operator installs "
-                         "it in the common git dir (never in a worktree); refusing") from None
+        raise GuardError(f"private identity policy is missing: {pdir}/policy.json\n  The operator "
+                         "installs it in the common git dir (never in a worktree); refusing") from None
     except OSError as exc:
         raise GuardError(f"private identity policy dir {pdir} is unreadable ({exc.strerror}); "
                          "refusing") from None
     try:
         check_private_node(pdir, os.fstat(dfd), euid=euid, want="dir")
-        try:
-            check_private_node(pfile, os.stat("policy.json", dir_fd=dfd, follow_symlinks=False),
-                               euid=euid, want="file")
-            ffd = os.open("policy.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
-        except FileNotFoundError:
-            raise GuardError(f"private identity policy is missing: {pfile}; refusing") from None
-        except OSError as exc:
-            raise GuardError(f"private identity policy {pfile} is unreadable ({exc.strerror}); "
-                             "refusing") from None
-        try:
-            check_private_node(pfile, os.fstat(ffd), euid=euid, want="file")
-            with os.fdopen(ffd, "rb", closefd=False) as fh:
-                raw = fh.read(POLICY_MAX_BYTES + 1)
-        finally:
-            os.close(ffd)
-    finally:
+    except GuardError:
         os.close(dfd)
+        raise
+    return dfd
+
+
+def read_policy_file(dfd: int, pfile: str, euid: int) -> bytes:
+    """Read policy.json inside the opened dir; the owner/mode check is on the opened file."""
+    try:
+        check_node_type(pfile, os.stat("policy.json", dir_fd=dfd, follow_symlinks=False), "file")
+        ffd = os.open("policy.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+    except FileNotFoundError:
+        raise GuardError(f"private identity policy is missing: {pfile}; refusing") from None
+    except OSError as exc:
+        raise GuardError(f"private identity policy {pfile} is unreadable ({exc.strerror}); "
+                         "refusing") from None
+    try:
+        check_private_node(pfile, os.fstat(ffd), euid=euid, want="file")
+        with os.fdopen(ffd, "rb", closefd=False) as fh:
+            raw = fh.read(POLICY_MAX_BYTES + 1)
+    finally:
+        os.close(ffd)
     if len(raw) > POLICY_MAX_BYTES:
         raise GuardError(f"private identity policy exceeds {POLICY_MAX_BYTES} bytes; refusing")
+    return raw
+
+
+def load_policy(common: str, euid: int) -> tuple[list[str], list[str]]:
+    dfd = open_policy_dir(common, euid)
+    try:
+        raw = read_policy_file(dfd, os.path.join(common, "identity-policy", "policy.json"), euid)
+    finally:
+        os.close(dfd)
     return parse_policy(raw)
 
 
@@ -257,13 +278,17 @@ class Matchers:
             found.append(f"{field} matches the public block pattern")
         return found
 
-    def message(self, text: str) -> list[str]:
+    def text(self, field: str, text: str) -> list[str]:
+        """Free text (a message or an extra header's whole value): full names and emails."""
         found = []
         if any(r.search(text) for r in self.names) or any(r.search(text) for r in self.emails):
-            found.append("message matches the private deny-list")
+            found.append(f"{field} matches the private deny-list")
         if self.block.search(text):
-            found.append("message matches the public block pattern")
+            found.append(f"{field} matches the public block pattern")
         return found
+
+    def message(self, text: str) -> list[str]:
+        return self.text("message", text)
 
 
 # ── raw commit audit ───────────────────────────────────────────────────────────────────────
@@ -284,7 +309,8 @@ def _ident(role: str, line: bytes | None, match: Matchers) -> list[str]:
     return found
 
 
-def _headers(head: bytes, hexlen: int) -> tuple[list[str], bytes | None, bytes | None]:
+def _headers(head: bytes, hexlen: int,
+             match: Matchers) -> tuple[list[str], bytes | None, bytes | None]:
     """Validate header structure; return (problems, author line, committer line)."""
     lines = head.split(b"\n")
     oid = rb"[0-9a-f]{%d}" % hexlen
@@ -299,20 +325,41 @@ def _headers(head: bytes, hexlen: int) -> tuple[list[str], bytes | None, bytes |
     i += author is not None
     committer = lines[i] if i < len(lines) and lines[i].startswith(b"committer ") else None
     i += committer is not None
-    problems, seen = [], set()
-    for line in lines[i:]:
+    return _extra_headers(lines[i:], match), author, committer
+
+
+def _extra_headers(lines: list[bytes], match: Matchers) -> list[str]:
+    """Every header after committer (encoding, mergetag, gpgsig, ...), with its continuation
+    lines, must be well formed and UTF-8, and its whole text is scanned like a message: a
+    mergetag embeds a tagger and a tag message, a signature block is free text."""
+    problems, seen, blocks = [], set(), []
+    for line in lines:
         if line.startswith(b" "):
-            continue  # continuation of a multi-line header (gpgsig, mergetag)
-        key = line.split(b" ", 1)[0]
-        if not re.fullmatch(rb"[a-z][a-z0-9-]*", key) or key in seen or key in {
-                b"tree", b"parent", b"author", b"committer"}:
-            problems.append("malformed header: duplicate, misplaced or unparseable "
-                            f"'{key.decode(errors='replace')}'")
+            if not blocks:
+                problems.append("malformed header: a continuation line without a header")
+                blocks.append(("a header continuation line", []))
+            blocks[-1][1].append(line[1:])
             continue
+        key = line.split(b" ", 1)[0]
+        if not re.fullmatch(rb"[a-z][a-z0-9-]*", key):
+            label = "an unparseable header"  # never echo the token: it may be a private value
+            problems.append("malformed header: an unparseable header line")
+        else:
+            label = f"'{key.decode()}' header"
+            if key in seen or key in {b"tree", b"parent", b"author", b"committer"}:
+                problems.append(f"malformed header: duplicate or misplaced {label}")
         seen.add(key)
         if key == b"encoding" and line[len(key) + 1:].lower() not in UTF8_NAMES:
             problems.append("declares a non-UTF-8 encoding header")
-    return problems, author, committer
+        blocks.append((label, [line]))
+    for label, parts in blocks:
+        try:
+            text = b"\n".join(parts).decode("utf-8")
+        except UnicodeDecodeError:
+            problems.append(f"{label} is not valid UTF-8")
+            continue
+        problems += match.text(label, text)
+    return problems
 
 
 def audit_commit(raw: bytes, hexlen: int, match: Matchers) -> list[str]:
@@ -322,7 +369,7 @@ def audit_commit(raw: bytes, hexlen: int, match: Matchers) -> list[str]:
     head, msg = raw[:sep], raw[sep + 2:]
     if b"\x00" in head:
         return ["malformed commit: NUL byte in the headers"]
-    problems, author, committer = _headers(head, hexlen)
+    problems, author, committer = _headers(head, hexlen, match)
     problems += _ident("author", author, match) + _ident("committer", committer, match)
     if b"\x00" in msg:
         problems.append("message contains a NUL byte")

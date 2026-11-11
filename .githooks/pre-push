@@ -47,7 +47,7 @@ BLOCK_MD5=ea4d230cadaf6e4a3d46b0d1a41219bb
 WARN_MD5=144222245d71a493d62303158528d40a
 # The identity helper is pinned the same way: a copied hook beside a stale or edited helper
 # must refuse, not run whatever is there. Update this together with identity_guard.py.
-IDENTITY_GUARD_SHA256=9519c02696f77bad078f86257b192a36ce23c0c77664fb82e87bc487a100e8ab
+IDENTITY_GUARD_SHA256=b727ba092a9e0c75c716e995562dea240397a58038efb37b90a68fd4e125cbed
 IDENTITY_TIMEOUT=240           # outer kill; the helper enforces its own 180 s limit first
 
 # ── never touch the network ──────────────────────────────────────────────────────────────
@@ -165,9 +165,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   if [ "$remote_sha" = "0000000000000000000000000000000000000000" ] \
      || ! timeout "$GIT_TIMEOUT" git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
     # A new ref, or a force-push whose old tip we do not have. The whole ancestry is
-    # reachable, but nearly all of it is ALREADY PUBLISHED, so scanning it is both useless
-    # (31,996 commits on development) and slow — and it would refuse every new branch.
-    # Evaluate instead what the remote's own tracking refs do not already contain.
+    # reachable, but nearly all of it is ALREADY PUBLISHED, so diff-scanning it is useless,
+    # and it would refuse every new branch: the ancestry of development is tens of thousands
+    # of commits (64,236 reachable when the identity gate was added), far over MAX_COMMITS; their
+    # blobs are absent in a blob:none clone. So THIS content scan evaluates only what the
+    # remote's own tracking refs do not already contain. The identity gate above does not take
+    # this shortcut: it audits the raw metadata of a new ref's full ancestry.
     r=$(timeout "$GIT_TIMEOUT" git rev-list "$local_sha" \
           --not --remotes="$remote_name" --remotes=origin --remotes=upstream 2>/dev/null) \
       || { unevaluable="$unevaluable $local_sha"; continue; }
@@ -206,6 +209,7 @@ if [ -n "$unevaluable" ]; then
   printf '    git fetch --no-filter <remote>          # or unset remote.<r>.partialclonefilter\n' >&2
   printf '    git fetch --refetch <remote>            # and remote.<r>.promisor, then re-fetch\n' >&2
   printf '  or bypass:  HERMES_ALLOW_HOST_PATHS=1 git push ...\n' >&2
+  printf '  (skips only this host-path content check, never the identity check)\n' >&2
   exit 1
 fi
 
@@ -220,7 +224,8 @@ if [ "$commit_count" -gt "$MAX_COMMITS" ]; then
   die "$commit_count commits to evaluate exceeds MAX_COMMITS=$MAX_COMMITS; refusing (fail closed).
   This normally means the remote's refs are not fetched locally, so every commit looks new.
   Run:  git fetch <remote>            (then push again)
-  or bypass:  HERMES_ALLOW_HOST_PATHS=1 git push ..."
+  or bypass:  HERMES_ALLOW_HOST_PATHS=1 git push ...
+  (skips only this host-path content check, never the identity check)"
 fi
 
 # ── scan the added lines of exactly those commits ────────────────────────────────────────
@@ -337,7 +342,8 @@ if [ -n "$info_attr" ]; then
   if [ -s "$info_attr_abs" ]; then
     die "a local attributes file exists and can hide content from this gate:
   $info_attr_abs
-Remove it (or empty it) and push again, or bypass: HERMES_ALLOW_HOST_PATHS=1 git push ..."
+Remove it (or empty it) and push again, or bypass: HERMES_ALLOW_HOST_PATHS=1 git push ...
+  (skips only this host-path content check, never the identity check)"
   fi
 fi
 
@@ -414,12 +420,14 @@ if [ -n "$suppress" ]; then
   die "content is hidden from this gate by a diff-suppressing attribute:
 $suppress
   Refusing because the gate cannot read those paths. Remove the attribute (or the attribute
-  file) and push again, or bypass: HERMES_ALLOW_HOST_PATHS=1 git push ..."
+  file) and push again, or bypass: HERMES_ALLOW_HOST_PATHS=1 git push ...
+  (skips only this host-path content check, never the identity check)"
 fi
 
 if [ -n "$binary_hits" ]; then
   die "a host-path literal is present in file content the diff did not show:$binary_hits
-  Bypass with HERMES_ALLOW_HOST_PATHS=1 git push ... if this is deliberate."
+  Bypass with HERMES_ALLOW_HOST_PATHS=1 git push ... if this is deliberate.
+  (skips only this host-path content check, never the identity check)"
 fi
 
 if [ -z "$hits" ]; then
