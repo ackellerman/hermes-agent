@@ -501,6 +501,9 @@ class AuthorityConnection:
         hidden = params.pop('hidden', False)
         if type(hidden) is not bool:
             raise RuntimeStoreError('invalid_params', field='hidden', detail='must be a boolean')
+        # Who made the row (`info['created']`): a titled create is resolve-or-create, so the caller
+        # that resumes next cannot otherwise tell its own new session from another creator's row.
+        created = False
         ref = title and resolve_titled_session(self.authority, self.actor, title, missing_ok=True)
         if (not ref and title == 'Bot Chat'
                 and not any(params.get(name) is True for name in BYPASS_FIELDS)
@@ -531,6 +534,8 @@ class AuthorityConnection:
                 await tracked_write(self.authority, partial(
                     commit_local_session, self.authority.db, epoch=self.authority.epoch, receipt=receipt))
                 ref = restore_local_session(self.authority, receipt['session_id'])
+                # Staged and committed by this call: the row is this invocation's own.
+                created = True
             # `--accept-hooks`: record this launch's consent; ``resume`` below registers the hooks.
             if params.get('accept_hooks') is True:
                 from gateway.session_policy import accept_launch_hooks, restore_policy
@@ -541,7 +546,13 @@ class AuthorityConnection:
                 await tracked_write(self.authority, partial(title_new_session, self.authority, ref, title))
             if hidden:
                 await tracked_write(self.authority, partial(self.authority.db.set_session_hidden, ref.session_id, True))
-        return await self.resume(ref, {})
+        reply = await self.resume(ref, {})
+        # One new observation on the reply's ``info``: whether this call staged and committed the
+        # row. Nothing else about the create changes — not a parameter, not the frozen request.
+        info = reply.get('info') if isinstance(reply, dict) else None
+        if isinstance(info, dict):
+            info['created'] = created
+        return reply
 
     async def ping(self, ref, params):
         if not self.actor.capabilities:
@@ -556,8 +567,12 @@ class AuthorityConnection:
         from gateway.session_skin import resolved_skin
         return {'instance_id': self.authority.instance_id, 'profile_id': self.authority.profile_id,
                 'authority_epoch': self.authority.epoch,
+                # ``session-create-created-v1``: ``session.create``'s reply reports
+                # ``info['created']`` (a client that needs the created-here exemption must not read a
+                # gateway too old to send it as "resolved someone else's row").
                 'capabilities': ['durable-admission-v1', 'event-replay-v1', 'local-cli-create-v1', 'acp-editor-policy-v1',
-                                 'acp-session-mcp-v1', 'clarify-batch-v1', 'plugin-rpc-v1', 'session-client-v1', 'session-transcript-v1', 'session-list-picker-v1'],
+                                 'acp-session-mcp-v1', 'clarify-batch-v1', 'plugin-rpc-v1', 'session-client-v1', 'session-transcript-v1', 'session-list-picker-v1',
+                                 'session-create-created-v1'],
                 'session_create': {'sources': sorted(SURFACES),
                                    'parameters': sorted(CREATE_FIELDS | {'title'})},
                 # Main's ``gateway.ready.skin``: the canonical client's own ready carries it.

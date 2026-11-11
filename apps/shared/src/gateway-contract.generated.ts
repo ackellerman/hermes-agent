@@ -5230,6 +5230,7 @@ export interface CanonicalSnapshotInfo {
   tool_count?: number | null
   credential_hint?: string | null
   config_warning?: string | null
+  created?: boolean | null
 }
 export interface CanonicalResumeParams {
   profile?: string | null

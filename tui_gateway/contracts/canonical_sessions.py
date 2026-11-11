@@ -147,6 +147,10 @@ class CanonicalSnapshotInfo(SessionInventoryFields):
     credential_hint: str | None = None
     # ``session.info``'s session-start notice: ``session.create`` returns the same projection.
     config_warning: str | None = None
+    # ``session.create``'s created-vs-resolved report (``gateway/session_controls.py`` ``_create``):
+    # true when that call staged and committed the row, false when it resolved an existing one.
+    # Written only by ``_create``; a resume omits it because nothing serialises this model.
+    created: bool | None = None
 
 
 class CanonicalSnapshot(Result):
