@@ -26,6 +26,7 @@ import logging
 import math
 import os
 import struct
+import sys
 import tempfile
 import time
 import wave
@@ -343,22 +344,30 @@ class DiscordVoiceReadyMixin:
                 # t_ready is when the play call RETURNED, success or failure: the tone has been heard
                 # for exactly as long as it took.
                 ready_at = time.monotonic()
-        except Exception as exc:  # health: allow BLE001 -- a broken config/GPU probe must degrade to a silent ready; an un-stamped receiver is deaf for the rest of the join
+        except Exception as exc:
             # The tail is guarded for the same reason the poll loop is, and one more: `ready_at is
             # None` now means "cut everything" (adapter.py's `_cut_pre_ready_locked`), so a raise
-            # here would leave a joined, still-listening receiver deaf for the rest of the join with
-            # no `voice ready` line at all.  Degrade instead, and say so.
+            # here would leave a joined, still-listening receiver deaf for the rest of the join.
+            # It therefore degrades to an ANNOUNCED ready — a WARNING with traceback here and a
+            # `voice ready (degraded: …)` line after the stamp — not a silent one: an un-stamped
+            # receiver is deaf for the rest of the join.
             logger.warning("[Discord] ready check failed (guild=%d): %s", guild_id, exc,
                            exc_info=True)
             reason = f"the ready check failed: {exc}"
         finally:
-            # Stamped on BOTH paths, the degraded one included: a join never stays deaf (plan step 9).
-            if ready_at is None:
-                ready_at = time.monotonic()
-            receiver = self._voice_receivers.get(guild_id)
-            mark_ready = getattr(receiver, "mark_ready", None)
-            if callable(mark_ready):
-                mark_ready(ready_at)
+            # Stamped on both normal paths, the degraded one included: a join never stays deaf
+            # (plan step 9).  A CANCELLED gate is not this join any more — a move re-arms the
+            # receiver (clears `_ready_at`) and then cancels this task, so the stamp taken before
+            # the tone would mark the NEW room ready with the old join's time and let its
+            # pre-ready speech through unchecked.  Let the CancelledError propagate: no stamp, and
+            # no `_voice_ready_info` write either (the new cycle owns both).
+            if not isinstance(sys.exc_info()[1], asyncio.CancelledError):
+                if ready_at is None:
+                    ready_at = time.monotonic()
+                receiver = self._voice_receivers.get(guild_id)
+                mark_ready = getattr(receiver, "mark_ready", None)
+                if callable(mark_ready):
+                    mark_ready(ready_at)
         self._ready_map("_voice_ready_info")[guild_id] = {
             "t_ready": ready_at, "reason": reason, "degraded": reason is not None,
             "device": result.get("device"), "model": result.get("model"),
