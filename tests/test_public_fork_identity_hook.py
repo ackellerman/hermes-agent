@@ -369,8 +369,8 @@ def test_shallow_clone_refuses(forge, tmp_path):
 
 # ── raw metadata and malformed objects ─────────────────────────────────────────────────────
 def test_non_utf8_message_refuses(forge):
-    forge.commit(b"bad bytes \xff\xfe here\n", [forge.base], files={"a.txt": "a\n"},
-                 ref="refs/heads/main")
+    # commit-tree transcodes invalid bytes as Latin-1, so write the raw object.
+    forge.raw_commit(forge.header(forge.base) + b"\nbad bytes \xff\xfe here\n", "refs/heads/main")
     assert_refused(forge, forge.push("main"), "UTF-8")
 
 
