@@ -923,9 +923,11 @@ def report(bad, total: int, hints: dict[str, str] | None = None) -> None:
               "  full object ids. This check never writes approval. Fork work is otherwise\n"
               "  authored, committed and tagged as sim.",
               file=err)
-        for oid in approve:
-            if oid in (hints or {}):
-                print(f"  Cherry-pick review: {hints[oid]}", file=err)
+        shown = [h for oid in approve if (h := (hints or {}).get(oid))]
+        for line in shown[:MAX_REPORTED]:
+            print(f"  Cherry-pick review: {line}", file=err)
+        if len(shown) > MAX_REPORTED:
+            print(f"  ... and {len(shown) - MAX_REPORTED} more cherry-pick review lines", file=err)
         if any(p.startswith("mergetag ") for oid, problems, _cls in bad if oid in approve
                for p in problems):
             print("  For a commit refused for its mergetag, the tag object to record is the mergetag of\n"

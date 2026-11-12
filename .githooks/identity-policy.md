@@ -59,8 +59,9 @@ actually opened:
 
 - `identity-policy/` must be a directory owned by the pushing user.
 - `policy.json` must be a regular file owned by the pushing user.
-- Any symlink, any other owner, or any group- or world-writable bit refuses. Bootstrap with
-  exactly `0700` for the directory and `0600` for the file (below).
+- Any symlink, any other owner, or any group- or world-writable bit refuses. Group or world
+  read/execute bits and a setgid bit do not (a setgid `2700` directory passes). Bootstrap with
+  `0700` for the directory and `0600` for the file (below), which is what TARS should leave.
 
 The parent common dir itself is not checked. The fork's `.git` is group-writable (setgid
 `2775`), and anyone who replaced `identity-policy/` there would own the replacement and fail
@@ -152,7 +153,7 @@ setgid parent gives a `2775` directory and a `664` file, and the gate refuses bo
 common=$(git rev-parse --path-format=absolute --git-common-dir)
 mkdir -m 700 "$common/identity-policy"
 # write policy.json there with an editor that does not leave backups beside it
-chmod 700 "$common/identity-policy"           # also clears the setgid bit
+chmod 700 "$common/identity-policy"           # keeps setgid on a directory (2700); that passes
 chmod 600 "$common/identity-policy/policy.json"
 ```
 

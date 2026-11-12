@@ -49,7 +49,7 @@ BLOCK_MD5=ea4d230cadaf6e4a3d46b0d1a41219bb
 WARN_MD5=144222245d71a493d62303158528d40a
 # The identity helper is pinned the same way: a copied hook beside a stale or edited helper
 # must refuse, not run whatever is there. Update this together with identity_guard.py.
-IDENTITY_GUARD_SHA256=e9855f14221a289a799fa35a39fb7a8ff6e9250b1e6a35aea10cf5ae98963e81
+IDENTITY_GUARD_SHA256=63db3678bba7cdcbb76876708eba5aabed2a0f9db298e3c16007b2b43acd1924
 IDENTITY_TIMEOUT=240           # outer kill; the helper enforces its own 180 s limit first
 
 # ── never touch the network ──────────────────────────────────────────────────────────────
