@@ -291,7 +291,7 @@ another clone or another configured client.
 
 ## Deployment
 
-Landing the topic branch and deploying the hook is one later step. It needs TARS, with Adam's
+Landing the topic branch and deploying the hook is one later step. It needs TARS, with the operator's
 independent authorization. In that step TARS:
 
 1. bootstraps and reviews the bundle in the deploying clone;
