@@ -210,6 +210,51 @@ def test_cherry_pick_hint_lines_are_capped(scene):
     assert "(25)" in scene.forge.said(res.stderr)
 
 
+def forged_chain(scene, n: int, trailer: bool = True) -> str:
+    """`n` sim-committed commits by the upstream author on the fork commit; a trailer names the
+    recorded source when `trailer` is set. None is a recorded pick, so each is unapproved."""
+    tip = scene.fork
+    for k in range(n):
+        body = f"fix {k}\n" + (f"\n(cherry picked from commit {scene.source})\n" if trailer else "")
+        tip = commit_on(scene.forge, tip, {f"f{k}.txt": f"{k}\n"}, body, author=UPSTREAM)
+    return tip
+
+
+@pytest.mark.parametrize("n,more", [(20, None), (21, 1)], ids=["exactly-20", "21"])
+def test_cherry_pick_hint_cap_boundary(scene, n, more):
+    """At the cap every hint prints and no remainder line follows; one over prints 20 hints
+    and exactly one `and 1 more` line."""
+    scene.policy(picks=[])
+    res = scene.push(forged_chain(scene, n))
+    assert_refused(scene.forge, res, NOT_VERIFIED)
+    lines = scene.forge.said(res.stderr).splitlines()
+    assert len([ln for ln in lines if ln.startswith("  Cherry-pick review:")]) == 20, lines
+    remainder = [ln for ln in lines if "more cherry-pick review lines" in ln]
+    if more is None:
+        assert remainder == [], remainder
+    else:
+        assert len(remainder) == 1 and f"and {more} more cherry-pick review lines" in remainder[0]
+
+
+@pytest.mark.parametrize("n", [20, 21, 25])
+def test_not_approved_list_is_capped_and_states_the_total(scene, n):
+    """The `Not approved (n):` line names at most 20 object ids, all of them real unapproved
+    commits, and its count is the full total. No trailer, so no hint line is involved."""
+    scene.policy(picks=[])
+    chain = forged_chain(scene, n, trailer=False)
+    res = scene.push(chain)
+    assert_refused(scene.forge, res, NOT_VERIFIED)
+    said = scene.forge.said(res.stderr)
+    listing = [ln for ln in said.splitlines() if ln.startswith("  Not approved (")]
+    assert len(listing) == 1, said
+    head, _, oids = listing[0].partition(": ")
+    listed = oids.split()
+    unapproved = set(scene.forge.out("rev-list", f"{scene.fork}..{chain}").split())
+    assert head == f"  Not approved ({n})", head
+    assert len(listed) == len(set(listed)) == min(n, 20), listed
+    assert set(listed) <= unapproved and len(unapproved) == n
+
+
 @pytest.mark.parametrize("edit", ["message", "tree", "committer-date"])
 def test_changed_candidate_refuses(scene, edit):
     """An amended pick is another object; the record of the reviewed one does not carry over.
@@ -281,20 +326,25 @@ def test_pick_author_is_the_upstream_author_not_its_committer(forge, up):
 
 
 def test_each_pick_is_checked_against_its_own_records_upstream_author(forge):
-    """Two records, two upstream authors: the right pairs pass, a crossed pair refuses."""
+    """Two records, two upstream authors: the right pairs pass; the same two records with the
+    upstream ids swapped refuse both picks. Both records stay in the bundle in each step, so
+    an author that matched any record's upstream commit, not its own, would pass the swap."""
     sources = {name: commit_on(forge, forge.base, {f"{name}.txt": f"{name}\n"}, f"fix {name}\n",
                                author=who, committer=who)
                for name, who in (("a", UPSTREAM), ("b", OTHER))}
     picks = {name: cherry_pick(forge, commit_on(forge, forge.base, {"f.txt": f"{name}\n"}, "fork\n"),
                                src) for name, src in sources.items()}
-    forge.write_policy(bundle(pick_records=[pick_record(picks[n], sources[n]) for n in sources]))
-    for name in sources:
-        assert_accepted(forge, push_to(forge, picks[name], f"ok-{name}"), f"refs/heads/ok-{name}",
-                        picks[name])
-    forge.write_policy(bundle(pick_records=[pick_record(picks["a"], sources["b"])]))
-    res = push_to(forge, picks["a"], "crossed")
-    assert_refused(forge, res, PICK_AUTHOR)
-    assert picks["a"] in forge.said(res.stderr)
+    right = {"a": sources["a"], "b": sources["b"]}
+    crossed = {"a": sources["b"], "b": sources["a"]}
+    forge.write_policy(bundle(pick_records=[pick_record(picks[n], right[n]) for n in picks]))
+    for name, pick in picks.items():
+        assert_accepted(forge, push_to(forge, pick, f"ok-{name}"), f"refs/heads/ok-{name}", pick)
+    forge.write_policy(bundle(pick_records=[pick_record(picks[n], crossed[n]) for n in picks]))
+    for name, pick in picks.items():
+        res = push_to(forge, pick, f"crossed-{name}")
+        assert_refused(forge, res, PICK_AUTHOR)
+        assert pick in forge.said(res.stderr)
+        assert f"refs/heads/crossed-{name}" not in forge.remote_refs()
 
 
 @pytest.mark.parametrize("old,new", [
