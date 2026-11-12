@@ -11,8 +11,11 @@ never excluding tracking refs), and checks each raw commit object:
 
   * author AND committer must be byte-exact `sim <sim@hermes-agent.nousresearch.com>`, unless
     the commit is VERIFIED UPSTREAM: reachable from an exact snapshot tip that TARS pinned in
-    the private bundle. A verified upstream commit keeps its own author and committer. Every
-    other identity fails closed (reviewed cherry-pick records are a later element);
+    the private bundle. A verified upstream commit keeps its own author and committer. A fork
+    commit may keep a non-sim AUTHOR only as a REVIEWED CHERRY-PICK: an exact pick record names
+    its full OID and the full OID of the upstream commit it was picked from, its committer is
+    sim, and its raw author name and email equal that upstream commit's. A trailer, an equal
+    author or an equal patch is never proof. Every other identity fails closed;
   * headers must be well formed and UTF-8, the message UTF-8 without NUL bytes;
   * every class, verified upstream included, is scanned with the public block pattern and the
     private deny-list. A header (author, committer, tagger) refuses when its name or its email
@@ -30,17 +33,20 @@ end at a commit, whose ancestry is audited like a branch. A `mergetag` in a fork
 tag object and obeys the same tag rules; in a verified upstream commit it is only scanned.
 
 The private bundle lives ONLY in `<git common dir>/identity-policy/policy.json` (never a
-worktree or hook-directory copy). Schema v2 is exactly
-`{"version": 2, "names": [...], "emails": [...], "snapshots": [...], "tag_records": [...]}`:
+worktree or hook-directory copy). Schema v3 is exactly `{"version": 3, "names": [...],
+"emails": [...], "snapshots": [...], "tag_records": [...], "pick_records": [...]}`:
 `names`/`emails` are the non-empty deny-list; a snapshot record is
 `{"tips": [<full commit oid>, ...], "repository": "NousResearch/hermes-agent", "source": <https
 or ssh URL of that repository on github.com>, "ref": "refs/heads/..|refs/tags/..",
 "verified_at": "YYYY-MM-DDTHH:MM:SSZ", "note": <TARS's verification note>}`; a tag record has
 the same provenance fields with `"tag": <full tag-object oid>` instead of `tips` and a
-`refs/tags/` ref. Every pinned tip must be a local commit and every recorded tag a local tag
-object. A missing, malformed, duplicate-keyed, other-version, symlinked, foreign-owned or
-group/world-writable bundle refuses, and so do duplicate or conflicting records. The check
-never writes approval: TARS verifies the canonical upstream independently and edits the bundle.
+`refs/tags/` ref; a pick record has them with `"candidate"` and `"upstream_commit"` (full
+commit oids) instead, and a `refs/heads/`, `refs/tags/` or `refs/pull/<n>/head` ref. Every
+pinned tip, pick candidate and picked upstream commit must be a local commit and every recorded
+tag a local tag object. A missing, malformed, duplicate-keyed, other-version, symlinked,
+foreign-owned or group/world-writable bundle refuses, and so do duplicate or conflicting
+records. The check never writes approval: TARS verifies the canonical upstream independently
+and edits the bundle. The operator guide is `identity-policy.md` beside this file.
 
 Limits: 250,000 commits and 180 s for the whole gate, fail closed. `git -c
 identityguard.maxCommits=N` / `identityguard.timeoutSeconds=S` can only LOWER them (tests use
@@ -66,8 +72,8 @@ SIM_NAME = b"sim"
 SIM_EMAIL = b"sim@hermes-agent.nousresearch.com"
 MAX_COMMITS = 250_000
 TIME_LIMIT = 180.0
-POLICY_VERSION = 2
-POLICY_MAX_BYTES = 64 * 1024
+POLICY_VERSION = 3
+POLICY_MAX_BYTES = 256 * 1024
 POLICY_MAX_ENTRIES = 32
 MAX_RECORDS = 256
 MAX_TIPS = 32
@@ -79,12 +85,19 @@ APPROVED_SOURCE = re.compile(r"(?:https://github\.com/|ssh://git@github\.com/|gi
                              r"NousResearch/hermes-agent(?:\.git)?")
 SNAPSHOT_FIELDS = {"tips", "repository", "source", "ref", "verified_at", "note"}
 TAG_RECORD_FIELDS = {"tag", "repository", "source", "ref", "verified_at", "note"}
+PICK_FIELDS = {"candidate", "upstream_commit", "repository", "source", "ref", "verified_at", "note"}
 REF_PART = r"[A-Za-z0-9_][A-Za-z0-9._-]*"
 SNAPSHOT_REF = re.compile(rf"refs/(?:heads|tags)/{REF_PART}(?:/{REF_PART})*")
 TAG_REF = re.compile(rf"refs/tags/{REF_PART}(?:/{REF_PART})*")
+# A pick's evidence: a canonical branch or tag, or an upstream pull request's head.
+PICK_REF = re.compile(rf"refs/(?:(?:heads|tags)/{REF_PART}(?:/{REF_PART})*|pull/[1-9][0-9]*/head)")
+TRAILER = re.compile(rb"^\(cherry picked from commit ([0-9a-f]{40}|[0-9a-f]{64})\)$", re.MULTILINE)
 UTC_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 FULL_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
-NOT_VERIFIED = "is not the fork identity sim and the commit is not in a verified upstream snapshot"
+NOT_VERIFIED = ("is not the fork identity sim and the commit is not in a verified upstream snapshot "
+                "nor named by a pick record")
+PICK_AUTHOR = "author does not equal the author of the upstream commit its pick record names"
+PICK_COMMITTER = "committer is not the fork identity sim; a recorded cherry-pick is committed by sim"
 TAG_UNRECORDED = ("tagger is not the fork identity sim and no tag record names this exact tag "
                   "object")
 MAX_STDIN = 16 * 1024 * 1024
@@ -219,10 +232,11 @@ class Bundle:
     """The validated private bundle. Record values other than object ids are never printed."""
 
     def __init__(self, names: list[str], emails: list[str], tips: frozenset[str],
-                 tag_records: dict[str, str]):
+                 tag_records: dict[str, str], picks: dict[str, str]):
         self.names, self.emails = names, emails
         self.tips = tips                # every pinned snapshot tip
         self.tag_records = tag_records  # exact tag-object oid -> the recorded refs/tags/<name>
+        self.picks = picks              # exact candidate commit oid -> its upstream commit oid
 
 
 def _records(policy: dict, key: str) -> list:
@@ -306,6 +320,23 @@ def _tag_records(policy: dict) -> dict[str, str]:
     return by_oid
 
 
+def _pick_records(policy: dict) -> dict[str, str]:
+    picks: dict[str, str] = {}
+    for i, rec in enumerate(_records(policy, "pick_records")):
+        label = f"pick_records[{i}]"
+        _provenance(rec, label, PICK_FIELDS, PICK_REF, "refs/heads/, refs/tags/ or refs/pull/<n>/head")
+        candidate = _oid(rec["candidate"], f"{label} candidate")
+        source = _oid(rec["upstream_commit"], f"{label} upstream_commit")
+        if candidate == source:
+            raise GuardError(f"private identity policy {label} names one commit as both candidate and "
+                             "upstream commit; refusing")
+        if candidate in picks:
+            raise GuardError(f"private identity policy has duplicate or conflicting pick records "
+                             f"({label}); refusing")
+        picks[candidate] = source
+    return picks
+
+
 def parse_policy(raw: bytes) -> Bundle:
     try:
         text = raw.decode("utf-8")
@@ -319,7 +350,7 @@ def parse_policy(raw: bytes) -> Bundle:
     if type(version) is not int or version != POLICY_VERSION:
         raise GuardError(f"private identity policy version is not {POLICY_VERSION}; this hook "
                          f"accepts exactly schema v{POLICY_VERSION}; refusing")
-    expected = {"version", "names", "emails", "snapshots", "tag_records"}
+    expected = {"version", "names", "emails", "snapshots", "tag_records", "pick_records"}
     if set(policy) - expected:
         raise GuardError(f"private identity policy has unknown key(s) "
                          f"{sorted(set(policy) - expected)}; refusing (schema v{POLICY_VERSION})")
@@ -334,7 +365,7 @@ def parse_policy(raw: bytes) -> Bundle:
     for i, email in enumerate(emails):
         if not EMAIL_SHAPE.fullmatch(email):
             raise GuardError(f"private identity policy emails[{i}] is not an email; refusing")
-    return Bundle(names, emails, _snapshot_tips(policy), _tag_records(policy))
+    return Bundle(names, emails, _snapshot_tips(policy), _tag_records(policy), _pick_records(policy))
 
 
 def open_policy_dir(common: str, euid: int) -> int:
@@ -394,14 +425,18 @@ def load_policy(common: str, euid: int) -> tuple[list[str], list[str]]:
 
 
 def check_records(bundle: Bundle, hexlen: int, clock: Clock) -> None:
-    """Every pinned tip must be a local commit and every recorded tag a local tag object."""
-    for oid in sorted(bundle.tips | set(bundle.tag_records)):
+    """Every pinned tip, pick candidate and picked upstream commit must be a local commit and
+    every recorded tag a local tag object."""
+    wanted = ([(t, "commit", "snapshot tip") for t in sorted(bundle.tips)]
+              + [(t, "tag", "tag record") for t in sorted(bundle.tag_records)]
+              + [(c, "commit", "pick candidate") for c in sorted(bundle.picks)]
+              + [(u, "commit", "pick upstream commit") for u in sorted(set(bundle.picks.values()))])
+    for oid, _want, _what in wanted:
         if len(oid) != hexlen:
             raise GuardError(f"private identity policy names {oid}, which is not a full object id "
                              "of this repository's object format; refusing")
-    types = object_types(set(bundle.tips) | set(bundle.tag_records), clock)
-    for oid, want, what in ([(t, "commit", "snapshot tip") for t in sorted(bundle.tips)]
-                            + [(t, "tag", "tag record") for t in sorted(bundle.tag_records)]):
+    types = object_types({oid for oid, _want, _what in wanted}, clock)
+    for oid, want, what in wanted:
         kind = types.get(oid, "missing")
         if kind != want:
             desc = "missing" if kind == "missing" else f"a {kind}"
@@ -409,6 +444,15 @@ def check_records(bundle: Bundle, hexlen: int, clock: Clock) -> None:
                              f"{'commit' if want == 'commit' else 'tag object'} in this repository. "
                              "TARS fetches the canonical upstream, re-verifies the record and "
                              "updates the private bundle; refusing")
+
+
+def pick_authors(bundle: Bundle, hexlen: int, match: Matchers, clock: Clock) -> dict[str, bytes | None]:
+    """Each picked upstream commit -> its raw author `name <email>` bytes (None if unusable)."""
+    authors: dict[str, bytes | None] = {}
+    for oid, _kind, raw in read_objects(sorted(set(bundle.picks.values())), clock):
+        _problems, author, _committer, _tags = _headers(raw.split(b"\n\n", 1)[0], hexlen, match)
+        authors[oid] = _ident_value(author)
+    return authors
 
 
 # ── matching ───────────────────────────────────────────────────────────────────────────────
@@ -465,6 +509,12 @@ def _ident(role: str, line: bytes | None, match: Matchers,
     except UnicodeDecodeError:
         return [f"{role} header is not valid UTF-8"], None
     return match.header(role, *texts), name == SIM_NAME and email == SIM_EMAIL
+
+
+def _ident_value(line: bytes | None) -> bytes | None:
+    """The raw `name <email>` of a well-formed identity header, else None."""
+    m = IDENT_RE.fullmatch(line or b"")
+    return m.group(2) + b" <" + m.group(3) + b">" if m else None
 
 
 def _headers(head: bytes, hexlen: int,
@@ -540,9 +590,12 @@ def _message(msg: bytes, field: str, match: Matchers) -> list[str]:
 
 
 def audit_commit(raw: bytes, hexlen: int, match: Matchers, *, upstream: bool = False,
-                 tag_records: dict[str, str] | None = None, fmt: str = "sha1") -> list[str]:
+                 tag_records: dict[str, str] | None = None, fmt: str = "sha1",
+                 pick: tuple[str, bytes | None] | None = None) -> list[str]:
     """Problems of one raw commit. A verified upstream commit (`upstream`) keeps its own
-    identities; a fork commit must be sim and its mergetags obey the tag rules."""
+    identities; a fork commit must be sim and its mergetags obey the tag rules, except that a
+    recorded pick (`pick`: its upstream commit and that commit's raw author) keeps exactly the
+    upstream author."""
     sep = raw.find(b"\n\n")
     if sep < 0:
         return ["malformed commit: no header/message separator"]
@@ -554,7 +607,12 @@ def audit_commit(raw: bytes, hexlen: int, match: Matchers, *, upstream: bool = F
         found, is_sim = _ident(role, line, match)
         problems += found
         if is_sim is False and not upstream:
-            problems.append(f"{role} {NOT_VERIFIED}")
+            if pick is None:
+                problems.append(f"{role} {NOT_VERIFIED}")
+            elif role == "committer":
+                problems.append(PICK_COMMITTER)
+            elif _ident_value(line) != pick[1]:
+                problems.append(f"{PICK_AUTHOR} ({pick[0]})")
     problems += _message(msg, "message", match)
     if not upstream:
         for embedded in mergetags:
@@ -700,10 +758,7 @@ def peel(remote_ref: str, local_oid: str, kind: str, hexlen: int, match: Matcher
                 problems.append("malformed tag: the type header does not match the tagged object")
         if problems:
             bad.append((target, problems, "upstream" if recorded else "fork"))
-        if actual is None or actual != declared:
-            if not problems:  # fail closed: a chain that stops here must never refuse silently
-                bad.append((target, ["malformed tag: the tag chain does not resolve to a commit"],
-                            "upstream" if recorded else "fork"))
+        if actual is None or actual != declared:  # always with a problem appended above
             return None, bad
         target, kind = tagged, actual
     else:
@@ -788,6 +843,7 @@ def run(argv: list[str], stdin: bytes) -> int:
     hexlen = OBJECT_HEX[fmt]
     zero = "0" * hexlen
     check_records(bundle, hexlen, clock)
+    sources = pick_authors(bundle, hexlen, match, clock)
     updates = parse_input(stdin, hexlen)
     shallow = git(["rev-parse", "--is-shallow-repository"], clock)
     if shallow.returncode != 0 or shallow.stdout.strip() != b"false":
@@ -798,33 +854,52 @@ def run(argv: list[str], stdin: bytes) -> int:
     commits = enumerate_commits(targets, zero, cap, clock)
     outside = unverified_commits(targets, zero, bundle.tips, cap, clock)
     t_audit = time.monotonic()
-    upstream_count = 0
+    upstream_count = picked = 0
+    hints: dict[str, str] = {}
     for oid, kind, raw in read_objects(commits, clock):
         upstream = outside is not None and oid not in outside
         upstream_count += upstream
+        source = None if upstream else bundle.picks.get(oid)
+        picked += source is not None
         problems = ([f"object is a {kind}"] if kind != "commit" else
                     audit_commit(raw, hexlen, match, upstream=upstream,
-                                 tag_records=bundle.tag_records, fmt=fmt))
+                                 tag_records=bundle.tag_records, fmt=fmt,
+                                 pick=None if source is None else (source, sources[source])))
         if problems:
             bad.append((oid, problems, "upstream" if upstream else "fork"))
+            hints.update(pick_hint(oid, raw, source) if not upstream else {})
     clock.remaining()
     done = time.monotonic()
     print(f"{PREFIX} {len(commits)} commits enumerated in {t_audit - t_enum:.2f}s, audited in "
           f"{done - t_audit:.2f}s (total {done - start:.2f}s)", file=sys.stderr)
     if not bad:
-        print(f"{PREFIX} passed ({len(commits)} commits: {len(commits) - upstream_count} sim, "
-              f"{upstream_count} verified upstream)", file=sys.stderr)
+        print(f"{PREFIX} passed ({len(commits)} commits: {len(commits) - upstream_count - picked} "
+              f"sim, {upstream_count} verified upstream, {picked} reviewed cherry-picks)",
+              file=sys.stderr)
         return 0
-    report(bad, len(commits))
+    report(bad, len(commits), hints)
     return 1
 
 
+def pick_hint(oid: str, raw: bytes, source: str | None) -> dict[str, str]:
+    """Object ids only: the recorded upstream commit, or the one a trailer claims."""
+    if source is not None:
+        return {oid: f"candidate {oid}: its pick record names upstream commit {source}"}
+    claim = TRAILER.search(raw.split(b"\n\n", 1)[-1])
+    if claim is None:
+        return {}
+    return {oid: f"candidate {oid} claims upstream commit {claim.group(1).decode()} by its "
+                 "trailer (a trailer is not proof)"}
+
+
 def _needs_record(problems: list[str]) -> bool:
-    """True when the only problems are a missing approval (no deny-list hit, nothing malformed)."""
-    return all(p.endswith(NOT_VERIFIED) or p.endswith(TAG_UNRECORDED) for p in problems)
+    """True when the only problems are a missing or uncertain approval (no deny-list hit,
+    nothing malformed)."""
+    return all(p.endswith(NOT_VERIFIED) or p.endswith(TAG_UNRECORDED) or p.startswith(PICK_AUTHOR)
+               for p in problems)
 
 
-def report(bad, total: int) -> None:
+def report(bad, total: int, hints: dict[str, str] | None = None) -> None:
     err = sys.stderr
     print(f"{PREFIX} REFUSED — {len(bad)} objects fail the identity/metadata audit "
           f"({total} commits audited):", file=err)
@@ -842,9 +917,15 @@ def report(bad, total: int) -> None:
               "  Upstream history passes only through the private bundle: TARS independently fetches\n"
               f"  the canonical {CANONICAL_REPO} over an authenticated transport, verifies these\n"
               "  exact objects there, and records the verified tip (a snapshot record) or the exact\n"
-              "  tag object (a tag record) in <git common dir>/identity-policy/policy.json. This\n"
-              "  check never writes approval. Fork work is authored, committed and tagged as sim.",
+              "  tag object (a tag record) in <git common dir>/identity-policy/policy.json. A fork\n"
+              "  cherry-pick that keeps its upstream author needs a pick record: TARS compares the\n"
+              "  exact candidate with the exact upstream commit (diffs and message) and records both\n"
+              "  full object ids. This check never writes approval. Fork work is otherwise\n"
+              "  authored, committed and tagged as sim.",
               file=err)
+        for oid in approve:
+            if oid in (hints or {}):
+                print(f"  Cherry-pick review: {hints[oid]}", file=err)
         if any(p.startswith("mergetag ") for oid, problems, _cls in bad if oid in approve
                for p in problems):
             print("  For a commit refused for its mergetag, the tag object to record is the mergetag of\n"
