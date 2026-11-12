@@ -199,15 +199,31 @@ def _error_json(message: str) -> str:
 
 
 def _run_edge_tts(text: str, file_str: str, tts_config: dict[str, Any]) -> None:
-    """Run the async Edge generator from sync code (worker thread; direct run if that fails)."""
+    """Run the async Edge generator in a worker thread (inline only if no thread can be started).
+
+    A failure raised *inside* the worker propagates unchanged after that single run: re-running it
+    here would repeat its side effects (partial file write, a second network synthesis).
+    """
     run = lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config))
     try:
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            # A pool thread starts with an empty context: carry the caller's profile home/secret scope.
-            pool.submit(contextvars.copy_context().run, run).result(timeout=60)
-    except RuntimeError:
+        pool = ThreadPoolExecutor(max_workers=1)
+    except RuntimeError:  # "can't start new thread": no worker available, so run inline
         run()
+        return
+    try:
+        # A pool thread starts with an empty context: carry the caller's profile home/secret scope.
+        future = pool.submit(contextvars.copy_context().run, run)
+    except RuntimeError:  # the pool refused the work: fall back to running inline
+        pool.shutdown(wait=True)
+        run()
+        return
+    try:
+        # 60s bounds only *this* wait, not the synthesis: it does not cancel the worker, and the
+        # shutdown below waits for the worker, so the caller blocks for the real duration regardless.
+        future.result(timeout=60)
+    finally:
+        pool.shutdown(wait=True)
 
 
 def _select_builtin_engine(provider: str) -> tuple:
