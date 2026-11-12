@@ -15,19 +15,19 @@ never excluding tracking refs), and checks each raw commit object:
     other identity fails closed (reviewed cherry-pick records are a later element);
   * headers must be well formed and UTF-8, the message UTF-8 without NUL bytes;
   * every class, verified upstream included, is scanned with the public block pattern and the
-    private deny-list. A header (author, committer, tagger) refuses when its email is the
-    operator email token or its name is the operator's full name (whatever email goes with
-    it); messages refuse on the full name (case-insensitive, word-bounded phrase) or the email
+    private deny-list. A header (author, committer, tagger) refuses when its name or its email
+    field holds the operator email token or the operator's full name (whatever the other field
+    says); messages refuse on the full name (case-insensitive, word-bounded phrase) or the email
     token, never on substrings. Every header after committer (mergetag, gpgsig, ...) must be
     UTF-8 and its whole text, continuation lines included, is scanned like the message;
     matched values are never printed.
 
 An annotated tag is peeled recursively. Every tag object in the chain must be well formed
-(object, type, tag name, tagger), its declared type must be the tagged object's real type, its
-tagger and message obey the header/message rules above, and its tagger must be sim unless an
-exact tag record names that tag object (and its tag name). The chain must end at a commit,
-whose ancestry is audited like a branch. A `mergetag` in a fork commit embeds a tag object and
-obeys the same tag rules; in a verified upstream commit it is only scanned.
+(object, type, tag name, tagger, each exactly once), its declared type must be the tagged
+object's real type, its tagger and message obey the header/message rules above, and its tagger
+must be sim unless an exact tag record names that tag object (and its tag name). The chain must
+end at a commit, whose ancestry is audited like a branch. A `mergetag` in a fork commit embeds a
+tag object and obeys the same tag rules; in a verified upstream commit it is only scanned.
 
 The private bundle lives ONLY in `<git common dir>/identity-policy/policy.json` (never a
 worktree or hook-directory copy). Schema v2 is exactly
@@ -99,7 +99,10 @@ IDENT_RE = re.compile(rb"(author|committer|tagger) ([^<>\n]+) <([^<>\n]*)> ([0-9
 EMAIL_SHAPE = re.compile(r"[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+")
 UTF8_NAMES = {b"utf-8", b"utf8"}
 KNOWN_HEADERS = {b"tree", b"parent", b"author", b"committer", b"encoding", b"mergetag", b"gpgsig",
-                 b"gpgsig-sha256"}
+                 b"gpgsig-sha256", b"object", b"type", b"tag", b"tagger"}
+# Headers whose one place is fixed: met again among the extra headers, they refuse.
+COMMIT_RESERVED = frozenset({b"tree", b"parent", b"author", b"committer"})
+TAG_RESERVED = frozenset({b"object", b"type", b"tag", b"tagger"})
 
 
 class GuardError(Exception):
@@ -427,11 +430,11 @@ class Matchers:
 
     def header(self, role: str, name: str, email: str) -> list[str]:
         """An identity header identifies the operator by the email token, or by the full name
-        whatever email goes with it (a name field may also carry the email)."""
+        whatever email goes with it; either value may sit in either field."""
         found = []
         if any(r.search(name) for r in self.names) or any(r.search(name) for r in self.emails):
             found.append(f"{role} name matches the private deny-list")
-        if any(r.search(email) for r in self.emails):
+        if any(r.search(email) for r in self.emails) or any(r.search(email) for r in self.names):
             found.append(f"{role} email matches the private deny-list")
         for field, value in (("name", name), ("email", email)):
             if self.block.search(value):
@@ -481,11 +484,12 @@ def _headers(head: bytes, hexlen: int,
     i += author is not None
     committer = lines[i] if i < len(lines) and lines[i].startswith(b"committer ") else None
     i += committer is not None
-    problems, mergetags = _extra_headers(lines[i:], match)
+    problems, mergetags = _extra_headers(lines[i:], match, COMMIT_RESERVED)
     return problems, author, committer, mergetags
 
 
-def _extra_headers(lines: list[bytes], match: Matchers) -> tuple[list[str], list[bytes]]:
+def _extra_headers(lines: list[bytes], match: Matchers,
+                   reserved: frozenset[bytes]) -> tuple[list[str], list[bytes]]:
     """Every header after committer (encoding, mergetag, gpgsig, ...), with its continuation
     lines, must be well formed and UTF-8, and its whole text is scanned like a message: a
     mergetag embeds a tagger and a tag message, a signature block is free text. Also return
@@ -506,7 +510,7 @@ def _extra_headers(lines: list[bytes], match: Matchers) -> tuple[list[str], list
             # Only a known git header name is ever printed: any other key-shaped token may be a
             # word of a private value.
             label = f"'{key.decode()}' header" if key in KNOWN_HEADERS else "an unknown header"
-            if key in seen or key in {b"tree", b"parent", b"author", b"committer"}:
+            if key in seen or key in reserved:
                 problems.append(f"malformed header: duplicate or misplaced {label}")
         seen.add(key)
         if key == b"encoding" and line[len(key) + 1:].lower() not in UTF8_NAMES:
@@ -578,7 +582,7 @@ def audit_tag(raw: bytes, hexlen: int, match: Matchers, tag_records: dict[str, s
         return ["malformed tag: bad object, type or tag header"], None, None, False
     lines = lines[:-2]
     tagger = lines[3] if len(lines) > 3 and lines[3].startswith(b"tagger ") else None
-    problems, _ = _extra_headers(lines[3 + (tagger is not None):], match)
+    problems, _ = _extra_headers(lines[3 + (tagger is not None):], match, TAG_RESERVED)
     found, is_sim = _ident("tagger", tagger, match, "malformed tag: missing or malformed tagger header")
     problems += found
     record = tag_records.get(oid)
@@ -697,6 +701,9 @@ def peel(remote_ref: str, local_oid: str, kind: str, hexlen: int, match: Matcher
         if problems:
             bad.append((target, problems, "upstream" if recorded else "fork"))
         if actual is None or actual != declared:
+            if not problems:  # fail closed: a chain that stops here must never refuse silently
+                bad.append((target, ["malformed tag: the tag chain does not resolve to a commit"],
+                            "upstream" if recorded else "fork"))
             return None, bad
         target, kind = tagged, actual
     else:
@@ -838,6 +845,11 @@ def report(bad, total: int) -> None:
               "  tag object (a tag record) in <git common dir>/identity-policy/policy.json. This\n"
               "  check never writes approval. Fork work is authored, committed and tagged as sim.",
               file=err)
+        if any(p.startswith("mergetag ") for oid, problems, _cls in bad if oid in approve
+               for p in problems):
+            print("  For a commit refused for its mergetag, the tag object to record is the mergetag of\n"
+                  "  that commit (the tag embedded in its mergetag header; git cat-file -p <commit>\n"
+                  "  shows it), not the commit itself.", file=err)
     if fork:
         print("  Fork commits must be authored AND committed as sim <sim@hermes-agent.nousresearch.com>,\n"
               "  and no name, email or message may carry a private deny-list or host-path value:\n"
