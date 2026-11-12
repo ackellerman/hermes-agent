@@ -581,6 +581,57 @@ def test_brief_synthesizes_with_the_profile_voice_not_the_root_voice(monkeypatch
     assert voices == ["en-GB-ProfileVoiceNeural"]
 
 
+def test_concurrent_briefs_synthesize_with_each_profiles_own_credentials(monkeypatch, tmp_path):
+    """Two seats brief at once: each worker-side synthesis (the tool call AND the Edge run inside it)
+    resolves the key from its own profile's secret scope, never the root env or the other seat's.
+    Real ``_profile_runtime_scope`` and config resolution; only the Edge SDK and the model are faked."""
+    from agent.secret_scope import get_secret
+    from tools import tts_tool
+    from tools.tool_backend_helpers import resolve_provider_secret
+
+    key = "ELEVENLABS_API_KEY"
+    root = tmp_path / "root"
+    seats = {name: tmp_path / "profiles" / name for name in ("alpha", "beta")}
+    for home, voice in ((root, "en-US-RootVoiceNeural"), *((h, f"en-GB-{n}Neural") for n, h in seats.items())):
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(
+            f"tts:\n  provider: edge\n  edge:\n    voice: {voice}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv(key, "root-key")
+
+    seen: dict[str, list] = {"tool": [], "edge": []}
+    both_in_worker = threading.Barrier(2, timeout=5)  # proves the two syntheses overlap
+    real_tts = tts_tool.text_to_speech_tool
+
+    def spy_tts(*args, **kwargs):
+        seen["tool"].append(resolve_provider_secret(key, "elevenlabs"))
+        both_in_worker.wait()
+        return real_tts(*args, **kwargs)
+
+    class _Communicate:
+        def __init__(self, text, voice=None, **kwargs):
+            seen["edge"].append((voice, get_secret(key)))
+
+        async def save(self, path):
+            await asyncio.to_thread(Path(path).write_bytes, b"ID3fake")
+
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", spy_tts)
+    monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: SimpleNamespace(Communicate=_Communicate))
+    monkeypatch.setattr(voice_brief, "_ask_model", lambda route, messages: asyncio.sleep(0, MODEL_OUTPUT))
+
+    async def brief(name):
+        with gateway_run._profile_runtime_scope(seats[name], prepared_secret_scope={key: f"{name}-key"}):
+            return await voice_brief.deliver_preturn_brief(
+                adapter=_EdgeAdapter(), guild_id=GUILD_ID, chat_id=CHAT_ID, message="hi", route={})
+
+    async def go():
+        return await asyncio.gather(brief("alpha"), brief("beta"))
+
+    assert asyncio.run(go()) == [MODEL_OUTPUT, MODEL_OUTPUT]
+    assert sorted(seen["tool"]) == ["alpha-key", "beta-key"]
+    assert sorted(seen["edge"]) == [("en-GB-alphaNeural", "alpha-key"), ("en-GB-betaNeural", "beta-key")]
+
+
 def test_strict_legacy_stop_callback_is_not_completion(monkeypatch):
     adapter = _bare_adapter()
     vc = adapter._voice_clients[GUILD_ID]
