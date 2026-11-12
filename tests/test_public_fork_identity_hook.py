@@ -35,8 +35,8 @@ HOOKS_SRC = Path(__file__).resolve().parents[1] / ".githooks"
 SIM = ("sim", "sim@hermes-agent.nousresearch.com")
 PERSONAL = ("Pat Example", "pat@example.invalid")
 UPSTREAM = ("Upstream Dev", "dev@upstream.example")
-POLICY = {"version": 2, "names": ["Pat Example"], "emails": ["pat@example.invalid"], "snapshots": [],
-          "tag_records": []}
+POLICY = {"version": 3, "names": ["Pat Example"], "emails": ["pat@example.invalid"], "snapshots": [],
+          "tag_records": [], "pick_records": []}
 DATE = "1700000000 +0000"
 # Built at runtime so this file's own text never matches the public block pattern.
 HOST_PATH = "/" + "mnt" + "/" + "work" + "/projects/x"
@@ -592,10 +592,10 @@ POLICY_BREAKAGE = {
     "duplicate keys": (lambda f: f.write_policy(None, raw=(
         b'{"version": 2, "names": ["Pat Example"], "emails": ["pat@example.invalid"], '
         b'"emails": ["other@example.invalid"]}')), "has a duplicate JSON key"),
-    "unknown key": (lambda f: f.write_policy({**POLICY, "pick_records": []}),
-                    "has unknown key(s) ['pick_records']"),
-    "other version": (lambda f: f.write_policy({**POLICY, "version": 1}), "version is not 2"),
-    "bool version": (lambda f: f.write_policy({**POLICY, "version": True}), "version is not 2"),
+    "unknown key": (lambda f: f.write_policy({**POLICY, "approvals": []}),
+                    "has unknown key(s) ['approvals']"),
+    "other version": (lambda f: f.write_policy({**POLICY, "version": 2}), "version is not 3"),
+    "bool version": (lambda f: f.write_policy({**POLICY, "version": True}), "version is not 3"),
     "no names": (lambda f: f.write_policy({k: v for k, v in POLICY.items() if k != "names"}),
                  "lacks key(s) ['names']"),
     "empty emails": (lambda f: f.write_policy({**POLICY, "emails": []}),

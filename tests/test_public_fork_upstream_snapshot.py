@@ -23,6 +23,7 @@ import pytest
 
 from tests.test_public_fork_identity_hook import (
     DATE,
+    HOST_PATH,
     PERSONAL,
     SIM,
     UPSTREAM,
@@ -54,8 +55,8 @@ def tag_record(oid: str, name: str = "v1", **over) -> dict:
 
 
 def bundle(snaps=(), recs=(), **over) -> dict:
-    return {"version": 2, "names": [PERSONAL[0]], "emails": [PERSONAL[1]],
-            "snapshots": list(snaps), "tag_records": list(recs), **over}
+    return {"version": 3, "names": [PERSONAL[0]], "emails": [PERSONAL[1]],
+            "snapshots": list(snaps), "tag_records": list(recs), "pick_records": [], **over}
 
 
 class Upstream:
@@ -324,6 +325,15 @@ def test_recorded_tag_deny_list_collision_refuses(forge, up, tagger, msg, needle
     assert_refused(forge, forge.push("refs/tags/v1"), needle)
 
 
+def test_recorded_tag_name_matching_the_public_block_pattern_refuses(forge, up):
+    """A ref part may contain '/', so a recorded tag name can carry a host-path fragment."""
+    name = "a" + HOST_PATH
+    tip = up.commit("upstream release")
+    tag = up.tag(name, tip)
+    published(forge, up, records=[tag_record(tag, name=name)])
+    assert_refused(forge, forge.push(f"refs/tags/{name}"), "tag name matches the public block pattern")
+
+
 def test_personal_tagger_on_sim_commit_refuses(forge):
     forge.commit("tagged", [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
     forge.git("tag", "-a", "v1", "-m", "release", "main",
@@ -515,7 +525,7 @@ def _with(snap=None, rec=None, **top):
 
 BROKEN_BUNDLE = {
     "v1 bundle": (lambda f, tip, tag: {"version": 1, "names": [PERSONAL[0]], "emails": [PERSONAL[1]]},
-                  "version is not 2"),
+                  "version is not 3"),
     "no snapshots key": (lambda f, tip, tag: {k: v for k, v in bundle().items() if k != "snapshots"},
                          "lacks key(s) ['snapshots']"),
     "snapshots not a list": (_with(snapshots={}), "'snapshots' must be a list"),
