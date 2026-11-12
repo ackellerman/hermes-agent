@@ -319,6 +319,13 @@ def _sim_tag(forge: Forge, name: str, target: str) -> str:
     return forge.out("rev-parse", f"refs/tags/{name}")
 
 
+def test_tag_chain_deeper_than_the_cap_refuses(forge):
+    target = forge.commit("tagged", [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
+    for depth in range(17):
+        target = _sim_tag(forge, f"t{depth}", target)
+    assert_refused(forge, forge.push("refs/tags/t16"), "the tag chain is deeper than 16")
+
+
 @pytest.mark.parametrize("target,kind", [
     (lambda f: f.out("hash-object", "-w", "--stdin", input=b"payload\n"), "blob"),
     (lambda f: f.out("rev-parse", f"{f.base}^{{tree}}"), "tree"),

@@ -17,8 +17,9 @@
 #
 # Two gates, in this order, on every exit path:
 #   1. IDENTITY (identity_guard.py beside this hook): raw author/committer/message audit of every
-#      commit each pushed ref would publish, through all parents, against `sim` and the private
-#      deny-list in <git common dir>/identity-policy/policy.json. It has NO override.
+#      commit each pushed ref would publish, through all parents, and of every annotated tag
+#      object, against `sim` and the private bundle in <git common dir>/identity-policy/
+#      policy.json (deny-list, pinned upstream snapshots, exact tag records). It has NO override.
 #   2. HOST-PATH CONTENT (the rest of this script): the diff scan described below.
 #
 # Escape hatch: HERMES_ALLOW_HOST_PATHS=1 git push ...  skips ONLY gate 2, never the identity gate.
@@ -47,7 +48,7 @@ BLOCK_MD5=ea4d230cadaf6e4a3d46b0d1a41219bb
 WARN_MD5=144222245d71a493d62303158528d40a
 # The identity helper is pinned the same way: a copied hook beside a stale or edited helper
 # must refuse, not run whatever is there. Update this together with identity_guard.py.
-IDENTITY_GUARD_SHA256=e5021ffe29490375255fcd7d7f542c2ccf6d971a2487211c578d6e40b6c5359d
+IDENTITY_GUARD_SHA256=619b6bac345f8a3839183db532956821516a09f8daa34ab715a3335e13995b5c
 IDENTITY_TIMEOUT=240           # outer kill; the helper enforces its own 180 s limit first
 
 # ── never touch the network ──────────────────────────────────────────────────────────────
