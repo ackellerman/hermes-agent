@@ -198,10 +198,12 @@ def test_changed_candidate_refuses(scene, edit):
     assert_refused(scene.forge, scene.push(changed), NOT_VERIFIED)
 
 
-def test_record_naming_another_upstream_commit_refuses(scene):
-    """The record's source changed to an upstream commit by someone else."""
+@pytest.mark.parametrize("author", [OTHER, (UPSTREAM[0], OTHER[1]), (OTHER[0], UPSTREAM[1])],
+                         ids=["other-author", "same-name-other-email", "other-name-same-email"])
+def test_record_naming_another_upstream_commit_refuses(scene, author):
+    """The record's source changed to an upstream commit with another author (name or email)."""
     other = commit_on(scene.forge, scene.forge.base, {"up.txt": "upstream fix\n"}, "upstream fix\n",
-                      author=OTHER, committer=OTHER)
+                      author=author, committer=author)
     scene.forge.write_policy(bundle([snapshot(scene.source, other)],
                                     pick_records=[pick_record(scene.candidate, other)]))
     res = scene.push(scene.candidate)
