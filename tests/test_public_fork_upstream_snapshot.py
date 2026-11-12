@@ -17,6 +17,8 @@ never reaches the network. Deny-list values are synthetic (`Pat Example`,
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from tests.test_public_fork_identity_hook import (
@@ -201,7 +203,11 @@ def test_snapshot_tip_that_is_not_a_local_commit_refuses(forge, up, pin, needle)
      "author name matches the private deny-list"),
     (UPSTREAM, ("Another Dev", PERSONAL[1]), "work", "committer email matches the private deny-list"),
     (UPSTREAM, UPSTREAM, "thanks Pat Example", "message matches the private deny-list"),
-], ids=["author-email", "author-name-other-email", "committer-email", "message-name"])
+    ((PERSONAL[1], "other@upstream.example"), UPSTREAM, "work",
+     "author name matches the private deny-list"),
+    (("Upstream Dev", PERSONAL[0]), UPSTREAM, "work", "author email matches the private deny-list"),
+], ids=["author-email", "author-name-other-email", "committer-email", "message-name",
+        "email-in-name-field", "name-in-email-field"])
 def test_verified_upstream_deny_list_collision_refuses(forge, up, author, committer, msg, needle):
     tip = up.commit(msg, author=author, committer=committer)
     published(forge, up)
@@ -219,6 +225,19 @@ def test_verified_upstream_non_utf8_author_name_refuses(forge, up):
     published(forge, up)
     forge.git("update-ref", "refs/heads/main", tip)
     assert_refused(forge, forge.push("main"), "author header is not valid UTF-8")
+
+
+@pytest.mark.parametrize("msg,needle", [
+    (b"upstr\xffeam work\n", "message is not valid UTF-8"),
+    (b"upstream \x00work\n", "message contains a NUL byte"),
+], ids=["not-utf8", "nul"])
+def test_verified_upstream_malformed_message_refuses(forge, up, msg, needle):
+    tree = up.out("rev-parse", f"{up.tip}^{{tree}}")
+    tip = up.raw_commit(f"tree {tree}\nparent {up.tip}\nauthor {UPSTREAM[0]} <{UPSTREAM[1]}> {DATE}\n"
+                        f"committer {UPSTREAM[0]} <{UPSTREAM[1]}> {DATE}\n\n".encode() + msg)
+    published(forge, up)
+    forge.git("update-ref", "refs/heads/main", tip)
+    assert_refused(forge, forge.push("main"), needle)
 
 
 def test_verified_upstream_commit_with_an_empty_email_passes(forge, up):
@@ -343,6 +362,13 @@ def test_tag_chain_deeper_than_the_cap_refuses(forge):
     assert_refused(forge, forge.push("refs/tags/t16"), "the tag chain is deeper than 16")
 
 
+def test_tag_chain_exactly_at_the_cap_passes(forge):
+    target = forge.commit("tagged", [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
+    for depth in range(16):
+        target = _sim_tag(forge, f"t{depth}", target)
+    assert_accepted(forge, forge.push("refs/tags/t15"), "refs/tags/t15", target)
+
+
 @pytest.mark.parametrize("target,kind", [
     (lambda f: f.out("hash-object", "-w", "--stdin", input=b"payload\n"), "blob"),
     (lambda f: f.out("rev-parse", f"{f.base}^{{tree}}"), "tree"),
@@ -372,29 +398,63 @@ def _raw_tag(forge: Forge, body: bytes) -> str:
      + b"nul \x00\n", "tag message contains a NUL byte"),
     (lambda b: f"object {b}\ntype commit\ntag \ntagger {SIM[0]} <{SIM[1]}> {DATE}\n\nm\n".encode(),
      "malformed tag: bad object, type or tag header"),
-], ids=["no-tagger", "tagger-shape", "type-mismatch", "not-utf8", "nul", "empty-name"])
+    (lambda b: f"object {b}\ntype commit\ntag v1\ntagger {SIM[0]} <{SIM[1]}> {DATE}\n"
+     f"tagger Joe Q <joe@q.example> {DATE}\n\nm\n".encode(),
+     "malformed header: duplicate or misplaced 'tagger' header"),
+    (lambda b: f"object {b}\ntype commit\n".encode() + b"tag v\xff1\n"
+     + f"tagger {SIM[0]} <{SIM[1]}> {DATE}\n\nm\n".encode(),
+     "malformed tag: the tag name is not valid UTF-8"),
+    (lambda b: f"object {b}\ntype commit\ntag v1\ntagger {SIM[0]} <{SIM[1]}> {DATE}\n"
+     f"x-reviewed-by {PERSONAL[1]}\n\nm\n".encode(), "an unknown header matches the private deny-list"),
+], ids=["no-tagger", "tagger-shape", "type-mismatch", "not-utf8", "nul", "empty-name",
+        "second-tagger", "name-not-utf8", "extra-header-email"])
 def test_malformed_tag_object_refuses(forge, make, needle):
     _raw_tag(forge, make(forge.base))
     assert_refused(forge, forge.push("refs/tags/v1"), needle)
 
 
+def _non_sim_inner_tag(forge: Forge) -> str:
+    forge.git("tag", "-a", "inner", "-m", "inner", forge.base,
+              env={"GIT_COMMITTER_NAME": UPSTREAM[0], "GIT_COMMITTER_EMAIL": UPSTREAM[1]})
+    return forge.out("rev-parse", "refs/tags/inner")
+
+
+@pytest.mark.parametrize("target", [
+    _non_sim_inner_tag,
+    lambda f: f.out("rev-parse", f"{f.base}^{{tree}}"),
+], ids=["unrecorded-non-sim-tag", "tree"])
+def test_tag_declaring_commit_over_a_non_commit_refuses(forge, target):
+    """`type commit` is a lie here: following it would stop the peel with nothing to audit."""
+    _raw_tag(forge, f"object {target(forge)}\ntype commit\ntag v1\n"
+                    f"tagger {SIM[0]} <{SIM[1]}> {DATE}\n\nrelease\n".encode())
+    assert_refused(forge, forge.push("refs/tags/v1"),
+                   "malformed tag: the type header does not match the tagged object")
+
+
 # ── a mergetag embeds a tag object: same tagger rule in fork commits ───────────────────────
+def _mergetag_header(git_owner, tag: str) -> bytes:
+    """The `mergetag` header `git merge` writes for `tag` (one leading space per continuation)."""
+    body = git_owner.git("cat-file", "tag", tag).stdout
+    return b"mergetag " + body.rstrip(b"\n").replace(b"\n", b"\n ") + b"\n"
+
+
 def _merge_with_tag(forge: Forge, tag: str) -> str:
     """A sim merge whose `mergetag` header embeds the real tag object `tag`, as `git merge`
-    writes it for a signed tag (one leading space per continuation line)."""
-    body = forge.git("cat-file", "tag", tag).stdout
+    writes it for a signed tag."""
     target = forge.out("rev-parse", f"{tag}^{{commit}}")
     mine = forge.commit("fork work", [forge.base], files={"m.txt": "m\n"})
-    embedded = b"mergetag " + body.rstrip(b"\n").replace(b"\n", b"\n ") + b"\n"
     head = forge.header(mine).replace(b"author ", f"parent {target}\nauthor ".encode(), 1)
-    return forge.raw_commit(head + embedded + b"\nmerge tag\n", "refs/heads/main")
+    return forge.raw_commit(head + _mergetag_header(forge, tag) + b"\nmerge tag\n", "refs/heads/main")
 
 
 def test_mergetag_from_an_unrecorded_upstream_tag_refuses(forge, up):
     tag = up.tag("v1", up.commit("upstream release"))
     published(forge, up)
-    _merge_with_tag(forge, tag)
-    assert_refused(forge, forge.push("main"), f"mergetag {TAG_UNRECORDED}")
+    merge = _merge_with_tag(forge, tag)
+    res = forge.push("main")
+    assert_refused(forge, res, f"mergetag {TAG_UNRECORDED}")
+    said = forge.said(res.stderr)
+    assert merge in said and "the tag object to record is the mergetag of" in said, said
 
 
 def test_mergetag_from_a_recorded_upstream_tag_passes(forge, up):
@@ -402,6 +462,46 @@ def test_mergetag_from_a_recorded_upstream_tag_passes(forge, up):
     published(forge, up, records=[tag_record(tag)])
     merge = _merge_with_tag(forge, tag)
     assert_accepted(forge, forge.push("main"), "refs/heads/main", merge)
+
+
+def test_unrecorded_mergetag_inside_a_verified_upstream_merge_is_only_scanned(forge, up):
+    """Published upstream history keeps its mergetags: no tag record is required for them."""
+    tag = up.tag("v1", up.commit("upstream release"))
+    target = up.tip
+    side = up.commit("upstream side", parent=forge.base)
+    tree = up.out("rev-parse", f"{side}^{{tree}}")
+    merge = up.raw_commit(f"tree {tree}\nparent {side}\nparent {target}\n"
+                          f"author {UPSTREAM[0]} <{UPSTREAM[1]}> {DATE}\n"
+                          f"committer {UPSTREAM[0]} <{UPSTREAM[1]}> {DATE}\n".encode()
+                          + _mergetag_header(up, tag) + b"\nmerge tag v1\n")
+    published(forge, up)
+    forge.git("update-ref", "refs/heads/main", merge)
+    assert_accepted(forge, forge.push("main"), "refs/heads/main", merge)
+
+
+class Sha256Forge(Forge):
+    """The same disposable forge with every repository created in the sha256 object format."""
+
+    def git(self, *args, env=None, **kw):
+        return super().git(*args, env={"GIT_DEFAULT_HASH": "sha256", **(env or {})}, **kw)
+
+
+@pytest.mark.parametrize("recorded", [True, False], ids=["recorded", "unrecorded"])
+def test_mergetag_in_a_sha256_repository(root, recorded):
+    """The embedded tag's object id is recomputed in the repository's own hash."""
+    forge = Sha256Forge(root, policy=bundle())
+    if forge.out("rev-parse", "--show-object-format") != "sha256":
+        pytest.skip("the local git cannot create sha256 repositories")
+    up = Upstream(forge)
+    tag = up.tag("v1", up.commit("upstream release"))
+    assert len(tag) == 64
+    published(forge, up, records=[tag_record(tag)] if recorded else [])
+    merge = _merge_with_tag(forge, tag)
+    res = forge.push("main")
+    if recorded:
+        assert_accepted(forge, res, "refs/heads/main", merge)
+    else:
+        assert_refused(forge, res, f"mergetag {TAG_UNRECORDED}")
 
 
 # ── the v2 bundle: strict schema, exact records ────────────────────────────────────────────
@@ -475,3 +575,47 @@ def test_ssh_source_is_an_approved_authenticated_url(forge, up):
     forge.write_policy(bundle([snapshot(tip, source="git@github.com:NousResearch/hermes-agent.git")]))
     forge.git("update-ref", "refs/heads/main", tip)
     assert_accepted(forge, forge.push("main"), "refs/heads/main", tip)
+
+
+def _local_commits(forge: Forge, n: int) -> list[str]:
+    """`n` distinct local commits (one fast-import process), to pin as snapshot tips."""
+    stream = b"".join(b"commit refs/heads/pins\ncommitter %s <%s> %s\ndata 5\np%04d\n\n"
+                      % (SIM[0].encode(), SIM[1].encode(), DATE.encode(), i) for i in range(n))
+    forge.git("fast-import", "--quiet", input=stream)
+    oids = forge.out("rev-list", "refs/heads/pins").split()
+    assert len(oids) == n
+    return oids
+
+
+def _compact_policy(forge: Forge, policy: dict) -> None:
+    raw = json.dumps(policy, separators=(",", ":")).encode()
+    assert len(raw) < 64 * 1024, "the cap case must not hit the bundle size limit instead"
+    forge.write_policy(None, raw=raw)
+
+
+@pytest.mark.parametrize("count,needle", [
+    (256, None), (257, "'snapshots' must be a list of at most 256 records"),
+], ids=["256-records", "257-records"])
+def test_snapshot_record_cap(forge, count, needle):
+    snaps = [snapshot(oid, ref=f"refs/heads/p{i}", source="git@github.com:NousResearch/hermes-agent",
+                      note="n") for i, oid in enumerate(_local_commits(forge, count))]
+    _compact_policy(forge, bundle(snaps))
+    clean = forge.commit("clean", [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
+    res = forge.push("main")
+    if needle is None:
+        assert_accepted(forge, res, "refs/heads/main", clean)
+    else:
+        assert_refused(forge, res, needle)
+
+
+@pytest.mark.parametrize("count,needle", [
+    (32, None), (33, "snapshots[0] 'tips' must be a list of 1..32 object ids"),
+], ids=["32-tips", "33-tips"])
+def test_snapshot_tips_cap(forge, count, needle):
+    _compact_policy(forge, bundle([snapshot(*_local_commits(forge, count))]))
+    clean = forge.commit("clean", [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
+    res = forge.push("main")
+    if needle is None:
+        assert_accepted(forge, res, "refs/heads/main", clean)
+    else:
+        assert_refused(forge, res, needle)
