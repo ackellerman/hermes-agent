@@ -35,7 +35,8 @@ HOOKS_SRC = Path(__file__).resolve().parents[1] / ".githooks"
 SIM = ("sim", "sim@hermes-agent.nousresearch.com")
 PERSONAL = ("Pat Example", "pat@example.invalid")
 UPSTREAM = ("Upstream Dev", "dev@upstream.example")
-POLICY = {"version": 1, "names": ["Pat Example"], "emails": ["pat@example.invalid"]}
+POLICY = {"version": 2, "names": ["Pat Example"], "emails": ["pat@example.invalid"], "snapshots": [],
+          "tag_records": []}
 DATE = "1700000000 +0000"
 # Built at runtime so this file's own text never matches the public block pattern.
 HOST_PATH = "/" + "mnt" + "/" + "work" + "/projects/x"
@@ -411,11 +412,12 @@ def test_lightweight_tag_on_sim_commit_passes(forge):
     assert_accepted(forge, forge.push("refs/tags/v1"), "refs/tags/v1", oid)
 
 
-def test_annotated_tag_refuses_at_this_checkpoint(forge):
+def test_annotated_sim_tag_on_sim_commit_passes(forge):
     forge.commit("tagged", [forge.base], files={"a.txt": "a\n"}, ref="refs/heads/main")
     forge.git("tag", "-a", "v1", "-m", "release", "main",
               env={"GIT_COMMITTER_NAME": SIM[0], "GIT_COMMITTER_EMAIL": SIM[1]})
-    assert_refused(forge, forge.push("refs/tags/v1"), "is an annotated tag; annotated tags are refused")
+    tag = forge.out("rev-parse", "refs/tags/v1")
+    assert_accepted(forge, forge.push("refs/tags/v1"), "refs/tags/v1", tag)
 
 
 def test_non_commit_object_refuses(forge):
@@ -588,13 +590,13 @@ POLICY_BREAKAGE = {
     "world-writable dir": (lambda f: (f.common / "identity-policy").chmod(0o707),
                            "identity-policy is group- or world-writable"),
     "duplicate keys": (lambda f: f.write_policy(None, raw=(
-        b'{"version": 1, "names": ["Pat Example"], "emails": ["pat@example.invalid"], '
+        b'{"version": 2, "names": ["Pat Example"], "emails": ["pat@example.invalid"], '
         b'"emails": ["other@example.invalid"]}')), "has a duplicate JSON key"),
-    "unknown key": (lambda f: f.write_policy({**POLICY, "snapshots": []}),
-                    "has unknown key(s) ['snapshots']"),
-    "other version": (lambda f: f.write_policy({**POLICY, "version": 2}), "version is not 1"),
-    "bool version": (lambda f: f.write_policy({**POLICY, "version": True}), "version is not 1"),
-    "no names": (lambda f: f.write_policy({"version": 1, "emails": POLICY["emails"]}),
+    "unknown key": (lambda f: f.write_policy({**POLICY, "pick_records": []}),
+                    "has unknown key(s) ['pick_records']"),
+    "other version": (lambda f: f.write_policy({**POLICY, "version": 1}), "version is not 2"),
+    "bool version": (lambda f: f.write_policy({**POLICY, "version": True}), "version is not 2"),
+    "no names": (lambda f: f.write_policy({k: v for k, v in POLICY.items() if k != "names"}),
                  "lacks key(s) ['names']"),
     "empty emails": (lambda f: f.write_policy({**POLICY, "emails": []}),
                      "'emails' must be a list of 1..32 entries"),
@@ -602,9 +604,9 @@ POLICY_BREAKAGE = {
                          "names[0] is not a full name"),
     "bad email": (lambda f: f.write_policy({**POLICY, "emails": ["not-an-email"]}),
                   "emails[0] is not an email"),
-    "invalid json": (lambda f: f.write_policy(None, raw=b'{"version": 1, '),
+    "invalid json": (lambda f: f.write_policy(None, raw=b'{"version": 2, '),
                      "is not valid UTF-8 JSON"),
-    "not utf-8": (lambda f: f.write_policy(None, raw=b'{"version": 1, "names": ["\xff"]}'),
+    "not utf-8": (lambda f: f.write_policy(None, raw=b'{"version": 2, "names": ["\xff"]}'),
                   "is not valid UTF-8 JSON"),
 }
 
