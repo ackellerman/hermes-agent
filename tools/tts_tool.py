@@ -205,22 +205,19 @@ def _run_edge_tts(text: str, file_str: str, tts_config: dict[str, Any]) -> None:
     here would repeat its side effects (partial file write, a second network synthesis).
     """
     run = lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config))
+    from concurrent.futures import ThreadPoolExecutor
+
+    pool = ThreadPoolExecutor(max_workers=1)  # starts no thread until submit()
     try:
-        from concurrent.futures import ThreadPoolExecutor
-        pool = ThreadPoolExecutor(max_workers=1)
-    except RuntimeError:  # "can't start new thread": no worker available, so run inline
-        run()
-        return
-    try:
-        # A pool thread starts with an empty context: carry the caller's profile home/secret scope.
-        future = pool.submit(contextvars.copy_context().run, run)
-    except RuntimeError:  # the pool refused the work: fall back to running inline
-        pool.shutdown(wait=True)
-        run()
-        return
-    try:
+        try:
+            # A pool thread starts with an empty context: carry the caller's profile home/secret scope.
+            future = pool.submit(contextvars.copy_context().run, run)
+        except RuntimeError:  # "can't start new thread": no worker available, so run inline
+            run()
+            return
         # 60s bounds only *this* wait, not the synthesis: it does not cancel the worker, and the
-        # shutdown below waits for the worker, so the caller blocks for the real duration regardless.
+        # shutdown below waits for the worker, so the caller blocks for the real duration regardless
+        # (a worker that hangs forever hangs the caller forever, timeout or not).
         future.result(timeout=60)
     finally:
         pool.shutdown(wait=True)
