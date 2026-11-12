@@ -1345,8 +1345,7 @@ DEFAULT_CONFIG = {
         # and every compaction is a chance to lose detail, so the default stays off. A token count >= 16000 enables it;
         # other values (true, "200k") are config errors: warned and ignored.
         "compression_threshold_tokens": 0,
-        # When delegate_task narrows child toolsets, keep the parent's enabled MCP toolsets (so
-        # toolsets=["web"] doesn't strip MCP). false = strict intersection.
+        # Narrowed child toolsets keep the parent's MCP toolsets (toolsets=["web"] keeps MCP); false = strict
         "inherit_mcp_toolsets": True,
         # Per-subagent iteration cap (own budget, independent of the parent's).
         "max_iterations": 250,
@@ -1383,13 +1382,7 @@ DEFAULT_CONFIG = {
         # Kept children (tools/delegate_children.py): model-spawned children of these parent session sources (null
         # = DEFAULT_KEEP_SOURCES; never /review, plugin, cron, one-shot); idle expiry, orphan rule, prune protection.
         "keep_sources": None, "keep_idle_days": 7, "orphan_after_s": 300, "keep_protects_transcripts": True,
-        # A child stopped by a restart, a crash or a provider failure (not by you) keeps a durable record:
-        # delegate_task(action="continue") resumes it on its own conversation and worktree, and that worktree is
-        # kept from the startup sweep. Hours a record lasts, and how many per profile keep their worktree pinned.
-        "resumable_ttl_hours": 48,
-        "max_resumable": 32,
-        # Resume such children automatically (at a limit's reset time, after a restart). Off: you continue them.
-        "auto_resume": False,
+        "resumable_ttl_hours": 48, "max_resumable": 32, "auto_resume": False,  # stopped-child records; auto: opt-in
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
     # every API call for few-shot priming. Never saved to sessions/logs/trajectories.

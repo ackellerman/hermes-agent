@@ -4,21 +4,38 @@
   "parameters": {
     "properties": {
       "action": {
-        "description": "Default 'spawn'. Live control of running children: 'list' = ids/goals/status/transcripts; 'steer' = queue course-correction text into one child (subagent_id + message) without stopping it; 'stop' = end one child early (subagent_id; partial result still returns). Control actions return immediately; goal/tasks are ignored unless spawning.",
+        "description": "Default 'spawn'. Live control of running children and the kept children this session holds: 'list' = ids/goals/status/transcripts (add scope='profile' for the whole profile's kept children, query=<text> to search); 'steer' = queue course-correction text into one child (subagent_id or child_id + message) without stopping it; 'stop' = end one child early (subagent_id or child_id; partial result still returns); 'continue' = give a FINISHED child a follow-up: it resumes its own conversation and returns like a spawn. Control actions return immediately; goal/tasks are ignored unless spawning.",
         "enum": [
           "spawn",
           "list",
           "steer",
-          "stop"
+          "stop",
+          "continue"
         ],
         "type": "string"
       },
+      "child_id": {
+        "description": "Kept-child key, also a target for action='steer'/'stop': the child_id a kept child's dispatch handle or completion result carries. Stable across the child's own compression; preferred over subagent_id.",
+        "type": "string"
+      },
       "message": {
-        "description": "For action='steer': the course correction, appended to the child's next tool result mid-run. Be directive and specific.",
+        "description": "For action='steer': the course correction, appended to the child's next tool result mid-run. Be directive and specific. For 'continue': the child's next instruction.",
+        "type": "string"
+      },
+      "query": {
+        "description": "For action='list': case-insensitive substring filter over a child's goal, child_id, subagent_id and title, in either scope. Leave it out to list everything the session holds.",
+        "type": "string"
+      },
+      "scope": {
+        "description": "For action='list': 'session' (default) = the live and kept children this session holds; 'profile' = also the same profile's other kept children, each labelled with the holder session that owns it and read_only when it is not yours.",
+        "enum": [
+          "session",
+          "profile"
+        ],
         "type": "string"
       },
       "subagent_id": {
-        "description": "Target for action='steer'/'stop' (ids from the spawn response or action='list').",
+        "description": "Target for action='steer'/'stop', required for 'continue' (ids from the spawn response or action='list').",
         "type": "string"
       },
       "tasks": {
