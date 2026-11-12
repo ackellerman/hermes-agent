@@ -1383,6 +1383,13 @@ DEFAULT_CONFIG = {
         # Kept children (tools/delegate_children.py): model-spawned children of these parent session sources (null
         # = DEFAULT_KEEP_SOURCES; never /review, plugin, cron, one-shot); idle expiry, orphan rule, prune protection.
         "keep_sources": None, "keep_idle_days": 7, "orphan_after_s": 300, "keep_protects_transcripts": True,
+        # A child stopped by a restart, a crash or a provider failure (not by you) keeps a durable record:
+        # delegate_task(action="continue") resumes it on its own conversation and worktree, and that worktree is
+        # kept from the startup sweep. Hours a record lasts, and how many per profile keep their worktree pinned.
+        "resumable_ttl_hours": 48,
+        "max_resumable": 32,
+        # Resume such children automatically (at a limit's reset time, after a restart). Off: you continue them.
+        "auto_resume": False,
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
     # every API call for few-shot priming. Never saved to sessions/logs/trajectories.
