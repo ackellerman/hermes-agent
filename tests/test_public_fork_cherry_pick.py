@@ -93,22 +93,34 @@ def cherry_pick(forge: Forge, onto: str, source: str, committer=SIM) -> str:
     return oid
 
 
-def variant(forge: Forge, oid: str, old: bytes, new: bytes) -> str:
-    """Another commit object: the raw bytes of `oid` with one edit."""
+def variant(forge: Forge, oid: str, old: bytes, new: bytes, literally: bool = False) -> str:
+    """Another commit object: the raw bytes of `oid` with one edit. `literally` skips git's
+    own object checks (for a header git would refuse to write)."""
     raw = forge.git("cat-file", "commit", oid).stdout
     assert old in raw, (old, raw)
-    return forge.out("hash-object", "-t", "commit", "-w", "--stdin", input=raw.replace(old, new, 1))
+    extra = ["--literally"] if literally else []
+    return forge.out("hash-object", "-t", "commit", "-w", *extra, "--stdin",
+                     input=raw.replace(old, new, 1))
+
+
+def author_line(author) -> bytes:
+    return f"author {author[0]} <{author[1]}>".encode()
+
+
+def push_to(forge: Forge, oid: str, name: str):
+    """Push `oid` to a new branch, so that each push is a real update and the hook sees it."""
+    return forge.push(f"{oid}:refs/heads/{name}")
 
 
 class Scene:
     """The fork has one sim commit on the base; upstream has one fix by its own author; the
     candidate is the fix cherry-picked onto the fork commit by sim."""
 
-    def __init__(self, forge: Forge, up: Upstream, upstream_author=UPSTREAM):
+    def __init__(self, forge: Forge, up: Upstream, upstream_author=UPSTREAM, upstream_committer=None):
         self.forge, self.up = forge, up
         self.source = publish_upstream(forge, up, commit_on(
             forge, forge.base, {"up.txt": "upstream fix\n"}, "upstream fix\n",
-            author=upstream_author, committer=upstream_author))
+            author=upstream_author, committer=upstream_committer or upstream_author))
         self.fork = commit_on(forge, forge.base, {"a.txt": "fork work\n"}, "fork work\n")
         self.candidate = cherry_pick(forge, self.fork, self.source)
 
@@ -181,6 +193,23 @@ def test_forged_cherry_pick_trailer_refuses(scene):
     assert forged in said and TRAILER_HINT in said, said
 
 
+def test_cherry_pick_hint_lines_are_capped(scene):
+    """25 forged-trailer commits: one hint line each would be 25 lines; at most 20 print, then
+    a count of the rest. The push still refuses and the remote does not move."""
+    tip = scene.fork
+    for n in range(25):
+        tip = commit_on(scene.forge, tip, {f"f{n}.txt": f"{n}\n"},
+                        f"fix {n}\n\n(cherry picked from commit {scene.source})\n", author=UPSTREAM)
+    scene.policy(picks=[])
+    res = scene.push(tip)
+    assert_refused(scene.forge, res, NOT_VERIFIED)
+    lines = scene.forge.said(res.stderr).splitlines()
+    hints = [ln for ln in lines if ln.startswith("  Cherry-pick review:")]
+    assert len(hints) == 20, hints
+    assert [ln for ln in lines if "and 5 more cherry-pick review lines" in ln], lines
+    assert "(25)" in scene.forge.said(res.stderr)
+
+
 @pytest.mark.parametrize("edit", ["message", "tree", "committer-date"])
 def test_changed_candidate_refuses(scene, edit):
     """An amended pick is another object; the record of the reviewed one does not carry over.
@@ -223,10 +252,78 @@ def test_pick_of_a_changed_upstream_source_refuses(scene):
 
 
 def test_removing_the_pick_record_revokes_approval(scene):
+    """The same candidate: approved through the hook, refused once the record is gone (each
+    push is a real update to a new branch), approved again when the record is back. Nothing
+    is remembered between invocations."""
+    forge, cand = scene.forge, scene.candidate
     scene.policy()
-    scene.forge.git("push", "-q", "--no-verify", "origin", f"{scene.candidate}:refs/heads/probe")
+    assert_accepted(forge, push_to(forge, cand, "first"), "refs/heads/first", cand)
     scene.policy(picks=[])
-    assert_refused(scene.forge, scene.push(scene.candidate), NOT_VERIFIED)
+    assert_refused(forge, push_to(forge, cand, "second"), NOT_VERIFIED)
+    assert "refs/heads/second" not in forge.remote_refs()
+    scene.policy()
+    assert_accepted(forge, push_to(forge, cand, "third"), "refs/heads/third", cand)
+
+
+# ── the author rule: exactly the recorded upstream commit's author header ─────────────────
+def test_pick_author_is_the_upstream_author_not_its_committer(forge, up):
+    """A GitHub merge commit: upstream author != upstream committer. A candidate with the
+    upstream author passes; one carrying the upstream committer as author refuses."""
+    scene = Scene(forge, up, upstream_author=UPSTREAM, upstream_committer=OTHER)
+    wrong = variant(forge, scene.candidate, author_line(UPSTREAM), author_line(OTHER))
+    scene.policy(picks=[pick_record(scene.candidate, scene.source),
+                        pick_record(wrong, scene.source)])
+    assert_accepted(forge, push_to(forge, scene.candidate, "right"), "refs/heads/right",
+                    scene.candidate)
+    res = push_to(forge, wrong, "wrong")
+    assert_refused(forge, res, PICK_AUTHOR)
+    assert wrong in forge.said(res.stderr)
+
+
+def test_each_pick_is_checked_against_its_own_records_upstream_author(forge):
+    """Two records, two upstream authors: the right pairs pass, a crossed pair refuses."""
+    sources = {name: commit_on(forge, forge.base, {f"{name}.txt": f"{name}\n"}, f"fix {name}\n",
+                               author=who, committer=who)
+               for name, who in (("a", UPSTREAM), ("b", OTHER))}
+    picks = {name: cherry_pick(forge, commit_on(forge, forge.base, {"f.txt": f"{name}\n"}, "fork\n"),
+                               src) for name, src in sources.items()}
+    forge.write_policy(bundle(pick_records=[pick_record(picks[n], sources[n]) for n in sources]))
+    for name in sources:
+        assert_accepted(forge, push_to(forge, picks[name], f"ok-{name}"), f"refs/heads/ok-{name}",
+                        picks[name])
+    forge.write_policy(bundle(pick_records=[pick_record(picks["a"], sources["b"])]))
+    res = push_to(forge, picks["a"], "crossed")
+    assert_refused(forge, res, PICK_AUTHOR)
+    assert picks["a"] in forge.said(res.stderr)
+
+
+@pytest.mark.parametrize("old,new", [
+    (b"author Upstream Dev <", b"author upstream dev <"),
+    (b"author Upstream Dev <", b"author  Upstream Dev <"),
+    (b"author Upstream Dev <", b"author Upstream Dev  <"),
+    (b"<dev@upstream.example>", b"<Dev@Upstream.Example>"),
+    (b"<dev@upstream.example>", b"<dev@upstream.example >"),
+], ids=["name-case", "leading-space", "trailing-space", "email-case", "email-trailing-space"])
+def test_pick_author_must_match_byte_for_byte(scene, old, new):
+    """Not case-folded and not whitespace-normalised. Built with hash-object: commit-tree
+    would trim the name."""
+    lookalike = variant(scene.forge, scene.candidate, old, new)
+    assert lookalike != scene.candidate
+    scene.policy(picks=[pick_record(lookalike, scene.source)])
+    assert_refused(scene.forge, push_to(scene.forge, lookalike, "x"), PICK_AUTHOR)
+
+
+def test_upstream_commit_without_a_usable_author_leaves_no_author_unchecked(scene):
+    """The recorded upstream commit's author header is malformed: there is nothing to equal,
+    so a candidate with any non-sim author refuses."""
+    broken = variant(scene.forge, scene.source, author_line(UPSTREAM),
+                     b"author Upstream Dev dev@upstream.example", literally=True)
+    candidate = commit_on(scene.forge, scene.fork, {"up.txt": "upstream fix\n"}, "upstream fix\n",
+                          author=UPSTREAM)
+    scene.policy(picks=[pick_record(candidate, broken)])
+    res = push_to(scene.forge, candidate, "x")
+    assert_refused(scene.forge, res, PICK_AUTHOR)
+    assert candidate in scene.forge.said(res.stderr)
 
 
 def test_recorded_pick_committed_by_someone_else_refuses(scene):
