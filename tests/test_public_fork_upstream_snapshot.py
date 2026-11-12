@@ -221,6 +221,23 @@ def test_verified_upstream_non_utf8_author_name_refuses(forge, up):
     assert_refused(forge, forge.push("main"), "author header is not valid UTF-8")
 
 
+def test_verified_upstream_commit_with_an_empty_email_passes(forge, up):
+    """Canonical upstream history has `Name <> time tz` identities, which git itself accepts."""
+    tree = up.out("rev-parse", f"{up.tip}^{{tree}}")
+    tip = up.raw_commit(f"tree {tree}\nparent {up.tip}\nauthor Upstream Dev <> {DATE}\n"
+                        f"committer Upstream Bot <> {DATE}\n\nwork\n".encode())
+    published(forge, up)
+    forge.git("update-ref", "refs/heads/main", tip)
+    assert_accepted(forge, forge.push("main"), "refs/heads/main", tip)
+
+
+def test_fork_commit_with_an_empty_email_refuses(forge):
+    tree = forge.out("rev-parse", f"{forge.base}^{{tree}}")
+    forge.raw_commit(f"tree {tree}\nparent {forge.base}\nauthor {SIM[0]} <> {DATE}\n"
+                     f"committer {SIM[0]} <{SIM[1]}> {DATE}\n\nwork\n".encode(), "refs/heads/main")
+    assert_refused(forge, forge.push("main"), NOT_VERIFIED)
+
+
 def test_personal_fork_commit_still_gets_the_rewrite_remedy(forge, up):
     up.commit("upstream one")
     published(forge, up)
