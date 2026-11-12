@@ -94,7 +94,8 @@ PREFIX = "pre-push identity:"
 
 GIT_ENV = dict(os.environ, GIT_NO_LAZY_FETCH="1", GIT_NO_REPLACE_OBJECTS="1",
                GIT_TERMINAL_PROMPT="0", GIT_PAGER="cat", LC_ALL="C")
-IDENT_RE = re.compile(rb"(author|committer|tagger) ([^<>\n]+) <([^<>\n]+)> ([0-9]+) ([+-][0-9]{4})")
+# The email may be empty (`Name <> ...`), as git itself allows: canonical upstream history has it.
+IDENT_RE = re.compile(rb"(author|committer|tagger) ([^<>\n]+) <([^<>\n]*)> ([0-9]+) ([+-][0-9]{4})")
 EMAIL_SHAPE = re.compile(r"[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+")
 UTF8_NAMES = {b"utf-8", b"utf8"}
 KNOWN_HEADERS = {b"tree", b"parent", b"author", b"committer", b"encoding", b"mergetag", b"gpgsig",
