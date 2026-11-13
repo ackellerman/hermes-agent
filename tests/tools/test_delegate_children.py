@@ -729,7 +729,9 @@ def test_orphan_replayed_unknown_completion_carries_the_kept_line(tmp_path, monk
         event = json.loads(conn.execute("SELECT event_json FROM async_delegations").fetchone()[0])
         conn.close()
         assert event["status"] == "unknown"
-        assert event["error"].endswith(dc.ORPHANED_LINE)
+        assert event["error"].endswith(dc.orphaned_line(["sa-0-rep"]))
+        # The line names the id its own instruction takes: nothing else in a recovered notice lists a kept child.
+        assert "subagent_id='sa-0-rep'" in event["error"] and "subagent_id=..." not in event["error"]
         assert dc.ChildStore(tmp_path / "state.db").get("kid-r")["idle_reason"] == "orphaned"
     finally:
         handle.close()
@@ -1190,7 +1192,7 @@ def test_orphan_replay_keyed_on_the_unit_id_without_a_live_delegation_id(tmp_pat
         conn = sqlite3.connect(tmp_path / "state.db")
         event = json.loads(conn.execute("SELECT event_json FROM async_delegations").fetchone()[0])
         conn.close()
-        assert event["error"].endswith(dc.ORPHANED_LINE)
+        assert event["error"].endswith(dc.orphaned_line(["sa-0-unit"]))
     finally:
         handle.close()
 
