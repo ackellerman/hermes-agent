@@ -1203,9 +1203,10 @@ class GatewaySlashCommandsMixin(
             return session_key, t(stale_key)
         return session_key, t(none_key)
 
-    async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
+    async def _handle_approve_command(self, event: MessageEvent, request_id: Optional[str] = None) -> Optional[str]:
         """Handle /approve — unblock waiting agent thread(s). They block inside tools/approval.py;
-        signalling the event resumes them so the command executes inline (same flow as the CLI)."""
+        signalling the event resumes them so the command executes inline (same flow as the CLI).
+        ``request_id`` (the bare-word route) answers that one request instead of the oldest."""
         from tools.approval import resolve_gateway_approval
         session_key, stale = self._blocking_approval_or_stale(event, "gateway.approval_expired",
                                                               "gateway.approve.no_pending")
@@ -1215,14 +1216,14 @@ class GatewaySlashCommandsMixin(
         args = event.get_command_args().strip().lower().split()
         choices = {_APPROVE_CHOICE_BY_ARG[a] for a in args if a in _APPROVE_CHOICE_BY_ARG}
         choice = "always" if "always" in choices else "session" if "session" in choices else "once"
-        count = resolve_gateway_approval(session_key, choice, resolve_all="all" in args)
+        count = resolve_gateway_approval(session_key, choice, resolve_all="all" in args, request_id=request_id)
         if not count:
             return t("gateway.approve.no_pending")
         confirmation_text = t(f"gateway.approve.{choice}_{'plural' if count > 1 else 'singular'}", count=count)
         logger.info("User approved %d dangerous command(s) via /approve (%s)", count, choice)
         return await self._deliver_approval_confirmation(event, confirmation_text, "approve")
 
-    async def _handle_deny_command(self, event: MessageEvent) -> str:
+    async def _handle_deny_command(self, event: MessageEvent, request_id: Optional[str] = None) -> str:
         """Handle /deny — reject pending dangerous command(s) with a definitive BLOCKED result, as in
         the CLI. ``/deny`` denies the oldest; ``/deny all`` denies everything.
 
@@ -1240,7 +1241,8 @@ class GatewaySlashCommandsMixin(
         tokens = raw_args.split()
         resolve_all = bool(tokens) and tokens[0].lower() == "all"
         reason = (raw_args[len(tokens[0]):].strip() if resolve_all else raw_args)[:280].strip()
-        count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all, reason=reason or None)
+        count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all, reason=reason or None,
+                                         request_id=request_id)
         if not count:
             return t("gateway.deny.no_pending")
         logger.info("User denied %d dangerous command(s) via /deny%s", count,

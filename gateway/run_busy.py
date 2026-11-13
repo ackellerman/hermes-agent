@@ -663,9 +663,9 @@ class GatewayBusySessionMixin:
         """
         # A bare "yes" while blocked on a dangerous-command approval must reach the approval handler,
         # not queue behind a turn that can't start until it resolves (auto-deny deadlock). Gated on
-        # has_blocking_approval so a conversational "yes" never fires a command.
+        # the turn's own blocking approval so a conversational "yes" never fires a command.
         try:
-            from tools.approval import has_blocking_approval
+            from tools.approval import turn_approval_request_id
             # --- Approval response routing (#46866) --- When the agent is blocked waiting for a
             # dangerous-command approval, plain-text responses like "yes" or "approve" must be routed to the
             # approval handler instead of being steered/queued/interrupted. Slash forms (/approve, /deny)
@@ -678,7 +678,11 @@ class GatewayBusySessionMixin:
             # they resolve the waiting thread, resume typing, AND return a localized confirmation string.
             # The busy-handler path does not auto-send that return, so we deliver it ourselves (mirroring
             # the draining-case send above).
-            if event.allow_gateway_control and has_blocking_approval(session_key):
+            # A bare word answers only the request the running turn is itself blocked on. A background
+            # child's request stays open across later turns, where "yes" answers the agent's question,
+            # not the child's card: that one takes the button or an explicit /approve or /deny.
+            _request_id = turn_approval_request_id(session_key) if event.allow_gateway_control else None
+            if _request_id:
                 _raw_text = (event.text or "").strip().lower()
                 _match = self._plaintext_approval_words().get(_raw_text)
                 if _match is not None:
@@ -690,7 +694,7 @@ class GatewayBusySessionMixin:
                     # event.get_command_args(). Always a literal "/": is_command()/get_command_args()
                     # don't recognize per-platform display prefixes ("!" on Slack/Matrix).
                     event.text = f"/{_verb} {_normalized_args}".rstrip()
-                    _reply = await _approval_handler(event)
+                    _reply = await _approval_handler(event, request_id=_request_id)
                     logger.info(
                         "Approval response via plain text: session=%s verb=%s args=%r",
                         session_key, _verb, _normalized_args,

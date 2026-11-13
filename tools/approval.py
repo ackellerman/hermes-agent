@@ -218,6 +218,15 @@ def list_gateway_approvals(session_key: str) -> list[dict]:
         return [dict(entry.data) for entry in _gateway_queues.get(session_key, [])]
 
 
+def turn_approval_request_id(session_key: str) -> Optional[str]:
+    """Request id of the oldest pending approval the session's running turn is itself blocked on,
+    else None. A background child's request carries the child's notify lease as ``owner`` and can
+    outlive the turn that dispatched it, so it is never the turn's own."""
+    with _lock:
+        return next((entry.data.get("request_id") for entry in _gateway_queues.get(session_key, [])
+                     if entry.owner is None), None)
+
+
 def register_gateway_settle(session_key: str, request_id: str, settle) -> bool:
     """Attach ``settle(reason)`` to one pending approval; it runs once when that wait ends by any path.
     False when the request is no longer pending (the surface should withdraw its prompt itself)."""
