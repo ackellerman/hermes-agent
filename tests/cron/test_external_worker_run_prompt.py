@@ -107,3 +107,31 @@ def test_scheduled_fire_hands_the_worker_no_run_context(tmp_path, monkeypatch):
 
     assert "Do the work." in prompt
     assert "## Run Context" not in prompt
+
+
+
+
+def test_the_carried_prompt_is_on_neither_the_callers_job_nor_the_job_the_worker_runs(tmp_path, monkeypatch):
+    from cron import scheduler
+
+    job = {"id": "job-1", "execution_id": "exec-1", "name": "nightly", "prompt": "Do the work."}
+    before = dict(job)
+    payload_file = _hand_off_through_fake_worker_spawn(scheduler, monkeypatch, tmp_path, job, RUN_PROMPT)
+    assert job == before, "the per-run prompt was written onto the caller's job"
+
+    ran = {}
+    monkeypatch.setattr(
+        "cron.executions.adopt_claimed_execution",
+        lambda execution_id: {"id": execution_id, "status": "running"})
+    monkeypatch.setattr(scheduler, "run_one_job", lambda job, **kwargs: ran.update(job=dict(job), **kwargs) or True)
+    assert scheduler._run_external_worker_payload(payload_file, tmp_path / "worker.ready") is True
+    assert ran["extra_prompt"] == RUN_PROMPT
+    assert ran["job"] == before, "the job the worker runs still carries the per-run prompt"
+
+
+def test_a_scheduled_fire_hands_off_exactly_the_stored_job(tmp_path, monkeypatch):
+    from cron import scheduler
+
+    job = {"id": "job-1", "execution_id": "exec-1", "name": "nightly", "prompt": "Do the work."}
+    payload_file = _hand_off_through_fake_worker_spawn(scheduler, monkeypatch, tmp_path, dict(job), None)
+    assert json.loads(payload_file.read_text(encoding="utf-8"))["job"] == job
