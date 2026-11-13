@@ -987,7 +987,8 @@ class _ChildRun:
         # Resolved after seed_workspace so a multimodal goal's text part carries the worktree note too.
         _images = list(getattr(child, "_delegate_images", None) or [])
         # action='continue': the child's saved transcript, so ``self.goal`` (the follow-up) is its next turn,
-        # sent bare.
+        # sent bare. Building the brief still registers its context prefix: the saved first turn starts with
+        # it, so the rebuilt child keeps the cache breakpoint its first run wrote.
         _history = getattr(child, "_delegate_continue_history", None)
         resume = {"conversation_history": _history} if isinstance(_history, list) else {}
         from tools.delegate_tool_progress import child_task_message
