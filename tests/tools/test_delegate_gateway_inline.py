@@ -19,8 +19,6 @@ import pytest
 from gateway.session_context import set_session_vars
 from tools.process_registry import process_registry
 
-LIVE_CONTROL = {"action", "subagent_id", "message"}
-
 
 @pytest.fixture(autouse=True)
 def _clean_queue_and_context(monkeypatch):
@@ -52,7 +50,7 @@ def _delegate(agent) -> dict:
 
 def test_the_build_scope_picks_the_schema_and_the_agent_keeps_it():
     import model_tools
-    from tools.delegate_tool import oneshot_delegate_function
+    from tools.delegate_tool_joined import joined_delegate_function
     from tools.mcp_tool_agent import refresh_agent_mcp_tools
 
     background = _built(inline=False)
@@ -62,14 +60,15 @@ def test_the_build_scope_picks_the_schema_and_the_agent_keeps_it():
     assert _delegate(background) == registry  # byte-identical to main
 
     inline = _built(inline=True)
-    assert _delegate(inline) == oneshot_delegate_function(registry)
+    assert _delegate(inline) == joined_delegate_function(registry)
     assert "END YOUR TURN" not in _delegate(inline)["description"]
-    assert not LIVE_CONTROL & set(_delegate(inline)["parameters"]["properties"])
+    # No control that needs a running child; a finished one can still be continued (see the _continue module).
+    assert _delegate(inline)["parameters"]["properties"]["action"]["enum"] == ["spawn", "continue"]
     assert "clarify" in {t["function"]["name"] for t in inline.tools}  # nothing else of the one-shot footprint
 
     # A later rebuild outside any gateway scope (explicit reload, compaction) keeps the session's variant.
     refresh_agent_mcp_tools(inline, quiet_mode=True, content_aware=True)
-    assert _delegate(inline) == oneshot_delegate_function(registry)
+    assert _delegate(inline) == joined_delegate_function(registry)
 
 
 def test_a_session_keeps_its_mode_until_a_new_session():

@@ -169,7 +169,9 @@ async def test_interim_off_joins_the_children_and_the_chat_gets_one_completed_an
     delegate = _delegate_def(requests[0])
     assert END_TURN not in delegate["description"] and "BETWEEN your turns" not in delegate["description"]
     assert "results return in this tool call" in delegate["description"]
-    assert not {"action", "subagent_id", "message"} & set(delegate["parameters"]["properties"])
+    # Nothing that needs a running child; continuing a finished one stays offered.
+    assert delegate["parameters"]["properties"]["action"]["enum"] == ["spawn", "continue"]
+    assert not {"child_id", "scope", "query"} & set(delegate["parameters"]["properties"])
     tool_result = requests[-1]["messages"][-1]
     assert tool_result["role"] == "tool" and FINDING in tool_result["content"]
     assert END_TURN not in tool_result["content"] and '"dispatched"' not in tool_result["content"]

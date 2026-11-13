@@ -668,8 +668,11 @@ delegation:
 - **`background`** (alias `async`): every gateway session keeps background delegation.
 
 An inline session's `delegate_task` says results return in the call and leaves out the
-live-control parameters (`action` list/steer/stop, `subagent_id`, `message`), the same
-schema as a one-shot run. While it waits, the typing indicator stays on and the turn
+controls that need a running child (`action` list/steer/stop, `child_id`, `scope`, `query`).
+It keeps `action: continue` with `subagent_id` and `message`: a child that finished in an
+earlier call can be given a follow-up, whose result also returns in the call. A session
+started by a message from a known bot gets no interim messages, so under `auto` it is an
+inline session too. While it waits, the typing indicator stays on and the turn
 behaves like any long tool call. `/stop` stops the children, and so does a follow-up
 message under the default `busy_input_mode: interrupt` (each child returns an interrupted
 result with its partial output); under `queue` the follow-up waits for the turn.
