@@ -605,6 +605,8 @@ def _settings_of(home: Path) -> tuple[float, int]:
     # Fork carry: upstream binds ``agent.runtime_scope.bind_profile_scope(home, hydrate_secrets=False)``; that
     # module (upstream 151dc5fc3e4) is not carried. Reading the ``delegation`` section needs the home only.
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    if not Path(home).is_dir():  # a profile removed since its store was listed: the override would recreate it
+        return _DEFAULT_TTL_HOURS, _DEFAULT_MAX_RESUMABLE
     try:
         token = set_hermes_home_override(str(home))
         try:
