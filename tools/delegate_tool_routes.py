@@ -43,12 +43,17 @@ class TaskRoute:
     # The task's provider-declared parameters this route came from (no secrets): what a continue after a restart
     # re-routes with. None for an internal caller's explicit route (``route_for_config``), which cannot be rebuilt.
     request: Optional[dict[str, Any]] = None
+    # The profile's own model when its rate limit started the child on a fallback entry instead (None otherwise).
+    fallback_from: Optional[str] = None
 
     def report(self) -> Optional[dict[str, Any]]:
-        """The ``route`` a backend-routed task's result carries (None for the default backend's unlabelled route)."""
-        if self.backend == "default" and not self.label:
+        """The ``route`` a backend-routed task's result carries (None for the default backend's unlabelled route).
+        A child started on a fallback entry says so: the caller asked for the profile, not for that model."""
+        if self.backend == "default" and not self.label and not self.fallback_from:
             return None
-        return {"backend": self.backend, **({"label": self.label} if self.label else {})}
+        started_on_fallback = {"fallback_activated": True, "fallback_from": self.fallback_from}
+        return {"backend": self.backend, **({"label": self.label} if self.label else {}),
+                **(started_on_fallback if self.fallback_from else {})}
 
     def refused_entry(self, index: int) -> dict[str, Any]:
         """Result entry for a task this route refused: no child was built for it."""
@@ -277,7 +282,8 @@ def _profile_route(home: Path, config: Optional[Mapping[str, Any]] = None, paren
         command=rt.get("command"), args=list(rt.get("args") or []),
     )
     return TaskRoute(creds, {"fallback_providers": fallback if isinstance(fallback, list) else []},
-                     ResolvedReasoning(resolve_reasoning_config(cfg, model or "")), home)
+                     ResolvedReasoning(resolve_reasoning_config(cfg, model or "")), home,
+                     fallback_from=None if entry is None else str(request["target_model"] or "the profile's model"))
 
 
 def _with_inherited_fallback(route: dict[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
