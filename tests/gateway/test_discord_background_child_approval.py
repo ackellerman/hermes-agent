@@ -249,6 +249,57 @@ def test_session_started_by_another_bot_gets_the_card_and_a_member_answers(disco
     assert child.ran == [COMMAND]
 
 
+def _press(bot: _Discord, card: dict, *, user_id: int, is_bot: bool = False) -> SimpleNamespace:
+    """A press of the card's Allow Once button by ``user_id``, through the view's own gate."""
+    interaction = SimpleNamespace(
+        message=bot.channels[int(THREAD)].messages[0], channel_id=int(THREAD), channel=None, guild=SimpleNamespace(id=1),
+        user=SimpleNamespace(display_name=f"user-{user_id}", id=user_id, bot=is_bot),
+        response=SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock()))
+
+    async def press():
+        await card["view"]._resolve(interaction, "once", 2, "platform.discord.approval.resolved_once")
+
+    bot.call(press())
+    return interaction
+
+
+def _child_card_with_an_allowlist(bot: _Discord) -> tuple[str, _Child, dict]:
+    """The child's card, sent by an adapter whose user allowlist names member 43 only."""
+    bot.adapter._allowed_user_ids = {"43"}
+    child = _Child()
+    key = _parent_dispatches_child_then_ends(bot.turn(bot.source("thread")), child)
+    child.ask.set()
+    card = _card_reached(bot, key, "thread")
+    assert card["view"].allowed_user_ids == {"43"}, "the card carries the adapter's allowlist"
+    return key, child, card
+
+
+def test_button_press_by_an_allow_listed_user_resolves_the_childs_request(discord):
+    key, child, card = _child_card_with_an_allowlist(discord)
+    interaction = _press(discord, card, user_id=43)
+    assert child.done.wait(5)
+    assert child.decisions[0]["approved"] is True and child.ran == [COMMAND]
+    interaction.response.send_message.assert_not_awaited()
+    interaction.response.edit_message.assert_awaited_once()
+    assert not approval.has_blocking_approval(key)
+
+
+@pytest.mark.parametrize("user_id,is_bot", [(44, False), (9001, True)], ids=["user-not-allowed", "another-bot"])
+def test_button_press_by_someone_not_allowed_is_refused_and_the_request_stays_pending(discord, user_id, is_bot):
+    """The view's real gate: a user off the allowlist, and another bot (which no allowlist names),
+    get the ephemeral refusal; the child's request is untouched and the card stays live."""
+    key, child, card = _child_card_with_an_allowlist(discord)
+    interaction = _press(discord, card, user_id=user_id, is_bot=is_bot)
+    interaction.response.send_message.assert_awaited_once()
+    assert interaction.response.send_message.await_args.kwargs == {"ephemeral": True}
+    interaction.response.edit_message.assert_not_awaited()
+    assert approval.has_blocking_approval(key), "a refused press resolves nothing"
+    assert not child.done.is_set() and child.ran == []
+    assert card["view"].resolved is False
+    _press(discord, card, user_id=43)
+    assert child.done.wait(5) and child.ran == [COMMAND], "the allow-listed user can still answer the same card"
+
+
 def test_child_in_a_thread_discord_can_no_longer_reach_is_refused_not_pending(discord):
     """The thread is gone when the child asks: neither the card nor the text prompt can be posted."""
     child = _Child()
