@@ -2797,6 +2797,11 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         heartbeat_thread.join(timeout=1.0)
 
 
+# A manual run's per-fire prompt, on the job copy handed to the restart-safe worker. It is not part
+# of the stored job, and the worker is the process that builds the prompt.
+_HANDOFF_RUN_PROMPT = "_handoff_run_prompt"
+
+
 def run_one_job(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, cancel_event: Optional[_CancelEventLike] = None,
@@ -2819,7 +2824,8 @@ def run_one_job(
     external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
     if not external_owner:
         try:
-            handed_off = _launch_external_cron_worker(job)
+            handed_off = _launch_external_cron_worker(
+                {**job, _HANDOFF_RUN_PROMPT: extra_prompt} if extra_prompt else job)
         except Exception as handoff_error:
             # Arbitrary waiter errors must not claim dispatch failure or resend
             # a worker's notice. A recovered unknown execution is different:
@@ -3938,7 +3944,9 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
             old_external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
             os.environ["_HERMES_CRON_EXTERNAL_WORKER"] = execution_id
             try:
-                completed = run_one_job(job, adapters=None, loop=None, verbose=False)
+                completed = run_one_job(
+                    job, adapters=None, loop=None, verbose=False,
+                    extra_prompt=job.pop(_HANDOFF_RUN_PROMPT, None))
                 # Successful return: the worker recorded its outcome. If it raises,
                 # retain fd 2's pathname until the waiter consumes the traceback.
                 with contextlib.suppress(OSError):
