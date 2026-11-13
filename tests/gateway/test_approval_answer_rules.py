@@ -25,12 +25,14 @@ import pytest
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
-from tests.gateway.test_discord_background_child_approval import (  # `discord` is a fixture
-    COMMAND, THREAD, _Child, _parent_dispatches_child_then_ends, _wait, discord,
+from tests.gateway import test_discord_background_child_approval as card_cases
+from tests.gateway.test_discord_background_child_approval import (
+    COMMAND, THREAD, _Child, _parent_dispatches_child_then_ends, _wait,
 )
 from tools import approval, async_delegation as ad
 from tools.approval_gateway_wait import _ApprovalEntry
 
+discord = card_cases.discord  # the real adapter over a fake client, as a fixture of this module too
 SECOND = "rm -rf /tmp/second-victim"
 OWNER, OTHER_BOT = "42", "9001"
 
