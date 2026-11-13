@@ -277,3 +277,21 @@ def test_the_admin_list_leaves_the_card_button_to_the_user_allowlist():
     assert _resolve_exec_approval_admin_gate(_GATED) == (False, set())
     assert _resolve_exec_approval_admin_gate(
         {"require_admin_for_exec_approval": True, "allow_admin_from": [OWNER]}) == (True, {OWNER})
+
+
+@pytest.mark.parametrize("user_id,resolved", [(OWNER, True), ("43", False)])
+def test_bare_word_obeys_the_slash_access_policy(clean_approvals, user_id, resolved):
+    """A bare ``yes`` is a typed ``/approve``: someone the policy refuses ``/approve`` cannot say it."""
+    runner = _policy_runner(_GATED)
+    source = _thread_source(user_id)
+    key = runner._session_key_for_source(source)
+    entry = _pending(runner, source)
+    runner._delivery_adapter_for = lambda _source: runner.adapters[Platform.DISCORD]
+    runner._send_busy_reply = AsyncMock()
+    event = MessageEvent(text="yes", message_type=MessageType.TEXT, source=source, message_id="m2")
+
+    consumed = asyncio.run(runner._route_plaintext_approval_while_busy(event, key))
+
+    assert consumed is resolved
+    assert entry.event.is_set() is resolved
+    assert event.text == ("/approve" if resolved else "yes"), "a refused word stays an ordinary message"
