@@ -187,8 +187,10 @@ _BRIEF_FIELDS = (
 )
 
 # Route keys that may be stored. Never an api_key, client, credential pool or ACP transport (``acp_command`` /
-# ``acp_args`` are trusted-config-only and may carry tokens): a resume re-derives the route.
-_ROUTE_KEYS = ("provider", "model", "base_url", "api_mode", "reasoning_effort", "service_tier",
+# ``acp_args`` are trusted-config-only and may carry tokens): a resume re-derives the route. Never the
+# ``base_url`` either (its userinfo or query can carry a key): ``note_spawn`` stores ``endpoint``, the
+# ``endpoint_identity`` digest the resumable record stores for the same child.
+_ROUTE_KEYS = ("provider", "model", "api_mode", "reasoning_effort", "service_tier",
                "requested_provider", "profile_home")
 
 
@@ -914,7 +916,11 @@ def note_spawn(parent_agent: Any, child: Any, *, goal: str, context: Optional[st
         db_path = parent_db_path(parent_agent)
         if not child_id or not subagent_id or db_path is None:
             return False
+        base_url = (route or {}).get("base_url")
         route = {k: v for k, v in (route or {}).items() if k in _ROUTE_KEYS and v not in (None, "")}
+        if base_url not in (None, ""):
+            from tools.delegate_tool_resumable import endpoint_identity
+            route["endpoint"] = list(endpoint_identity(route.get("provider"), base_url))
         if "profile_home" in route:
             route["profile_home"] = str(route["profile_home"])
         brief = {
