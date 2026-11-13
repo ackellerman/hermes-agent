@@ -602,10 +602,15 @@ def _profile_dbs() -> list[Path]:
 
 def _settings_of(home: Path) -> tuple[float, int]:
     """*home*'s own ``delegation`` limits, read under its scope (the sweep runs under whichever profile started it)."""
-    from agent.runtime_scope import bind_profile_scope
+    # Fork carry: upstream binds ``agent.runtime_scope.bind_profile_scope(home, hydrate_secrets=False)``; that
+    # module (upstream 151dc5fc3e4) is not carried. Reading the ``delegation`` section needs the home only.
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     try:
-        with bind_profile_scope(home, hydrate_secrets=False):
+        token = set_hermes_home_override(str(home))
+        try:
             return _settings()
+        finally:
+            reset_hermes_home_override(token)
     except Exception:  # health: allow BLE001 -- an unreadable profile keeps the default cap, never loses its pins
         logger.debug("delegation settings of %s unreadable", home, exc_info=True)
         return _DEFAULT_TTL_HOURS, _DEFAULT_MAX_RESUMABLE
