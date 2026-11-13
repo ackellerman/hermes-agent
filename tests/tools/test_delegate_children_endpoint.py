@@ -8,11 +8,21 @@ a continue re-resolves the route.
 import json
 from concurrent.futures import Future
 
-from tests.tools.test_delegate_children import _child, _child_session, _finish, _parent, _rows, db
+import pytest
+
+from tests.tools.test_delegate_children import _child, _child_session, _finish, _parent, _rows
 from tools import delegate_children as dc
 from tools.delegate_tool_resumable import endpoint_identity
 
 _URL = "https://svc-user:pw-USERINFO@gateway.example.invalid/v1?api-key=QUERYSECRET"
+
+
+@pytest.fixture
+def db(tmp_path):
+    from hermes_state import SessionDB
+    handle = SessionDB(db_path=tmp_path / "state.db")
+    yield handle
+    handle.close()
 
 
 def test_the_kept_row_stores_the_endpoint_digest_not_the_url(db):
