@@ -143,3 +143,55 @@ def test_bare_yes_still_answers_a_foreground_request(discord):
     assert _bare(discord, "yes", source, key) is True
     assert entry.event.is_set() and entry.result == "once"
     assert not approval.has_blocking_approval(key)
+
+
+# -- the reply names what it resolved -----------------------------------------------------------
+
+
+def test_typed_approve_names_the_command_and_says_how_many_remain(discord):
+    first = _Child()
+    second = _Child(guard=lambda: approval.check_all_command_guards(SECOND, "local"))
+    turn = discord.turn(discord.source("thread"))
+    key, dispatched = turn._ctx.session_key, []
+
+    def run_conversation(message, **_kw):
+        for child in (first, second):
+            dispatched.append(ad.dispatch_async_delegation(
+                goal="g", context=None, toolsets=None, role="leaf", model=None, session_key=key, runner=child))
+        return {"final_response": "started two helpers"}
+
+    turn._run_conversation_with_approval(SimpleNamespace(run_conversation=run_conversation), [], None, None, None)
+    assert [d["status"] for d in dispatched] == ["dispatched", "dispatched"]
+    first.ask.set()
+    _wait(lambda: len(approval.list_gateway_approvals(key)) == 1, "first request")
+    second.ask.set()
+    _wait(lambda: len(approval.list_gateway_approvals(key)) == 2, "second request")
+
+    reply = discord.slash("approve", discord.source("thread", user_id="43"))
+
+    assert first.done.wait(5) and first.ran == [COMMAND], "one /approve takes the oldest request"
+    assert not second.done.is_set()
+    assert "background-child-victim" in reply, "the reply names the command it approved"
+    assert "second-victim" not in reply
+    assert "1 more" in reply, "and says one request is still pending"
+
+    reply = discord.slash("deny", discord.source("thread", user_id="43"))
+
+    assert second.done.wait(5) and second.decisions[0]["approved"] is False
+    assert "second-victim" in reply, "the deny reply names the command it denied"
+    assert "more" not in reply, "nothing is left pending"
+
+
+def test_answer_preview_is_redacted_and_cut_short():
+    from gateway.platforms.base_exec_approval import APPROVAL_ANSWER_PREVIEW_CHARS, approval_answer_detail
+    secret = "ghp_" + "X" * 36
+    long_command = f"curl -H 'Authorization: token {secret}' https://example.com/" + "a" * 400 + " TAIL"
+
+    detail = approval_answer_detail([{"command": long_command}], 0)
+
+    assert secret not in detail, "the preview is the redacted text the card shows"
+    assert "TAIL" not in detail and "curl" in detail
+    assert len(detail) < APPROVAL_ANSWER_PREVIEW_CHARS + 40
+    assert approval_answer_detail([{"command": "a"}, {"command": "b"}], 0) == "", "several at once: the count says it"
+    multiline = approval_answer_detail([{"command": "echo `id`\nrm x"}], 0)
+    assert multiline.count("`") == 2 and "\nrm" not in multiline, "one inline-code span, on one line"
