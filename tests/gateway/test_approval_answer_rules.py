@@ -195,3 +195,85 @@ def test_answer_preview_is_redacted_and_cut_short():
     assert approval_answer_detail([{"command": "a"}, {"command": "b"}], 0) == "", "several at once: the count says it"
     multiline = approval_answer_detail([{"command": "echo `id`\nrm x"}], 0)
     assert multiline.count("`") == 2 and "\nrm" not in multiline, "one inline-code span, on one line"
+
+
+# -- who may type the answer: the slash access policy -------------------------------------------
+
+
+def _policy_runner(extra: dict):
+    """A runner whose Discord platform carries ``extra``, driven through ``_handle_message``."""
+    from tests.gateway.test_slash_access_dispatch import _make_runner
+    runner = _make_runner(platform_extra=extra)
+    runner._busy_ack_ts, runner._draining = {}, False
+    runner.adapters[Platform.DISCORD]._unwrap_ephemeral = lambda r: (r, 0) if isinstance(r, str) else (None, 0)
+    return runner
+
+
+def _thread_source(user_id: str, *, is_bot: bool = False) -> SessionSource:
+    return SessionSource(platform=Platform.DISCORD, user_id=user_id, user_name=f"name-{user_id}", chat_id="777",
+                         chat_type="thread", thread_id="777", is_bot=is_bot)
+
+
+def _pending(runner, source, owner=None) -> _ApprovalEntry:
+    entry = _ApprovalEntry({"command": COMMAND})
+    entry.owner = owner
+    with approval._lock:
+        approval._gateway_queues.setdefault(runner._session_key_for_source(source), []).append(entry)
+    return entry
+
+
+@pytest.fixture
+def clean_approvals():
+    yield
+    with approval._lock:
+        approval._gateway_queues.clear()
+        approval._pending.clear()
+
+
+_GATED = {"group_allow_admin_from": [OWNER]}
+
+
+@pytest.mark.parametrize("background", [False, True], ids=["foreground", "background-child"])
+@pytest.mark.parametrize("verb", ["approve", "approve always", "approve session", "approve all", "deny"])
+def test_with_an_admin_list_another_bots_typed_answer_is_refused(clean_approvals, verb, background):
+    runner = _policy_runner(_GATED)
+    bot = _thread_source(OTHER_BOT, is_bot=True)
+    entry = _pending(runner, bot, owner=object() if background else None)
+
+    reply = asyncio.run(runner._handle_message(MessageEvent(text=f"/{verb}", source=bot, message_id="m1")))
+
+    assert "admin-only" in reply, reply
+    assert entry.result is None and not entry.event.is_set(), "the request is still pending"
+    assert approval.has_blocking_approval(runner._session_key_for_source(bot))
+
+
+@pytest.mark.parametrize("verb,result", [("approve", "once"), ("approve always", "always"), ("deny", "deny")])
+def test_with_an_admin_list_the_admins_typed_answer_still_resolves(clean_approvals, verb, result):
+    runner = _policy_runner(_GATED)
+    owner = _thread_source(OWNER)
+    entry = _pending(runner, owner)
+
+    asyncio.run(runner._handle_message(MessageEvent(text=f"/{verb}", source=owner, message_id="m1")))
+
+    assert entry.event.is_set() and entry.result == result
+
+
+@pytest.mark.parametrize("verb,result", [("approve", "once"), ("deny", "deny")])
+def test_without_an_admin_list_another_bots_typed_answer_resolves_as_before(clean_approvals, verb, result):
+    """The shipped default: no ``group_allow_admin_from`` means no slash gating at all."""
+    runner = _policy_runner({})
+    bot = _thread_source(OTHER_BOT, is_bot=True)
+    entry = _pending(runner, bot)
+
+    asyncio.run(runner._handle_message(MessageEvent(text=f"/{verb}", source=bot, message_id="m1")))
+
+    assert entry.event.is_set() and entry.result == result
+
+
+def test_the_admin_list_leaves_the_card_button_to_the_user_allowlist():
+    """``group_allow_admin_from`` gates typed commands only; the button stays with the allowlist
+    unless ``require_admin_for_exec_approval`` is also set (and then it reads ``allow_admin_from``)."""
+    from plugins.platforms.discord.adapter_config_readers import _resolve_exec_approval_admin_gate
+    assert _resolve_exec_approval_admin_gate(_GATED) == (False, set())
+    assert _resolve_exec_approval_admin_gate(
+        {"require_admin_for_exec_approval": True, "allow_admin_from": [OWNER]}) == (True, {OWNER})
