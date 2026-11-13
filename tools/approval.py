@@ -147,30 +147,32 @@ def unregister_gateway_notify(session_key: str) -> None:
             _gateway_queues.pop(session_key, None)
 
 
-def resolve_gateway_approval(session_key: str, choice: str,
-                             resolve_all: bool = False,
-                             reason: Optional[str] = None,
-                             request_id: Optional[str] = None) -> int:
+def resolve_gateway_approval_report(session_key: str, choice: str,
+                                    resolve_all: bool = False,
+                                    reason: Optional[str] = None,
+                                    request_id: Optional[str] = None) -> tuple[list[dict], int]:
     """Unblock waiting agent thread(s) from the gateway's /approve or /deny handler.
 
     *resolve_all* resolves every pending approval (``/approve all``); otherwise the oldest
     (FIFO) or the one matching *request_id*. *reason* is the ``/deny <reason>`` free text,
-    relayed to the agent in the BLOCKED message. Returns the number resolved.
+    relayed to the agent in the BLOCKED message. Returns snapshots of the requests it resolved
+    and how many the session still has pending, read in the same critical section.
     """
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
-            return 0
+            return [], 0
         if request_id:
             targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
             if not targets:
-                return 0
+                return [], len(queue)
             queue[:] = [entry for entry in queue if entry not in targets]
         elif resolve_all:
             targets = list(queue)
             queue.clear()
         else:
             targets = [queue.pop(0)]
+        remaining = len(queue)
         if not queue:
             _gateway_queues.pop(session_key, None)
         # Popping the entry and committing its outcome are ONE critical section: the waiter's
@@ -181,7 +183,15 @@ def resolve_gateway_approval(session_key: str, choice: str,
             if reason:
                 entry.reason = reason
             entry.event.set()
-    return len(targets)
+    return [dict(entry.data) for entry in targets], remaining
+
+
+def resolve_gateway_approval(session_key: str, choice: str,
+                             resolve_all: bool = False,
+                             reason: Optional[str] = None,
+                             request_id: Optional[str] = None) -> int:
+    """``resolve_gateway_approval_report`` for callers that only need the number resolved."""
+    return len(resolve_gateway_approval_report(session_key, choice, resolve_all, reason, request_id)[0])
 
 
 def resolve_gateway_approval_card(session_key: str, choice: str, request_id: Optional[str]) -> int:

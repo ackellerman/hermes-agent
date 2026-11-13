@@ -632,6 +632,8 @@ gateway:
     text_choice_joiner: ", "
     text_choice_last: ", または {choice} と返信してください。\n"
     text_body: "{heading}\n```\n{command}\n```\n{reason_label}: {reason}\n\n"
+    answered_command: "コマンド: `{command}`"
+    answered_remaining: "⏳ このチャットであと {count} 件が承認待ちです。"
   notify:
     media_kind:
       audio: "音声"

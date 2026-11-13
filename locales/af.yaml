@@ -632,6 +632,8 @@ gateway:
     text_choice_joiner: ", "
     text_choice_last: ", of {choice}.\n"
     text_body: "{heading}\n```\n{command}\n```\n{reason_label}: {reason}\n\n"
+    answered_command: "Opdrag: `{command}`"
+    answered_remaining: "⏳ Nog {count} hangend in hierdie klets."
   notify:
     media_kind:
       audio: "klank"

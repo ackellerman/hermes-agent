@@ -632,6 +632,8 @@ gateway:
     text_choice_joiner: "، "
     text_choice_last: "، أو {choice}.\n"
     text_body: "{heading}\n```\n{command}\n```\n{reason_label}: {reason}\n\n"
+    answered_command: "الأمر: `{command}`"
+    answered_remaining: "⏳ {count} أخرى قيد الانتظار في هذه المحادثة."
   notify:
     media_kind:
       audio: "صوت"

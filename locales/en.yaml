@@ -636,6 +636,8 @@ gateway:
     text_choice_joiner: ", "
     text_choice_last: ", or {choice}.\n"
     text_body: "{heading}\n```\n{command}\n```\n{reason_label}: {reason}\n\n"
+    answered_command: "Command: `{command}`"
+    answered_remaining: "⏳ {count} more pending in this chat."
   notify:
     media_kind:
       audio: "audio"

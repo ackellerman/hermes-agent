@@ -725,6 +725,8 @@ gateway:
     text_choice_joiner: ", "
     text_choice_last: |
       , ou {choice}.
+    answered_command: "Commande : `{command}`"
+    answered_remaining: "⏳ {count} autre(s) en attente dans cette discussion."
     text_body: |+
       {heading}
       ```

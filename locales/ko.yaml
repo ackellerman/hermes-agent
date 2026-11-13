@@ -632,6 +632,8 @@ gateway:
     text_choice_joiner: ", "
     text_choice_last: ", 또는 {choice}으로 답해 주세요.\n"
     text_body: "{heading}\n```\n{command}\n```\n{reason_label}: {reason}\n\n"
+    answered_command: "명령: `{command}`"
+    answered_remaining: "⏳ 이 채팅에 {count}건이 더 대기 중입니다."
   notify:
     media_kind:
       audio: "오디오"

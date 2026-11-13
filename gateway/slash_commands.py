@@ -1207,7 +1207,8 @@ class GatewaySlashCommandsMixin(
         """Handle /approve — unblock waiting agent thread(s). They block inside tools/approval.py;
         signalling the event resumes them so the command executes inline (same flow as the CLI).
         ``request_id`` (the bare-word route) answers that one request instead of the oldest."""
-        from tools.approval import resolve_gateway_approval
+        from gateway.platforms.base_exec_approval import approval_answer_detail
+        from tools.approval import resolve_gateway_approval_report
         session_key, stale = self._blocking_approval_or_stale(event, "gateway.approval_expired",
                                                               "gateway.approve.no_pending")
         if stale:
@@ -1216,10 +1217,13 @@ class GatewaySlashCommandsMixin(
         args = event.get_command_args().strip().lower().split()
         choices = {_APPROVE_CHOICE_BY_ARG[a] for a in args if a in _APPROVE_CHOICE_BY_ARG}
         choice = "always" if "always" in choices else "session" if "session" in choices else "once"
-        count = resolve_gateway_approval(session_key, choice, resolve_all="all" in args, request_id=request_id)
+        resolved, remaining = resolve_gateway_approval_report(
+            session_key, choice, resolve_all="all" in args, request_id=request_id)
+        count = len(resolved)
         if not count:
             return t("gateway.approve.no_pending")
-        confirmation_text = t(f"gateway.approve.{choice}_{'plural' if count > 1 else 'singular'}", count=count)
+        confirmation_text = (t(f"gateway.approve.{choice}_{'plural' if count > 1 else 'singular'}", count=count)
+                             + approval_answer_detail(resolved, remaining))
         logger.info("User approved %d dangerous command(s) via /approve (%s)", count, choice)
         return await self._deliver_approval_confirmation(event, confirmation_text, "approve")
 
@@ -1230,7 +1234,8 @@ class GatewaySlashCommandsMixin(
         ``/deny <reason>`` (or ``/deny all <reason>``) attaches a one-line reason that is relayed back to
         the agent so it can adapt instead of only hearing "denied". Ported from qwibitai/nanoclaw#2832.
         """
-        from tools.approval import resolve_gateway_approval
+        from gateway.platforms.base_exec_approval import approval_answer_detail
+        from tools.approval import resolve_gateway_approval_report
         session_key, stale = self._blocking_approval_or_stale(event, "gateway.deny.stale",
                                                               "gateway.deny.no_pending")
         if stale:
@@ -1241,14 +1246,15 @@ class GatewaySlashCommandsMixin(
         tokens = raw_args.split()
         resolve_all = bool(tokens) and tokens[0].lower() == "all"
         reason = (raw_args[len(tokens[0]):].strip() if resolve_all else raw_args)[:280].strip()
-        count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all, reason=reason or None,
-                                         request_id=request_id)
+        resolved, remaining = resolve_gateway_approval_report(
+            session_key, "deny", resolve_all=resolve_all, reason=reason or None, request_id=request_id)
+        count = len(resolved)
         if not count:
             return t("gateway.deny.no_pending")
         logger.info("User denied %d dangerous command(s) via /deny%s", count,
                     " (with reason)" if reason else "")
         key = "gateway.deny.denied" + ("_reason" if reason else "") + ("_plural" if count > 1 else "_singular")
-        confirmation_text = t(key, count=count, reason=reason)
+        confirmation_text = t(key, count=count, reason=reason) + approval_answer_detail(resolved, remaining)
         return await self._deliver_approval_confirmation(event, confirmation_text, "deny")
 
     async def _handle_curator_command(self, event: MessageEvent) -> str:

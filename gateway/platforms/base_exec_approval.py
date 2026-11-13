@@ -82,3 +82,24 @@ def format_approval_deadline_line(timeout_s: int) -> str:
 
 def format_approval_timed_out_notice(timeout_s: int) -> str:
     return approval_timed_out_notice(format_approval_window(timeout_s))
+
+
+# Longest command preview a typed ``/approve`` / ``/deny`` confirmation echoes back.
+APPROVAL_ANSWER_PREVIEW_CHARS = 120
+
+
+def approval_answer_detail(resolved: list[dict], remaining: int) -> str:
+    """Lines appended to a typed ``/approve`` / ``/deny`` confirmation: the command it resolved (for
+    a single request: the redacted text the prompt showed, on one line, cut short, never more than
+    the prompt did) and how many requests the session still has pending. Empty when neither applies."""
+    lines = []
+    if len(resolved) == 1:
+        from agent.redact import redact_approval_display
+        preview = " ".join(redact_approval_display(resolved[0].get("command"), force=True).split()).replace("`", "'")
+        if len(preview) > APPROVAL_ANSWER_PREVIEW_CHARS:
+            preview = preview[:APPROVAL_ANSWER_PREVIEW_CHARS].rstrip() + "…"
+        if preview:
+            lines.append(t("gateway.exec_approval.answered_command", command=preview))
+    if remaining > 0:
+        lines.append(t("gateway.exec_approval.answered_remaining", count=remaining))
+    return "".join(f"\n{line}" for line in lines)

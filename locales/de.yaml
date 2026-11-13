@@ -632,6 +632,8 @@ gateway:
     text_choice_joiner: ", "
     text_choice_last: ", oder {choice}.\n"
     text_body: "{heading}\n```\n{command}\n```\n{reason_label}: {reason}\n\n"
+    answered_command: "Befehl: `{command}`"
+    answered_remaining: "⏳ {count} weitere ausstehend in diesem Chat."
   notify:
     media_kind:
       audio: "Audio"

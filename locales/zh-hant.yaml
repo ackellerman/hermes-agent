@@ -632,6 +632,8 @@ gateway:
     text_choice_joiner: ", "
     text_choice_last: "，或 {choice}。\n"
     text_body: "{heading}\n```\n{command}\n```\n{reason_label}：{reason}\n\n"
+    answered_command: "命令：`{command}`"
+    answered_remaining: "⏳ 此聊天中還有 {count} 個待處理。"
   notify:
     media_kind:
       audio: "音訊"

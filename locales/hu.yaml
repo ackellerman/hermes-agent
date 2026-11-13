@@ -635,6 +635,8 @@ gateway:
     text_choice_joiner: ", "
     text_choice_last: |
       , vagy {choice}.
+    answered_command: "Parancs: `{command}`"
+    answered_remaining: "⏳ Még {count} függőben van ebben a csevegésben."
     text_body: |+
       {heading}
       ```

@@ -632,6 +632,8 @@ gateway:
     text_choice_joiner: ", "
     text_choice_last: ", nó {choice}.\n"
     text_body: "{heading}\n```\n{command}\n```\n{reason_label}: {reason}\n\n"
+    answered_command: "Ordú: `{command}`"
+    answered_remaining: "⏳ {count} eile ar feitheamh sa chomhrá seo."
   notify:
     media_kind:
       audio: "fuaime"
