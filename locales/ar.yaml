@@ -634,6 +634,7 @@ gateway:
     text_body: "{heading}\n```\n{command}\n```\n{reason_label}: {reason}\n\n"
     answered_command: "الأمر: `{command}`"
     answered_remaining: "⏳ {count} أخرى قيد الانتظار في هذه المحادثة."
+    needs_person: "الموافقة على الأوامر تتطلب شخصًا: رسالة من بوت لا يمكنها الموافقة أو الرفض."
   notify:
     media_kind:
       audio: "صوت"

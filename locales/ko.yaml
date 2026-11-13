@@ -634,6 +634,7 @@ gateway:
     text_body: "{heading}\n```\n{command}\n```\n{reason_label}: {reason}\n\n"
     answered_command: "명령: `{command}`"
     answered_remaining: "⏳ 이 채팅에 {count}건이 더 대기 중입니다."
+    needs_person: "명령 승인은 사람이 해야 합니다. 봇의 메시지로는 승인하거나 거부할 수 없습니다."
   notify:
     media_kind:
       audio: "오디오"

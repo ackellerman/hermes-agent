@@ -634,6 +634,7 @@ gateway:
     text_body: "{heading}\n```\n{command}\n```\n{reason_label}: {reason}\n\n"
     answered_command: "コマンド: `{command}`"
     answered_remaining: "⏳ このチャットであと {count} 件が承認待ちです。"
+    needs_person: "コマンドの承認には人が必要です。ボットのメッセージでは承認も拒否もできません。"
   notify:
     media_kind:
       audio: "音声"

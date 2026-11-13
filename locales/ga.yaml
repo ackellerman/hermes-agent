@@ -634,6 +634,7 @@ gateway:
     text_body: "{heading}\n```\n{command}\n```\n{reason_label}: {reason}\n\n"
     answered_command: "Ordú: `{command}`"
     answered_remaining: "⏳ {count} eile ar feitheamh sa chomhrá seo."
+    needs_person: "Teastaíonn duine le haghaidh ceaduithe orduithe: ní féidir le teachtaireacht ó bhota ceann a cheadú ná a dhiúltú."
   notify:
     media_kind:
       audio: "fuaime"

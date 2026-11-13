@@ -665,6 +665,7 @@ class GatewayBusySessionMixin:
         # not queue behind a turn that can't start until it resolves (auto-deny deadlock). Gated on
         # the turn's own blocking approval so a conversational "yes" never fires a command.
         try:
+            from gateway.platforms.base_exec_approval import approval_answer_needs_person
             from tools.approval import turn_approval_request_id
             # --- Approval response routing (#46866) --- When the agent is blocked waiting for a
             # dangerous-command approval, plain-text responses like "yes" or "approve" must be routed to the
@@ -687,8 +688,10 @@ class GatewayBusySessionMixin:
                 _match = self._plaintext_approval_words().get(_raw_text)
                 if _match is not None:
                     _verb, _normalized_args = _match
-                    # The word stands for a typed /approve or /deny: the same slash access policy applies.
-                    if self._check_slash_access(event.source, _verb) is not None:
+                    # The word stands for a typed /approve or /deny: the same slash access policy applies,
+                    # and a bot's word is never an answer (it stays an ordinary message).
+                    if (approval_answer_needs_person(event.source)
+                            or self._check_slash_access(event.source, _verb) is not None):
                         return False
                     _approval_handler = (
                         self._handle_approve_command if _verb == "approve" else self._handle_deny_command

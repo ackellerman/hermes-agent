@@ -634,6 +634,7 @@ gateway:
     text_body: "{heading}\n```\n{command}\n```\n{reason_label}: {reason}\n\n"
     answered_command: "Komut: `{command}`"
     answered_remaining: "⏳ Bu sohbette {count} istek daha bekliyor."
+    needs_person: "Komut onayları bir insan gerektirir: bir botun mesajı onaylayamaz veya reddedemez."
   notify:
     media_kind:
       audio: "ses"

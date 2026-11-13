@@ -634,6 +634,7 @@ gateway:
     text_body: "{heading}\n```\n{command}\n```\n{reason_label}: {reason}\n\n"
     answered_command: "Команда: `{command}`"
     answered_remaining: "⏳ Ещё ожидают ответа в этом чате: {count}."
+    needs_person: "Подтверждать команды должен человек: сообщение бота не может ни одобрить, ни отклонить запрос."
   notify:
     media_kind:
       audio: "аудио"

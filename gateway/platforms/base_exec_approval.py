@@ -103,3 +103,11 @@ def approval_answer_detail(resolved: list[dict], remaining: int) -> str:
     if remaining > 0:
         lines.append(t("gateway.exec_approval.answered_remaining", count=remaining))
     return "".join(f"\n{line}" for line in lines)
+
+
+def approval_answer_needs_person(source) -> bool:
+    """The one rule on who may answer a command approval by message: never a bot. True when the
+    author is a known bot (``SessionSource.is_bot``: the platform's bot flag or the adapter's
+    ``bot_users`` opt-in); a typed ``/approve`` / ``/deny`` and the bare-word route both ask here.
+    No configuration key: a pending command is granted or refused by a person."""
+    return getattr(source, "is_bot", False) is True

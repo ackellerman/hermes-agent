@@ -634,6 +634,7 @@ gateway:
     text_body: "{heading}\n```\n{command}\n```\n{reason_label}：{reason}\n\n"
     answered_command: "命令：`{command}`"
     answered_remaining: "⏳ 此聊天中还有 {count} 个待处理。"
+    needs_person: "命令审批需要由人来答复：机器人的消息无法批准或拒绝。"
   notify:
     media_kind:
       audio: "音频"

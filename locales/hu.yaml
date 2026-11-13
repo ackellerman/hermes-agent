@@ -637,6 +637,7 @@ gateway:
       , vagy {choice}.
     answered_command: "Parancs: `{command}`"
     answered_remaining: "⏳ Még {count} függőben van ebben a csevegésben."
+    needs_person: "A parancsok jóváhagyásához ember kell: egy bot üzenete nem hagyhat jóvá és nem utasíthat el egyet sem."
     text_body: |+
       {heading}
       ```

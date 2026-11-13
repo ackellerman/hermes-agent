@@ -727,6 +727,7 @@ gateway:
       , ou {choice}.
     answered_command: "Commande : `{command}`"
     answered_remaining: "⏳ {count} autre(s) en attente dans cette discussion."
+    needs_person: "Les approbations de commandes exigent une personne : le message d'un bot ne peut ni en approuver ni en refuser."
     text_body: |+
       {heading}
       ```

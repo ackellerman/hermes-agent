@@ -1193,9 +1193,13 @@ class GatewaySlashCommandsMixin(
 
     def _blocking_approval_or_stale(self, event: MessageEvent, stale_key: str, none_key: str):
         """``(session_key, None)`` when an agent thread is blocked on approval, else the reply to send.
-        A pending-approvals entry with no blocked thread is a stale prompt: drop it and say so."""
+        A pending-approvals entry with no blocked thread is a stale prompt: drop it and say so.
+        A bot-authored message answers nothing: the request stays as it is and the reply says so."""
+        from gateway.platforms.base_exec_approval import approval_answer_needs_person
         from tools.approval import has_blocking_approval
         session_key = self._session_key_for_source(event.source)
+        if approval_answer_needs_person(event.source):
+            return session_key, t("gateway.exec_approval.needs_person")
         if has_blocking_approval(session_key):
             return session_key, None
         if session_key in self._pending_approvals:

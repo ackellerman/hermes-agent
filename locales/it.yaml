@@ -634,6 +634,7 @@ gateway:
     text_body: "{heading}\n```\n{command}\n```\n{reason_label}: {reason}\n\n"
     answered_command: "Comando: `{command}`"
     answered_remaining: "⏳ Altre {count} in attesa in questa chat."
+    needs_person: "Le approvazioni dei comandi richiedono una persona: il messaggio di un bot non può approvarne né negarne una."
   notify:
     media_kind:
       audio: "audio"
