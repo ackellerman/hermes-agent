@@ -142,10 +142,10 @@ def _segment_tip(db: Any, sid: str, session_id: str) -> str:
 
 def _start(
     sid: str, message: str, spec: dict[str, Any], parent_agent: Any, background: bool,
-    record: Optional[dict[str, Any]] = None,
+    record: Optional[dict[str, Any]] = None, built: Optional[list] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Rebuild, hydrate and dispatch the continued child: ``(tool result JSON, None)`` or ``(None, error)`` when
-    it was refused before anything ran."""
+    it was refused before anything ran. The rebuilt child is appended to *built* for the caller's failure path."""
     from tools.delegate_tool import (
         DEFAULT_MAX_ITERATIONS, _build_children, _get_max_concurrent_children, _load_config, _oneshot_spawn_budget,
         _parent_live_home,
@@ -177,6 +177,8 @@ def _start(
         )
         if err:
             return None, err
+        if built is not None:
+            built.append(children[0][2])
         db.reopen_session(session_id)  # its close() ended it; the continued child's close() ends it again
         children[0][2]._delegate_continue_history = history
         from tools.delegate_tool_resumable import hold_claim, last_workspace
@@ -188,6 +190,17 @@ def _start(
         _get_max_concurrent_children(), live_id, writers, paths, *origin, time.monotonic(), live_home=live_home,
     )
     return _run_batch(batch, background), None
+
+
+def _discard_unstarted(parent_agent: Any, built: list[Any]) -> None:
+    """A child rebuilt for a continue that then failed is still attached to the parent with its session reopened:
+    give it the spawn path's teardown for a child that never started (detach, close, which ends its session
+    again). One a runner already took is detached by then and is left to that runner."""
+    from types import SimpleNamespace
+    from tools.delegate_tool_dispatch import _release_unstarted_child
+    for child in built:
+        if any(child is c for c in getattr(parent_agent, "_active_children", None) or ()):
+            _release_unstarted_child(SimpleNamespace(parent_agent=parent_agent), child)
 
 
 def continue_subagent(subagent_id: Optional[str], message: Optional[str], parent_agent: Any, *, background: bool) -> str:
@@ -204,12 +217,14 @@ def continue_subagent(subagent_id: Optional[str], message: Optional[str], parent
     spec, record, err = _claim(sid, parent_agent)
     if spec is None:
         return tool_error(err or _NOT_FOUND.format(sid=sid))
+    built: list[Any] = []
     try:
-        result, err = _start(sid, text, spec, parent_agent, background, record)
+        result, err = _start(sid, text, spec, parent_agent, background, record, built)
     except Exception as exc:
         logger.warning("delegate_task continue of %s failed before dispatch", sid, exc_info=True)
         result, err = None, f"Could not continue subagent '{sid}': {exc}"
     if result is None:
+        _discard_unstarted(parent_agent, built)
         _release_resume(sid, spec)
         if record is not None:
             from tools.delegate_tool_resumable import release
