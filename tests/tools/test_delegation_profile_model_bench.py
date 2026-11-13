@@ -156,3 +156,18 @@ def test_benched_model_auth_error_carries_the_remaining_wait(reviewer):
         resolve_runtime_provider(requested="anthropic", target_model=MODEL)
     assert raised.value.retryable is True and 590 < raised.value.retry_after <= 600
     assert raised.value.provider == "anthropic"
+
+
+def test_a_child_started_on_a_chain_entry_says_so_in_its_route_report(reviewer, naps):
+    """A seat that asked for a profile must be able to see its child did not start on the profile's own model."""
+    from dataclasses import replace
+    _bench(reviewer, 600)
+    _set_fallbacks(reviewer, FALLBACKS)
+    report = replace(_route({"model_bench_wait_seconds": 5}), backend="profiles").report()
+    assert report["fallback_activated"] is True and report["fallback_from"] == MODEL
+
+
+def test_a_child_on_the_profiles_own_model_reports_no_fallback(reviewer, naps):
+    from dataclasses import replace
+    report = replace(_route({}), backend="profiles").report()
+    assert report == {"backend": "profiles"}
