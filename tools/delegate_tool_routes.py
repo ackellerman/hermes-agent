@@ -13,6 +13,7 @@ import contextlib
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
@@ -190,11 +191,61 @@ def _refuse_under_worker_snapshot(home: Path) -> None:
             f"cannot run as the profile at {home}. Delegate without a profile.")
 
 
-def _profile_route(home: Path) -> TaskRoute:
+#: ``delegation.model_bench_wait_seconds`` when unset: the longest a profile-routed dispatch waits for a
+#: rate-limit bench on the profile's model to lift (a sole credential's bench is 60s). 0 never waits.
+DEFAULT_MODEL_BENCH_WAIT_SECONDS = 60.0
+_BENCH_WAIT_MARGIN_SECONDS = 0.25  # land just past the bench, not on it
+_bench_nap = time.sleep
+
+
+def _bench_wait_limit(config: Optional[Mapping[str, Any]]) -> float:
+    raw = (config or {}).get("model_bench_wait_seconds")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return max(0.0, float(raw))
+    return DEFAULT_MODEL_BENCH_WAIT_SECONDS
+
+
+def _wait_out_bench(seconds: float, parent_agent: Any) -> bool:
+    """Sleep *seconds* in short naps; False as soon as the parent is interrupted."""
+    deadline = time.monotonic() + seconds + _BENCH_WAIT_MARGIN_SECONDS
+    while (left := deadline - time.monotonic()) > 0:
+        if getattr(parent_agent, "_interrupt_requested", False) is True:
+            return False
+        _bench_nap(min(left, 0.5))
+    return True
+
+
+def _resolve_profile_runtime(cfg: Mapping[str, Any], request: dict[str, Any], wait_limit: float,
+                             parent_agent: Any) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
+    """``(runtime, fallback entry or None)`` for a profile's primary model, called inside its scope. A primary
+    that is only rate-limited is not a missing provider: a bench that lifts within *wait_limit* seconds is
+    waited out and resolved once more, and otherwise the profile's own fallback chain is walked. When no entry
+    resolves, the primary's refusal is raised. Any other failure (no credentials, bad config) raises unchanged."""
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    from hermes_cli.runtime_provider import resolve_runtime_provider, resolve_runtime_with_fallback
+    try:
+        return resolve_runtime_provider(**request), None
+    except AuthError as exc:
+        wait = exc.retry_after if exc.retryable and isinstance(exc.retry_after, (int, float)) else None
+        if wait is None and not is_rate_limited_auth_error(exc):
+            raise
+        if wait is not None and 0 < wait_limit and wait <= wait_limit:
+            logger.info("delegation: %s is rate-limited for about %.0fs; waiting before the child starts",
+                        request.get("target_model") or "the profile's model", wait)
+            if not _wait_out_bench(wait, parent_agent):
+                raise
+            try:
+                return resolve_runtime_provider(**request), None
+            except AuthError:
+                pass  # benched again while waiting: the chain decides
+    return resolve_runtime_with_fallback(dict(cfg), **request)
+
+
+def _profile_route(home: Path, config: Optional[Mapping[str, Any]] = None, parent_agent: Any = None) -> TaskRoute:
     """The profile's own primary route, resolved inside its scope (its config.yaml + secrets). The
-    child never borrows the launching profile's key, pool, fallback chain or reasoning level."""
+    child never borrows the launching profile's key, pool, fallback chain or reasoning level. *config* is the
+    launching profile's ``delegation`` section: it only says how long this dispatch may wait for a bench."""
     from hermes_cli.config import load_config_readonly
-    from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_constants import resolve_reasoning_config
     from tools.delegate_tool_config import ResolvedReasoning, _credential_bundle, _require_pinned_command
     _refuse_under_worker_snapshot(home)
@@ -202,11 +253,16 @@ def _profile_route(home: Path) -> TaskRoute:
         cfg = load_config_readonly() or {}
         request = _profile_model_request(cfg)
         try:
-            rt = resolve_runtime_provider(**request)
+            rt, entry = _resolve_profile_runtime(cfg, request, _bench_wait_limit(config), parent_agent)
         except Exception as exc:
             raise DelegationRouteError(f"Profile at {home} has no usable model provider: {exc}") from exc
-        model = request["target_model"] or rt.get("model") or None
         fallback = cfg.get("fallback_providers")
+        if entry is None:
+            model = request["target_model"] or rt.get("model") or None
+        else:  # the child runs on a chain entry; what follows that entry stays its mid-run chain
+            from hermes_cli.fallback_config import get_fallback_chain
+            chain = get_fallback_chain(cfg)
+            model, fallback = entry["model"], chain[chain.index(entry) + 1:] if entry in chain else []
     # A named custom provider resolves to provider "custom": keep its name as the identity (as delegation.provider
     # does) so two named providers sharing one URL never lease each other's pool.
     requested = str(rt.get("requested_provider") or "").strip()
@@ -233,9 +289,10 @@ def _with_inherited_fallback(route: dict[str, Any], config: Mapping[str, Any]) -
     return route if inherited is None else {**route, "fallback_providers": inherited}
 
 
-def _resolve_route(route: dict[str, Any], parent_agent: Any, backend: str) -> TaskRoute:
+def _resolve_route(route: dict[str, Any], parent_agent: Any, backend: str,
+                   config: Optional[Mapping[str, Any]] = None) -> TaskRoute:
     if route.get("profile"):
-        return replace(_profile_route(_profile_home(route["profile"])), backend=backend)
+        return replace(_profile_route(_profile_home(route["profile"]), config, parent_agent), backend=backend)
     from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
     creds = _resolve_delegation_credentials(route, parent_agent)
     if route.get("service_tier") not in (None, ""):
@@ -251,7 +308,7 @@ def _route_to_task_route(route: dict[str, Any], parent_agent: Any, cache: dict[s
     # The label is display-only: two labels on one route (or one profile) resolve once.
     key = json.dumps({k: v for k, v in route.items() if k != "label"}, sort_keys=True, default=str)
     if key not in cache:
-        cache[key] = _resolve_route(route, parent_agent, backend)
+        cache[key] = _resolve_route(route, parent_agent, backend, config)
     return replace(cache[key], label=label)
 
 

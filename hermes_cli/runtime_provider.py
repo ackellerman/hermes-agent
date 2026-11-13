@@ -409,6 +409,20 @@ def _anthropic_cfg_base_url(model_cfg: dict[str, Any]) -> str:
     return cfg_base_url if _anthropic_base_url_override_ok(cfg_base_url) else ""
 
 
+def _anthropic_model_benched_error(model: str) -> AuthError:
+    """The refusal for a key the pool benched for *model*: it names when the bench lifts and carries the
+    remaining seconds as ``retry_after``, so a caller can wait a short one out instead of failing."""
+    import time
+    from agent.anthropic_credentials import anthropic_model_bench_until
+    until = anthropic_model_bench_until(model)
+    remaining = max(0.0, until - time.time()) if until else None
+    when = "" if until is None else (
+        f" until {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(until))} (about {int(remaining) + 1}s from now)")
+    return AuthError(f"Anthropic credentials are rate-limited for {model}{when}; "
+                     "other Claude models remain available (see `hermes auth list`).",
+                     provider="anthropic", retry_after=remaining, retryable=True)
+
+
 def _anthropic_token_or_raise(*, model: str | None = None) -> str:
     from agent.anthropic_credentials import resolve_anthropic_token
     token = resolve_anthropic_token(model=model)
@@ -416,8 +430,7 @@ def _anthropic_token_or_raise(*, model: str | None = None) -> str:
         # A key the pool benched for *this* model is not a missing credential; telling the
         # user to re-authenticate would send them chasing a cooldown that lifts on its own.
         if model and resolve_anthropic_token():
-            raise AuthError(f"Anthropic credentials are rate-limited for {model}; "
-                            "other Claude models remain available (see `hermes auth list`).")
+            raise _anthropic_model_benched_error(model)
         raise AuthError(_NO_ANTHROPIC_CREDENTIALS_MSG)
     return token
 

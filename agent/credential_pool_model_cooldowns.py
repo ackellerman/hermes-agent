@@ -67,11 +67,14 @@ class CredentialPoolModelCooldownMixin:
         selecting it from the pool (env / borrowed credentials). Tokens the
         pool does not know fail open: no row can attribute a cooldown to them.
         """
+        return self.token_blocked_until(token, model=model) is not None
+
+    def token_blocked_until(self, token: str, *, model: Optional[str] = None) -> Optional[float]:
+        """Epoch second the cooldown blocking *token* for *model* lifts, or ``None`` when nothing blocks it."""
         with self._lock:
-            return any(
-                entry.runtime_api_key == token and model_cooldown_until(entry, model) is not None
-                for entry in self._entries
-            )
+            waits = [until for entry in self._entries if entry.runtime_api_key == token
+                     for until in (model_cooldown_until(entry, model),) if until is not None]
+        return max(waits) if waits else None
 
     def _is_model_scoped_failure(
         self, status_code: Optional[int], model: Optional[str], failure_reason: Optional[str],

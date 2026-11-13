@@ -718,6 +718,20 @@ def resolve_anthropic_token(*, model: Optional[str] = None) -> Optional[str]:
     )
 
 
+def anthropic_model_bench_until(model: Optional[str]) -> Optional[float]:
+    """Epoch second the pool's cooldown on *model* lifts for the token a model-less resolve returns, or ``None``
+    when that token is not benched for it (or there is no token). Read-only."""
+    token = resolve_anthropic_token() if model else None
+    if not token:
+        return None
+    try:
+        from agent.credential_pool import load_pool
+        return load_pool("anthropic").token_blocked_until(token, model=model)
+    except Exception:
+        logger.debug("Failed to read Anthropic model cooldown", exc_info=True)
+        return None
+
+
 def run_oauth_setup_token() -> Optional[str]:
     """Run 'claude setup-token' interactively; the resulting token or None. FileNotFoundError if no 'claude' CLI."""
     from agent.anthropic_adapter import find_claude_code_cli  # late: the adapter imports this module
