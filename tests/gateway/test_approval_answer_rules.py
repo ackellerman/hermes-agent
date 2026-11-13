@@ -8,8 +8,11 @@ outlive its parent turn.
   requests are still pending.
 * The slash access policy (``allow_admin_from`` / ``group_allow_admin_from``) decides who may type
   ``/approve`` and ``/deny``; the bare-word route obeys the same policy. With the policy set, another
-  bot's ``/approve`` is refused and the admin's still works; with it unset every admitted author
+  bot's ``/approve`` is refused and the admin's still works; with it unset every admitted person
   answers, as before.
+* A bot-authored message never answers a command approval, whatever the configuration: a typed
+  ``/approve`` / ``/deny`` gets one sentence back and the request stays pending; a bare word from a
+  bot is an ordinary message.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from tools.approval_gateway_wait import _ApprovalEntry
 discord = card_cases.discord  # the real adapter over a fake client, as a fixture of this module too
 SECOND = "rm -rf /tmp/second-victim"
 OWNER, OTHER_BOT = "42", "9001"
+NEEDS_PERSON = "need a person"  # the one sentence a bot's typed answer gets back
 
 
 @pytest.fixture(autouse=True)
@@ -260,16 +264,18 @@ def test_with_an_admin_list_the_admins_typed_answer_still_resolves(clean_approva
     assert entry.event.is_set() and entry.result == result
 
 
-@pytest.mark.parametrize("verb,result", [("approve", "once"), ("deny", "deny")])
-def test_without_an_admin_list_another_bots_typed_answer_resolves_as_before(clean_approvals, verb, result):
-    """The shipped default: no ``group_allow_admin_from`` means no slash gating at all."""
+@pytest.mark.parametrize("verb,result", [
+    ("approve", "once"), ("approve always", "always"), ("approve session", "session"), ("deny", "deny")])
+def test_without_an_admin_list_any_persons_typed_answer_resolves_as_before(clean_approvals, verb, result):
+    """The shipped default: no ``group_allow_admin_from`` means no slash gating at all for people."""
     runner = _policy_runner({})
-    bot = _thread_source(OTHER_BOT, is_bot=True)
-    entry = _pending(runner, bot)
+    member = _thread_source("43")
+    entry = _pending(runner, member)
 
-    asyncio.run(runner._handle_message(MessageEvent(text=f"/{verb}", source=bot, message_id="m1")))
+    reply = asyncio.run(runner._handle_message(MessageEvent(text=f"/{verb}", source=member, message_id="m1")))
 
     assert entry.event.is_set() and entry.result == result
+    assert NEEDS_PERSON not in reply
 
 
 def test_the_admin_list_leaves_the_card_button_to_the_user_allowlist():
@@ -297,3 +303,102 @@ def test_bare_word_obeys_the_slash_access_policy(clean_approvals, user_id, resol
     assert consumed is resolved
     assert entry.event.is_set() is resolved
     assert event.text == ("/approve" if resolved else "yes"), "a refused word stays an ordinary message"
+
+
+# -- a bot-authored message never answers: a code rule, no configuration ------------------------
+
+
+def _grants() -> tuple:
+    with approval._lock:
+        return ({k: set(v) for k, v in approval._session_approved.items() if v}, set(approval._permanent_approved))
+
+
+@pytest.mark.parametrize("extra", [{}, _GATED], ids=["no-admin-list", "admin-list"])
+@pytest.mark.parametrize("background", [False, True], ids=["foreground", "background-child"])
+@pytest.mark.parametrize("verb", ["approve", "approve always", "approve session", "approve all",
+                                  "approve all always", "deny", "deny all", "deny not today"])
+def test_a_bots_typed_answer_never_resolves_whatever_the_configuration(clean_approvals, verb, background, extra):
+    runner = _policy_runner(extra)
+    bot = _thread_source(OTHER_BOT, is_bot=True)
+    entry = _pending(runner, bot, owner=object() if background else None)
+    grants = _grants()
+
+    reply = asyncio.run(runner._handle_message(MessageEvent(text=f"/{verb}", source=bot, message_id="m1")))
+
+    assert entry.result is None and not entry.event.is_set(), "the request is still pending"
+    assert approval.has_blocking_approval(runner._session_key_for_source(bot))
+    assert _grants() == grants, "no session or permanent grant was written"
+    if not extra:
+        assert NEEDS_PERSON in reply and "\n" not in reply.strip(), reply
+
+
+@pytest.mark.parametrize("text", ["/approve", "/approve always", "/approve all session", "/deny"])
+def test_a_bots_typed_answer_is_refused_by_the_handler_itself_for_a_childs_request(discord, text):
+    """Below the dispatcher: the handlers refuse, so no route into them lets a bot answer."""
+    key, child = _child_request_pending(discord)
+    grants = _grants()
+    bot = discord.source("thread", user_id=OTHER_BOT, is_bot=True)
+    event = MessageEvent(text=text, message_type=MessageType.COMMAND, source=bot, message_id="5004")
+    handler = discord.runner._handle_deny_command if text.startswith("/deny") else discord.runner._handle_approve_command
+
+    reply = discord.call(handler(event))
+
+    assert NEEDS_PERSON in reply
+    assert approval.has_blocking_approval(key) and not child.done.is_set() and child.ran == []
+    assert _grants() == grants
+    assert discord.slash("approve", discord.source("thread", user_id="43")), "a person still answers it"
+    assert child.done.wait(5) and child.ran == [COMMAND]
+
+
+def test_a_bots_typed_approve_does_not_drop_a_stale_prompt_either(clean_approvals):
+    runner = _policy_runner({})
+    bot = _thread_source(OTHER_BOT, is_bot=True)
+    key = runner._session_key_for_source(bot)
+    runner._pending_approvals[key] = {"command": COMMAND}
+
+    reply = asyncio.run(runner._handle_message(MessageEvent(text="/approve", source=bot, message_id="m1")))
+
+    assert NEEDS_PERSON in reply and key in runner._pending_approvals
+
+
+@pytest.mark.parametrize("extra", [{}, _GATED], ids=["no-admin-list", "admin-list"])
+@pytest.mark.parametrize("word", ["yes", "ok", "y", "approve", "always", "session", "👍", "no", "deny"])
+def test_a_bots_bare_word_is_an_ordinary_message(clean_approvals, word, extra):
+    """Called on the route itself: the ingress exclusion of bot authors is not what holds the rule."""
+    runner = _policy_runner(extra)
+    bot = _thread_source(OTHER_BOT, is_bot=True)
+    key = runner._session_key_for_source(bot)
+    entry = _pending(runner, bot)
+    grants = _grants()
+    runner._delivery_adapter_for = lambda _source: runner.adapters[Platform.DISCORD]
+    runner._send_busy_reply = AsyncMock()
+    event = MessageEvent(text=word, message_type=MessageType.TEXT, source=bot, message_id="m2")
+
+    consumed = asyncio.run(runner._route_plaintext_approval_while_busy(event, key))
+
+    assert consumed is False, "not consumed: it goes on as an ordinary message"
+    assert event.text == word, "and unchanged"
+    assert entry.result is None and not entry.event.is_set(), "the request is still pending"
+    assert _grants() == grants
+    runner._send_busy_reply.assert_not_awaited()
+
+
+@pytest.mark.parametrize("word,result", [("yes", "once"), ("always", "always"), ("👍", "once"), ("no", "deny")])
+def test_a_persons_bare_word_still_answers_the_turns_own_request(clean_approvals, word, result):
+    runner = _policy_runner({})
+    member = _thread_source("43")
+    key = runner._session_key_for_source(member)
+    entry = _pending(runner, member)
+    runner._delivery_adapter_for = lambda _source: runner.adapters[Platform.DISCORD]
+    runner._send_busy_reply = AsyncMock()
+    event = MessageEvent(text=word, message_type=MessageType.TEXT, source=member, message_id="m2")
+
+    assert asyncio.run(runner._route_plaintext_approval_while_busy(event, key)) is True
+    assert entry.event.is_set() and entry.result == result
+
+
+def test_the_rule_reads_the_sources_bot_flag_and_nothing_else():
+    from gateway.platforms.base_exec_approval import approval_answer_needs_person
+    assert approval_answer_needs_person(_thread_source(OTHER_BOT, is_bot=True)) is True
+    assert approval_answer_needs_person(_thread_source("43")) is False
+    assert approval_answer_needs_person(SimpleNamespace()) is False, "no flag: not a known bot"
