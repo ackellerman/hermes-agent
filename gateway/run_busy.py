@@ -687,6 +687,9 @@ class GatewayBusySessionMixin:
                 _match = self._plaintext_approval_words().get(_raw_text)
                 if _match is not None:
                     _verb, _normalized_args = _match
+                    # The word stands for a typed /approve or /deny: the same slash access policy applies.
+                    if self._check_slash_access(event.source, _verb) is not None:
+                        return False
                     _approval_handler = (
                         self._handle_approve_command if _verb == "approve" else self._handle_deny_command
                     )
