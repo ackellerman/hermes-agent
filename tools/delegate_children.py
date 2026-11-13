@@ -79,8 +79,15 @@ HEARTBEAT_INTERVAL_S = 30.0
 # long for a writer's lock, then shows the derived state and leaves the write to the next read.
 READ_WRITE_BUSY_MS = 250
 
+# The recovered notice's line for a kept child that is now idle-orphaned; it names that child's own id, since
+# nothing else in the notice lists a kept child.
 ORPHANED_LINE = ("child kept as idle-orphaned; continue it with delegate_task(action='continue', "
-                 "subagent_id=..., message=...)")
+                 "subagent_id='{subagent_id}', message=...)")
+
+
+def orphaned_line(subagent_ids: Iterable[str]) -> str:
+    """``ORPHANED_LINE`` once per idle-orphaned child of the unit."""
+    return "; ".join(ORPHANED_LINE.format(subagent_id=sid) for sid in subagent_ids)
 
 # ``action='list'`` shows at most this many kept children per list (the plan's 20-child cap). The roster
 # (agent/turn_context.py) applies its own smaller cap.
@@ -1076,17 +1083,17 @@ def wait_abandoned(child: Any) -> None:
 def orphaned_unit_note(conn: sqlite3.Connection, delegation_id: str,
                        task_indexes: Optional[Iterable[int]] = None) -> Optional[str]:
     """For ``recover_abandoned_delegations``: apply the orphan rule to the kept children of the abandoned unit
-    *delegation_id* (on the ledger's own connection) and return ``ORPHANED_LINE`` when any of them is now
-    idle-orphaned. Units of a grouped call carry ``<id>-<n>``; their children record the call's id."""
+    *delegation_id* (on the ledger's own connection) and return ``ORPHANED_LINE`` for each that is now
+    idle-orphaned, naming its ``subagent_id``. Units of a grouped call carry ``<id>-<n>``; their children record the call's id."""
     if not delegation_id or not _table_exists(conn):
         return None
     base = delegation_id.rsplit("-", 1)[0] if delegation_id.rsplit("-", 1)[-1].isdigit() else delegation_id
     _apply_rules(conn, time.time(), _delegation_cfg())
-    rows = conn.execute(f"SELECT task_index, status, idle_reason FROM {TABLE} WHERE delegation_id IN (?, ?)",
-                        (delegation_id, base)).fetchall()
+    rows = conn.execute(f"SELECT task_index, status, idle_reason, subagent_id FROM {TABLE} "
+                        "WHERE delegation_id IN (?, ?) ORDER BY task_index", (delegation_id, base)).fetchall()
     wanted = set(task_indexes) if task_indexes else None
-    hit = any(r[1] == IDLE and r[2] == ORPHANED and (wanted is None or r[0] is None or r[0] in wanted) for r in rows)
-    return ORPHANED_LINE if hit else None
+    hit = [r[3] for r in rows if r[1] == IDLE and r[2] == ORPHANED and (wanted is None or r[0] is None or r[0] in wanted)]
+    return orphaned_line(hit) if hit else None
 
 
 # ── session pruning ─────────────────────────────────────────────────────────

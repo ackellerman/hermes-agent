@@ -199,6 +199,8 @@ def _recovery_lines(evt: dict) -> list[str]:
         return []
     lines = [f"Last persisted unit status: {evt['last_known_status']} (before owner exit; not current liveness). "
              "Unrecorded outcomes remain unknown; inspect evidence before retrying side effects."]
+    if evt.get("resumable_subagent_ids"):  # the continue instruction in the error text carries a literal ``...``
+        lines.append(f"Continuable subagent ids: {', '.join(evt['resumable_subagent_ids'])}")
     tails = evt.get("transcript_tails") or {}
     for index, path in (evt.get("task_transcripts") or {}).items():
         lines.append(f"Task index {index} transcript (may be incomplete): {path}")
