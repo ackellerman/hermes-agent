@@ -1793,8 +1793,10 @@ def test_ids_completion_result_carries_child_id_and_the_resume_hint(db):
 
     entry = entries[0]
     assert (entry["child_id"], entry["subagent_id"]) == ("kid-1", "sa-0-aaaa")
-    assert entry["resume_hint"] == dc.resume_hint("kid-1")
-    assert "action='resume'" in entry["resume_hint"] and "child_id=kid-1" in entry["resume_hint"]
+    assert entry["resume_hint"] == dc.resume_hint("sa-0-aaaa")
+    # The action that exists, with the id it takes (``continue`` is addressed by subagent_id, not child_id).
+    assert "action='continue', subagent_id='sa-0-aaaa'" in entry["resume_hint"]
+    assert "'resume'" not in entry["resume_hint"] and "kid-1" not in entry["resume_hint"]
     assert entry["summary"] == "the answer"
 
     loose = SimpleNamespace(session_id="kid-2", _subagent_id="sa-0-bbbb")
@@ -2218,7 +2220,7 @@ def test_ids_recovered_completion_of_a_finished_child_carries_its_ids(tmp_path, 
         replayed = event["results"][0]
         assert replayed["status"] == "completed" and replayed["summary"] == "the token is 42"
         assert (replayed["child_id"], replayed["subagent_id"]) == ("kid-u", "sa-0-unit")
-        assert replayed["resume_hint"] == dc.resume_hint("kid-u")
+        assert replayed["resume_hint"] == dc.resume_hint("sa-0-unit")
         assert event["results"][1]["status"] == "unknown"  # the child that never finished is still unknown
     finally:
         handle.close()

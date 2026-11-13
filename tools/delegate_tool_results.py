@@ -408,7 +408,7 @@ def _rollup_children_cost(parent_agent, children_cost_total: float) -> None:
 
 def _stamp_child_identities(results, child_by_index) -> None:
     """Add the parent's stable handles to each kept child's completion entry: ``child_id`` (its first session
-    id, what ``steer``/``stop``/``resume`` accept) next to ``subagent_id``, plus the one-line ``resume_hint``
+    id, what ``steer``/``stop`` accept) next to ``subagent_id`` (what ``continue`` takes), plus the ``resume_hint``
     the completion text ends with. A child that is not kept gains nothing: the field is absent, never a fake id.
     Runs after the redaction/summary passes: ids are host-owned and the hint is parent-facing prose, so neither
     belongs in the child's summary (memory, hooks and the spill file keep the clean answer).

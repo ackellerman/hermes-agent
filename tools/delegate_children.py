@@ -1,4 +1,4 @@
-"""Kept delegated children: the durable record that lets a parent find, hold and later resume a child.
+"""Kept delegated children: the durable record that lets a parent find, hold and later continue a child.
 
 Upstream's stamp (``_subagent_id`` in the child's ``model_config``) and ``stored_child_session`` decide
 WHICH stored transcript is a child's and whether a conversation may see it. This module decides the
@@ -28,6 +28,12 @@ one process write to their own stores). The table is created on first use; there
   keeps its children: nothing here writes through the worker RPC.
 
 Credentials, provider clients and ACP transport args are never stored; a resume re-derives the route.
+
+The follow-up itself is upstream's ``delegate_task(action='continue')`` (``tools/delegate_tool_continue.py``),
+which addresses a child by ``subagent_id`` and rebuilds it from its own record (``resumable_subagents``). This
+module only follows it: a continue re-opens the kept row of the child it rebuilt (``note_spawn(rebuilt=True)``
+takes the row's fence when the worker starts), so the row says ``running`` while the continue runs and goes
+``idle`` when it ends. A continue never creates a kept row: only a spawn decides that a child is kept.
 """
 
 from __future__ import annotations
@@ -73,7 +79,8 @@ HEARTBEAT_INTERVAL_S = 30.0
 # long for a writer's lock, then shows the derived state and leaves the write to the next read.
 READ_WRITE_BUSY_MS = 250
 
-ORPHANED_LINE = "child kept as idle-orphaned; resumable with action='resume'"
+ORPHANED_LINE = ("child kept as idle-orphaned; continue it with delegate_task(action='continue', "
+                 "subagent_id=..., message=...)")
 
 # ``action='list'`` shows at most this many kept children per list (the plan's 20-child cap). The roster
 # (agent/turn_context.py) applies its own smaller cap.
@@ -82,19 +89,21 @@ LIST_LIMIT = 20
 HOLDER_LABEL_MAX = 60
 
 # The one line that ends a kept child's completion text: model- and user-visible prose, one sentence,
-# naming the action and the id the parent will address the child by later.
-RESUME_HINT = "This child is kept: send it a follow-up with action='resume', child_id={child_id}."
+# naming the action and the id that action takes. ``action='continue'`` is addressed by ``subagent_id``
+# (``child_id`` is what ``list``/``steer``/``stop`` also accept; ``continue`` does not).
+RESUME_HINT = ("This subagent can be continued on its own conversation: "
+               "delegate_task(action='continue', subagent_id='{subagent_id}', message=...).")
 
 
-def resume_hint(child_id: str) -> str:
-    """The resume hint for *child_id* (see ``RESUME_HINT``)."""
-    return RESUME_HINT.format(child_id=child_id)
+def resume_hint(subagent_id: str) -> str:
+    """The follow-up hint for the child *subagent_id* (see ``RESUME_HINT``)."""
+    return RESUME_HINT.format(subagent_id=subagent_id)
 
 
 def stamp_completion_entry(entry: dict[str, Any], child: Any) -> bool:
     """Add the parent's stable handles to a kept child's completion *entry*: ``child_id`` (its first session
-    id — what ``steer``/``stop``/``resume`` accept) next to ``subagent_id``, plus the one-line ``resume_hint``
-    the completion text ends with. A child that is not kept gains nothing (the keys stay absent, never a fake
+    id — what ``steer``/``stop`` accept) next to ``subagent_id`` (what ``continue`` takes), plus the one-line
+    ``resume_hint`` the completion text ends with. A child that is not kept gains nothing (the keys stay absent, never a fake
     id). One definition serves both places a completion entry is built: the finalize pass
     (``delegate_tool_results._stamp_child_identities``) and the durable record of a finished child of a
     still-running unit (``delegate_tool_dispatch._record_finished_child``), so a replay after the owner process
@@ -106,7 +115,7 @@ def stamp_completion_entry(entry: dict[str, Any], child: Any) -> bool:
     subagent_id = getattr(child, "_subagent_id", None)
     if isinstance(subagent_id, str) and subagent_id:
         entry["subagent_id"] = subagent_id
-    entry["resume_hint"] = resume_hint(child_id)
+        entry["resume_hint"] = resume_hint(subagent_id)  # no id to continue by, no hint
     return True
 
 
@@ -882,11 +891,14 @@ _PENDING_ATTR = "_delegate_children_pending"
 
 def note_spawn(parent_agent: Any, child: Any, *, goal: str, context: Optional[str], toolsets: Any, role: Any,
                model: Optional[str], route: Optional[dict[str, Any]] = None, profile_home: Any = None,
-               title: Optional[str] = None, keep: Optional[bool] = None) -> bool:
+               title: Optional[str] = None, keep: Optional[bool] = None, rebuilt: bool = False) -> bool:
     """Spawn hook (``_build_child_agent``): when the child is kept, stash its record on the child. The row is
     written when its worker starts (``worker_started``), so a child that never runs leaves no row; the holder and
-    its conversation are read then too, so a ``/new`` in between lands the row on the new session."""
+    its conversation are read then too, so a ``/new`` in between lands the row on the new session. *rebuilt*
+    (``action='continue'``): the child already ran, so its existing row is found and re-opened instead."""
     try:
+        if rebuilt:
+            return _note_rebuilt(parent_agent, child)
         depth = int(getattr(child, "_delegate_depth", 1) or 1)
         if not should_keep(parent_agent, origin=current_spawn_origin(), child_depth=depth, keep=keep):
             return False
@@ -914,6 +926,25 @@ def note_spawn(parent_agent: Any, child: Any, *, goal: str, context: Optional[st
     except Exception:
         logger.warning("delegate_children: could not note a kept child", exc_info=True)
         return False
+
+
+def _note_rebuilt(parent_agent: Any, child: Any) -> bool:
+    """``action='continue'`` rebuilt a finished child under its own ``subagent_id``: find the kept row its first
+    run wrote (lineage-checked, as ``show`` resolves a ``subagent_id``) and stash it for ``worker_started`` to
+    re-open. A child with no row was never kept and stays that way."""
+    if current_spawn_origin() != ORIGIN_MODEL:
+        return False
+    from agent.prompt_cache_scope import conversation_id
+    store = ChildStore.for_agent(parent_agent)
+    subagent_id = str(getattr(child, "_subagent_id", "") or "")
+    child_id = store.resolve(subagent_id, [conversation_id(parent_agent) or ""]) if store and subagent_id else None
+    if not child_id:
+        return False
+    child._delegate_child_id = child_id
+    setattr(child, _PENDING_ATTR, {"db_path": store.db_path, "child_id": child_id, "subagent_id": subagent_id,
+                                   "session_db": _plain_session_db(getattr(parent_agent, "_session_db", None)),
+                                   "reopen": True})
+    return True
 
 
 class _Tick:
@@ -998,7 +1029,13 @@ def worker_started(child: Any, future: Any, *, task_index: Optional[int] = None,
         child_id = pending["child_id"]
         parent = pending.pop("parent", None)  # no lasting child -> parent reference
         token = getattr(child, "_delegate_run_token", None)
-        if not token:
+        if pending.get("reopen"):  # a continue: the same row runs again, under a new fence
+            fence = store.take_fence(child_id)
+            if not fence.ok:
+                logger.info("delegate_children: continued child %s keeps its row as is (%s)", child_id, fence.reason)
+                return None
+            token = fence.token
+        elif not token:
             # The async ledger's unit id when the call runs in the background (what a replay is keyed on), else
             # the live-transcript id of the call.
             delegation_id = getattr(child, "_delegation_unit_id", None) or getattr(child, "_delegation_id", None)

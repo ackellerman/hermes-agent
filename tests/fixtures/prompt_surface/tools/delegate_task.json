@@ -4,7 +4,7 @@
   "parameters": {
     "properties": {
       "action": {
-        "description": "Default 'spawn'. Live control of running children and the kept children this session holds: 'list' = ids/goals/status/transcripts (add scope='profile' for the whole profile's kept children, query=<text> to search); 'steer' = queue course-correction text into one child (subagent_id or child_id + message) without stopping it; 'stop' = end one child early (subagent_id or child_id; partial result still returns); 'continue' = give a FINISHED child a follow-up: it resumes its own conversation and returns like a spawn. Control actions return immediately; goal/tasks are ignored unless spawning.",
+        "description": "Default 'spawn'. Live control of running children and the kept children this session holds: 'list' = ids/goals/status/transcripts (add scope='profile' for the whole profile's kept children, query=<text> to search); 'steer' = queue course-correction text into one child (subagent_id or child_id + message) without stopping it; 'stop' = end one child early (subagent_id or child_id; partial result still returns); 'continue' = give a FINISHED child a follow-up (subagent_id + message): it resumes its own conversation and returns like a spawn. Control actions return immediately; goal/tasks are ignored unless spawning.",
         "enum": [
           "spawn",
           "list",
@@ -15,7 +15,7 @@
         "type": "string"
       },
       "child_id": {
-        "description": "Kept-child key, also a target for action='steer'/'stop': the child_id a kept child's dispatch handle or completion result carries. Stable across the child's own compression; preferred over subagent_id.",
+        "description": "Kept-child key, also a target for action='steer'/'stop': the child_id a kept child's dispatch handle or completion result carries. Stable across the child's own compression; preferred over subagent_id for those two. 'continue' takes subagent_id, not child_id.",
         "type": "string"
       },
       "message": {

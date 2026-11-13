@@ -380,7 +380,8 @@ def _build_child_agent(
         from tools.delegate_children import note_spawn
         note_spawn(parent_agent, child, goal=goal, context=context, toolsets=child_toolsets, role=effective_role,
                    model=rt.get("model"), route={**rt, "reasoning_effort": override_reasoning_effort,
-                                                 "profile_home": profile_home}, profile_home=profile_home)
+                                                 "profile_home": profile_home}, profile_home=profile_home,
+                   rebuilt=session_id is not None)
     if child_pool is not None:
         child._credential_pool = child_pool
 
@@ -632,8 +633,11 @@ def delegate_task(
 
     normalized_action = (action or "").strip().lower()
     if normalized_action == "continue":
+        from tools.delegate_children import spawn_origin
         from tools.delegate_tool_continue import continue_subagent
-        return continue_subagent(subagent_id, message, parent_agent, background=is_truthy_value(background, default=False))
+        with spawn_origin(origin):  # a kept child's row follows the continue (tools/delegate_children.py)
+            return continue_subagent(subagent_id, message, parent_agent,
+                                     background=is_truthy_value(background, default=False))
     if normalized_action in _CONTROL_ACTIONS:
         return _handle_control_action(normalized_action, subagent_id, message, parent_agent, child_id=child_id,
                                       scope=scope, query=query)
@@ -917,7 +921,8 @@ DELEGATE_TASK_SCHEMA = {
                 "query=<text> to search); 'steer' = queue "
                 "course-correction text into one child (subagent_id or child_id "
                 "+ message) without stopping it; 'stop' = end one child "
-                "early (subagent_id or child_id; partial result still returns); 'continue' = give a FINISHED child a follow-up: "
+                "early (subagent_id or child_id; partial result still returns); 'continue' = give a FINISHED child a follow-up "
+                "(subagent_id + message): "
                 "it resumes its own conversation and returns like a spawn. "
                 "Control actions return immediately; goal/tasks are ignored unless spawning.",
                 enum=["spawn", "list", "steer", "stop", "continue"],
@@ -926,7 +931,8 @@ DELEGATE_TASK_SCHEMA = {
             "child_id": _p(
                 "string",
                 "Kept-child key, also a target for action='steer'/'stop': the child_id a kept child's dispatch handle "
-                "or completion result carries. Stable across the child's own compression; preferred over subagent_id.",
+                "or completion result carries. Stable across the child's own compression; preferred over subagent_id for those two. "
+                "'continue' takes subagent_id, not child_id.",
             ),
             "scope": _p(
                 "string",

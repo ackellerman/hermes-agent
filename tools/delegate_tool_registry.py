@@ -283,7 +283,8 @@ def _list_payload(parent_agent: Any, *, scope: Optional[str] = None, query: Opti
 
     ``subagents`` is the unchanged live view (the running children of this conversation's spawn tree).
     ``children`` adds the kept children this session holds, idle/expired/orphaned included, each with the
-    ``child_id`` a later ``resume``/``steer``/``stop`` takes, its status and whether this session may act on it;
+    ``child_id`` a later ``steer``/``stop`` takes (``continue`` takes its ``subagent_id``), its status and whether
+    this session may act on it;
     ``scope='profile'`` adds ``profile_children``: the same profile's other kept children, labelled with the
     holder session that owns them and ``read_only`` (another session's child, or one that ran as another
     profile — a ``profile_routes`` child). ``query`` filters both lists, case-insensitively, over goal, ids and
