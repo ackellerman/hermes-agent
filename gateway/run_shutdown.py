@@ -29,8 +29,8 @@ from gateway.restart import (
 )
 from gateway.run_common import _UNSET
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
-from gateway.session_runtime_workers import uncounted_runtime_work_units
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
+from gateway.run_shutdown_work import GatewayShutdownWorkMixin, active_delegation_count
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
 
 # Log-record parity with the origin module.
@@ -171,7 +171,7 @@ def _effective_watchdog_leash(runner: object) -> float:
     return effective_stop_watchdog_delay(runner, resolve_shutdown_watchdog_delay(effective_stop_drain_timeout(runner)))
 
 
-class GatewayShutdownMixin(GatewaySessionEndMixin):
+class GatewayShutdownMixin(GatewayShutdownWorkMixin, GatewaySessionEndMixin):
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
     @dataclasses.dataclass
@@ -192,13 +192,15 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
 
     # Active-work accounting
     def _active_work_count(self) -> int:
-        """All agent work the gateway must expose and drain as one total."""
+        """All agent work the gateway must expose and drain as one total, live background
+        delegations included (``delegate_task`` children run on this process's thread pool)."""
         return (
             self._running_agent_count()
             + managed_turn_count(self)
             + self._active_cron_job_count()
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
+            + active_delegation_count()
         )
 
     @staticmethod
@@ -803,9 +805,11 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
 
     # Drain / interrupt
     def _drain_work_counts(self) -> tuple:
-        """``(agents, cron, api, deferred)`` the drain waits on; a managed-worker turn is a chat turn."""
+        """``(agents, cron, api, deferred)`` the drain waits on; a managed-worker turn is a chat turn,
+        and a background delegation drains on the chat-turn deadline (``restart_drain_timeout``)."""
         return (
-            self._running_agent_count() + managed_turn_count(self), self._active_cron_job_count(),
+            self._running_agent_count() + managed_turn_count(self) + active_delegation_count(),
+            self._active_cron_job_count(),
             self._active_api_run_count(), self._active_deferred_agent_worker_count(),
         )
 
@@ -1560,50 +1564,12 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             + managed_turn_count(self)
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
+            + active_delegation_count()
         )
         return (
             max(0, non_cron - self._wedged_chat_agent_count())
             + self._restart_wait_cron_counts()["awaitable"]
         )
-
-    def _describe_active_work(self) -> list:
-        """One dict per in-flight work unit the restart wait is holding for, so an observer
-        (``hermes update``, ``hermes gateway status``) can name it instead of printing a bare count.
-
-        ``kind`` ∈ ``chat`` (session turn), ``cron`` (job id + external worker pid when the run was handed to a
-        restart-safe scope), ``managed`` (session + worker pid when a worker holds it), ``api`` / ``deferred``
-        (count only). Best-effort: a source that can't be read is omitted, never raises."""
-        from gateway.run import _AGENT_PENDING_SENTINEL
-        now = time.time()
-        units: list = []
-        for key, state in list(self._sessions_map().items()):
-            agent = state.turn.agent
-            if agent is None:
-                continue
-            unit: dict = {"kind": "chat", "session": key, "pid": os.getpid()}
-            if state.turn.started_ts:
-                unit["elapsed_s"] = round(now - state.turn.started_ts, 1)
-            if agent is not _AGENT_PENDING_SENTINEL:
-                unit["model"] = getattr(agent, "model", None)
-                summary_fn = getattr(agent, "get_activity_summary", None)
-                if callable(summary_fn):
-                    with suppress(Exception):
-                        summary = summary_fn()
-                        unit["current_tool"] = summary.get("current_tool")
-                        unit["idle_s"] = summary.get("seconds_since_activity")
-            units.append(unit)
-        with suppress(Exception):
-            from cron.scheduler import get_running_job_details, get_wedged_job_ids
-            wedged = get_wedged_job_ids()
-            for job in get_running_job_details():
-                units.append({"kind": "cron", "job_id": job["job_id"], "elapsed_s": job["elapsed_s"],
-                              "pid": job["worker_pid"] or os.getpid(), "external": bool(job["worker_pid"]),
-                              "wedged": job["job_id"] in wedged,
-                              "restart_safe": bool(job.get("restart_safe"))})
-        units.extend(uncounted_runtime_work_units(self, os.getpid()))
-        for kind, count in (("api", self._active_api_run_count()), ("deferred", self._active_deferred_agent_worker_count())):
-            units.extend({"kind": kind, "pid": os.getpid()} for _ in range(count))
-        return units
 
     async def _await_active_work_before_restart(self) -> bool:
         """Wait for in-flight work before ``stop()`` so the requesting turn isn't force-interrupted.
@@ -1860,6 +1826,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         _cron_at_start = self._active_cron_job_count()
         _api_at_start = self._active_api_run_count()
         _deferred_at_start = ctx.deferred_count()
+        _delegations_at_start = active_delegation_count()
         # Cron floor clamped to the watchdog leash; getattr-guard for bare shutdown-path doubles.
         _cron_drain_cfg = getattr(self, "_cron_drain_timeout", DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT)
         # Under launchd the real leash is launchd's own exit timeout, not our watchdog
@@ -1883,10 +1850,12 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         logger.info(
             "Shutdown phase: drain done at +%.2fs (drain took %.2fs, timed_out=%s, active_at_start=%d, "
             "active_now=%d, cron_at_start=%d, cron_now=%d, api_at_start=%d, api_now=%d, "
-            "deferred_at_start=%d, deferred_now=%d)", ctx.elapsed(), ctx.drain_elapsed,
+            "deferred_at_start=%d, deferred_now=%d, delegations_at_start=%d, delegations_now=%d)",
+            ctx.elapsed(), ctx.drain_elapsed,
             ctx.timed_out, len(ctx.active_agents), self._running_agent_count(), _cron_at_start,
             self._active_cron_job_count(), _api_at_start, self._active_api_run_count(),
             _deferred_at_start, ctx.deferred_count(),
+            _delegations_at_start, active_delegation_count(),
         )
         if ctx.timed_out:
             return
@@ -1904,9 +1873,10 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         from gateway.run import GatewayRunner
         logger.warning(
             "Gateway drain timed out after %.1fs with %d active agent(s), "
-            "%d in-flight cron job(s), %d api_server run(s), and %d deferred agent worker(s); "
-            "interrupting remaining work.", ctx.drain_elapsed, self._running_agent_count(),
-            self._active_cron_job_count(), self._active_api_run_count(), ctx.deferred_count(),
+            "%d in-flight cron job(s), %d api_server run(s), %d deferred agent worker(s), and "
+            "%d background delegation(s); interrupting remaining work.", ctx.drain_elapsed,
+            self._running_agent_count(), self._active_cron_job_count(), self._active_api_run_count(),
+            ctx.deferred_count(), active_delegation_count(),
         )
         # Mark resume_pending BEFORE interrupting so the next message auto-resumes (stuck sessions
         # still escalate via .restart_failure_counts). CURRENT _running_agents, not the drain snapshot.
