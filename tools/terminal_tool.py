@@ -1364,7 +1364,9 @@ def _apply_command_wrap(
                 background=background, task_id=task_id or "", session_key=session_key,
             )
         except Exception as exc:
-            logger.warning("wrap_terminal_command hook raised (%s); refusing the command", exc)
+            logger.warning(
+                "wrap_terminal_command hook raised (%s); refusing the command", exc, exc_info=True,
+            )
             raise _Rejected(_error_json(
                 f"Command not run: a wrap_terminal_command hook raised: {exc}", status="blocked",
             ))
