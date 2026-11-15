@@ -1842,10 +1842,15 @@ def my_callback(
 **Fail-closed:** a callback that raises, returns an unusable value (an empty string, a non-string), or disagrees with another callback **refuses the command**. Hermes calls the registered callbacks directly here rather than through `invoke_hook`, so an exception is not swallowed: if the wrapper cannot be built, nothing runs unwrapped. Only in-process Python plugins receive this hook — shell hooks have no channel for a replacement command.
 
 ```python
+import shlex
+
 def wrap_in_sandbox(command, env_type, cwd, **kwargs):
     if env_type != "local":
         return {"action": "block", "message": "the sandbox runs on the local backend only"}
-    return ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--", "/bin/bash", "-c", command]
+    # The return is a command *string*: a list (an argv) is refused as an unusable value.
+    return shlex.join([
+        "/usr/bin/bwrap", "--ro-bind", "/", "/", "--new-session", "--", "/bin/bash", "-c", command,
+    ])
 
 def register(ctx):
     ctx.register_hook("wrap_terminal_command", wrap_in_sandbox)

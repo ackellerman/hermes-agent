@@ -143,6 +143,14 @@ def test_a_callback_that_returns_a_non_string_refuses_the_command(harness):
     assert not harness["env"].execute.called
 
 
+def test_a_callback_that_returns_an_empty_string_refuses_the_command(harness):
+    harness["use"](_record(harness, ""))
+
+    _run()
+
+    assert not harness["env"].execute.called
+
+
 def test_a_background_call_spawns_the_wrapped_command(harness):
     harness["use"](_record(harness, WRAPPED))
 
