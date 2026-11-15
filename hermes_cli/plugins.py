@@ -211,13 +211,24 @@ VALID_HOOKS: set[str] = {
     # block/rewrite adopters are discoverable once the middleware variant ships (#64231 taxonomy).
     "pre_command",
     "post_compaction",  # once per committed compaction on every path; observer (hooks.md, #118382)
+    # wrap_terminal_command: after EVERY guard has passed on the model's raw command, immediately
+    # before execution. Kwargs: command (raw, what the guards inspected), env_type, cwd, workdir,
+    # background, task_id, session_key. Return None to leave the command alone, a non-empty str to
+    # run that string instead (a sandbox wrapper), or {"action": "block", "message"} to refuse.
+    # A raise, an unusable return value, or two disagreeing strings refuses the command: the
+    # returned string is what actually runs, so every failure here fails closed.
+    "wrap_terminal_command",
 }
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
 # the shell-hook allow-list, so these are refused loudly instead of having output silently ignored.
 # pre_final_stop is also kept off shell hooks deliberately: its payload carries raw tool error text and
-# its directive steers the turn, so it stays with in-process plugins.
-SHELL_UNSUPPORTED_HOOKS: set[str] = {"transform_api_error_classification", "pre_final_stop"}
+# its directive steers the turn, so it stays with in-process plugins. wrap_terminal_command is on the
+# allow-list only through VALID_HOOKS, and the shell-hook response parser has no channel for a command
+# string (and could not rewrite what runs anyway), so it stays with in-process plugins too.
+SHELL_UNSUPPORTED_HOOKS: set[str] = {
+    "transform_api_error_classification", "pre_final_stop", "wrap_terminal_command",
+}
 
 _env_enabled = env_var_enabled  # imported by plugins/memory
 

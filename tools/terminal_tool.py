@@ -1339,14 +1339,68 @@ def _yield_kwargs(command: str, **ctx) -> dict:
     return {"yield_handler": handler} if handler is not None else {}
 
 
+def _apply_command_wrap(
+    command: str, *, env_type: str, cwd: str, workdir: Optional[str], background: bool,
+    task_id: Optional[str], session_key: str,
+) -> str:
+    """Return the string that actually runs, after ``wrap_terminal_command`` hooks.
+
+    Called only once every guard has passed on *command*, so a plugin (a sandbox, a launcher) can
+    wrap what runs without changing what the guards inspected. The callbacks are taken from
+    ``iter_hook_callbacks`` directly rather than ``invoke_hook``, which swallows a callback's
+    exception: here any failure must refuse the command, because the returned string is what runs.
+
+    Raises :class:`_Rejected` when a callback raises, blocks, returns an unusable value, or two
+    callbacks disagree. ``None`` skips a callback; a non-empty ``str`` is collected; no collected
+    string leaves *command* alone.
+    """
+    from hermes_cli.plugins import iter_hook_callbacks
+
+    wrapped: list[str] = []
+    for callback in iter_hook_callbacks("wrap_terminal_command"):
+        try:
+            decision = callback(
+                command=command, env_type=env_type, cwd=cwd, workdir=workdir,
+                background=background, task_id=task_id or "", session_key=session_key,
+            )
+        except Exception as exc:
+            logger.warning("wrap_terminal_command hook raised (%s); refusing the command", exc)
+            raise _Rejected(_error_json(
+                f"Command not run: a wrap_terminal_command hook raised: {exc}", status="blocked",
+            ))
+        if decision is None:
+            continue
+        if isinstance(decision, dict) and str(decision.get("action", "")).lower() == "block":
+            raise _Rejected(_error_json(
+                decision.get("message") or "Command not run: a wrap_terminal_command hook blocked it.",
+                status="blocked",
+            ))
+        if not isinstance(decision, str) or not decision.strip():
+            logger.warning("wrap_terminal_command hook returned an unusable value: %r", decision)
+            raise _Rejected(_error_json(
+                "Command not run: a wrap_terminal_command hook returned an unusable value "
+                f"({type(decision).__name__}); expected a non-empty string, a block directive or None.",
+                status="blocked",
+            ))
+        wrapped.append(decision)
+    if len(set(wrapped)) > 1:
+        raise _Rejected(_error_json(
+            "Command not run: two wrap_terminal_command hooks disagree on what to run.",
+            status="blocked",
+        ))
+    return wrapped[0] if wrapped else command
+
+
 def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
     task_id: Optional[str], session_id: Optional[str], session_key: str,
     workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
-    metered: bool = True,
+    metered: bool = True, exec_command: Optional[str] = None,
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize. ``metered``
-    is False for Hermes' own control-plane commands (``_host_local``)."""
+    is False for Hermes' own control-plane commands (``_host_local``). ``exec_command`` is the
+    string a ``wrap_terminal_command`` hook returned; only ``env.execute`` uses it, while every
+    other use (``command`` for metering, logging and finalization) keeps the raw command."""
     from hermes_cli.observability.shared_metrics_harness import record_terminal_outcome
     max_retries = 3
     env_type, eff, effective_timeout = plan.env_type, plan.effective_task_id, plan.effective_timeout
@@ -1371,7 +1425,7 @@ def _run_foreground(
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.
             result = env.execute(
-                command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
+                exec_command or command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
                 **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
                                 task_id=task_id, session_key=session_key),
             )
@@ -1563,6 +1617,13 @@ def terminal_tool(
             # Pre-exec security checks (floors + dangerous command detection);
             # force=True means the user already confirmed.
             verdict = _run_approval_guards(command, env_type, plan.config, force=force)
+            # Every guard above inspected the raw command. Only now may a plugin wrap what runs,
+            # so a sandbox cannot change the command the guards approved (and cannot trip the
+            # parser limit on a wrapped string).
+            exec_command = _apply_command_wrap(
+                command, env_type=env_type, cwd=cwd, workdir=workdir, background=background,
+                task_id=task_id, session_key=session_key,
+            )
 
             pty_disabled = pty and _command_requires_pipe_stdin(command)
             if plan.promoted_from_foreground_timeout is not None:
@@ -1571,7 +1632,7 @@ def terminal_tool(
                 background, notify_on_complete, watch_patterns = True, True, None
             if background:
                 result = spawn_background_process(
-                    command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
+                    command=exec_command, env=env, env_type=env_type, effective_task_id=effective_task_id,
                     task_id=task_id, session_key=session_key, workdir=workdir, cwd=cwd,
                     mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
                     effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
@@ -1589,7 +1650,7 @@ def terminal_tool(
                 command, env, plan,
                 task_id=task_id, session_id=session_id, session_key=session_key,
                 workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
-                metered=not _host_local,
+                metered=not _host_local, exec_command=exec_command,
             ))
     except _Rejected as r:
         return r.result_json

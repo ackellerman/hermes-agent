@@ -456,6 +456,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `post_tool_call` | Observer | After blocked, error, or successful result; return ignored. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `conversation_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message`, `middleware_trace` | Result/error text may contain arbitrary tool or user content and secrets. |
 | `transform_tool_result` | Transform | After `post_tool_call`, before conversation append; first string replaces the result. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `conversation_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message` | Exposes the full model-bound result and arguments. |
 | `transform_terminal_output` | Transform | After bounded foreground process capture, before final output limiting; first string replaces output. | `command`, `output`, `returncode`, `task_id`, `env_type` | Command/output may contain credentials. |
+| [`wrap_terminal_command`](#wrap_terminal_command) | Transform | After every guard has passed on the raw command, immediately before execution; a string replaces what runs (foreground and background), and a raise or an unusable return refuses the command. | `command`, `env_type`, `cwd`, `workdir`, `background`, `task_id`, `session_key` | Raw command, paths and session identifiers. |
 | `pre_transcription` | Transform | Fired by the STT dispatcher after provider resolution and before any backend (built-in, command-type, or plugin-registered) is invoked; dict results are applied in registration order, last-writer-wins per field (`prompt`, `language`, `model`; `file_path` is read-only). | `file_path`, `provider`, `model`, `language`, `prompt`, `source` | The final prompt is uploaded to the configured STT provider with the audio — keep secrets out of hook returns. |
 | `pre_llm_call` | Directive/control | Once per turn before the loop; all valid string/`{"context": ...}` returns are joined and injected into the user message; the first valid `{"action": "block", "message": ...}` ends the turn before any inference request. | `session_id`, `task_id`, `turn_id`, `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`, `parent_session_id`, `sender_id` | Full user message and conversation history. |
 | `post_llm_call` | Observer | Successful, non-interrupted turn finalization; return ignored. | `session_id`, `task_id`, `turn_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform`, `side_question_token` | Full prompt, response, and history. |
@@ -1800,6 +1801,55 @@ def register(ctx):
 ```
 
 Pairs with `transform_tool_result`, which runs afterward for every tool, including `terminal`.
+
+---
+
+### `wrap_terminal_command`
+
+Fires inside the `terminal` tool **after every guard has passed on the model's raw command** and immediately before execution, so a plugin can wrap what actually runs — a sandbox, a launcher, an audit wrapper — without changing the string the guards inspected. The string the hook returns is what runs, for both foreground and background calls; the raw `command` is still what approval, metering, logging and process records show.
+
+**Callback signature:**
+
+```python
+def my_callback(
+    command: str,
+    env_type: str,
+    cwd: str,
+    workdir: str | None,
+    background: bool,
+    task_id: str,
+    session_key: str,
+    **kwargs,
+) -> str | None:
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `command` | `str` | The raw command the guards approved. |
+| `env_type` | `str` | Execution-environment type (`local`, `docker`, …). |
+| `cwd` | `str` | Resolved working directory for this call. |
+| `workdir` | `str \| None` | The per-call `workdir` argument, if any. |
+| `background` | `bool` | Whether the call runs as a tracked background process. |
+| `task_id` | `str` | Effective task identifier, or an empty string. |
+| `session_key` | `str` | Session key for cwd records, or an empty string. |
+
+**Return value:**
+
+- `None` — this callback leaves the command alone.
+- A non-empty `str` — the command to run instead. Two callbacks that return different strings refuse the call.
+- `{"action": "block", "message": str}` — refuse the call; `message` becomes the tool result.
+
+**Fail-closed:** a callback that raises, returns an unusable value (an empty string, a non-string), or disagrees with another callback **refuses the command**. Hermes calls the registered callbacks directly here rather than through `invoke_hook`, so an exception is not swallowed: if the wrapper cannot be built, nothing runs unwrapped. Only in-process Python plugins receive this hook — shell hooks have no channel for a replacement command.
+
+```python
+def wrap_in_sandbox(command, env_type, cwd, **kwargs):
+    if env_type != "local":
+        return {"action": "block", "message": "the sandbox runs on the local backend only"}
+    return ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--", "/bin/bash", "-c", command]
+
+def register(ctx):
+    ctx.register_hook("wrap_terminal_command", wrap_in_sandbox)
+```
 
 ---
 
