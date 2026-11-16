@@ -174,9 +174,9 @@ def test_model_request_describes_understanding_and_next_action_without_confirmat
     assert "timeout" not in endpoint.await_args.kwargs
 
 
-def _source() -> SessionSource:
+def _source(chat_id: str = CHAT_ID) -> SessionSource:
     return SessionSource(
-        platform=Platform.DISCORD, chat_id=CHAT_ID, chat_type="group", user_id="u1",
+        platform=Platform.DISCORD, chat_id=chat_id, chat_type="group", user_id="u1",
         guild_id=str(GUILD_ID),
     )
 
@@ -735,17 +735,35 @@ def _skips(caplog) -> list[str]:
     ]
 
 
+def _unreadable(*args, **kwargs):
+    """A FIFO read that fails the way an unreadable state.db does."""
+    raise RuntimeError("state.db is unreadable")
+
+
 def test_brief_skipped_while_speech_is_busy(edge, monkeypatch, tmp_path, caplog):
     caplog.set_level(logging.INFO, logger="gateway.voice_brief")
     edge.voice_speech_busy = lambda guild_id: True
     _wire(monkeypatch, tmp_path)
+    runner = _make_runner()
+    runner._voice_ack_guild_for = lambda source: GUILD_ID
+    contexts = []
+    real_build = gateway_run.GatewayRunner._run_agent_build_turn_context
 
-    result = _run(_make_runner(), MessageType.VOICE)
+    def build(self, *args, **kwargs):
+        built = real_build(self, *args, **kwargs)
+        contexts.append(built[0])
+        return built
+
+    monkeypatch.setattr(gateway_run.GatewayRunner, "_run_agent_build_turn_context", build)
+
+    result = _run(runner, MessageType.VOICE)
 
     assert [step[0] for step in ORDER] == ["turn"]
     assert edge.posted == [] and edge.played == []
     assert result["final_response"] == "Done."
     assert _skips(caplog) == ["Voice brief skipped (guild=111, reason=speech-busy)"]
+    # D2: the skip leaves the canned ack armed, so the turn behaves as it does with the brief off.
+    assert [ctx._voice_ack_guild for ctx in contexts] == [[GUILD_ID]]
 
 
 def test_brief_skipped_when_a_newer_voice_input_is_held(edge, monkeypatch, tmp_path, caplog):
@@ -796,32 +814,70 @@ def test_a_clip_started_meanwhile_leaves_the_text_post_only(edge, monkeypatch, t
     assert _skips(caplog) == ["Voice brief skipped (guild=111, reason=started-meanwhile)"]
 
 
-def test_newer_voice_input_held_reads_the_fifo(owner):
-    from hermes_state_runtime import admit_session_input, claim_session_input
+def test_newer_voice_input_held_reads_the_fifo(owner, monkeypatch):
+    import hermes_state_runtime
+    from hermes_state_runtime import (
+        admit_session_input, claim_session_input, list_session_admissions, rehome_queued_inputs,
+    )
 
     ref = owner.register(_source())
     session_id = ref.session_id
     session_key = owner.sessions[session_id].route
     runner = SimpleNamespace(session_authority=owner)
 
-    def admit(request_id, text, message_type):
+    def admit(sid, request_id, text, message_type):
         envelope = {"event": {"message_id": request_id}}
         if message_type:
             envelope["message_type"] = message_type
         return admit_session_input(
-            owner.db, epoch=owner.epoch, principal_id="messaging:t", session_id=session_id,
+            owner.db, epoch=owner.epoch, principal_id="messaging:t", session_id=sid,
             request_id=request_id, payload={"text": text, "native_text_v1": envelope},
         )
 
-    def held():
+    def held(sid=session_id, key=session_key):
         return voice_brief.newer_voice_input_held(
-            runner, adapter=None, session_key=session_key, session_id=session_id,
+            runner, adapter=None, session_key=key, session_id=sid,
         )
 
-    admit("m1", "say this", "voice")
+    admit(session_id, "m1", "say this", "voice")
     assert claim_session_input(owner.db, epoch=owner.epoch, session_id=session_id)
     assert held() is False                  # only the head the running turn claimed
-    admit("m2", "typed behind it", None)
+    admit(session_id, "m2", "typed behind it", None)
     assert held() is False                  # a queued TEXT input is not a newer voice input
-    admit("m3", "and then this", "voice")
+    admit(session_id, "m3", "and then this", "voice")
     assert held() is True                   # a queued VOICE input is
+
+    # A queued voice row at or below the started row's seq is NOT newer: FIFO place is the order of
+    # admission, not the moment a row lands in this session's queue. The state is real — a rehome
+    # (a /branch hand-off, the compression auto-reset) re-targets still-queued inputs onto another
+    # session and keeps their seq, so the destination can hold a queued row older than its own
+    # running turn. A floor of -1 would count it and skip a brief for an utterance already answered.
+    donor = owner.register(_source(chat_id="456")).session_id
+    target = owner.register(_source(chat_id="789")).session_id
+    admit(donor, "d1", "older voice", "voice")
+    admit(target, "t1", "turn in progress", "voice")
+    started = claim_session_input(owner.db, epoch=owner.epoch, session_id=target)
+    assert isinstance(started, dict) and started["status"] == "started"
+    moved = rehome_queued_inputs(
+        owner.db, epoch=owner.epoch, old_session_id=donor, new_session_id=target,
+        principal_prefix="messaging:",
+    )
+    rows = {row["request_id"]: row for row in list_session_admissions(owner.db, session_id=target)}
+    assert moved == [rows["d1"]["admission_id"]]
+    assert rows["d1"]["status"] == "queued" and rows["t1"]["status"] == "started"
+    assert rows["d1"]["seq"] < rows["t1"]["seq"], "the moved row must sit below the started row"
+    assert held(target, owner.sessions[target].route) is False
+
+    # The whole probe is guarded: a read that fails reads False instead of raising, so a check that
+    # cannot see the FIFO can never block the turn. (The read works just above: it says True.)
+    assert held() is True
+    monkeypatch.setattr(hermes_state_runtime, "list_session_admissions", _unreadable)
+    assert held() is False
+
+    # The floor also leaves a STEERING transfer out of the running turn's place. No writer can make
+    # status='started' with outcome='steering' (steer_session_input commits terminal+steering and
+    # _requeue_transfer writes it back to queued), so that half of the condition is unreachable
+    # through the real FIFO and has no row-level case here; it stays as defence for the receipt
+    # reading that maps a transfer to 'started' (SessionAuthority._receipt).
+
+
