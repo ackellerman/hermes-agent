@@ -115,7 +115,9 @@ async def test_the_drop_log_names_the_message_id(clock, caplog):
     assert drops and "1571794454132686869" in drops[0] and "reply_to_reply" in drops[0]
 
 
-def test_merged_bursts_keep_a_fresh_mention():
+def test_merged_bursts_keep_the_first_messages_verdict():
+    """A burst takes the first message's flag: a later fresh @mention merged in (another author in a
+    shared thread, or a later chunk) must not turn an answer to our answer into a new ask."""
     from gateway.platforms.base import MessageEvent
 
     head = MessageEvent(text="<mention stripped> part 1")
@@ -123,8 +125,9 @@ def test_merged_bursts_keep_a_fresh_mention():
     tail = MessageEvent(text="part 2")
     head.absorb_reply_expected(tail)
     assert head.fresh_self_mention is True
-    tail.absorb_reply_expected(head)
-    assert tail.fresh_self_mention is True
+    answer = MessageEvent(text="thanks!")
+    answer.absorb_reply_expected(head)
+    assert answer.fresh_self_mention is False
     assert MessageEvent(text="x").fresh_self_mention is False
 
 
@@ -151,6 +154,10 @@ def test_discord_fresh_mention_is_a_typed_mention_not_a_reply_to_this_bot():
     # A reply to this bot's own message keeps the reply_to_reply verdict, typed mention or not.
     assert not adapter._is_fresh_self_mention(_message("<@99> thanks", reference=own))
     assert not adapter._is_fresh_self_mention(_message("<@99> thanks", reference=unresolved))
+    # A streamed answer's overflow chunk replies to the author's own previous chunk: not a new ask.
+    chunk = _message("<@99> ...continued", reference=SimpleNamespace(resolved=SimpleNamespace(author=SimpleNamespace(id=7))))
+    chunk.author = SimpleNamespace(id=7)
+    assert not adapter._is_fresh_self_mention(chunk)
     # A reply-ping puts us in ``mentions`` without a typed token: not fresh.
     assert not adapter._is_fresh_self_mention(_message("thanks", reference=own, mentions=[adapter._client.user]))
     # Another bot's mention is not ours (multiplexed profiles each judge their own bot id).

@@ -232,6 +232,35 @@ async def test_discord_accepts_and_strips_bot_mentions_when_required(adapter, mo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reference_author, expected", [(None, True), (7, True), (999, False)])
+async def test_a_typed_mention_marks_the_event_a_fresh_ask(adapter, monkeypatch, reference_author, expected):
+    """The bot-loop guard's fresh-mention exemption (Discord message 1571794454132686869): the flag is
+    read from the raw content before the mention is stripped; a reply to this bot's message is no new ask."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    bot_user = adapter._client.user
+    message = make_message(channel=FakeTextChannel(channel_id=321), content=f"<@{bot_user.id}> Added scope for X",
+                           mentions=[bot_user])
+    if reference_author is not None:
+        message.reference = SimpleNamespace(message_id=5, resolved=SimpleNamespace(
+            author=SimpleNamespace(id=reference_author), content="earlier"))
+
+    await adapter._handle_message(message)
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "Added scope for X"
+    assert event.fresh_self_mention is expected
+
+
+@pytest.mark.asyncio
+async def test_an_unmentioned_message_is_not_a_fresh_ask(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    await adapter._handle_message(make_message(channel=FakeTextChannel(channel_id=321), content="thanks!"))
+    assert adapter.handle_message.await_args.args[0].fresh_self_mention is False
+
+
+@pytest.mark.asyncio
 async def test_unmentioned_bot_chunks_join_recent_tag_batch(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")

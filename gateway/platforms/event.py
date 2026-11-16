@@ -153,11 +153,11 @@ class MessageEvent:
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
 
     def absorb_reply_expected(self, other: "MessageEvent") -> None:
-        """One turn now answers *other* too: an addressed message wins, then an unknown one. A fresh
-        @mention anywhere in the merged burst keeps the turn a new ask for the bot-loop guard."""
+        """One turn now answers *other* too: an addressed message wins, then an unknown one.
+        ``fresh_self_mention`` stays the first message's: a later fresh @mention merged into a burst
+        (another author in a shared thread, or a later chunk) must not turn an answer into a new ask."""
         if self.reply_expected is not True and other.reply_expected is not False:
             self.reply_expected = other.reply_expected
-        self.fresh_self_mention = bool(self.fresh_self_mention or getattr(other, "fresh_self_mention", False))
 
     def extend_media(self, other: "MessageEvent") -> None:
         """Append *other*'s attachments (urls, types and original names) to this event's. Names are

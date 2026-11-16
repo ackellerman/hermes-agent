@@ -6928,15 +6928,19 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
     def _is_fresh_self_mention(self, message: Any) -> bool:
         """A literal ``<@bot>`` token in a message that is not a Discord reply to one of this bot's
         own messages: a new ask, which the gateway bot-loop guard never reads as an answer to this
-        bot's answer. A reply whose referenced message is unresolved counts as a reply to us (the
-        guard keeps its old verdict). Read before the mention is stripped from ``message.content``."""
+        bot's answer. A reply to the author's own message (a streamed answer's overflow chunk replies
+        to its previous chunk) or to an unresolved message counts as an answer too (the guard keeps
+        its old verdict). Read before the mention is stripped from ``message.content``."""
         if not self._self_is_raw_mentioned(message):
             return False
         reference = getattr(message, "reference", None)
         if reference is None:
             return True
         author = getattr(getattr(reference, "resolved", None), "author", None)
-        return author is not None and str(getattr(author, "id", "")) != str(self._client.user.id)
+        if author is None:
+            return False
+        sender_id = str(getattr(getattr(message, "author", None), "id", ""))
+        return str(getattr(author, "id", "")) not in {str(self._client.user.id), sender_id}
 
     def _discord_bots_require_inline_mention(self) -> bool:
         """Whether another bot must type an inline @mention to trigger us.
