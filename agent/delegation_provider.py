@@ -24,8 +24,11 @@ Route vocabulary (:meth:`DelegationProvider.route_task` returns a dict with any 
   the task, and the tier is re-applied after the child is built.
 * ``profile`` - the name of a Hermes profile. Core runs the child as that profile: its config,
   primary model and credentials, skills, ``SOUL.md`` and terminal policy, bound through the same
-  scope helpers a multiplexed gateway uses for a routed turn. A profile route ignores the other
-  route keys; the profile's own config decides them.
+  scope helpers a multiplexed gateway uses for a routed turn. A route that also names ``model`` keeps
+  the profile's home, SOUL, skills and toolsets but runs on the route's model, provider, reasoning
+  and fallback chain, with credentials from the profile's own scope (:data:`PROFILE_ROUTE_MODEL`);
+  ``base_url`` and a bare ``model`` without a ``provider`` are refused there. A profile route without
+  ``model`` ignores the other route keys; the profile's own config decides them.
 * ``label`` - short text shown with the child's progress and result (e.g. the option title).
 
 A backend's own settings live under ``delegation.backends.<backend name>`` (:meth:`DelegationProvider.settings`),
@@ -46,6 +49,12 @@ RESERVED_TASK_PARAMETERS = frozenset({
     "goal", "context", "index", "output_schema", "images", "group", "role", "toolsets",
     "acp_command", "acp_args", "provider", "model", "base_url", "api_key", "api_mode",
 })
+
+#: A profile route may carry ROUTE_KEYS model fields: core runs the child as the profile (its home, SOUL, skills
+#: and toolsets) on the route's model, provider, reasoning and fallback chain, in the profile's own credential
+#: scope. A plugin checks this before sending ``profile`` + a model option, so an older core refuses the task
+#: instead of silently dropping the model and running the profile's own primary.
+PROFILE_ROUTE_MODEL = True
 
 #: Keys a route may carry; anything else in a provider's answer is ignored.
 ROUTE_KEYS = frozenset({
