@@ -209,6 +209,24 @@ async def test_discord_free_response_in_server_channels(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("thread", [False, True])
+async def test_an_unmentioned_message_dropped_by_require_mention_is_logged(adapter, monkeypatch, caplog, thread):
+    """A human's bare "A" in a multi-bot forum post (Discord message 1571808231284547635) was dropped by the
+    mention gate with no log line, so a grep for its id found nothing. The drop now logs the id and reason."""
+    import logging
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    channel = FakeThread(channel_id=456) if thread else FakeTextChannel(channel_id=321)
+    message = make_message(channel=channel, content="A")
+    with caplog.at_level(logging.INFO):
+        await adapter._handle_message(message)
+    adapter.handle_message.assert_not_awaited()
+    drops = [r.getMessage() for r in caplog.records if "dropping message 123" in r.getMessage()]
+    assert drops and "reason=mention-required" in drops[0], [r.getMessage() for r in caplog.records]
+
+
+@pytest.mark.asyncio
 async def test_discord_accepts_and_strips_bot_mentions_when_required(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)

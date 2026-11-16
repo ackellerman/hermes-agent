@@ -8071,6 +8071,13 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     and not mention_prefix
                     and not self._is_bot_tag_debounce_continuation(message)
                 ):
+                    # Same shape as the admission drops, so a grep for the message id finds it: in a
+                    # multi-bot thread (thread_require_mention) a human's bare reply is dropped here.
+                    logger.info(
+                        "[%s] admission: dropping message %s (author=%s channel=%s reason=mention-required)",
+                        self.name, getattr(message, "id", None),
+                        getattr(getattr(message, "author", None), "id", None), getattr(message.channel, "id", None),
+                    )
                     return False
         # Auto-thread: isolate each @mention in a text channel into its own thread (Slack-style).
         auto_threaded_channel = None
