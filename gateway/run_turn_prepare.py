@@ -519,6 +519,16 @@ class GatewayTurnPrepareMixin:
         except Exception as e:
             logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
+    async def _hmwa_stale_skill_note(self, history) -> Optional[str]:
+        """``[Skill changed on disk: ...]`` for skills whose in-history copy is out of date, else None.
+        Read-only (history plus SKILL.md files), off the event loop; never raises."""
+        try:
+            from agent.skill_staleness import stale_skill_notice
+            return await asyncio.to_thread(stale_skill_notice, history or [])
+        except Exception:
+            logger.debug("Stale-skill notice failed", exc_info=True)
+            return None
+
     async def _hmwa_acquire_turn_lease(self, _quick_key, run_generation, session_entry, _session_env_tokens):
         """Serialize [load history → run → flush] per resolved SESSION_ID so another routing key on
         the same session waits for the prior flush. Fail-closed on timeout (outer dispatch returns
@@ -712,6 +722,11 @@ class GatewayTurnPrepareMixin:
             return record_unexecuted_failure(t("gateway.errors.history_unavailable")), _session_env_tokens
 
         await self._hmwa_first_contact_notes(source, history, turn_sidecar_notes, internal=event.internal)
+
+        # A skill loaded earlier in this session (auto-load payload or skill_view) that changed on disk
+        # since: tell the agent to re-read it. New sessions just loaded the current text.
+        if not _is_new_session and (note := await self._hmwa_stale_skill_note(history)):
+            turn_sidecar_notes.append(note)
 
         # Voice channel state rides the user message ONLY when changed (in the system prompt it
         # forced a rebuild + prompt-cache re-key per message).

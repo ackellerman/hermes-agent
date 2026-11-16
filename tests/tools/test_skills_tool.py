@@ -1134,3 +1134,72 @@ class TestTrustWarningSymlinkAware:
             self._log("sym", root / "sym" / "SKILL.md", [root], root)
 
         assert "outside the trusted" in caplog.text, caplog.text
+
+
+class TestResolveSkillMd:
+    """``resolve_skill_md``: skill_view's name → SKILL.md lookup without its side effects (the
+    stale-skill notice polls it every gateway turn)."""
+
+    def test_resolves_and_refuses_without_side_effects(self, tmp_path, monkeypatch, caplog):
+        import pm
+        from tools.skills_tool import resolve_skill_md
+
+        def must_not_run(*args, **kwargs):
+            raise AssertionError("resolve_skill_md must have no side effects")
+
+        monkeypatch.setattr(pm, "ensure", must_not_run)
+        monkeypatch.setattr(skills_tool_module, "find_all_skills", must_not_run)
+        monkeypatch.setattr(skills_tool_module, "_mark_background_review_read", must_not_run)
+        home = Path(os.environ["HERMES_HOME"])
+        local = home / "skills"
+        external = tmp_path / "external"
+        external.mkdir()
+        alpha = _make_skill(local, "alpha", category="devops", frontmatter_extra="deps: [ffmpeg]\n")
+        beta = external / "beta-dir"
+        beta.mkdir()
+        (beta / "SKILL.md").write_text("---\nname: beta\ndescription: d.\n---\nbody\n")
+        _make_skill(local, "dup", category="one")
+        _make_skill(local, "dup", category="two", body="A different skill.")
+        _make_skill(local, "gamma")
+        _make_skill(local, "ns:odd")  # a ':' name is a plugin name, never a local lookup
+        (home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external}\n  disabled:\n    - gamma\n")
+
+        with caplog.at_level("WARNING"):
+            assert resolve_skill_md("alpha") == (alpha, alpha / "SKILL.md", "alpha")
+            assert resolve_skill_md("devops/alpha") == (alpha, alpha / "SKILL.md", "alpha")
+            ext = external.resolve() / "beta-dir"
+            for lookup in ("beta", "beta-dir"):
+                found = resolve_skill_md(lookup)
+                assert found is not None and found[1].resolve() == ext / "SKILL.md" and found[2] == "beta"
+            assert resolve_skill_md("missing") is None
+            assert resolve_skill_md("dup") is None  # same-tier ambiguity
+            assert resolve_skill_md("one/dup") is not None
+            assert resolve_skill_md("plugin:alpha") is None
+            assert resolve_skill_md("ns:odd") is None
+            assert resolve_skill_md("gamma") is None  # disabled
+            assert resolve_skill_md("../escape") is None
+        assert not caplog.records, caplog.text
+
+    def test_quarantined_project_skill_does_not_resolve(self, tmp_path, monkeypatch):
+        """A project skill with a dangerous scan verdict is invisible to skill_view, so it must not
+        resolve here either; the scanner is consulted for project-tier files only."""
+        import agent.skill_utils as su
+        from tools.skills_tool import resolve_skill_md
+        project = tmp_path / "repo" / ".hermes" / "skills"
+        evil = _make_skill(project, "evil")
+        clean = _make_skill(project, "clean")
+        local = _make_skill(Path(os.environ["HERMES_HOME"]) / "skills", "local-only")
+        scanned = []
+
+        def verdict(skill_md):
+            scanned.append(Path(skill_md).parent.name)
+            return Path(skill_md).parent == evil
+
+        monkeypatch.setattr(su, "is_quarantined_project_skill", verdict)
+        monkeypatch.setattr(skills_tool_module, "skill_search_dirs", lambda: (
+            [(su.TIER_PROJECT, project), (su.TIER_LOCAL, local.parent)], local.parent))
+        assert resolve_skill_md("evil") is None
+        assert resolve_skill_md("clean") == (clean, clean / "SKILL.md", "clean")
+        assert resolve_skill_md("local-only") == (local, local / "SKILL.md", "local-only")
+        assert scanned == ["evil", "clean"]
