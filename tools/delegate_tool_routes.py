@@ -286,6 +286,54 @@ def _profile_route(home: Path, config: Optional[Mapping[str, Any]] = None, paren
                      fallback_from=None if entry is None else str(request["target_model"] or "the profile's model"))
 
 
+def _profile_option_route(home: Path, route: Mapping[str, Any], config: Optional[Mapping[str, Any]] = None,
+                          parent_agent: Any = None) -> TaskRoute:
+    """A profile route that names a model option: the child runs AS the profile (its home, SOUL, skills and
+    toolsets) on the route's model, provider, speed tier, reasoning and fallback chain, with credentials resolved
+    inside the profile's own scope (D1). ``base_url`` is refused: that branch inherits the launching seat's key.
+    *config* is the launching profile's ``delegation`` section; the option resolves its own credentials, so it is
+    unused."""
+    from hermes_cli.config import load_config_readonly
+    from hermes_constants import resolve_reasoning_config
+    from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
+    from tools.delegate_tool_config import ResolvedReasoning
+    _refuse_under_worker_snapshot(home)
+    if str(route.get("base_url") or "").strip():
+        raise DelegationRouteError(
+            "a model option on a profile route takes provider, not base_url: a base_url route would carry the "
+            "launching seat's key")
+    if not str(route.get("provider") or "").strip():
+        # Without a provider the resolver takes its pure-inherit branch: the parent's endpoint and key.
+        raise DelegationRouteError("a model option on a profile route must name its provider")
+    with delegated_profile_scope(home):
+        cfg = load_config_readonly() or {}
+        creds = _resolve_delegation_credentials(
+            {"model": route.get("model"), "provider": route.get("provider"), "api_mode": route.get("api_mode"),
+             "request_overrides": route.get("request_overrides")}, parent_agent)
+        if route.get("service_tier") not in (None, ""):
+            from tools.delegate_tool_tuning import task_service_tier
+            creds = {**creds, **task_service_tier(str(route["service_tier"]), creds, parent_agent)}
+        effort = route.get("reasoning_effort")
+        if effort in (None, ""):
+            reasoning = ResolvedReasoning(resolve_reasoning_config(cfg, creds.get("model") or ""))
+        else:  # the route's own level is the child's final answer, never the launching seat's
+            from hermes_constants import parse_reasoning_effort
+            reasoning = ResolvedReasoning(parse_reasoning_effort(effort))
+        fallback = route.get("fallback_providers")
+        if not isinstance(fallback, list):
+            # D2: the profile's own model first, then the profile's own chain.
+            primary = _profile_model_request(cfg)
+            model_cfg = cfg.get("model")
+            if not isinstance(model_cfg, dict):
+                model_cfg = {}
+            provider = primary.get("requested") or str(model_cfg.get("provider") or "").strip() or None
+            model = primary.get("target_model")
+            chain = cfg.get("fallback_providers")
+            fallback = ([{"provider": provider, "model": model}] if provider and model else []) + (
+                list(chain) if isinstance(chain, list) else [])
+    return TaskRoute(creds, {"fallback_providers": fallback}, reasoning, home)
+
+
 def _with_inherited_fallback(route: dict[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
     """A route without a fallback chain of its own takes ``delegation.fallback_providers`` (an explicit ``[]`` on the
     route still disables fallback). A profile route keeps its profile's own chain."""
@@ -298,6 +346,9 @@ def _with_inherited_fallback(route: dict[str, Any], config: Mapping[str, Any]) -
 def _resolve_route(route: dict[str, Any], parent_agent: Any, backend: str,
                    config: Optional[Mapping[str, Any]] = None) -> TaskRoute:
     if route.get("profile"):
+        if route.get("model"):
+            return replace(_profile_option_route(_profile_home(route["profile"]), route, config, parent_agent),
+                           backend=backend)
         return replace(_profile_route(_profile_home(route["profile"]), config, parent_agent), backend=backend)
     from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
     creds = _resolve_delegation_credentials(route, parent_agent)
@@ -320,9 +371,13 @@ def _route_to_task_route(route: dict[str, Any], parent_agent: Any, cache: dict[s
 
 def _check_backend_effort(index: int, route: Mapping[str, Any], config: Mapping[str, Any]) -> None:
     """A backend's ``reasoning_effort`` must be a known level: a typo is a tool error, never the parent's level.
-    The ``delegation`` section's own value (the default route, ``dict(config)``) keeps its warn-and-inherit rule."""
+    The ``delegation`` section's own value (the default route, ``dict(config)``) keeps its warn-and-inherit rule.
+    A profile route without a model resolves its reasoning from the profile's config instead; one with a model
+    takes the route's level, so that level is checked here like any other route's."""
     effort = route.get("reasoning_effort")
-    if route.get("profile") or effort in (None, "") or effort == config.get("reasoning_effort"):
+    if route.get("profile") and not route.get("model"):
+        return
+    if effort in (None, "") or (not route.get("profile") and effort == config.get("reasoning_effort")):
         return
     from hermes_constants import VALID_REASONING_EFFORTS, parse_reasoning_effort
     if parse_reasoning_effort(effort) is None:
