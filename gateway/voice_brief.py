@@ -172,6 +172,92 @@ def voice_binding(source: Any, adapter: Any) -> Optional[tuple[int, str]]:
     return int(guild_id), str(getattr(source, "chat_id", ""))
 
 
+def log_brief_skipped(guild_id: int, reason: str) -> None:
+    """One INFO line per skipped brief, in the shape the witness's checker parses."""
+    logger.info("Voice brief skipped (guild=%d, reason=%s)", guild_id, reason)
+
+
+def _speech_busy(adapter: Any, guild_id: int) -> bool:
+    """True while a clip of this guild sounds or waits. Duck-typed edges read as idle."""
+    check = getattr(adapter, "voice_speech_busy", None)
+    return bool(check and check(guild_id))
+
+
+def _fifo_holds_voice(authority: Any, *, session_key: Optional[str], session_id: Optional[str]) -> bool:
+    """Authority branch of ``newer_voice_input_held``: read the session's admission rows.
+
+    The floor is the newest row the running turn claimed (``started``, not a steering hand-off), so
+    only inputs admitted AFTER this turn began count as newer. A voice envelope in that window means
+    the user has already said something else: the brief would speak over it.
+    """
+    from hermes_state_runtime import STEERING, list_session_admissions
+
+    sids = {
+        sid for sid, live in (getattr(authority, "sessions", None) or {}).items()
+        if session_key and getattr(live, "route", None) == session_key
+    }
+    owner = authority.logical_owner(session_id)
+    if owner:
+        sids.add(owner)
+    for sid in sorted(sids):
+        rows = list_session_admissions(authority.db, session_id=sid)
+        floor = max(
+            (row["seq"] for row in rows if row["status"] == "started" and row.get("outcome") != STEERING),
+            default=-1,
+        )
+        for row in rows:
+            if row["status"] != "queued" or row["seq"] <= floor:
+                continue
+            envelope = (row.get("payload") or {}).get("native_text_v1") or {}
+            if envelope.get("message_type") == "voice":
+                return True
+    return False
+
+
+def _pending_holds_voice(runner: Any, *, adapter: Any, session_key: Optional[str]) -> bool:
+    """Legacy branch: a bare runner holds queued input on the adapter slot or its overflow queue.
+
+    The slot is PEEKED (``_pending_messages.get``), never ``get_pending_message``, which pops it:
+    a check that consumed the user's next utterance would lose it.
+    """
+    from gateway.platforms.event import MessageType
+
+    if not session_key:
+        return False
+    pending: list[Any] = []
+    slot = (getattr(adapter, "_pending_messages", None) or {}).get(session_key) if adapter is not None else None
+    if slot is not None:
+        pending.append(slot)
+    overflow: Any = getattr(runner, "_overflow_queue", None)
+    if callable(overflow) and hasattr(runner, "_peek_session_state"):
+        pending.extend(overflow(session_key) or [])
+    return any(getattr(event, "message_type", None) == MessageType.VOICE for event in pending)
+
+
+def newer_voice_input_held(
+    runner: Any, *, adapter: Any, session_key: Optional[str], session_id: Optional[str],
+) -> bool:
+    """True when a voice input newer than this turn's is waiting for the same session.
+
+    The brief is worth a model call and a clip only while the user is still waiting on that one
+    utterance. If they have already sent another voice message, the brief would answer the older
+    one out loud, so the caller skips it (the turn still runs).
+
+    Best-effort by design: the whole read is guarded, and any failure logs and reads False. A check
+    that cannot see the FIFO must never refuse or block a turn.
+    """
+    try:
+        from gateway.session_authorities import active_authority
+
+        authority = active_authority(runner)
+        if authority is not None:
+            return _fifo_holds_voice(authority, session_key=session_key, session_id=session_id)
+        return _pending_holds_voice(runner, adapter=adapter, session_key=session_key)
+    except Exception:
+        logger.warning("Voice brief could not read the session FIFO", exc_info=True)
+        return False
+
+
 def brief_messages(message: str) -> list[dict[str, str]]:
     """Provider-edge request: spoken words and the one-sentence understanding and next action."""
     return [
@@ -286,6 +372,10 @@ async def deliver_preturn_brief(
     starts the turn. Raises ``VoiceBriefError`` (user-visible) on any failure, except a failed
     model call on a PINNED route (``pinned_task_route``), which raises ``VoiceBriefBypassed`` so the
     caller can say so in one line and run the turn.
+
+    If a clip of this guild started between the model call and this playback (the guild's speech
+    queue is busy), the sentence is posted WITHOUT audio and returned: the brief never talks over
+    another clip, and the text still reaches the chat.
     """
     try:
         pinned = pinned_task_route()
@@ -349,14 +439,19 @@ async def deliver_preturn_brief(
             logger.warning("Voice brief synthesis error: %s", exc, exc_info=True)
             raise VoiceBriefError(failure_text("synthesis failed")) from exc
 
-        try:
-            played = await adapter.play_in_voice_channel(guild_id, actual, strict=True, kind="brief")
-        except Exception as exc:
-            logger.warning("Voice brief playback error: %s", exc, exc_info=True)
-            raise VoiceBriefError(failure_text("playback failed")) from exc
-        if not played:
-            logger.warning("Voice brief playback did not complete (guild=%s)", guild_id)
-            raise VoiceBriefError(failure_text("playback did not complete"))
+        if _speech_busy(adapter, guild_id):
+            # A clip started (another turn's reply, an ack) between this brief's model call and its
+            # playback. Say it in text only: playing over that clip is the overlap this avoids.
+            log_brief_skipped(guild_id, "started-meanwhile")
+        else:
+            try:
+                played = await adapter.play_in_voice_channel(guild_id, actual, strict=True, kind="brief")
+            except Exception as exc:
+                logger.warning("Voice brief playback error: %s", exc, exc_info=True)
+                raise VoiceBriefError(failure_text("playback failed")) from exc
+            if not played:
+                logger.warning("Voice brief playback did not complete (guild=%s)", guild_id)
+                raise VoiceBriefError(failure_text("playback did not complete"))
 
         try:
             sent = await adapter.send(str(chat_id), text)

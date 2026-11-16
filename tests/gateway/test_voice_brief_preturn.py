@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 import threading
@@ -25,7 +26,7 @@ import pytest
 
 import gateway.run as gateway_run
 from gateway.config import Platform
-from gateway.platforms.event import MessageType
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 from gateway import voice_brief
 _REAL_ASK_MODEL = voice_brief._ask_model
@@ -718,3 +719,109 @@ def test_playback_timeout_returns_true_by_default_and_false_when_strict(monkeypa
     default_result, strict_result = asyncio.new_event_loop().run_until_complete(_go())
     assert default_result is True   # historical contract preserved (play_tts / run_voice)
     assert strict_result is False   # the brief can treat a cut-off clip as failure
+
+
+# ---------------------------------------------------------------------------
+# Skips: speech busy, or the user already said something newer
+# ---------------------------------------------------------------------------
+
+SESSION_KEY = "agent:main:discord:group:123"
+
+
+def _skips(caplog) -> list[str]:
+    return [
+        record.getMessage() for record in caplog.records
+        if record.name == "gateway.voice_brief" and "Voice brief skipped" in record.getMessage()
+    ]
+
+
+def test_brief_skipped_while_speech_is_busy(edge, monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="gateway.voice_brief")
+    edge.voice_speech_busy = lambda guild_id: True
+    _wire(monkeypatch, tmp_path)
+
+    result = _run(_make_runner(), MessageType.VOICE)
+
+    assert [step[0] for step in ORDER] == ["turn"]
+    assert edge.posted == [] and edge.played == []
+    assert result["final_response"] == "Done."
+    assert _skips(caplog) == ["Voice brief skipped (guild=111, reason=speech-busy)"]
+
+
+def test_brief_skipped_when_a_newer_voice_input_is_held(edge, monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="gateway.voice_brief")
+    newer = MessageEvent(text="next", message_type=MessageType.VOICE, source=_source())
+    edge._pending_messages = {SESSION_KEY: newer}
+    _wire(monkeypatch, tmp_path)
+
+    result = _run(_make_runner(), MessageType.VOICE)
+
+    assert [step[0] for step in ORDER] == ["turn"]
+    assert edge.posted == [] and edge.played == []
+    assert result["final_response"] == "Done."
+    assert _skips(caplog) == ["Voice brief skipped (guild=111, reason=newer-input)"]
+    # Peeked, never popped: the user's next utterance is still queued for its own turn.
+    assert edge._pending_messages[SESSION_KEY] is newer
+
+
+def test_a_newer_text_input_does_not_skip_the_brief(edge, monkeypatch, tmp_path):
+    typed = MessageEvent(text="next", message_type=MessageType.TEXT, source=_source())
+    edge._pending_messages = {SESSION_KEY: typed}
+    _wire(monkeypatch, tmp_path)
+
+    result = _run(_make_runner(), MessageType.VOICE)
+
+    assert [step[0] for step in ORDER] == ["model", "synth", "play", "post", "turn"]
+    assert edge.played and edge.posted == [MODEL_OUTPUT]
+    assert result["final_response"] == "Done."
+
+
+def test_a_clip_started_meanwhile_leaves_the_text_post_only(edge, monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="gateway.voice_brief")
+    calls = []
+
+    def busy(guild_id):
+        calls.append(guild_id)
+        return len(calls) > 1   # idle at the pre-turn check, busy by the time the clip would play
+
+    edge.voice_speech_busy = busy
+    _wire(monkeypatch, tmp_path)
+
+    result = _run(_make_runner(), MessageType.VOICE)
+
+    assert [step[0] for step in ORDER] == ["model", "synth", "post", "turn"]
+    assert edge.played == []
+    assert edge.posted == [MODEL_OUTPUT]
+    assert result["final_response"] == "Done."
+    assert _skips(caplog) == ["Voice brief skipped (guild=111, reason=started-meanwhile)"]
+
+
+def test_newer_voice_input_held_reads_the_fifo(owner):
+    from hermes_state_runtime import admit_session_input, claim_session_input
+
+    ref = owner.register(_source())
+    session_id = ref.session_id
+    session_key = owner.sessions[session_id].route
+    runner = SimpleNamespace(session_authority=owner)
+
+    def admit(request_id, text, message_type):
+        envelope = {"event": {"message_id": request_id}}
+        if message_type:
+            envelope["message_type"] = message_type
+        return admit_session_input(
+            owner.db, epoch=owner.epoch, principal_id="messaging:t", session_id=session_id,
+            request_id=request_id, payload={"text": text, "native_text_v1": envelope},
+        )
+
+    def held():
+        return voice_brief.newer_voice_input_held(
+            runner, adapter=None, session_key=session_key, session_id=session_id,
+        )
+
+    admit("m1", "say this", "voice")
+    assert claim_session_input(owner.db, epoch=owner.epoch, session_id=session_id)
+    assert held() is False                  # only the head the running turn claimed
+    admit("m2", "typed behind it", None)
+    assert held() is False                  # a queued TEXT input is not a newer voice input
+    admit("m3", "and then this", "voice")
+    assert held() is True                   # a queued VOICE input is

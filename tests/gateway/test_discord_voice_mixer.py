@@ -58,6 +58,17 @@ class TestVoiceMixerCore:
         assert any(p > 0 for p in peaks[10:])
         assert max(peaks) < int(32767 * 0.5)
 
+    def test_stop_speech_and_cleanup_mark_dropped_children_stopped(self):
+        """A dropped clip must be distinguishable from a finished one, or a waiter never wakes."""
+        mx = vm.VoiceMixer()
+        pcm = b"\x01\x00" * (vm.FRAME_SIZE // 2)
+        stopped = mx.play_speech(pcm)
+        mx.stop_speech()
+        assert stopped._stopped is True and stopped._finished is False
+        cleaned = mx.play_speech(pcm)
+        mx.cleanup()
+        assert cleaned._stopped is True and cleaned._finished is False
+
 
 # =====================================================================
 # Adapter integration

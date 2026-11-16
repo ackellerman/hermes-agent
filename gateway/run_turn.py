@@ -658,11 +658,14 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
 
         Runs before any turn task is started. On success the canned ack slot is cleared (the brief
         already spoke). A pinned brief that cannot be served posts one line naming the provider and
-        returns ``None`` — the turn still runs. The turn itself is not modified in any other way.
+        returns ``None`` — the turn still runs. So does a brief skipped because the guild's speech is
+        busy or the user has already sent a newer voice input: same ``None``, one INFO line, no model
+        call, no audio, no post, and the ack slot untouched. The turn itself is not modified in any
+        other way.
         """
         from gateway.voice_brief import (
-            VoiceBriefBypassed, VoiceBriefError, brief_enabled, bypassed_text,
-            deliver_preturn_brief, failure_text, voice_binding,
+            VoiceBriefBypassed, VoiceBriefError, _speech_busy, brief_enabled, bypassed_text,
+            deliver_preturn_brief, failure_text, log_brief_skipped, newer_voice_input_held, voice_binding,
         )
 
         if not brief_enabled(user_config):
@@ -673,6 +676,17 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             logger.warning("Voice brief enabled but no voice channel is bound to chat=%s", source.chat_id)
             return self._proxy_error_result(failure_text("no bound voice channel"))
         guild_id, chat_id = binding
+        # A brief that would talk over a clip, or answer an utterance the user has already moved
+        # past, is worse than no brief. Both skips leave turn_ctx._voice_ack_guild alone (D2): the
+        # turn runs exactly as it would with the brief off, canned ack still armed.
+        if _speech_busy(adapter, guild_id):
+            log_brief_skipped(guild_id, "speech-busy")
+            return None
+        if newer_voice_input_held(
+            self, adapter=adapter, session_key=session_key, session_id=turn_ctx.session_id,
+        ):
+            log_brief_skipped(guild_id, "newer-input")
+            return None
         model, runtime = self._resolve_session_agent_runtime(
             source=source, session_key=session_key, user_config=user_config,
         )
