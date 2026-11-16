@@ -216,7 +216,7 @@ class _EdgeAdapter:
     def get_pending_message(self, session_key):
         return None
 
-    async def play_in_voice_channel(self, guild_id, audio_path, strict=False):
+    async def play_in_voice_channel(self, guild_id, audio_path, strict=False, *, kind="reply"):
         self.played.append((guild_id, audio_path, strict, os.path.isfile(audio_path)))
         ORDER.append(("play", guild_id, os.path.isfile(audio_path)))
         return True

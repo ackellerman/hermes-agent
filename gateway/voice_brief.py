@@ -350,7 +350,7 @@ async def deliver_preturn_brief(
             raise VoiceBriefError(failure_text("synthesis failed")) from exc
 
         try:
-            played = await adapter.play_in_voice_channel(guild_id, actual, strict=True)
+            played = await adapter.play_in_voice_channel(guild_id, actual, strict=True, kind="brief")
         except Exception as exc:
             logger.warning("Voice brief playback error: %s", exc, exc_info=True)
             raise VoiceBriefError(failure_text("playback failed")) from exc

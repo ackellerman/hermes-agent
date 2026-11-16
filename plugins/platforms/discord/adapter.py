@@ -301,6 +301,11 @@ try:
 except ImportError:
     from ffmpeg_utils import resolve_ffmpeg_executable
 
+try:
+    from .speech_queue import GuildSpeechQueue, next_clip_id
+except ImportError:
+    from speech_queue import GuildSpeechQueue, next_clip_id
+
 from gateway.config import Platform, PlatformConfig, discord_channel_id_from_link
 
 from gateway.platforms.helpers import (
@@ -5087,7 +5092,12 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         return b"\x00" * (_voice_mixer_module().BYTES_PER_MS * lead_ms)
 
     async def play_ack_in_voice(self, guild_id: int, phrase: Optional[str] = None) -> bool:
-        """Speak a short ack over the ambient bed (first tool call of a turn); no-op without mixer/acks."""
+        """Speak a short ack over the ambient bed (first tool call of a turn); no-op without mixer/acks.
+
+        The ack is a clip like any other: it takes the guild's speech queue and is waited for, so
+        two acks — or an ack and a reply — never sound at once. Its only caller schedules it on the
+        gateway loop, so the wait never blocks an agent turn.
+        """
         if not self._voice_fx_cfg.get("ack_enabled"):
             return False
         mixer = self._voice_mixers.get(guild_id)
@@ -5115,10 +5125,17 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             pcm = await asyncio.to_thread(decode_to_pcm, actual)
             if not pcm:
                 return False
-            mixer.play_speech(
-                self._lead_silence_bytes() + pcm,
-                gain=float(self._voice_fx_cfg.get("speech_gain", 1.0)),
-            )
+            playback_timeout = await self._playback_timeout_for_audio(actual)
+            # Synthesis and decode stay outside the turn: a waiting clip must not hold the queue for
+            # a TTS round-trip. The ack then sounds alone and is waited for, like any other clip.
+            async with self._speech_queue(guild_id).turn() as waited_ms:
+                mixer = self._voice_mixers.get(guild_id)  # the guild may have left while we waited
+                if mixer is None:
+                    return False
+                await self._play_mixer_clip(
+                    guild_id, mixer, self._lead_silence_bytes() + pcm, kind="ack",
+                    waited_ms=waited_ms, playback_timeout=playback_timeout,
+                )
             self._reset_voice_timeout(guild_id)
             return True
         except Exception as e:
@@ -5136,6 +5153,69 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         """True when a continuous mixer is installed for this guild."""
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
+
+    def _speech_queue(self, guild_id: int) -> GuildSpeechQueue:
+        """This guild's speech queue, made on first use and never dropped.
+
+        Lazily, because many test doubles (and some legacy paths) build the adapter with
+        ``object.__new__`` and no ``__init__``; never dropped, so a leave and a rejoin cannot end up
+        with two queues for one guild.
+        """
+        queues = getattr(self, "_voice_speech_queues", None)
+        if queues is None:
+            queues = {}
+            self._voice_speech_queues = queues
+        queue = queues.get(guild_id)
+        if queue is None:
+            queue = queues[guild_id] = GuildSpeechQueue()
+        return queue
+
+    def voice_speech_busy(self, guild_id: int) -> bool:
+        """True while a clip of this guild is sounding or waiting to sound."""
+        queues = getattr(self, "_voice_speech_queues", None) or {}
+        queue = queues.get(guild_id)
+        return queue is not None and queue.busy()
+
+    async def _play_mixer_clip(
+        self, guild_id: int, mixer, pcm: bytes, *, kind: str, waited_ms: int, playback_timeout: float,
+    ) -> tuple[str, Any]:
+        """Add one clip to the mixer and wait for THAT child, not for ``speech_active``: another
+        guild's or another process's speech must not extend this wait. The caller holds the guild's
+        turn. Returns ``(result, child)`` and logs the start and end lines the witness parses."""
+        speech_gain = float((getattr(self, "_voice_fx_cfg", None) or {}).get("speech_gain", 1.0))
+        child = mixer.play_speech(pcm, gain=speech_gain)
+        if child is None:
+            return "error", None
+        clip = next_clip_id()
+        logger.info(
+            "Voice speech start (guild=%d, clip=%s, kind=%s, waited_ms=%d)", guild_id, clip, kind, waited_ms,
+        )
+        result = "error"
+        try:
+            wait_start = time.monotonic()
+            while True:
+                if getattr(child, "_finished", False) is True:
+                    result = "done"
+                    break
+                # Cut off from outside (stop_speech / cleanup): not a completed clip.
+                if getattr(child, "_stopped", False) is True:
+                    result = "stopped"
+                    break
+                if time.monotonic() - wait_start > playback_timeout:
+                    logger.warning("Mixer speech playback timed out after %.1fs", playback_timeout)
+                    mixer.stop_speech()
+                    result = "timeout"
+                    break
+                await asyncio.sleep(0.05)
+        except BaseException:
+            # A cancelled or failed waiter must not leave its child sounding after the turn is
+            # released: this child is the guild's only speech, so drop it.
+            mixer.stop_speech()
+            result = "stopped"
+            raise
+        finally:
+            logger.info("Voice speech end (guild=%d, clip=%s, kind=%s, result=%s)", guild_id, clip, kind, result)
+        return result, child
 
     async def join_voice_channel(self, channel, *, text_channel_id: int | None = None, source: dict | None = None) -> bool:
         """Join a voice channel; returns True on success. ``text_channel_id`` stores the
@@ -5188,7 +5268,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             return True
 
     async def play_in_voice_channel(
-        self, guild_id: int, audio_path: str, strict: bool = False,
+        self, guild_id: int, audio_path: str, strict: bool = False, *, kind: str = "reply",
     ) -> bool:
         """Play audio in the VC: via the mixer (layered over the ambient bed, ducking it)
         when installed, else the legacy one-shot FFmpegPCMAudio path.
@@ -5197,6 +5277,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         or errored as ``False``. The default keeps the historical contract — callers such as
         ``play_tts`` and ``run_voice`` receive ``True`` even when the clip was cut off — so this
         parameter cannot change any existing caller's behaviour.
+
+        Every clip, of every kind, takes its guild's speech queue (``_speech_queue``): it sounds
+        only while no other clip of that guild does, in arrival order, and other guilds never wait
+        for it. ``kind`` names the clip in the speech start/end log lines.
         """
         vc = self._voice_clients.get(guild_id)
         if not vc or not vc.is_connected():
@@ -5205,95 +5289,121 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         self._cancel_voice_timeout(guild_id)
         try:
             playback_timeout = await self._playback_timeout_for_audio(audio_path)
-            # ── Mixer path (overlap + ducking) ──────────────────────────────
+            # Decode before taking the turn, so a waiting clip never holds the queue for ffmpeg.
             mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if getattr(self, "_voice_mixers", None) else None
+            pcm = None
             if mixer is not None:
                 decode_to_pcm = _voice_mixer_module().decode_to_pcm
                 pcm = await asyncio.to_thread(decode_to_pcm, audio_path)
-                if pcm:
-                    speech_gain = float(self._voice_fx_cfg.get("speech_gain", 1.0))
-                    child = mixer.play_speech(self._lead_silence_bytes() + pcm, gain=speech_gain)
-                    # Block until speech drains so callers serialise replies; ambient keeps playing.
-                    wait_start = time.monotonic()
-                    timed_out = False
-                    while mixer.speech_active:
-                        if time.monotonic() - wait_start > playback_timeout:
-                            logger.warning("Mixer speech playback timed out after %.1fs", playback_timeout)
-                            mixer.stop_speech()
-                            timed_out = True
-                            break
-                        await asyncio.sleep(0.05)
-                    return not strict or (not timed_out and child is not None and child._finished)
-                logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
-            # Legacy one-shot path: pause receiver while playing (echo prevention).
-            receiver = self._voice_receivers.get(guild_id)
-            if receiver:
-                receiver.pause()
-            try:
-                wait_start = time.monotonic()
-                while vc.is_playing():
-                    if time.monotonic() - wait_start > playback_timeout:
-                        logger.warning("Timed out waiting for previous playback to finish")
-                        vc.stop()
-                        break
-                    await asyncio.sleep(0.1)
-                done = asyncio.Event()
-                loop = asyncio.get_running_loop()
-                playback_error: list[Any] = []
-
-                def _after(error):
-                    if error:
-                        logger.error("Voice playback error: %s", error)
-                        playback_error.append(error)
-                    loop.call_soon_threadsafe(done.set)
-                # Lead silence so socket warm-up doesn't clip the first word (mirrors mixer path).
-                ffmpeg_opts: dict[str, Any] = {}
-                _fx_cfg = getattr(self, "_voice_fx_cfg", None) or {}
-                try:
-                    lead_ms = int(_fx_cfg.get("lead_silence_ms", 0) or 0)
-                except (TypeError, ValueError):
-                    lead_ms = 0
-                if lead_ms > 0:
-                    ffmpeg_opts["options"] = f"-af adelay={lead_ms}:all=1"
-                source = discord.FFmpegPCMAudio(
-                    audio_path, executable=resolve_ffmpeg_executable(), **ffmpeg_opts,
+                if not pcm:
+                    logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
+            async with self._speech_queue(guild_id).turn() as waited_ms:
+                vc = self._voice_clients.get(guild_id)  # the guild may have left while we waited
+                if not vc or not vc.is_connected():
+                    return False
+                # ── Mixer path (ducking; one clip per guild at a time under the queue) ──────
+                if mixer is not None and pcm:
+                    if (getattr(self, "_voice_mixers", None) or {}).get(guild_id) is not mixer:
+                        return False  # the mixer was replaced while we waited
+                    result, child = await self._play_mixer_clip(
+                        guild_id, mixer, self._lead_silence_bytes() + pcm, kind=kind,
+                        waited_ms=waited_ms, playback_timeout=playback_timeout,
+                    )
+                    return not strict or (result == "done" and child is not None and child._finished is True)
+                return await self._play_legacy_clip(
+                    guild_id, vc, audio_path, strict=strict, kind=kind, waited_ms=waited_ms,
+                    playback_timeout=playback_timeout,
                 )
-                source = discord.PCMVolumeTransformer(source, volume=1.0)
-                if strict:
-                    class _TrackedSource(discord.AudioSource):
-                        def __init__(self, wrapped):
-                            self.wrapped = wrapped
-                            self.exhausted = False
-                            self.had_audio = False
-
-                        def read(self):
-                            data = self.wrapped.read()
-                            if data:
-                                self.had_audio = True
-                            else:
-                                self.exhausted = self.had_audio
-                            return data
-
-                        def is_opus(self):
-                            return self.wrapped.is_opus()
-
-                        def cleanup(self):
-                            self.wrapped.cleanup()
-
-                    source = _TrackedSource(source)
-                vc.play(source, after=_after)
-                try:
-                    await asyncio.wait_for(done.wait(), timeout=playback_timeout)
-                except TimeoutError:
-                    logger.warning("Voice playback timed out after %.1fs", playback_timeout)
-                    vc.stop()
-                    return not strict
-                return not strict or (not playback_error and source.exhausted)
-            finally:
-                if receiver:
-                    receiver.resume()
         finally:
             self._reset_voice_timeout(guild_id)
+
+    async def _play_legacy_clip(
+        self, guild_id: int, vc, audio_path: str, *, strict: bool, kind: str, waited_ms: int,
+        playback_timeout: float,
+    ) -> bool:
+        """Legacy one-shot FFmpegPCMAudio playback of one clip; the caller holds the guild's turn."""
+        # Pause the receiver while playing (echo prevention).
+        receiver = self._voice_receivers.get(guild_id)
+        if receiver:
+            receiver.pause()
+        clip = None
+        result = "error"
+        try:
+            wait_start = time.monotonic()
+            while vc.is_playing():
+                if time.monotonic() - wait_start > playback_timeout:
+                    logger.warning("Timed out waiting for previous playback to finish")
+                    vc.stop()
+                    break
+                await asyncio.sleep(0.1)
+            done = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            playback_error: list[Any] = []
+
+            def _after(error):
+                if error:
+                    logger.error("Voice playback error: %s", error)
+                    playback_error.append(error)
+                loop.call_soon_threadsafe(done.set)
+            # Lead silence so socket warm-up doesn't clip the first word (mirrors mixer path).
+            ffmpeg_opts: dict[str, Any] = {}
+            _fx_cfg = getattr(self, "_voice_fx_cfg", None) or {}
+            try:
+                lead_ms = int(_fx_cfg.get("lead_silence_ms", 0) or 0)
+            except (TypeError, ValueError):
+                lead_ms = 0
+            if lead_ms > 0:
+                ffmpeg_opts["options"] = f"-af adelay={lead_ms}:all=1"
+            source = discord.FFmpegPCMAudio(
+                audio_path, executable=resolve_ffmpeg_executable(), **ffmpeg_opts,
+            )
+            source = discord.PCMVolumeTransformer(source, volume=1.0)
+            if strict:
+                class _TrackedSource(discord.AudioSource):
+                    def __init__(self, wrapped):
+                        self.wrapped = wrapped
+                        self.exhausted = False
+                        self.had_audio = False
+
+                    def read(self):
+                        data = self.wrapped.read()
+                        if data:
+                            self.had_audio = True
+                        else:
+                            self.exhausted = self.had_audio
+                        return data
+
+                    def is_opus(self):
+                        return self.wrapped.is_opus()
+
+                    def cleanup(self):
+                        self.wrapped.cleanup()
+
+                source = _TrackedSource(source)
+            vc.play(source, after=_after)
+            clip = next_clip_id()
+            logger.info(
+                "Voice speech start (guild=%d, clip=%s, kind=%s, waited_ms=%d)", guild_id, clip, kind, waited_ms,
+            )
+            try:
+                await asyncio.wait_for(done.wait(), timeout=playback_timeout)
+            except TimeoutError:
+                logger.warning("Voice playback timed out after %.1fs", playback_timeout)
+                vc.stop()
+                result = "timeout"
+                return not strict
+            except BaseException:
+                # Cancelled while sounding: stop it so the next clip never plays over it.
+                vc.stop()
+                result = "stopped"
+                raise
+            result = "error" if playback_error else "done"
+            return not strict or (not playback_error and source.exhausted)
+        finally:
+            if clip is not None:
+                logger.info("Voice speech end (guild=%d, clip=%s, kind=%s, result=%s)", guild_id, clip, kind, result)
+            if receiver:
+                receiver.resume()
 
     async def get_user_voice_channel(self, guild_id: int, user_id: str):
         """Return the voice channel the user is currently in, or None."""

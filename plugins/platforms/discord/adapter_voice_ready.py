@@ -338,7 +338,7 @@ class DiscordVoiceReadyMixin:
             if bool(cfg.get("ready_tone_enabled", True)):
                 try:
                     path = ready_tone_cache_path(cfg.get("ready_tone_gain", DEFAULT_READY_TONE_GAIN))
-                    await self.play_in_voice_channel(guild_id, path, strict=True)
+                    await self.play_in_voice_channel(guild_id, path, strict=True, kind="ready")
                 except Exception as exc:  # health: allow BLE001 -- an unrenderable/unplayable tone degrades to a silent ready; it must never fail the join
                     logger.warning("[Discord] ready tone failed to play (guild=%d): %s", guild_id, exc)
                 # t_ready is when the play call RETURNED, success or failure: the tone has been heard

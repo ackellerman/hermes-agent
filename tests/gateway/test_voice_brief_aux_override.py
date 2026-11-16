@@ -304,7 +304,7 @@ class _EdgeAdapter:
     def get_pending_message(self, session_key):
         return None
 
-    async def play_in_voice_channel(self, guild_id, audio_path, strict=False) -> bool:
+    async def play_in_voice_channel(self, guild_id, audio_path, strict=False, *, kind="reply") -> bool:
         self.played.append((guild_id, audio_path, strict, os.path.isfile(audio_path)))
         ORDER.append(("play", guild_id, os.path.isfile(audio_path)))
         return True
@@ -874,7 +874,7 @@ def test_an_auto_brief_whose_route_and_chain_all_fail_refuses_the_turn(
 class _DeafAdapter(_EdgeAdapter):
     """A platform edge whose playback raises."""
 
-    async def play_in_voice_channel(self, guild_id, audio_path, strict=False) -> bool:
+    async def play_in_voice_channel(self, guild_id, audio_path, strict=False, *, kind="reply") -> bool:
         ORDER.append(("play-failed", guild_id))
         raise RuntimeError("voice connect failed")
 
@@ -882,7 +882,7 @@ class _DeafAdapter(_EdgeAdapter):
 class _MutePlaybackAdapter(_EdgeAdapter):
     """A platform edge whose playback returns without playing."""
 
-    async def play_in_voice_channel(self, guild_id, audio_path, strict=False) -> bool:
+    async def play_in_voice_channel(self, guild_id, audio_path, strict=False, *, kind="reply") -> bool:
         ORDER.append(("play-incomplete", guild_id))
         return False
 

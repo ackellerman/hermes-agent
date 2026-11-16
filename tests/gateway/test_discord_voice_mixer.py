@@ -9,6 +9,7 @@ integration (install on join, play routing, ack) is tested with the standard
 
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -103,7 +104,8 @@ class TestPlayInVoiceChannelMixerPath:
         class _Mixer:
             def __init__(self):
                 self._polls = 0
-                self.play_speech = MagicMock()
+                # The adapter waits for its own child: hand back one that has already finished.
+                self.play_speech = MagicMock(return_value=SimpleNamespace(_finished=True, _stopped=False))
 
             @property
             def speech_active(self):

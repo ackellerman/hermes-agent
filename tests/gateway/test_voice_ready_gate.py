@@ -233,9 +233,9 @@ def _env(monkeypatch, *, lease=None, tone=True, timeout=5.0, requested="cpu",
     calls: list = []
     real_play = adapter.play_in_voice_channel
 
-    async def spy(guild_id, audio_path, strict=False):
-        calls.append({"guild": guild_id, "path": audio_path, "strict": strict})
-        return await real_play(guild_id, audio_path, strict=strict)
+    async def spy(guild_id, audio_path, strict=False, *, kind="reply"):
+        calls.append({"guild": guild_id, "path": audio_path, "strict": strict, "kind": kind})
+        return await real_play(guild_id, audio_path, strict=strict, kind=kind)
 
     monkeypatch.setattr(adapter, "play_in_voice_channel", spy)
 
@@ -325,6 +325,8 @@ async def test_a_packet_received_before_the_dave_commit_is_cut_and_the_tone_play
     assert call["guild"] == GUILD and call["strict"] is True
     assert call["path"].endswith(".wav")
     assert receiver.dave_settled
+    # The spy records the call before the tone plays; the gate writes its info after the play returns.
+    assert await _until(lambda: "degraded" in env.info()), "the gate never recorded its ready info"
     assert env.info()["degraded"] is False
 
     _quiet(env)
@@ -712,6 +714,7 @@ async def test_the_tone_goes_through_the_strict_play_path(monkeypatch):
     assert await _until(lambda: _ready(env))
     [call] = env.calls
     assert call["strict"] is True
+    assert call["kind"] == "ready"
     [source] = env.vc.played
     assert type(source).__name__ == "_TrackedSource"   # strict wraps the clip that way
     assert env.adapter._voice_mixers.get(GUILD) is None
@@ -1053,7 +1056,7 @@ async def test_a_move_inside_the_tone_does_not_stamp_the_rearmed_receiver(
     env = _env(monkeypatch, lease=lease, timeout=30)
     tone_entered, tone_held = asyncio.Event(), asyncio.Event()
 
-    async def held_tone(guild_id, audio_path, strict=False):
+    async def held_tone(guild_id, audio_path, strict=False, *, kind="reply"):
         tone_entered.set()
         await tone_held.wait()            # the move lands while the gate is inside the tone
 

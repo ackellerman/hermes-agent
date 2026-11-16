@@ -40,7 +40,7 @@ class MixerChild:
     """One 48 kHz / stereo / s16le PCM stream feeding :class:`VoiceMixer`; ``read_frame``
     yields 20 ms frames, optionally looping, with per-child gain and linear fade-in."""
 
-    __slots__ = ("_fade_done", "_finished", "_pcm", "_pos", "fade_frames", "gain", "loop")
+    __slots__ = ("_fade_done", "_finished", "_pcm", "_pos", "_stopped", "fade_frames", "gain", "loop")
 
     def __init__(self, pcm: bytes, *, loop: bool = False, gain: float = 1.0, fade_in_ms: int = 0):
         # Pad to whole frames so looping is seamless and the final partial frame doesn't click.
@@ -49,6 +49,9 @@ class MixerChild:
         self.loop, self.gain = loop, float(gain)
         self.fade_frames = max(0, fade_in_ms // FRAME_LENGTH_MS)
         self._finished = False
+        # Set when the mixer drops this child before its last frame (stop_speech / cleanup), so the
+        # adapter can tell a cut-off clip from a completed one — otherwise it waits forever.
+        self._stopped = False
 
     def read_frame(self) -> Optional[np.ndarray]:
         """Next 20 ms frame as a float32 ndarray, or None when done."""
@@ -128,6 +131,8 @@ class VoiceMixer(discord.AudioSource):
     def stop_speech(self) -> None:
         """Drop any in-flight speech immediately and release the duck."""
         with self._lock:
+            for child in self._speech:
+                child._stopped = True
             self._speech.clear()
             self._begin_duck_release_locked()
 
@@ -175,6 +180,8 @@ class VoiceMixer(discord.AudioSource):
         with self._lock:
             self._closed = True
             self._ambient = None
+            for child in self._speech:
+                child._stopped = True
             self._speech.clear()
 
 
