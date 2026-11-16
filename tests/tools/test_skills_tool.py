@@ -1161,6 +1161,7 @@ class TestResolveSkillMd:
         _make_skill(local, "dup", category="one")
         _make_skill(local, "dup", category="two", body="A different skill.")
         _make_skill(local, "gamma")
+        _make_skill(local, "ns:odd")  # a ':' name is a plugin name, never a local lookup
         (home / "config.yaml").write_text(
             f"skills:\n  external_dirs:\n    - {external}\n  disabled:\n    - gamma\n")
 
@@ -1175,6 +1176,7 @@ class TestResolveSkillMd:
             assert resolve_skill_md("dup") is None  # same-tier ambiguity
             assert resolve_skill_md("one/dup") is not None
             assert resolve_skill_md("plugin:alpha") is None
+            assert resolve_skill_md("ns:odd") is None
             assert resolve_skill_md("gamma") is None  # disabled
             assert resolve_skill_md("../escape") is None
         assert not caplog.records, caplog.text
