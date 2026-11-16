@@ -1134,3 +1134,47 @@ class TestTrustWarningSymlinkAware:
             self._log("sym", root / "sym" / "SKILL.md", [root], root)
 
         assert "outside the trusted" in caplog.text, caplog.text
+
+
+class TestResolveSkillMd:
+    """``resolve_skill_md``: skill_view's name → SKILL.md lookup without its side effects (the
+    stale-skill notice polls it every gateway turn)."""
+
+    def test_resolves_and_refuses_without_side_effects(self, tmp_path, monkeypatch, caplog):
+        import pm
+        from tools.skills_tool import resolve_skill_md
+
+        def must_not_run(*args, **kwargs):
+            raise AssertionError("resolve_skill_md must have no side effects")
+
+        monkeypatch.setattr(pm, "ensure", must_not_run)
+        monkeypatch.setattr(skills_tool_module, "find_all_skills", must_not_run)
+        monkeypatch.setattr(skills_tool_module, "_mark_background_review_read", must_not_run)
+        home = Path(os.environ["HERMES_HOME"])
+        local = home / "skills"
+        external = tmp_path / "external"
+        external.mkdir()
+        alpha = _make_skill(local, "alpha", category="devops", frontmatter_extra="deps: [ffmpeg]\n")
+        beta = external / "beta-dir"
+        beta.mkdir()
+        (beta / "SKILL.md").write_text("---\nname: beta\ndescription: d.\n---\nbody\n")
+        _make_skill(local, "dup", category="one")
+        _make_skill(local, "dup", category="two", body="A different skill.")
+        _make_skill(local, "gamma")
+        (home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external}\n  disabled:\n    - gamma\n")
+
+        with caplog.at_level("WARNING"):
+            assert resolve_skill_md("alpha") == (alpha, alpha / "SKILL.md", "alpha")
+            assert resolve_skill_md("devops/alpha") == (alpha, alpha / "SKILL.md", "alpha")
+            ext = external.resolve() / "beta-dir"
+            for lookup in ("beta", "beta-dir"):
+                found = resolve_skill_md(lookup)
+                assert found is not None and found[1].resolve() == ext / "SKILL.md" and found[2] == "beta"
+            assert resolve_skill_md("missing") is None
+            assert resolve_skill_md("dup") is None  # same-tier ambiguity
+            assert resolve_skill_md("one/dup") is not None
+            assert resolve_skill_md("plugin:alpha") is None
+            assert resolve_skill_md("gamma") is None  # disabled
+            assert resolve_skill_md("../escape") is None
+        assert not caplog.records, caplog.text
