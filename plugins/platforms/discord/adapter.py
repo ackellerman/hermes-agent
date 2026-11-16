@@ -52,6 +52,18 @@ def _voice_mixer_module():
         return voice_mixer
 
 
+# Whisper hallucinates these three on near-silent audio, and a Discord voice session hits them all
+# the time. They are dropped HERE, not in ``tools.voice_mode_transcript.WHISPER_HALLUCINATIONS``:
+# the CLI, ``tools/transcription_chunking.py`` and ``tools/voice_client_config.py`` read that set,
+# so adding them there would change those paths (and the phrase list shipped to clients).
+_DISCORD_VOICE_SILENCE_PHRASES = frozenset({"thank you very much", "thank you so much", "thanks a lot"})
+
+
+def _is_discord_voice_silence_phrase(transcript: str) -> bool:
+    """True for a transcript that is only one of Whisper's Discord voice silence phrases."""
+    return transcript.strip().lower().rstrip(".!") in _DISCORD_VOICE_SILENCE_PHRASES
+
+
 def _image_ext_from_content_type(content_type: str) -> str:
     """Attachment extension for a downloaded image (png unless jpeg/gif/webp is evident)."""
     if "jpeg" in content_type or "jpg" in content_type:
@@ -5514,7 +5526,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             if not result.get("success"):
                 return
             transcript = result.get("transcript", "").strip()
-            if not transcript or is_whisper_hallucination(transcript):
+            if not transcript or is_whisper_hallucination(transcript) or _is_discord_voice_silence_phrase(transcript):
                 return
             logger.info("Voice input from user %d: %s", user_id, transcript[:100])
             if getattr(self, "_voice_text_channels", {}).get(guild_id) != captured_for:
