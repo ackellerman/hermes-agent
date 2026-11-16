@@ -795,10 +795,14 @@ class GatewayAuthorizationMixin:
                 not is_bot and not self._bot_loop_guard_instance().tracking_chains):
             return True
         allowed, state = self._under_authorization_profile(source, lambda: self._bot_loop_guard_instance().chain_admit(
-            self._bot_loop_guard_conversation(source), str(source.user_id or ""), str(event.text or ""), is_bot=is_bot))
+            self._bot_loop_guard_conversation(source), str(source.user_id or ""), str(event.text or ""), is_bot=is_bot,
+            fresh_mention=bool(getattr(event, "fresh_self_mention", False))))
         if not allowed:
-            logger.info("Bot loop guard ended a bot exchange in %s chat %s (%s from %s; gateway.bot_loop_guard).",
-                        source.platform.value if source.platform else "", source.chat_id, state, source.user_id)
+            # The message id makes the drop greppable from the platform's message link.
+            logger.info("Bot loop guard ended a bot exchange in %s chat %s (%s from %s, message %s; "
+                        "gateway.bot_loop_guard).",
+                        source.platform.value if source.platform else "", source.chat_id, state, source.user_id,
+                        getattr(event, "message_id", None))
         return allowed
 
     def _note_bot_reply(self, source) -> None:

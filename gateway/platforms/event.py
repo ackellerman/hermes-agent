@@ -137,6 +137,11 @@ class MessageEvent:
     # unknown). For adapters whose ``media_urls`` are random cache names (relay); the name is
     # display data only, never a path. Appended for positional compat.
     media_filenames: list[str] = field(default_factory=list)
+    # The author typed a literal @mention of THIS bot and the message is not a platform reply to one
+    # of this bot's own messages: a new ask, so the bot-loop guard never reads it as a bot answering
+    # this bot's answer (``reply_to_reply``); hop/duplicate/budget limits still apply. False = the
+    # adapter does not say (old behaviour). Appended for positional compat.
+    fresh_self_mention: bool = False
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
@@ -148,9 +153,11 @@ class MessageEvent:
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
 
     def absorb_reply_expected(self, other: "MessageEvent") -> None:
-        """One turn now answers *other* too: an addressed message wins, then an unknown one."""
+        """One turn now answers *other* too: an addressed message wins, then an unknown one. A fresh
+        @mention anywhere in the merged burst keeps the turn a new ask for the bot-loop guard."""
         if self.reply_expected is not True and other.reply_expected is not False:
             self.reply_expected = other.reply_expected
+        self.fresh_self_mention = bool(self.fresh_self_mention or getattr(other, "fresh_self_mention", False))
 
     def extend_media(self, other: "MessageEvent") -> None:
         """Append *other*'s attachments (urls, types and original names) to this event's. Names are

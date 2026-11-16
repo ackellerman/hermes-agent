@@ -6925,6 +6925,19 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             return False
         return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
 
+    def _is_fresh_self_mention(self, message: Any) -> bool:
+        """A literal ``<@bot>`` token in a message that is not a Discord reply to one of this bot's
+        own messages: a new ask, which the gateway bot-loop guard never reads as an answer to this
+        bot's answer. A reply whose referenced message is unresolved counts as a reply to us (the
+        guard keeps its old verdict). Read before the mention is stripped from ``message.content``."""
+        if not self._self_is_raw_mentioned(message):
+            return False
+        reference = getattr(message, "reference", None)
+        if reference is None:
+            return True
+        author = getattr(getattr(reference, "resolved", None), "author", None)
+        return author is not None and str(getattr(author, "id", "")) != str(self._client.user.id)
+
     def _discord_bots_require_inline_mention(self) -> bool:
         """Whether another bot must type an inline @mention to trigger us.
 
@@ -8011,6 +8024,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             if snapshot_text_parts and not raw_content:
                 raw_content = "\n".join(snapshot_text_parts)
                 normalized_content = raw_content
+        fresh_self_mention = self._is_fresh_self_mention(message)
         if self._self_is_explicitly_mentioned(message):
             mention_prefix = True
             if self._client.user:
@@ -8192,7 +8206,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             media_text_inlined=media_text_inlined,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text,
             timestamp=message.created_at, auto_skill=_skills, channel_prompt=_channel_prompt,
-            channel_context=_channel_context,
+            channel_context=_channel_context, fresh_self_mention=fresh_self_mention,
         )
         if (
             getattr(getattr(message, "author", None), "bot", False)

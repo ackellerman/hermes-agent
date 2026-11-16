@@ -7,7 +7,8 @@ once ``max_events`` land inside ``window_seconds``. Settings: config.yaml ``gate
 The chain rules (``chain_admit``) end an exchange long before that budget: a human message starts a
 new chain; each bot message after it is one hop and ``max_hops`` caps them; a bot repeating the same
 text inside one chain is one hop, not a new ask; and with ``bot_replies_expect_reply`` false (the
-default) a bot answering the reply this bot delivered to it is not answered again (#137027).
+default) a bot answering the reply this bot delivered to it is not answered again (#137027). A bot
+message that freshly @mentions this bot (not a reply to its message) is a new ask, not such an answer.
 """
 
 from __future__ import annotations
@@ -157,9 +158,14 @@ class BotLoopGuard:
             events.append(now)
             return True, "ok"
 
-    def chain_admit(self, conversation: Hashable, sender: str, text: str, *, is_bot: bool) -> tuple[bool, str]:
+    def chain_admit(
+        self, conversation: Hashable, sender: str, text: str, *, is_bot: bool, fresh_mention: bool = False,
+    ) -> tuple[bool, str]:
         """Apply the chain rules to one admitted inbound message. Returns ``(allowed, state)``; state is
-        ``disabled``, ``human`` (chain reset), ``ok``, ``max_hops``, ``duplicate`` or ``reply_to_reply``."""
+        ``disabled``, ``human`` (chain reset), ``ok``, ``max_hops``, ``duplicate`` or ``reply_to_reply``.
+        ``fresh_mention``: the message newly @mentions this bot and is not a reply to its message, so it
+        is a new ask and never ``reply_to_reply`` (``replied_to`` is keyed on the sender bot, not on one
+        of its sessions); it still counts as a hop and against ``duplicate``."""
         settings = self._settings()
         if not settings.enabled:
             return True, "disabled"
@@ -176,7 +182,7 @@ class BotLoopGuard:
             ask = (sender, hashlib.sha256(" ".join(str(text or "").split()).encode()).hexdigest())
             if ask in chain.asks:
                 return False, "duplicate"
-            if not settings.bot_replies_expect_reply and chain.replied_to == sender:
+            if not settings.bot_replies_expect_reply and chain.replied_to == sender and not fresh_mention:
                 return False, "reply_to_reply"
             if chain.hops >= settings.max_hops:
                 return False, "max_hops"
