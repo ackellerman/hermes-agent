@@ -109,7 +109,13 @@ def test_option_on_profile_runs_route_model_with_profile_identity(two_profiles):
 
     launch, coder = two_profiles
     parent = _parent()
-    route = _route_to_task_route({"profile": "coder", "model": "route-model", "provider": "custom"}, parent, {})
+    # A route's speed tier is applied on a profile+model route too, the way the non-profile branch applies it
+    # (the offer gate itself is tested in tests/tools/test_delegation_route_fields.py).
+    with patch("hermes_cli.models.resolve_fast_mode_overrides", return_value={"service_tier": "priority"}):
+        route = _route_to_task_route({"profile": "coder", "model": "route-model", "provider": "custom",
+                                      "service_tier": "fast"}, parent, {})
+    assert route.creds["service_tier"] == "priority" and route.creds["task_tier_overrides"] == {"service_tier": "priority"}
+    assert route.creds["request_overrides"]["service_tier"] == "priority"
     assert route.profile_home == coder
     assert (route.creds["model"], route.creds["base_url"], route.creds["api_key"]) == (
         "route-model", "https://coder.invalid/v1", "coder-key")
@@ -118,6 +124,7 @@ def test_option_on_profile_runs_route_model_with_profile_identity(two_profiles):
     _, built = _build(route, parent)
     assert (built["model"], built["base_url"], built["api_key"]) == (
         "route-model", "https://coder.invalid/v1", "coder-key")
+    assert built["service_tier"] == "priority"
     assert built["load_soul_identity"] is True
     assert _snapshot()["home"] == str(launch)
 

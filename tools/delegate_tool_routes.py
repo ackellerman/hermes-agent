@@ -289,9 +289,10 @@ def _profile_route(home: Path, config: Optional[Mapping[str, Any]] = None, paren
 def _profile_option_route(home: Path, route: Mapping[str, Any], config: Optional[Mapping[str, Any]] = None,
                           parent_agent: Any = None) -> TaskRoute:
     """A profile route that names a model option: the child runs AS the profile (its home, SOUL, skills and
-    toolsets) on the route's model, provider, reasoning and fallback chain, with credentials resolved inside the
-    profile's own scope (D1). ``base_url`` is refused: that branch inherits the launching seat's key. *config* is
-    the launching profile's ``delegation`` section; the option resolves its own credentials, so it is unused."""
+    toolsets) on the route's model, provider, speed tier, reasoning and fallback chain, with credentials resolved
+    inside the profile's own scope (D1). ``base_url`` is refused: that branch inherits the launching seat's key.
+    *config* is the launching profile's ``delegation`` section; the option resolves its own credentials, so it is
+    unused."""
     from hermes_cli.config import load_config_readonly
     from hermes_constants import resolve_reasoning_config
     from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
@@ -309,6 +310,9 @@ def _profile_option_route(home: Path, route: Mapping[str, Any], config: Optional
         creds = _resolve_delegation_credentials(
             {"model": route.get("model"), "provider": route.get("provider"), "api_mode": route.get("api_mode"),
              "request_overrides": route.get("request_overrides")}, parent_agent)
+        if route.get("service_tier") not in (None, ""):
+            from tools.delegate_tool_tuning import task_service_tier
+            creds = {**creds, **task_service_tier(str(route["service_tier"]), creds, parent_agent)}
         effort = route.get("reasoning_effort")
         if effort in (None, ""):
             reasoning = ResolvedReasoning(resolve_reasoning_config(cfg, creds.get("model") or ""))
