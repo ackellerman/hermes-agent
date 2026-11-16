@@ -586,6 +586,41 @@ def locate_skill(name: str, local_category_name: Optional[str], roots):
     return None, skill_dir, skill_md
 
 
+def resolve_skill_md(name: str) -> Optional[tuple[Path, Path, str]]:
+    """``(skill_dir, skill_md, resolved_name)`` that ``skill_view(name)`` would read, or None.
+
+    Same candidates and precedence as :func:`locate_skill`, but side-effect free and quiet, for
+    callers that poll every turn: no ``pm.ensure``, read-mark or usage bump, no not-found catalog
+    listing, no warning logs. None for a lookup-path error, a plugin name (``ns:x``), no match, a
+    same-tier ambiguity, a quarantined project skill, a legacy flat ``.md`` or a disabled skill."""
+    from agent.skill_utils import TIER_PROJECT, is_quarantined_project_skill, pick_skill_candidate, skill_candidate_rank
+    if not isinstance(name, str) or ":" in name or skill_lookup_path_error(name):
+        return None
+    roots, _active = skill_search_dirs()
+    all_dirs = [d for _t, d in roots]
+    candidates = _collect_skill_candidates(name, None, all_dirs) if all_dirs else []
+    if not candidates:
+        return None
+    tier_of = {d: t for t, d in roots}
+    if len(candidates) > 1:
+        owned = [(c, _owning_search_dir(c[1], all_dirs)) for c in candidates]
+        won, _contenders = pick_skill_candidate([
+            (tier_of[root], str(root), skill_candidate_rank(c[1], root), c[1]) for c, root in owned])
+        if won is None:
+            return None
+        candidates = [candidates[won]]
+    skill_dir, skill_md = candidates[0]
+    if skill_dir is None or not skill_md.is_file():
+        return None
+    if (tier_of.get(_owning_search_dir(skill_md, all_dirs)) == TIER_PROJECT
+            and is_quarantined_project_skill(skill_md)):
+        return None
+    resolved_name = str(_safe_frontmatter(skill_md).get("name") or skill_dir.name)
+    if _is_skill_disabled(resolved_name, _owned_relative(skill_dir, skill_md, all_dirs)):
+        return None
+    return skill_dir, skill_md, resolved_name
+
+
 def _owned_relative(skill_dir: Optional[Path], skill_md: Path, all_dirs) -> str:
     """Exact load path of a candidate: its skill dir (or flat ``.md`` stem) relative to its root."""
     root = _owning_search_dir(skill_md, all_dirs)
