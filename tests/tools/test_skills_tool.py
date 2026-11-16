@@ -1180,3 +1180,26 @@ class TestResolveSkillMd:
             assert resolve_skill_md("gamma") is None  # disabled
             assert resolve_skill_md("../escape") is None
         assert not caplog.records, caplog.text
+
+    def test_quarantined_project_skill_does_not_resolve(self, tmp_path, monkeypatch):
+        """A project skill with a dangerous scan verdict is invisible to skill_view, so it must not
+        resolve here either; the scanner is consulted for project-tier files only."""
+        import agent.skill_utils as su
+        from tools.skills_tool import resolve_skill_md
+        project = tmp_path / "repo" / ".hermes" / "skills"
+        evil = _make_skill(project, "evil")
+        clean = _make_skill(project, "clean")
+        local = _make_skill(Path(os.environ["HERMES_HOME"]) / "skills", "local-only")
+        scanned = []
+
+        def verdict(skill_md):
+            scanned.append(Path(skill_md).parent.name)
+            return Path(skill_md).parent == evil
+
+        monkeypatch.setattr(su, "is_quarantined_project_skill", verdict)
+        monkeypatch.setattr(skills_tool_module, "skill_search_dirs", lambda: (
+            [(su.TIER_PROJECT, project), (su.TIER_LOCAL, local.parent)], local.parent))
+        assert resolve_skill_md("evil") is None
+        assert resolve_skill_md("clean") == (clean, clean / "SKILL.md", "clean")
+        assert resolve_skill_md("local-only") == (local, local / "SKILL.md", "local-only")
+        assert scanned == ["evil", "clean"]

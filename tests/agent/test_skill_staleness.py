@@ -82,6 +82,8 @@ def _notice(history):
 def _assert_names(notice, stale, fresh=()):
     assert notice is not None
     assert notice.count(NOTICE_HEAD) == 1
+    for forbidden in ('[IMPORTANT: The "', "SKILL_PRUNED", "Skill directory"):  # never looks like a load
+        assert forbidden not in notice
     for name in stale:
         assert f'skill_view(name="{name}")' in notice
     for name in fresh:
@@ -102,8 +104,6 @@ def test_auto_load_copy_then_edit_gives_notice():
     notice = _notice(history)
     _assert_names(notice, ["alpha"])
     assert notice.startswith(NOTICE_HEAD)
-    for forbidden in ('[IMPORTANT: The "', "SKILL_PRUNED", "Skill directory"):
-        assert forbidden not in notice
 
 
 # U3
@@ -363,6 +363,20 @@ def test_wildcard_cap(tokens, expect_notice):
     history = _tool_rows("alpha", task_id="sess-7")
     _edit(alpha)
     assert (_notice(history) is not None) is expect_notice
+
+
+# Added: an edit at the END of the file is still a change: appending a line, or deleting the last
+# line (then the disk text is a strict prefix of the stale copy; the copy must end where the file ends).
+@pytest.mark.parametrize("kind", ["auto", "tool"])
+@pytest.mark.parametrize("body", ["Step one.\nStep two.\n", TOKEN_BODY], ids=["plain", "tokens"])
+@pytest.mark.parametrize("edit", [("Step two.\n", "Step two.\nStep three: new rule.\n"), ("\nStep two.\n", "\n")],
+                         ids=["append", "truncate"])
+def test_edit_at_end_of_file_is_detected(kind, body, edit):
+    alpha = _skill("alpha", body=body)
+    history = [_auto_row("alpha")] if kind == "auto" else _tool_rows("alpha")
+    assert _notice(history) is None
+    _edit(alpha, *edit)
+    _assert_names(_notice(history), ["alpha"])
 
 
 # Added: user rows are sanitized on load; a skill that documents <memory-context> must still match.
