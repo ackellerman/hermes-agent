@@ -33,6 +33,19 @@ def test_max_hops_and_reply_rule_from_config_yaml_drive_the_gateway_chain(config
     assert verdicts == ["ok", "ok", "max_hops", "max_hops"]
 
 
+def test_human_relays_from_config_yaml_reset_the_chain_and_apply_live(config_home):
+    relay = "1571240603155435684"
+    config_home({"max_hops": 2, "human_relays": [relay]})
+    assert load_settings().human_relays == frozenset({relay})
+
+    guard = BotLoopGuard()
+    assert [guard.chain_admit("chat", relay, f"line {n}", is_bot=guard.counts_as_bot(relay, True))[1]
+            for n in range(4)] == ["human"] * 4
+    config_home({"max_hops": 2})  # key removed: read on the next call, no restart
+    assert [guard.chain_admit("chat", relay, f"more {n}", is_bot=guard.counts_as_bot(relay, True))[1]
+            for n in range(3)] == ["ok", "ok", "max_hops"]
+
+
 def test_max_hops_from_config_yaml_caps_bot_mode_sends(config_home, monkeypatch):
     from types import SimpleNamespace
 

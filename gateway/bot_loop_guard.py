@@ -9,6 +9,11 @@ new chain; each bot message after it is one hop and ``max_hops`` caps them; a bo
 text inside one chain is one hop, not a new ask; and with ``bot_replies_expect_reply`` false (the
 default) a bot answering the reply this bot delivered to it is not answered again (#137027). A bot
 message that freshly @mentions this bot (not a reply to its message) is a new ask, not such an answer.
+
+``human_relays`` lists sender ids (e.g. a webhook bridging people from another chat into this one) the
+guard treats as people although the platform flags them as bots: such a message resets the chain and is
+never counted, cooled down or dropped. Only the guard reads it; admission (``*_ALLOW_BOTS``, bot
+allowlists, mention gates) is unchanged. List only relays that never carry this bot's replies back.
 """
 
 from __future__ import annotations
@@ -34,6 +39,11 @@ class BotLoopGuardSettings:
     cooldown_seconds: float = 600.0
     max_hops: int = 4
     bot_replies_expect_reply: bool = False
+    human_relays: frozenset = frozenset()
+
+    def is_human_relay(self, sender) -> bool:
+        """Whether ``sender`` is a listed relay of human messages (``human_relays``)."""
+        return sender is not None and str(sender).strip() in self.human_relays
 
 
 def _as_bool(raw, default: bool) -> bool:
@@ -62,6 +72,16 @@ def _as_positive_int(raw, default: int) -> int:
     return int(value) if value >= 1 and value == int(value) else default
 
 
+def _as_id_set(raw) -> frozenset:
+    """A list (or comma-separated string) of sender ids. Ids are strings; anything else reads as empty."""
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return frozenset()
+    return frozenset(text for item in raw
+                     if isinstance(item, (str, int)) and not isinstance(item, bool) and (text := str(item).strip()))
+
+
 def settings_from_config(cfg) -> BotLoopGuardSettings:
     """Read ``gateway.bot_loop_guard`` from a loaded config dict. Unusable values keep the default."""
     from hermes_cli.config import cfg_get
@@ -77,6 +97,7 @@ def settings_from_config(cfg) -> BotLoopGuardSettings:
         cooldown_seconds=_as_positive(block.get("cooldown_seconds"), defaults.cooldown_seconds),
         max_hops=_as_positive_int(block.get("max_hops"), defaults.max_hops),
         bot_replies_expect_reply=_as_bool(block.get("bot_replies_expect_reply"), defaults.bot_replies_expect_reply),
+        human_relays=_as_id_set(block.get("human_relays")),
     )
 
 
@@ -128,6 +149,11 @@ class BotLoopGuard:
     def tracking_chains(self) -> bool:
         """Whether any bot exchange is open, so a human message has a chain to reset."""
         return bool(self._chains)
+
+    def counts_as_bot(self, sender, is_bot: bool) -> bool:
+        """Whether this guard handles a message from ``sender`` as bot traffic: the platform's bot flag,
+        unless ``sender`` is listed in ``human_relays``. Every guard call site asks this first."""
+        return bool(is_bot) and not self._settings().is_human_relay(sender)
 
     def blocked(self, conversation: Hashable) -> bool:
         """True while ``conversation`` is cooling down. Reads only, so callers may ask as often as they like."""

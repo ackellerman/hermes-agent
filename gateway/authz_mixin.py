@@ -768,10 +768,17 @@ class GatewayAuthorizationMixin:
         platform = source.platform.value if source.platform else ""
         return (self._adapter_profile_for_source(source) or "", platform, str(source.chat_id or ""))
 
+    def _guard_counts_as_bot(self, source) -> bool:
+        """Whether the loop guard handles this message as bot traffic: the platform's bot flag, unless the
+        sender is a ``gateway.bot_loop_guard.human_relays`` entry. Every guard call site below asks this,
+        so a listed relay takes the human path everywhere (no count, no cooldown, chain reset)."""
+        return bool(getattr(source, "is_bot", False)) and self._bot_loop_guard_instance().counts_as_bot(
+            str(source.user_id or ""), True)
+
     def _admit_bot_message(self, source: SessionSource) -> bool:
         """Count one authorized bot-authored inbound message. False when it trips the budget or the chat is cooling down.
         The inbound handler calls this once per message; ``_is_user_authorized`` only peeks because it is asked several times."""
-        if not getattr(source, "is_bot", False):
+        if not self._guard_counts_as_bot(source):
             return True
         allowed, state = self._bot_loop_guard_instance().admit(self._bot_loop_guard_conversation(source))
         if state == "tripped":
@@ -789,14 +796,15 @@ class GatewayAuthorizationMixin:
         starts no turn (#137027)."""
         from gateway.session_ingress import executing_admission
         source = event.source
-        is_bot = bool(getattr(source, "is_bot", False))
+        guard = self._bot_loop_guard_instance()
         # A committed admission re-enters the handler to execute; ingress already judged that message.
         if executing_admission.get() or getattr(event, "internal", False) or (
-                not is_bot and not self._bot_loop_guard_instance().tracking_chains):
+                not getattr(source, "is_bot", False) and not guard.tracking_chains):
             return True
-        allowed, state = self._under_authorization_profile(source, lambda: self._bot_loop_guard_instance().chain_admit(
-            self._bot_loop_guard_conversation(source), str(source.user_id or ""), str(event.text or ""), is_bot=is_bot,
-            fresh_mention=bool(getattr(event, "fresh_self_mention", False))))
+        # The relay list is read under the transport profile, like the rest of the guard's config.
+        allowed, state = self._under_authorization_profile(source, lambda: guard.chain_admit(
+            self._bot_loop_guard_conversation(source), str(source.user_id or ""), str(event.text or ""),
+            is_bot=self._guard_counts_as_bot(source), fresh_mention=bool(getattr(event, "fresh_self_mention", False))))
         if not allowed:
             # The message id makes the drop greppable from the platform's message link.
             logger.info("Bot loop guard ended a bot exchange in %s chat %s (%s from %s, message %s; "
@@ -808,8 +816,9 @@ class GatewayAuthorizationMixin:
     def _note_bot_reply(self, source) -> None:
         """This turn's reply to a bot peer went out: its next message answers an answer."""
         if getattr(source, "is_bot", False):
-            self._under_authorization_profile(source, lambda: self._bot_loop_guard_instance().note_reply(
-                self._bot_loop_guard_conversation(source), str(source.user_id or "")))
+            self._under_authorization_profile(source, lambda: self._guard_counts_as_bot(source) and (
+                self._bot_loop_guard_instance().note_reply(self._bot_loop_guard_conversation(source),
+                                                           str(source.user_id or ""))))
 
     def _is_user_authorized(self, source: SessionSource, *, allow_adapter_delegation: bool = True) -> bool:
         """Whether a user may use the bot.
@@ -821,7 +830,7 @@ class GatewayAuthorizationMixin:
         """
         if not self._principal_authorized(source, allow_adapter_delegation=allow_adapter_delegation):
             return False
-        if not getattr(source, "is_bot", False):
+        if not self._guard_counts_as_bot(source):
             return True
         # The guard judges the final verdict: a chat allowlist admits a bot before the ALLOW_BOTS block runs.
         return not self._bot_loop_guard_instance().blocked(self._bot_loop_guard_conversation(source))

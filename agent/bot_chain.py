@@ -87,7 +87,8 @@ def on_turn_start(agent: Any, turn_author: Optional[dict], display_kind: Optiona
         for stale in [k for k, v in _CHAINS.items() if now - v["updated"] > settings.cooldown_seconds]:
             del _CHAINS[stale]
         state = _CHAINS.get(key)
-        if isinstance(turn_author, dict) and turn_author.get("is_bot"):
+        # A ``human_relays`` sender (a bridge relaying people) is a person here too.
+        if isinstance(turn_author, dict) and turn_author.get("is_bot") and not settings.is_human_relay(turn_author.get("id")):
             state = _CHAINS.setdefault(key, _new_state(now))
             state["hops"] = max(state["hops"] + 1, _hops(turn_author))
             state["sent"] = max(state["sent"], state["hops"])

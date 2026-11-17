@@ -2147,8 +2147,9 @@ DEFAULT_CONFIG = {
         "loop_watchdog_max_strikes": 3,
         # Allow all users without allowlists (security opt-in).
         "allow_all_users": False,
-        # Bot-to-bot loop guard: max_events per window before a cooldown; max_hops bot messages per exchange.
-        "bot_loop_guard": {"enabled": True, "max_events": 20, "window_seconds": 300, "cooldown_seconds": 600, "max_hops": 4, "bot_replies_expect_reply": False},
+        # Bot-to-bot loop guard: max_events per window before a cooldown; max_hops bot messages per exchange;
+        # human_relays: sender ids (e.g. a webhook bridging people in) the guard treats as human messages.
+        "bot_loop_guard": {"enabled": True, "max_events": 20, "window_seconds": 300, "cooldown_seconds": 600, "max_hops": 4, "bot_replies_expect_reply": False, "human_relays": []},
         # Startup-liveness watchdog: stdlib-only daemon thread armed at process entry that
         # hard-exits 75 if the loop isn't live within the deadline. Armed before config loads, so
         # run_gateway() bridges these to HERMES_STARTUP_WATCHDOG / HERMES_STARTUP_WATCHDOG_TIMEOUT_S
