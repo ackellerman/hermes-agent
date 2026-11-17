@@ -47,7 +47,6 @@ from gateway.platforms.base import SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
 from plugins.platforms.discord.adapter import DiscordAdapter
-from tests.gateway.wait_for_py311 import install as install_py311_wait_for
 
 CHAT = "555000111"
 INTERVAL = 0.2  # production refresh is 2.0 s
@@ -210,21 +209,80 @@ MODE_B_ROUNDS = 8
 
 
 @pytest.mark.asyncio
-async def test_mode_b_double_cancelled_turn_leaves_no_typing_loop(monkeypatch):
-    """Mode B: the turn task is cancelled twice (the second lands in its unwind). Under CPython
-    3.11 ``asyncio.wait_for`` semantics (emulated here, because the hermetic interpreter is
-    newer) the refresh task's own cancel can be lost when it races ``send_typing``'s
-    completion; the survivor then re-registers a Discord typing loop nobody owns once the chat is
-    unpaused. Repeated so the race is actually hit: the emulation must have swallowed at least
-    one refresh cancel, and no round may leave a key, a live loop, or a POST behind."""
-    emulated = install_py311_wait_for(monkeypatch, "_keep_typing")
+async def test_mode_b_double_cancelled_turn_leaves_no_typing_loop():
+    """Mode B: the turn task is cancelled twice (the second lands in its unwind). The refresh
+    task's own cancel must never orphan a Discord typing loop nobody owns once the chat is
+    unpaused. Repeated because the cancel/double-cancel interleaving is timing-sensitive: no
+    round may leave a key, a live loop, or a POST behind."""
     leaks = []
     for round_no in range(MODE_B_ROUNDS):
         found = await _double_cancelled_turn_leaks()
         if found:
             leaks.append((round_no, found))
-    assert emulated.swallowed >= 1, "the 3.11 lost-cancel path was never exercised (vacuous run)"
-    assert leaks == [], f"{len(leaks)}/{MODE_B_ROUNDS} rounds leaked (swallowed={emulated.swallowed}): {leaks}"
+    assert leaks == [], f"{len(leaks)}/{MODE_B_ROUNDS} rounds leaked: {leaks}"
+
+
+@pytest.mark.asyncio
+async def test_mode_b_send_typing_swallows_refresh_cancel_leaves_no_typing_loop():
+    """A platform adapter's ``send_typing`` that swallows the turn-stop's cancel delivered
+    mid-send (returns from inside ``except CancelledError``) must not orphan the refresh:
+    the cancelling() guard at the end of the tick must honour the counted cancel, so no
+    registry key, live typing loop, or POST survives the turn. The tick is held open so the
+    stop's cancel lands inside ``send_typing`` deterministically."""
+    async with _reap():
+        adapter, rec = _build()
+        swallowed = []
+        entered = []
+        real_send_typing = adapter.send_typing
+
+        async def send_typing(chat_id, metadata=None):
+            task = asyncio.current_task()
+            assert task is not None
+            name = getattr(getattr(task.get_coro(), "cr_code", None), "co_name", None)
+            if name == "_keep_typing":
+                entered.append(name)
+                if not swallowed:
+                    try:
+                        await asyncio.sleep(5)  # hold the tick open: the stop's cancel lands here
+                    except asyncio.CancelledError:
+                        swallowed.append(1)
+                        return  # platform adapter swallows the external cancel
+            return await real_send_typing(chat_id, metadata=metadata)
+
+        adapter.send_typing = send_typing
+        in_handler = asyncio.Event()
+
+        async def handler(_e):
+            in_handler.set()
+            await asyncio.sleep(30)
+            return "never"
+
+        adapter.set_message_handler(handler)
+        ev = _event()
+        task = asyncio.create_task(adapter._process_message_background(ev, build_session_key(ev.source)))
+        await asyncio.wait_for(in_handler.wait(), 5)
+        for _ in range(100):
+            if entered:
+                break
+            await asyncio.sleep(0.02)
+        assert entered, "the refresh task never called send_typing (vacuous run)"
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        await asyncio.sleep(0)
+        posts_after = await _posts_after(rec, INTERVAL * 5)
+        leaks = []
+        if not swallowed:
+            leaks.append("the swallowed-cancel path was never exercised (vacuous run)")
+        if CHAT in adapter._typing_tasks:
+            leaks.append("chat still registered")
+        if _live_typing_tasks():
+            leaks.append(f"live typing tasks {_live_typing_tasks()}")
+        if posts_after:
+            leaks.append(f"{posts_after} typing POST(s) after the turn")
+        assert leaks == [], leaks
 
 
 @pytest.mark.asyncio

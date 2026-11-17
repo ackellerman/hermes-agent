@@ -3301,9 +3301,9 @@ class BasePlatformAdapter(ABC):
                         pass  # Slow network — abandon this tick, stay on schedule.
                     except Exception as typing_err:
                         logger.debug("[%s] send_typing error (non-fatal): %s", self.name, typing_err)
-                    # CPython 3.11 asyncio.wait_for returns the inner result (or raises its error)
-                    # when a cancel races the inner's completion, so the cancel is swallowed here.
-                    # The request is still counted on the task: honour it instead of refreshing on
+                    # A platform adapter's send_typing can swallow the cancel (it returns from
+                    # inside `except CancelledError`): the tick then ends normally while a cancel
+                    # request is still counted on this task. Honour it instead of refreshing on
                     # as an orphan that re-creates platform typing after the turn stopped it.
                     _current = asyncio.current_task()
                     if _current is not None and _current.cancelling():

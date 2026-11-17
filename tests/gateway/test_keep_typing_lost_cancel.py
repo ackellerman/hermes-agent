@@ -1,15 +1,16 @@
-"""The generic typing refresh honours a cancel that CPython 3.11 ``asyncio.wait_for`` swallowed,
+"""The generic typing refresh survives a cancel a platform adapter swallowed inside ``send_typing``,
 and the turn's final typing stop does not disturb a refresh task that is legitimately unwinding.
 
-On 3.11, ``wait_for(send_typing(...))`` returns the inner result when the refresh task's cancel
-races ``send_typing``'s completion; the cancel is lost but stays counted (``cancelling()``). A
-refresh that ignores that keeps re-creating platform typing after its turn stopped it. The
-3.11 semantics are emulated (``tests/gateway/wait_for_py311.py``) because the hermetic test
-interpreter is newer.
+When ``send_typing`` returns from inside ``except CancelledError`` (the adapter swallowed the
+refresh task's cancel), the tick ends normally while the cancel request stays counted on the task
+(``Task.cancelling()``). A refresh that ignores that keeps re-creating platform typing after its
+turn stopped it. The ``cancelling()`` guard at the end of the tick is the defence; these tests
+witness it directly (self-cancelling ``send_typing``), which also stays live now that the tick's
+per-tick bound is ``asyncio.timeout`` (the upstream carry c6b6a8a8d9) instead of 3.11's
+``wait_for``.
 """
 
 import asyncio
-import time
 
 import pytest
 
@@ -17,46 +18,44 @@ from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 from tests.gateway.test_run_progress_topics import ProgressCaptureAdapter
-from tests.gateway.wait_for_py311 import install as install_py311_wait_for
 
 CHAT = "-1001"
 
 
 @pytest.mark.asyncio
-async def test_refresh_exits_when_its_cancel_is_swallowed_by_311_wait_for(monkeypatch):
-    """Deterministic: the refresh task is cancelled while its ``send_typing`` is completing (the
-    cancel is issued from inside that call), so the emulated 3.11 ``wait_for`` swallows it. The
-    refresh must still end, and must not call ``send_typing`` again."""
-    emulated = install_py311_wait_for(monkeypatch, "_keep_typing")
+async def test_refresh_exits_when_send_typing_swallows_its_cancel():
+    """Deterministic: the refresh task's ``send_typing`` cancels its own task and swallows the
+    CancelledError. The tick ends normally while the cancel stays counted; the guard must honour
+    it: the refresh ends here and never calls ``send_typing`` again."""
     adapter = ProgressCaptureAdapter()
-    refresh: list[asyncio.Task] = []
     calls = []
 
     async def send_typing(chat_id, metadata=None):
-        calls.append(time.monotonic())
+        calls.append(chat_id)
         if len(calls) == 2:
-            refresh[0].cancel()  # lands while this inner call completes in the same step
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()  # cancel the refresh task from inside its own tick
+            try:
+                await asyncio.sleep(0)  # deliver the cancel to this frame
+            except asyncio.CancelledError:
+                return  # platform adapter swallows the cancel
 
     adapter.send_typing = send_typing
-    refresh.append(asyncio.create_task(adapter._keep_typing(CHAT, interval=0.05)))
+    refresh = asyncio.create_task(adapter._keep_typing(CHAT, interval=0.05))
     try:
-        for _ in range(100):
-            if refresh[0].done() or len(calls) > 4:
-                break
-            await asyncio.sleep(0.02)
-        assert emulated.swallowed == 1, "the emulated 3.11 wait_for must have lost the cancel"
-        assert refresh[0].done(), f"refresh survived its swallowed cancel ({len(calls)} send_typing calls)"
-        assert len(calls) == 2
+        done, _ = await asyncio.wait({refresh}, timeout=1.0)
+        assert refresh in done, f"refresh survived a swallowed cancel ({len(calls)} send_typing calls)"
+        assert len(calls) == 2, calls
         assert CHAT not in adapter._typing_paused
     finally:
-        refresh[0].cancel()
-        await asyncio.gather(refresh[0], return_exceptions=True)
+        refresh.cancel()
+        await asyncio.gather(refresh, return_exceptions=True)
 
 
 @pytest.mark.asyncio
-async def test_refresh_keeps_running_without_a_cancel(monkeypatch):
-    """Control: under the same emulation, an uncancelled refresh keeps refreshing."""
-    install_py311_wait_for(monkeypatch, "_keep_typing")
+async def test_refresh_keeps_running_without_a_cancel():
+    """Control: with no cancel issued, the refresh keeps refreshing."""
     adapter = ProgressCaptureAdapter()
     task = asyncio.create_task(adapter._keep_typing(CHAT, interval=0.05))
     try:
