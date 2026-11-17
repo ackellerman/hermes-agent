@@ -6,6 +6,7 @@ never refused by a cooldown. Unlisted bots and webhooks keep the old behaviour. 
 """
 
 import itertools
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -244,3 +245,69 @@ def test_a_relay_authored_turn_starts_a_new_bot_mode_chain(monkeypatch):
         bot_chain.on_turn_start(agent, author, None, f"<player> {n}")
         refusals.append(bot_chain.admit_send(agent, ["bot:gamma"], f"other {n}").refusal)
     assert refusals[-1] is not None and "limit of 2" in refusals[-1]
+
+
+# --- transport-profile scoping (multiplexed seats): the list is read where the rest of the guard is ---
+
+
+def _profile_home(tmp_path, name, relays_yaml="", max_events=1000):
+    home = tmp_path / name
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "gateway:\n  bot_loop_guard:\n    max_hops: 2\n    bot_replies_expect_reply: true\n"
+        f"    max_events: {max_events}\n{relays_yaml}", encoding="utf-8")
+    return home
+
+
+def _transport_runner(transport_home):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._scale_to_zero_note_real_inbound = lambda: None
+
+    async def _passthrough(event, source):
+        return event
+    runner._hm_pre_gateway_dispatch_hook = _passthrough
+    runner._principal_authorized = lambda source, **kw: True  # admission is not under test
+    runner._adapter_profile_for_source = lambda source: "transport"
+    runner._authorization_home_for_source = lambda source: Path(transport_home)
+    runner._bot_loop_guard = BotLoopGuard()  # the real load_settings
+    return runner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("listed_in, expected", [
+    ("transport", [True] * 6),
+    ("ambient", [True, True, False, False, False, False]),  # control: an ambient listing does not leak in
+])
+async def test_relay_list_is_read_under_the_transport_profile(tmp_path, monkeypatch, listed_in, expected):
+    relays = f"    human_relays: ['{RELAY}']\n"
+    transport = _profile_home(tmp_path, "transport", relays if listed_in == "transport" else "")
+    ambient = _profile_home(tmp_path, "ambient", relays if listed_in == "ambient" else "")
+    monkeypatch.setenv("HERMES_HOME", str(ambient))
+    runner = _transport_runner(transport)
+    verdicts = [await _admit(runner, _event(RELAY, f"<player> {n}")) for n in range(6)]
+    assert verdicts == expected
+
+
+def test_cooldown_peek_reads_the_relay_list_under_the_transport_profile(tmp_path, monkeypatch):
+    transport = _profile_home(tmp_path, "transport", f"    human_relays: ['{RELAY}']\n", max_events=2)
+    monkeypatch.setenv("HERMES_HOME", str(_profile_home(tmp_path, "ambient")))
+    runner = _transport_runner(transport)
+    for _ in range(3):
+        runner._admit_bot_message_for_source(_event(PEER, "x").source)  # trips the chat's cooldown
+    assert runner._is_user_authorized_for_source(_event(PEER, "x").source) is False
+    relay = _event(RELAY, "y").source
+    assert runner._is_user_authorized_for_source(relay) is True
+    assert runner._admit_bot_message_for_source(relay) is True
+
+
+def test_an_unusable_value_is_logged_once(caplog):
+    import gateway.bot_loop_guard as module
+
+    module._WARNED_RELAY_VALUES.discard(repr(1571240603155435684))
+    cfg = {"gateway": {"bot_loop_guard": {"human_relays": 1571240603155435684}}}
+    with caplog.at_level("WARNING", logger="gateway.bot_loop_guard"):
+        assert settings_from_config(cfg).human_relays == frozenset()
+        assert settings_from_config(cfg).human_relays == frozenset()
+    assert sum("human_relays" in r.getMessage() for r in caplog.records) == 1

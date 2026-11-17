@@ -19,6 +19,7 @@ allowlists, mention gates) is unchanged. List only relays that never carry this 
 from __future__ import annotations
 
 import hashlib
+import logging
 import threading
 import time
 from collections import deque
@@ -26,6 +27,8 @@ from dataclasses import dataclass
 from typing import Callable, Deque, Dict, Hashable, Tuple
 
 __all__ = ["BotLoopGuard", "BotLoopGuardSettings", "configured_bot_user", "load_settings", "settings_from_config"]
+
+logger = logging.getLogger(__name__)
 
 _TRUTHY = frozenset({"true", "1", "yes", "on"})
 _FALSY = frozenset({"false", "0", "no", "off"})
@@ -72,11 +75,18 @@ def _as_positive_int(raw, default: int) -> int:
     return int(value) if value >= 1 and value == int(value) else default
 
 
+_WARNED_RELAY_VALUES: set[str] = set()
+
+
 def _as_id_set(raw) -> frozenset:
     """A list (or comma-separated string) of sender ids. Ids are strings; anything else reads as empty."""
     if isinstance(raw, str):
         raw = raw.split(",")
     if not isinstance(raw, (list, tuple, set, frozenset)):
+        if raw is not None and repr(raw) not in _WARNED_RELAY_VALUES:  # settings are re-read per message: warn once
+            _WARNED_RELAY_VALUES.add(repr(raw))
+            logger.warning("gateway.bot_loop_guard.human_relays must be a list of quoted ids, got %r; ignoring it "
+                           "(write human_relays: ['<id>']).", raw)
         return frozenset()
     return frozenset(text for item in raw
                      if isinstance(item, (str, int)) and not isinstance(item, bool) and (text := str(item).strip()))
