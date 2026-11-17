@@ -287,8 +287,8 @@ async def test_mode_b_send_typing_swallows_refresh_cancel_leaves_no_typing_loop(
 
 @pytest.mark.asyncio
 async def test_mode_b_native_wait_for_leaves_no_typing_loop():
-    """The same double-cancelled turn on the interpreter's own ``wait_for`` (3.12+ re-raises
-    the cancel): a guard that the fix does not depend on the emulation."""
+    """The same double-cancelled turn with no patched ``wait_for`` anywhere (3.12+ re-raises
+    the cancel): the mode B leak checks hold on the interpreter's own semantics alone."""
     assert await _double_cancelled_turn_leaks() == []
 
 
