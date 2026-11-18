@@ -213,9 +213,34 @@ _PRIVATE_RECORD_KEYS = frozenset({"agent", "owner_session_id", "owner_transport"
 
 def list_active_subagents() -> list[dict[str, Any]]:
     """Copy of the running subagent tree ({subagent_id, parent_id, depth, goal, model,
-    started_at, tool_count, status, ...}); safe from any thread."""
+    started_at, tool_count, status, ...}); safe from any thread.
+
+    Each copy also carries ``live_model`` and ``live_provider`` — the model and provider the
+    live child agent is calling now — and, while that child runs on a provider fallback,
+    ``fallback_from``, the model it fell back from. The three are read off the live agent
+    **under ``_active_subagents_lock``** (a fallback is swapped in place, so ``agent.model``
+    and ``agent.provider`` are the live route and ``_provider_fallback_active`` is the only
+    "a fallback is in force" marker); a route value that is not a non-empty string is not
+    reported, and ``fallback_from`` is the record's spawn model verbatim, so it is absent
+    for a record with no agent and for an agent on its primary. ``model`` stays the spawn
+    model, because ``_resume_spec()`` rebuilds a continued child from it.
+    """
     with _active_subagents_lock:
-        return [{k: v for k, v in r.items() if k not in _PRIVATE_RECORD_KEYS} for r in _active_subagents.values()]
+        snapshots = []
+        for r in _active_subagents.values():
+            snapshot = {k: v for k, v in r.items() if k not in _PRIVATE_RECORD_KEYS}
+            agent = r.get("agent")
+            if agent is not None:
+                live_model = getattr(agent, "model", None)
+                if isinstance(live_model, str) and live_model:
+                    snapshot["live_model"] = live_model
+                live_provider = getattr(agent, "provider", None)
+                if isinstance(live_provider, str) and live_provider:
+                    snapshot["live_provider"] = live_provider
+                if bool(getattr(agent, "_provider_fallback_active", False)):
+                    snapshot["fallback_from"] = r.get("model")
+            snapshots.append(snapshot)
+        return snapshots
 
 def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) -> bool:
     """True when *child_agent* sits below *parent_agent* in the spawn tree (walks the ``_delegate_parent_ref`` weakref
