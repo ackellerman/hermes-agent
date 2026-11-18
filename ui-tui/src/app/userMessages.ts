@@ -173,17 +173,23 @@ export const describeRpcError = (err: unknown): string => {
     return versionSkewMessage()
   }
 
+  // The owner names the check that fired in `data.detail` (gateway/session_controls.py
+  // _refusal_data copies RuntimeStoreError's field/detail into the error frame); print it under
+  // the refusal, as the slash-refusal hints do (describeSlashExecError below).
+  const detail = (err as { data?: { detail?: unknown } } | null)?.data?.detail
+  const detailRow = typeof detail === 'string' && detail.trim() ? `\n${detail.trim()}` : ''
+
   for (const [matcher, render] of RPC_ERROR_ROWS) {
     const m = matcher(code, text)
 
     if (m) {
       logReplacedWireText(code, text)
 
-      return render(m === true ? null : m)
+      return render(m === true ? null : m) + detailRow
     }
   }
 
-  return text
+  return text + detailRow
 }
 
 /** The shared owner's slash.exec refuses every command outside its reviewed reads with

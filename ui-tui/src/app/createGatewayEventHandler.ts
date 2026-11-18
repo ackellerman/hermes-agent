@@ -614,7 +614,9 @@ function applyDeferredPickOutcome(
       patchUiState({ info: { ...info, model: update.model, ...(typeof update.provider === 'string' ? { provider: update.provider } : {}) } })
     }
 
-    sys(t('slashCmd.session.model.deferredRefused', String(update.target_model ?? ''), String(update.reason ?? 'refused')))
+    const rawDetail = (update as { detail?: unknown }).detail
+    const detailRow = typeof rawDetail === 'string' && rawDetail.trim() ? `\n${rawDetail.trim()}` : ''
+    sys(t('slashCmd.session.model.deferredRefused', String(update.target_model ?? ''), String(update.reason ?? 'refused')) + detailRow)
 
     return
   }
