@@ -619,3 +619,60 @@ def test_oauth_in_a_plugin_keyed_custom_fails_admission(tmp_path):
     report = validate_plugin_dir(plugin)
 
     assert [ok for name, ok, _ in report.checks if name == "oauth"] == [False]
+
+
+class TestLegacyHooksSpelling:
+    """``hooks:`` is the spelling the bundled manifests carried and the loader still reads
+    (#108371), and the catalog display path reads both. Admission must not fail what the
+    loader runs clean: it passes and asks for the rename. The declared-vs-registered teeth
+    stay (a hook in neither key still fails), and ``provides_hooks:`` stays quiet."""
+
+    def test_legacy_hooks_spelling_passes_with_a_rename_warning(self, tmp_path):
+        manifest = dict(BASE_MANIFEST, hooks=["pre_tool_call"])
+        init = (
+            "def register(ctx):\n"
+            "    ctx.register_hook('pre_tool_call', lambda **kw: None)\n"
+        )
+        d = _make_plugin(tmp_path, manifest=manifest, init_py=init)
+        report = validate_plugin_dir(d)
+        assert report.ok, report.failures
+        assert ("declared hooks", True, "matches registrations") in report.checks
+        assert any(
+            "hooks:" in w and "provides_hooks:" in w for w in report.warnings
+        ), report.warnings
+
+    def test_provides_hooks_spelling_is_quiet(self, tmp_path):
+        manifest = dict(BASE_MANIFEST, provides_hooks=["pre_tool_call"])
+        init = (
+            "def register(ctx):\n"
+            "    ctx.register_hook('pre_tool_call', lambda **kw: None)\n"
+        )
+        d = _make_plugin(tmp_path, manifest=manifest, init_py=init)
+        report = validate_plugin_dir(d)
+        assert report.ok, report.failures
+        assert not any("hooks:" in w for w in report.warnings), report.warnings
+
+    def test_provides_hooks_wins_when_both_spellings_are_present(self, tmp_path):
+        """The loader reads ``provides_hooks`` and ignores ``hooks:`` when both are there, so
+        admission reads the same key: a hook only the legacy list names still fails."""
+        manifest = dict(BASE_MANIFEST, provides_hooks=[], hooks=["pre_tool_call"])
+        init = (
+            "def register(ctx):\n"
+            "    ctx.register_hook('pre_tool_call', lambda **kw: None)\n"
+        )
+        d = _make_plugin(tmp_path, manifest=manifest, init_py=init)
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        assert any("pre_tool_call" in f for f in report.failures), report.failures
+
+    def test_legacy_hooks_spelling_still_fails_an_undeclared_hook(self, tmp_path):
+        manifest = dict(BASE_MANIFEST, hooks=["pre_tool_call"])
+        init = (
+            "def register(ctx):\n"
+            "    ctx.register_hook('pre_tool_call', lambda **kw: None)\n"
+            "    ctx.register_hook('post_tool_call', lambda **kw: None)\n"
+        )
+        d = _make_plugin(tmp_path, manifest=manifest, init_py=init)
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        assert any("post_tool_call" in f for f in report.failures), report.failures

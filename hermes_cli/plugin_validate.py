@@ -404,6 +404,21 @@ def _declared_list(manifest: dict, key: str) -> list[str]:
     return [str(item) for item in raw if isinstance(item, str)]
 
 
+def _declared_hooks(manifest: dict) -> tuple[list[str], bool]:
+    """Declared hooks, read the way the loader reads them.
+
+    ``hooks:`` is the spelling the bundled manifests carried for months; the loader still
+    accepts it (#108371) and the catalog display path reads both, so admission has to read
+    the same key — otherwise a plugin the loader runs clean fails the gate. Returns
+    ``(declared, legacy_spelling)``.
+    """
+    if "provides_hooks" in manifest:
+        return _declared_list(manifest, "provides_hooks"), False
+    if "hooks" in manifest:
+        return _declared_list(manifest, "hooks"), True
+    return [], False
+
+
 def _check_capabilities(
     report: ValidationReport, manifest: dict, plugin_dir: Path,
     probe: Optional[tuple[Path, dict[str, str]]] = None,
@@ -437,7 +452,17 @@ def _check_capabilities(
         ("hooks", "provides_hooks"),
         ("middleware", "provides_middleware"),
     ):
-        declared = set(_declared_list(manifest, manifest_key))
+        if kind == "hooks":
+            declared_list, legacy_spelling = _declared_hooks(manifest)
+            if legacy_spelling:
+                report.warn(
+                    "plugin.yaml declares its hooks as `hooks:`; the loader still reads it, but "
+                    "rename the key to `provides_hooks:` — catalog admission and `hermes plugins "
+                    "catalog` read the declared list."
+                )
+        else:
+            declared_list = _declared_list(manifest, manifest_key)
+        declared = set(declared_list)
         actual = set(recorded.get(kind) or [])
         undeclared = sorted(actual - declared)
         unregistered = sorted(declared - actual)
