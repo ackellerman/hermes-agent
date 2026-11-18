@@ -101,7 +101,8 @@ async def _commit(authority, ref, entry, operation):
     except RuntimeStoreError as exc:
         if exc.reason == 'session_busy':
             return None
-        return {'session_id': ref.session_id, 'operation': operation, 'status': 'refused', 'reason': exc.reason}
+        return {'session_id': ref.session_id, 'operation': operation, 'status': 'refused', 'reason': exc.reason,
+                'detail': exc.detail}
     except Exception:
         # Resolving the pick failed (provider auth, catalog, resolver crash). This runs before the
         # claim, so letting it escape would kill or wedge the drain on the same pick forever.

@@ -69,7 +69,9 @@ async def prepare_model(authority, live, payload, prepared):
         is_global=False, user_providers=resolution.get('providers'),
         custom_providers=get_compatible_custom_providers(resolution))
     if not result.success:
-        raise RuntimeStoreError('model_resolution_failed')
+        # The resolver's own message (a 429 quota text, an unknown model, a missing provider)
+        # rides the refusal's detail, as the deferred pick already does (session_messaging_picks.py).
+        raise RuntimeStoreError('model_resolution_failed', detail=result.error_message)
     # The configured default is the user's own choice: a reset is never held behind a cost ask.
     refusal = None if reset else await _selection_guard_refusal(
         authority, live, payload, prepared['snapshot'], current, result)
