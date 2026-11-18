@@ -353,3 +353,21 @@ describe('describeShellExecError', () => {
     expect(describeShellExecError(new JsonRpcGatewayError('dangerous_command', { code: 4001 }))).toBe('dangerous_command')
   })
 })
+
+describe('describeRpcError detail row', () => {
+  it('appends the owner\'s refusal detail under the reason (model_resolution_failed)', () => {
+    const err = new JsonRpcGatewayError('model_resolution_failed', {
+      code: 4001,
+      data: { reason: 'model_resolution_failed', detail: 'Provider quota exhausted (429).' }
+    })
+
+    const text = describeRpcError(err)
+
+    expect(text).toContain('model_resolution_failed')
+    expect(text.split('\n')[1]).toBe('Provider quota exhausted (429).')
+  })
+
+  it('a refusal without detail renders exactly as before', () => {
+    expect(describeRpcError(new JsonRpcGatewayError('model_resolution_failed', { code: 4001 }))).toBe('model_resolution_failed')
+  })
+})

@@ -24,11 +24,12 @@ describe('a model pick made during a turn that did not apply at the boundary', (
     patchUiState({ info: { model: 'picked' } as any, sid: 'sess-1' })
     const sys = vi.fn()
 
-    createGatewayEventHandler(ctx(sys))({ payload: { model: 'frozen', operation: 'model', reason: 'model_resolution_failed',
+    createGatewayEventHandler(ctx(sys))({ payload: { detail: 'Provider quota exhausted (429).', model: 'frozen', operation: 'model', reason: 'model_resolution_failed',
       session_id: 'sess-1', status: 'refused', target_model: 'picked' }, session_id: 'sess-1', type: 'session.updated' } as any)
 
     expect(sys).toHaveBeenCalledWith(expect.stringContaining('model_resolution_failed'))
     expect(sys.mock.calls[0][0]).toContain('picked')
+    expect(sys.mock.calls[0][0]).toContain('Provider quota exhausted (429).')
     expect(getUiState().info?.model).toBe('frozen')
   })
 
