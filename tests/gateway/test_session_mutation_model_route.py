@@ -180,6 +180,7 @@ async def test_a_pick_never_switches_from_the_fallback_route(home, endpoints):
         response = await _pick(owner, authority, sid, {'model': 'picked', 'provider': 'custom'})
 
         assert response.get('error', {}).get('message') == 'model_resolution_failed', response
+        assert (response.get('error', {}).get('data') or {}).get('detail'), response
         assert fallback.received == []
         assert _route(runner, live) == ('current', url, 'key-fallback')
     finally:

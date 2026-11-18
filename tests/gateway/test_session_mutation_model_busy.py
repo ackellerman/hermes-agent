@@ -305,7 +305,8 @@ async def test_a_refused_deferred_pick_names_the_reason_and_the_committed_model(
     store, db, authority, owner, ref = _owner(tmp_path, monkeypatch, handle)
     switch = model_switch.switch_model
     monkeypatch.setattr(model_switch, 'switch_model', lambda **k: model_switch.ModelSwitchResult(
-        success=False, new_model='', target_provider='') if k['raw_input'] == 'gone' else switch(**k))
+        success=False, new_model='', target_provider='',
+        error_message='resolver refused the pick') if k['raw_input'] == 'gone' else switch(**k))
     stream = authority.sessions[ref.session_id].event_stream
     publish = stream.publish
     monkeypatch.setattr(stream, 'publish', lambda sid, payload, **k: (
@@ -321,6 +322,7 @@ async def test_a_refused_deferred_pick_names_the_reason_and_the_committed_model(
         await async_wait_until(lambda: refused(), timeout=10, what='the refusal was announced')
         assert refused()[0].items() >= {'operation': 'model', 'reason': 'model_resolution_failed',
                                      'target_model': 'gone', 'model': 'frozen'}.items()
+        assert refused()[0].get('detail'), refused()[0]
     finally:
         release.set()
         await owner.close()
