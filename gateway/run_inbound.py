@@ -1377,14 +1377,15 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.event = event
         _claim_state.turn.started_ts = time.time()
-        # A held message handed over for this very event: its slot is claimed (doubles without the mixin skip it).
-        getattr(self, "_bot_loop_hold_turn_claimed", lambda _event: None)(event)
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
         start_reply_clock(source, internal=is_internal)
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
+            # A held message handed over for this very event: its slot is claimed here, INSIDE the try, so the
+            # finally below always ends the record (doubles without the mixin skip it).
+            getattr(self, "_bot_loop_hold_turn_claimed", lambda _event: None)(event)
             # Fail-open plugin consume inside the claimed slot (#129958); once per message.
             if not is_internal:
                 _consumed, _consumer_reply = await self._hm_post_admission_consume(event, source, _quick_key)

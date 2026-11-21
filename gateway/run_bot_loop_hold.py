@@ -3,7 +3,7 @@
 ``gateway/bot_loop_guard.py`` owns the window, the queues and their pace. This mixin owns what needs the gateway:
 the ingress decision for a Discord message (``_admit_discord_hold``), the single pump task that hands held messages back
 to the serving adapter's ``handle_message`` one at a time, the chat notices, the restart file
-(``<HERMES_HOME>/gateway/bot_loop_hold_refs.json``) and the "lost to a restart" lines posted at startup.
+(one per seat: ``<that seat's profile home>/gateway/bot_loop_hold_refs.json``) and the "lost to a restart" lines posted at startup.
 
 Bound through the MRO of ``GatewayRunner``. Test doubles build bare runners with ``object.__new__``, so every attribute
 read here has a class-level default or goes through ``getattr``.
@@ -338,24 +338,63 @@ class GatewayBotLoopHoldMixin:
 
     # --- the restart file (S8) -----------------------------------------------------------------------------------
 
-    @staticmethod
-    def _bot_loop_hold_refs_path() -> Optional[Path]:
-        """``<profile home>/gateway/bot_loop_hold_refs.json``; None when the home does not exist (never re-created)."""
+    def _bot_loop_hold_seat_homes(self) -> dict[str, Path]:
+        """Seat (profile name; ``""`` is the process's own seat) -> that seat's profile home. Without
+        ``multiplex_profiles`` there is one seat and one home. Under it, one process serves every profile and each
+        seat keeps its own refs file in its own home (S8), never one shared file."""
         from hermes_constants import get_hermes_home
 
-        home = Path(get_hermes_home())
+        homes: dict[str, Path] = {"": Path(get_hermes_home())}
+        config = getattr(self, "config", None)
+        if getattr(config, "multiplex_profiles", False):
+            try:
+                from gateway.run import _multiplex_profile_homes
+
+                for name, home in _multiplex_profile_homes(config):
+                    homes[str(name)] = Path(home)
+            except Exception:
+                logger.warning("Bot loop guard could not list the served profiles; using the process home only "
+                               "(gateway.bot_loop_guard).", exc_info=True)
+        return homes
+
+    def _bot_loop_hold_home_for(self, seat: str) -> Optional[Path]:
+        """The profile home holding ``seat``'s refs file, or None when it cannot be told."""
+        homes = self._bot_loop_hold_seat_homes()
+        if seat in homes:
+            return homes[seat]
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return homes[""]
+        try:
+            from hermes_cli.profiles import get_profile_dir
+
+            return Path(get_profile_dir(seat))
+        except Exception:
+            return None
+
+    def _bot_loop_hold_all_homes(self) -> list[Path]:
+        """Every distinct seat home, in a stable order (one entry per file)."""
+        seen: list[Path] = []
+        for home in self._bot_loop_hold_seat_homes().values():
+            if home not in seen:
+                seen.append(home)
+        return seen
+
+    @staticmethod
+    def _bot_loop_hold_refs_path(home: Path) -> Optional[Path]:
+        """``<home>/gateway/bot_loop_hold_refs.json``; None when the home does not exist (never re-created)."""
         return home / "gateway" / _REFS_FILE if home.is_dir() else None
 
-    def _bot_loop_hold_write_refs(self, entries: list[dict[str, Any]], not_listed: int = 0) -> bool:
-        path = self._bot_loop_hold_refs_path()
+    def _bot_loop_hold_write_file(self, home: Path, entries: list[dict[str, Any]], not_listed: int = 0) -> bool:
+        """Write ONE seat's file: its 500-entry cap and its count of entries dropped from the list."""
+        path = self._bot_loop_hold_refs_path(home)
         if path is None:
             return False
         if not entries and not not_listed and not path.exists():
             return True
         if len(entries) > _REFS_MAX_ENTRIES:
             dropped = len(entries) - _REFS_MAX_ENTRIES
-            logger.warning("Bot loop guard restart file lists %d messages; the oldest %d are dropped from the list "
-                           "(gateway.bot_loop_guard).", len(entries), dropped)
+            logger.warning("Bot loop guard restart file %s lists %d messages; the oldest %d are dropped from the "
+                           "list (gateway.bot_loop_guard).", path, len(entries), dropped)
             entries, not_listed = entries[-_REFS_MAX_ENTRIES:], not_listed + dropped
         from utils import atomic_write_text
 
@@ -366,15 +405,28 @@ class GatewayBotLoopHoldMixin:
         return True
 
     def _bot_loop_hold_flush_refs(self, *, only_if_due: bool = False) -> None:
-        """Write what is held (and what the last run lost and this run has not yet named) to the restart file."""
+        """Write what is held (and what the last run lost and this run has not yet named) to each seat's file."""
         guard = getattr(self, "_bot_loop_guard", None)
         if guard is None or not self._hold_refs_ready:
             return
         if only_if_due and (not guard.refs_dirty()
                             or time.monotonic() - self._hold_refs_last_write < _REFS_COALESCE_SECONDS):
             return
-        carry = list(getattr(self, "_hold_refs_carry", None) or [])
-        if self._bot_loop_hold_write_refs(carry + guard.refs_snapshot(), getattr(self, "_hold_refs_not_listed", 0)):
+        carry: dict[Path, list[dict[str, Any]]] = getattr(self, "_hold_refs_carry", None) or {}
+        carry_not_listed: dict[Path, int] = getattr(self, "_hold_refs_not_listed", None) or {}
+        per_home: dict[Path, list[dict[str, Any]]] = {home: list(items) for home, items in carry.items()}
+        for item in guard.refs_snapshot():
+            home = self._bot_loop_hold_home_for(str(item.get("profile") or ""))
+            if home is not None:
+                per_home.setdefault(home, []).append(item)
+        written = getattr(self, "_hold_refs_written_homes", None) or set()
+        ok = True
+        for home in set(per_home) | set(written) | set(carry_not_listed):
+            items = per_home.get(home, [])
+            if not self._bot_loop_hold_write_file(home, items, carry_not_listed.get(home, 0)):
+                ok = False
+        self._hold_refs_written_homes = {home for home, items in per_home.items() if items}
+        if ok:
             guard.refs_written()
 
     async def _bot_loop_hold_report_lost(self) -> None:
@@ -394,9 +446,25 @@ class GatewayBotLoopHoldMixin:
                 logger.warning("Bot loop guard could not write its restart file", exc_info=True)
 
     async def _bot_loop_hold_report_lost_inner(self) -> None:
-        path = self._bot_loop_hold_refs_path()
+        carry: dict[Path, list[dict[str, Any]]] = {}
+        carry_not_listed: dict[Path, int] = {}
+        try:
+            for home in self._bot_loop_hold_all_homes():
+                remaining, not_listed = await self._bot_loop_hold_report_file(home)
+                if remaining:
+                    carry[home] = remaining
+                if not_listed:
+                    carry_not_listed[home] = not_listed
+        finally:
+            self._hold_refs_carry = carry
+            self._hold_refs_not_listed = carry_not_listed
+
+    async def _bot_loop_hold_report_file(self, home: Path) -> tuple[list[dict[str, Any]], int]:
+        """Name what ONE seat's file says its previous run lost; returns what could not be named (kept for the next
+        start) and the count of entries the file had already dropped from its list."""
+        path = self._bot_loop_hold_refs_path(home)
         if path is None or not path.exists():
-            return
+            return [], 0
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             entries = data["entries"]
@@ -411,16 +479,16 @@ class GatewayBotLoopHoldMixin:
                 aside = path
             logger.warning("Bot loop guard restart file %s is unreadable (%s); moved to %s "
                            "(gateway.bot_loop_guard).", path, exc, aside.name)
-            return
+            return [], 0
         if not entries and not not_listed:
-            return
+            return [], 0
         remaining: list[dict[str, Any]] = list(entries)
         groups: dict[tuple, list[dict[str, Any]]] = {}
         for item in entries:
             groups.setdefault((str(item.get("profile") or ""), str(item.get("channel") or "")), []).append(item)
         last_group = list(groups)[-1] if groups else None
-        total_lost = len(entries)
-        logger.warning("Bot loop guard lost %d held messages to a restart (gateway.bot_loop_guard).", total_lost)
+        logger.warning("Bot loop guard lost %d held messages to a restart (%s; gateway.bot_loop_guard).",
+                       len(entries), path)
 
         def forget(items: list[dict[str, Any]]) -> None:
             for item in items:
@@ -457,7 +525,7 @@ class GatewayBotLoopHoldMixin:
                     unpostable = not ok and any(mark in error.lower() for mark in _UNPOSTABLE)
                 if ok:
                     forget(chunk)
-                    self._bot_loop_hold_write_refs(remaining, extra_not_listed if remaining else 0)
+                    self._bot_loop_hold_write_file(home, remaining, extra_not_listed if remaining else 0)
                     continue
                 logger.warning("Bot loop guard could not post the lost-messages line in chat %s%s "
                                "(gateway.bot_loop_guard).", channel,
@@ -468,8 +536,7 @@ class GatewayBotLoopHoldMixin:
                 break
             if key == last_group and not remaining:
                 extra_not_listed = 0
-        self._hold_refs_carry = remaining
-        self._hold_refs_not_listed = extra_not_listed if remaining else 0
+        return remaining, (extra_not_listed if remaining else 0)
 
     def _bot_loop_hold_report_adapter(self, source) -> Any:
         try:
