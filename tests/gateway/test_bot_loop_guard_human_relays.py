@@ -1,7 +1,9 @@
 """``gateway.bot_loop_guard.human_relays``: a listed sender id (a webhook bridge relaying people, e.g. an
 in-game chat bridge) is a human to the loop guard on every path: it resets the chain and is never
 dropped by ``max_hops`` / ``duplicate`` / ``reply_to_reply``, never counted against the window budget and
-never refused by a cooldown. Unlisted bots and webhooks keep the old behaviour. Admission
+never refused by a cooldown. Unlisted bots and webhooks keep the old behaviour off Discord; on Discord the
+loop guard holds a flooded window instead of dropping (``max_hops`` and the budget cooldown do not apply there,
+loop-guard-hold), so the Discord controls below assert the hold. Admission
 (``*_ALLOW_BOTS``, bot allowlists, mention gates) is not the guard's business and is unchanged.
 """
 
@@ -58,8 +60,14 @@ def _ingress_runner(clock, settings):
     runner._hm_pre_gateway_dispatch_hook = _passthrough
     runner._is_user_authorized_for_source = lambda source, **kw: True  # admission is not under test
     runner._adapter_profile_for_source = lambda source: ""
+    runner._adapter_for_source = lambda source: None  # a held message stays queued; no pump runs here
+    runner._hm_estop_paused = lambda: False
     runner._bot_loop_guard = BotLoopGuard(settings=lambda: settings["value"], clock=clock.now)
     return runner
+
+
+def _held(runner, event) -> list:
+    return runner._bot_loop_guard.held_events(runner._bot_loop_guard_conversation(event.source))
 
 
 _MESSAGE_IDS = itertools.count(1)
@@ -94,24 +102,27 @@ async def test_listed_relay_is_admitted_past_max_hops_duplicates_and_reply_to_re
 
 @pytest.mark.asyncio
 async def test_unlisted_webhook_is_still_dropped_at_max_hops(clock, settings):
-    """Control: the same traffic from a webhook not on the list ends at the 4th hop (reply rule on too)."""
+    """Control: the same traffic from a webhook not on the list is a bot's. On Discord there is no hop cap: the
+    window holds it after 10 messages (held, in order, not dropped; reply rule on too)."""
     settings["value"] = _from_config(max_events=1000, bot_replies_expect_reply=True)
     runner = _ingress_runner(clock, settings)
-    verdicts = [await _admit(runner, _event(OTHER_WEBHOOK, f"<player> line {n}")) for n in range(8)]
-    assert verdicts == [True] * 4 + [False] * 4
+    events = [_event(OTHER_WEBHOOK, f"<player> line {n}") for n in range(12)]
+    verdicts = [await _admit(runner, event) for event in events]
+    assert verdicts == [True] * 10 + [False] * 2
+    assert _held(runner, events[0]) == events[10:]
 
 
 @pytest.mark.asyncio
 async def test_listed_relay_resets_the_chain_so_a_real_bot_gets_a_fresh_hop_budget(clock, settings):
-    settings["value"] = _from_config(max_events=1000, bot_replies_expect_reply=True)
+    settings["value"] = _from_config(max_events=1000, bot_replies_expect_reply=True, hold_after_messages=6)
     runner = _ingress_runner(clock, settings)
-    first = [await _admit(runner, _event(PEER, f"bot {n}")) for n in range(5)]
-    assert first == [True] * 4 + [False]
+    first = [await _admit(runner, _event(PEER, f"bot {n}")) for n in range(8)]
+    assert first == [True] * 6 + [False] * 2  # held by the window, not dropped at the 4th hop
 
     assert await _admit(runner, _event(RELAY, "<player> hello")) is True
 
-    second = [await _admit(runner, _event(PEER, f"bot again {n}")) for n in range(5)]
-    assert second == [True] * 4 + [False]
+    second = [await _admit(runner, _event(PEER, f"bot again {n}")) for n in range(8)]
+    assert second == [True] * 6 + [False] * 2
 
 
 @pytest.mark.asyncio
@@ -120,10 +131,10 @@ async def test_removing_the_key_restores_the_old_behaviour_without_a_restart(clo
     runner = _ingress_runner(clock, settings)
     assert all([await _admit(runner, _event(RELAY, f"<player> a{n}")) for n in range(6)])
 
-    settings["value"] = _from_config(human_relays=None, bot_replies_expect_reply=True)
+    settings["value"] = _from_config(human_relays=None, bot_replies_expect_reply=True, hold_after_messages=5)
     assert getattr(settings["value"], "human_relays", frozenset()) == frozenset()
-    verdicts = [await _admit(runner, _event(RELAY, f"<player> b{n}")) for n in range(6)]
-    assert verdicts == [True] * 4 + [False] * 2
+    verdicts = [await _admit(runner, _event(RELAY, f"<player> b{n}")) for n in range(8)]
+    assert verdicts == [True] * 5 + [False] * 3  # a bot again: held by the window (no hop cap on Discord)
 
 
 def test_note_reply_is_not_recorded_for_a_relay(clock, settings):
@@ -253,9 +264,10 @@ def test_a_relay_authored_turn_starts_a_new_bot_mode_chain(monkeypatch):
 def _profile_home(tmp_path, name, relays_yaml="", max_events=1000):
     home = tmp_path / name
     home.mkdir()
+    # max_hops is kept high so only the window's hold (hold_after_messages) can stop a Discord bot here.
     (home / "config.yaml").write_text(
-        "gateway:\n  bot_loop_guard:\n    max_hops: 2\n    bot_replies_expect_reply: true\n"
-        f"    max_events: {max_events}\n{relays_yaml}", encoding="utf-8")
+        "gateway:\n  bot_loop_guard:\n    max_hops: 100\n    bot_replies_expect_reply: true\n"
+        f"    hold_after_messages: 2\n    max_events: {max_events}\n{relays_yaml}", encoding="utf-8")
     return home
 
 
@@ -271,6 +283,8 @@ def _transport_runner(transport_home):
     runner._principal_authorized = lambda source, **kw: True  # admission is not under test
     runner._adapter_profile_for_source = lambda source: "transport"
     runner._authorization_home_for_source = lambda source: Path(transport_home)
+    runner._adapter_for_source = lambda source: None
+    runner._hm_estop_paused = lambda: False
     runner._bot_loop_guard = BotLoopGuard()  # the real load_settings
     return runner
 
@@ -291,12 +305,15 @@ async def test_relay_list_is_read_under_the_transport_profile(tmp_path, monkeypa
 
 
 def test_cooldown_peek_reads_the_relay_list_under_the_transport_profile(tmp_path, monkeypatch):
+    """On Discord there is no budget cooldown to peek: a bot past ``max_events`` is neither counted out nor
+    refused (the window holds it at ingress instead), and a listed relay is as unaffected as before."""
     transport = _profile_home(tmp_path, "transport", f"    human_relays: ['{RELAY}']\n", max_events=2)
     monkeypatch.setenv("HERMES_HOME", str(_profile_home(tmp_path, "ambient")))
     runner = _transport_runner(transport)
+    peer = _event(PEER, "x").source
     for _ in range(3):
-        runner._admit_bot_message_for_source(_event(PEER, "x").source)  # trips the chat's cooldown
-    assert runner._is_user_authorized_for_source(_event(PEER, "x").source) is False
+        assert runner._admit_bot_message_for_source(peer) is True  # the budget does not apply on Discord
+    assert runner._is_user_authorized_for_source(peer) is True  # no cooldown tripped
     relay = _event(RELAY, "y").source
     assert runner._is_user_authorized_for_source(relay) is True
     assert runner._admit_bot_message_for_source(relay) is True

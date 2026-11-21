@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway.bot_loop_guard import BotLoopGuard, BotLoopGuardSettings
+from gateway.bot_loop_guard import BotLoopGuard, BotLoopGuardSettings, settings_from_config
 from gateway.session import Platform, SessionSource
 
 CHAT = "1571780464853647400"
@@ -30,7 +30,8 @@ def clock():
 def _runner(clock, **overrides):
     from gateway.run import GatewayRunner
 
-    settings = BotLoopGuardSettings(**{"max_events": 1000, "window_seconds": 60, "cooldown_seconds": 600, **overrides})
+    block = {"max_events": 1000, "window_seconds": 60, "cooldown_seconds": 600, **overrides}
+    settings = settings_from_config({"gateway": {"bot_loop_guard": block}})
     runner = object.__new__(GatewayRunner)
     runner._scale_to_zero_note_real_inbound = lambda: None
 
@@ -40,6 +41,8 @@ def _runner(clock, **overrides):
     runner._is_user_authorized_for_source = lambda source, **kw: True
     runner._bot_loop_guard = BotLoopGuard(settings=lambda: settings, clock=clock.now)
     runner._adapter_profile_for_source = lambda source: ""
+    runner._adapter_for_source = lambda source: None  # a held message stays queued; no pump runs here
+    runner._hm_estop_paused = lambda: False
     return runner
 
 
@@ -84,16 +87,18 @@ async def test_the_same_sender_without_a_fresh_mention_is_still_reply_to_reply(c
 
 @pytest.mark.asyncio
 async def test_fresh_mentions_are_still_capped_by_max_hops_and_duplicates(clock):
-    """(c) A bot that @mentions us in every reply stays bounded by max_hops (and the duplicate rule)."""
-    runner = _runner(clock, max_hops=3)
-    verdicts = []
+    """(c) A bot that @mentions us in every reply stays bounded: on Discord by the window's hold (there is no
+    ``max_hops`` drop there; the third message is held, not dropped), and by the duplicate rule."""
+    runner = _runner(clock, max_hops=2, hold_after_messages=3)
+    verdicts, events = [], []
     for n in range(6):
         event = _event(PEER, f"ping {n}", mention=True)
+        events.append(event)
         verdicts.append(await _admitted(runner, event))
         runner._note_bot_reply(event.source)
-    assert verdicts == [True, True, True, False, False, False]
-    assert runner._bot_loop_guard.chain_admit(
-        ("", "discord", CHAT), PEER, "ping 9", is_bot=True, fresh_mention=True) == (False, "max_hops")
+    assert verdicts == [True, True, True, False, False, False]  # base: max_hops 2 dropped from the 3rd
+    guard = runner._bot_loop_guard
+    assert guard.held_events(runner._bot_loop_guard_conversation(events[0].source)) == events[3:]
     # A human message still starts a new chain.
     assert await _admitted(runner, _event(HUMAN, "carry on", is_bot=False))
     assert await _admitted(runner, _event(PEER, "ping 10", mention=True))

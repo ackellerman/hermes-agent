@@ -2,6 +2,9 @@
 
 Each of these is a message the runtime wrote, not the model; delivered to another bot it is a new
 inbound turn there, which answers it, which is a new turn here. The model's own reply still goes.
+
+One exception, Discord only (loop-guard-hold S6): the hold notice, sent through the adapter's
+``send_hold_notice`` when the window holds a bot's message. Every other runtime message stays quiet.
 """
 
 from types import SimpleNamespace
@@ -146,3 +149,50 @@ def test_the_runtime_footer_is_not_sent_to_a_bot_peer(monkeypatch, is_bot):
     monkeypatch.setattr(footer, "build_footer_line", lambda **kw: "— model · 3s")
     line = _Runner()._hmwa_runtime_footer_line({"model": "m"}, _source(is_bot), 3.0)
     assert line == ("" if is_bot else "— model · 3s")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_bot, sent", [(True, False), (False, True)], ids=["bot peer", "human control"])
+async def test_the_discord_busy_reply_skips_a_bot_peer_like_any_platform(is_bot, sent):
+    """The hold notice is the only runtime message a Discord bot peer gets; the busy reply is not one."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._reply_anchor_for_event = lambda event: None
+    runner._thread_metadata_for_source = lambda source, anchor=None: None
+    adapter = SimpleNamespace(_send_with_retry=AsyncMock())
+    source = SessionSource(platform=Platform.DISCORD, chat_id="thread", chat_type="thread", user_id="peer", is_bot=is_bot)
+    event = MessageEvent(text="x", message_id="m", source=source)
+
+    await GatewayRunner._send_busy_reply(runner, event, adapter, "Gateway is restarting; your message is queued.")
+
+    assert adapter._send_with_retry.await_count == (1 if sent else 0)
+
+
+@pytest.mark.asyncio
+async def test_a_discord_bot_peer_gets_exactly_the_hold_notice():
+    from tests.gateway.lgh_support import BOT_A, THREAD, Cfg, FakeClock, admit, event, fill_window, make_runner, pump
+
+    clock = FakeClock()
+    runner = make_runner(clock, Cfg(max_events=1000, max_hops=1000))
+    await fill_window(runner, clock, 10)
+    assert await admit(runner, event(BOT_A, "one too many")) is False  # held by the window
+
+    await pump(runner, clock, advance=1.0)
+
+    assert runner.adapter.notices and {chat for chat, _ in runner.adapter.notices} == {THREAD}
+    assert len(runner.adapter.notices) == 1  # the one notice, nothing else addressed to the bot peer
+    assert runner.adapter.handle_message.await_count == 0  # and nothing is handed over before the hold is due
+
+
+@pytest.mark.asyncio
+async def test_a_non_discord_bot_peer_never_gets_a_hold_notice():
+    from tests.gateway.lgh_support import BOT_A, Cfg, FakeClock, admit, event, make_runner, pump
+
+    clock = FakeClock()
+    runner = make_runner(clock, Cfg(max_events=1000, max_hops=1000), adapter=None)
+    for n in range(12):
+        await admit(runner, event(BOT_A, f"ask {n}", chat="dm", platform=Platform.MATTERMOST))
+        clock.advance(1)
+    await pump(runner, clock, advance=1.0)
+    assert runner.adapter.notices == []

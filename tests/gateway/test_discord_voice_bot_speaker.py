@@ -80,14 +80,35 @@ async def test_bot_speech_follows_discord_allow_bots(
 async def test_bot_speech_is_refused_while_the_loop_guard_cools_down(
     monkeypatch: pytest.MonkeyPatch, join: str,
 ) -> None:
+    """Discord has no budget cooldown (loop-guard-hold): a full window holds the bot's next message at ingress,
+    and the voice door itself stays open for it, as it does for a person in the same chat."""
+    from gateway.bot_loop_guard import BotLoopGuard, settings_from_config
+    from gateway.platforms.base import MessageEvent
+
     runner, adapter = _runner(monkeypatch, join, "all", inline_mention=False)
+    now = [10_000.0]
+    block = {"max_events": 1000, "max_hops": 1000}
+    guard = runner._bot_loop_guard = BotLoopGuard(
+        settings=lambda: settings_from_config({"gateway": {"bot_loop_guard": block}}), clock=lambda: now[0])
+    runner._scale_to_zero_note_real_inbound = lambda: None
+
+    async def _passthrough(event, source):
+        return event
+    runner._hm_pre_gateway_dispatch_hook = _passthrough
+    runner._adapter_for_source = lambda source: None  # a held message stays queued; no pump runs here
+    runner._hm_estop_paused = lambda: False
     source = runner._voice_input_source(adapter, _GUILD, _BOT, _TEXT)
-    guard, conversation = runner._bot_loop_guard_instance(), runner._bot_loop_guard_conversation(source)
-    # Spend the conversation's bot budget until it trips.
-    assert any(not guard.admit(conversation)[0] for _ in range(1000))
+    conversation = runner._bot_loop_guard_conversation(source)
+    # Fill the window: the bot's first ten messages are admitted.
+    for n in range(10):
+        assert await runner._hm_admit_event(MessageEvent(text=f"ask {n}", message_id=f"v{n}", source=source)) is not None
 
     await runner._handle_voice_channel_input(_GUILD, _BOT, "what broke?", adapter=adapter)
     await runner._handle_voice_channel_input(_GUILD, _HUMAN, "what broke?", adapter=adapter)
 
-    # The bot is held back in the cooling-down chat; a person in the same chat is not.
-    assert [call.args[0].source.user_id for call in adapter.handle_message.await_args_list] == [str(_HUMAN)]
+    # Nothing refused the bot at the voice door; the window holds what it says at ingress.
+    dispatched = [call.args[0] for call in adapter.handle_message.await_args_list]
+    assert [event.source.user_id for event in dispatched] == [str(_BOT), str(_HUMAN)]
+    assert await runner._hm_admit_event(dispatched[0]) is None
+    assert guard.held_events(conversation) == [dispatched[0]]
+    assert await runner._hm_admit_event(dispatched[1]) is not None  # a person in the same chat is not held
