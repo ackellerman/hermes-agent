@@ -780,6 +780,8 @@ class GatewayAuthorizationMixin:
         The inbound handler calls this once per message; ``_is_user_authorized`` only peeks because it is asked several times."""
         if not self._guard_counts_as_bot(source):
             return True
+        if getattr(source, "platform", None) == Platform.DISCORD:
+            return True  # Discord has no budget cooldown: the moving-window hold (``_admit_bot_chain``) replaces it
         allowed, state = self._bot_loop_guard_instance().admit(self._bot_loop_guard_conversation(source))
         if state == "tripped":
             logger.warning(
@@ -798,8 +800,22 @@ class GatewayAuthorizationMixin:
         source = event.source
         guard = self._bot_loop_guard_instance()
         # A committed admission re-enters the handler to execute; ingress already judged that message.
-        if executing_admission.get() or getattr(event, "internal", False) or (
-                not getattr(source, "is_bot", False) and not guard.tracking_chains):
+        if executing_admission.get() or getattr(event, "internal", False):
+            return True
+        if getattr(source, "platform", None) == Platform.DISCORD:
+            # Discord: the moving-window hold replaces the hop drop and the budget (loop-guard-hold). Persons are
+            # decided here too, before any early return: a person's message resets and releases what is held.
+            if guard.is_released_event(self._adapter_profile_for_source(source) or "", event):
+                return True  # already handed over by the hold: no rule judges it again
+            verdict = self._admit_discord_hold(event, guard)
+            if verdict in ("duplicate", "reply_to_reply"):
+                # The message id makes the drop greppable from the platform's message link.
+                logger.info("Bot loop guard ended a bot exchange in %s chat %s (%s from %s, message %s; "
+                            "gateway.bot_loop_guard).",
+                            source.platform.value if source.platform else "", source.chat_id, verdict,
+                            source.user_id, getattr(event, "message_id", None))
+            return verdict not in ("duplicate", "reply_to_reply", "held")
+        if not getattr(source, "is_bot", False) and not guard.tracking_chains:
             return True
         # The relay list is read under the transport profile, like the rest of the guard's config.
         allowed, state = self._under_authorization_profile(source, lambda: guard.chain_admit(

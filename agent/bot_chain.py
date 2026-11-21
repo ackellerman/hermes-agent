@@ -3,8 +3,10 @@
 A human message starts a chain. Inside a bot-authored turn every ``message_agent`` call is one more
 hop (a fan-out is one call, so its targets share the hop); a person's own turn sends at hop 1. The
 hop number rides in the delivery's author envelope (``hops``), which only the runtime writes, so the
-model cannot reset it. Past ``gateway.bot_loop_guard.max_hops`` (config.yaml, the same cap the
-messaging gateway applies) a send is refused and nothing is delivered. The same message to the same
+model cannot reset it. Past ``gateway.bot_loop_guard.max_hops`` (config.yaml) a send is refused and
+nothing is delivered. The messaging gateway no longer applies that cap to inbound messages on Discord (a
+moving-window hold replaces it there, gateway/bot_loop_guard.py); ``max_hops`` caps ``message_agent`` sends and the
+inbound messages of the other platforms. The same message to the same
 recipient twice in one chain is refused as a duplicate. A message to the bot whose message started
 this turn is a reply: unless ``bot_replies_expect_reply`` is true it goes notify-only (#144789's
 ``[no reply needed]`` marker and ``wake="none"``), and a turn started by such a message cannot message

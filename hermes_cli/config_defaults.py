@@ -2147,9 +2147,12 @@ DEFAULT_CONFIG = {
         "loop_watchdog_max_strikes": 3,
         # Allow all users without allowlists (security opt-in).
         "allow_all_users": False,
-        # Bot-to-bot loop guard: max_events per window before a cooldown; max_hops bot messages per exchange;
+        # Bot-to-bot loop guard. Discord: bot messages past hold_after_messages in hold_window_seconds are HELD and
+        # handed over one at a time (hold_initial_seconds doubling to hold_max_seconds; hold_runaway_at_cap full-length
+        # waits in a row pause the exchange until a person writes; hold_queue_max is when the notice is re-posted).
+        # Other platforms: max_events per window before a cooldown; max_hops bot messages per exchange. Everywhere:
         # human_relays: sender ids (e.g. a webhook bridging people in) the guard treats as human messages.
-        "bot_loop_guard": {"enabled": True, "max_events": 20, "window_seconds": 300, "cooldown_seconds": 600, "max_hops": 4, "bot_replies_expect_reply": False, "human_relays": []},
+        "bot_loop_guard": {"enabled": True, "max_events": 20, "window_seconds": 300, "cooldown_seconds": 600, "max_hops": 4, "bot_replies_expect_reply": False, "human_relays": [], "hold_after_messages": 10, "hold_window_seconds": 120, "hold_initial_seconds": 15, "hold_max_seconds": 480, "hold_runaway_at_cap": 3, "hold_queue_max": 50},
         # Startup-liveness watchdog: stdlib-only daemon thread armed at process entry that
         # hard-exits 75 if the loop isn't live within the deadline. Armed before config loads, so
         # run_gateway() bridges these to HERMES_STARTUP_WATCHDOG / HERMES_STARTUP_WATCHDOG_TIMEOUT_S

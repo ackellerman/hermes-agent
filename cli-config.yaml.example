@@ -1141,6 +1141,29 @@ hosted_rooms:
 # it, restart the gateway and reopen New Group Chat > Advanced; Hermes will
 # re-check the selected gateways automatically.
 
+# Bot-to-bot loop guard (messaging gateway). Defaults shown; every key is optional and re-read per message.
+# On Discord, bot messages past hold_after_messages inside hold_window_seconds are HELD (never dropped) and handed over
+# one at a time: hold_initial_seconds, doubling per delivery up to hold_max_seconds; hold_runaway_at_cap full-length waits
+# in a row pause the exchange until a person writes (a person's /stop discards what is held). max_events,
+# window_seconds, cooldown_seconds and the inbound max_hops drop apply to the other platforms; max_hops also caps
+# Bot Mode message_agent sends. human_relays lists sender ids treated as people. enabled: false turns the guard off.
+#
+# gateway:
+#   bot_loop_guard:
+#     enabled: true
+#     hold_after_messages: 10     # 1-1000
+#     hold_window_seconds: 120    # 10-3600
+#     hold_initial_seconds: 15    # 1-600
+#     hold_max_seconds: 480       # hold_initial_seconds-86400
+#     hold_runaway_at_cap: 3      # 1-100
+#     hold_queue_max: 50          # 1-10000
+#     max_events: 20              # non-Discord budget
+#     window_seconds: 300
+#     cooldown_seconds: 600
+#     max_hops: 4
+#     bot_replies_expect_reply: false
+#     human_relays: []
+
 # Startup sweep of session rows orphaned by a dead gateway process.
 # The normal disconnect cleanup runs on an in-process grace timer, so a
 # gateway restart (update, crash, systemd) leaves those rows permanently

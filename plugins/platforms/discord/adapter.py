@@ -834,6 +834,55 @@ def check_discord_requirements() -> bool:
     return True
 
 
+# --- hold notices (loop-guard-hold S6): recognised at every served seat, never counted or held -----------------------
+# One registry per gateway process, shared by every seat's adapter. A notice is registered as IN FLIGHT (channel id, the
+# posting bot's user id, exact text) before it is sent, because its gateway event can reach a seat before ``send()``
+# returns; once posted it is registered by (channel id, message id). In memory only: after a restart old notices are not
+# recognised (history backfill may show them as context).
+_HOLD_NOTICE_LOCK = threading.Lock()
+_HOLD_NOTICE_IN_FLIGHT: list[list] = []     # [channel_id, author_id, text, expires_at]
+_HOLD_NOTICE_IDS: dict[tuple[str, str], float] = {}   # (channel_id, message_id) -> registered_at
+_HOLD_NOTICE_IN_FLIGHT_SECONDS = 30.0
+_HOLD_NOTICE_ID_SECONDS = 24 * 3600.0
+
+
+def _hold_notice_prune(now: float) -> None:
+    _HOLD_NOTICE_IN_FLIGHT[:] = [item for item in _HOLD_NOTICE_IN_FLIGHT if item[3] > now]
+    if _HOLD_NOTICE_IDS:
+        for key in [k for k, at in _HOLD_NOTICE_IDS.items() if now - at > _HOLD_NOTICE_ID_SECONDS]:
+            del _HOLD_NOTICE_IDS[key]
+
+
+def _hold_notice_register_in_flight(channel_id: str, author_id: str, text: str) -> list:
+    now = time.monotonic()
+    entry = [str(channel_id), str(author_id), text, now + _HOLD_NOTICE_IN_FLIGHT_SECONDS]
+    with _HOLD_NOTICE_LOCK:
+        _hold_notice_prune(now)
+        _HOLD_NOTICE_IN_FLIGHT.append(entry)
+    return entry
+
+
+def _hold_notice_register_posted(channel_id: str, message_id: str, in_flight: list) -> None:
+    """The id is registered BEFORE the in-flight entry is removed, so there is no gap in recognition."""
+    with _HOLD_NOTICE_LOCK:
+        _HOLD_NOTICE_IDS[(str(channel_id), str(message_id))] = time.monotonic()
+        if in_flight in _HOLD_NOTICE_IN_FLIGHT:
+            _HOLD_NOTICE_IN_FLIGHT.remove(in_flight)
+
+
+def _is_hold_notice(channel_id: str, message_id: str, author_id: str, text: str) -> bool:
+    """A registered notice (channel and message id), or one still in flight (channel, author and exact text)."""
+    if not (_HOLD_NOTICE_IDS or _HOLD_NOTICE_IN_FLIGHT):
+        return False
+    now = time.monotonic()
+    with _HOLD_NOTICE_LOCK:
+        _hold_notice_prune(now)
+        if (str(channel_id), str(message_id)) in _HOLD_NOTICE_IDS:
+            return True
+        return any(item[0] == str(channel_id) and item[1] == str(author_id) and item[2] == text
+                   for item in _HOLD_NOTICE_IN_FLIGHT)
+
+
 def _build_allowed_mentions(extra: Optional[dict] = None):
     """Build Discord ``AllowedMentions`` denying @everyone/@here/roles by default (any LLM output
     with ``@everyone`` would otherwise ping the server); user / replied-user pings stay on.
@@ -2657,6 +2706,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             return _drop("dedup")
         if message.author == self._client.user:
             return _drop("self-message")
+        if _is_hold_notice(channel_id, message_id, author_id, str(getattr(message, "content", "") or "")):
+            return _drop("hold-notice")  # another seat's notice (or lost/discard line): never counted, never held
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
             try:  # IntEnum in discord.py; ``.value`` covers stubs/mocks that aren't int-coercible
                 type_reason = f"type:{int(message.type)}"
@@ -2676,12 +2727,14 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 and not self._self_is_explicitly_mentioned(message)
                 and not bot_tag_continuation
             ):
+                self._report_human_seen(message)  # a ``human_relays`` sender counts as a person (S7)
                 return _drop("bot-mention-required")
             if (
                 self._discord_bots_require_inline_mention()
                 and not self._self_is_raw_mentioned(message)
                 and not bot_tag_continuation
             ):
+                self._report_human_seen(message)
                 return _drop("bot-inline-mention-required")
         else:
             msg_guild = getattr(message, "guild", None)
@@ -2708,6 +2761,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 for mentioned in message.mentions
             )
             if other_bots_mentioned and not raw_self_mention:
+                self._report_human_seen(message)
                 return _drop("other-bot-addressed")
             ignore_no_mention = _scoped_gate_env("DISCORD_IGNORE_NO_MENTION", "true").lower() in {"true", "1", "yes"}
             if ignore_no_mention and not raw_self_mention and not other_bots_mentioned:
@@ -2722,6 +2776,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                         # The reason string carries what the old prose comment said: this is the drop
                         # an operator cannot guess from the outside (mentions someone else, the bot is
                         # not a participant, the channel is not free-response).
+                        self._report_human_seen(message)
                         return _drop("mentions-others-not-free-channel")
         _decision("admitted", admit=True)
         return True, role_authorized
@@ -3550,6 +3605,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 and not self._in_bot_thread(message)
                 and not self._self_is_explicitly_mentioned(message)
             ):
+                self._report_human_seen(message)
                 return False
         admitted, role_authorized = self._discord_message_admission(message, claim=False)
         if not admitted:
@@ -7115,6 +7171,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 nonlocal has_unverified
                 if msg.type not in {discord.MessageType.default, discord.MessageType.reply}:
                     return None
+                if _is_hold_notice(channel_id, str(getattr(msg, "id", "")),
+                                   str(getattr(getattr(msg, "author", None), "id", "")), ""):
+                    return None  # the loop guard's own notice: not conversation
                 content = getattr(msg, "clean_content", msg.content) or ""
                 if (
                     str(getattr(msg, "id", "")) in self._nonconversational_messages
@@ -7522,6 +7581,57 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         if not user_ids:
             return None
         return " ".join(f"<@{uid}>" for uid in user_ids)
+
+    async def send_hold_notice(self, chat_id: str, text: str) -> SendResult:
+        """Post one loop-guard notice (hold, pause, discard or lost line): plain text, ``AllowedMentions.none()`` and
+        no reply reference, so nothing in it pings or answers anyone. Registered as in flight before the send and by
+        message id after it, so every seat in this gateway drops it on arrival (``_is_hold_notice``). After a failed
+        send the in-flight entry is kept its full 30 s: a send that timed out but did post is still recognised."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+        author_id = str(getattr(getattr(self._client, "user", None), "id", "") or "")
+        in_flight = _hold_notice_register_in_flight(str(chat_id), author_id, text)
+        try:
+            channel = await self._resolve_channel(str(chat_id))
+            msg = await channel.send(content=text, allowed_mentions=discord.AllowedMentions.none())
+        except Exception as exc:
+            logger.warning("[%s] hold notice send failed in %s: %s", self.name, chat_id, exc)
+            return SendResult(success=False, error=str(exc))
+        _hold_notice_register_posted(str(chat_id), str(msg.id), in_flight)
+        return SendResult(success=True, message_id=str(msg.id))
+
+    def _report_human_seen(self, message: Any) -> None:
+        """A message this seat is about to drop, from a person its allowlist passed (or a ``human_relays`` sender):
+        tell the gateway's loop guard, whose hold for this conversation a person's message releases (S7). The source
+        is the one ``_handle_message`` would build, keyed on the thread id in a thread and the channel id otherwise.
+        Once per message id (the recovered path may meet the same message twice); never raises."""
+        runner = getattr(self, "gateway_runner", None)
+        handler = getattr(runner, "_bot_loop_human_seen", None)
+        if handler is None:
+            return
+        try:
+            message_id = str(getattr(message, "id", ""))
+            reported = self.__dict__.setdefault("_human_reported_ids", deque(maxlen=512))
+            if message_id and message_id in reported:
+                return
+            reported.append(message_id)
+            channel, author = message.channel, message.author
+            is_thread = isinstance(channel, getattr(discord, "Thread", ()))
+            if isinstance(channel, discord.DMChannel):
+                chat_type = "dm"
+            else:
+                chat_type = "thread" if is_thread else "group"
+            guild = getattr(message, "guild", None)
+            source = self.build_source(
+                chat_id=str(channel.id), chat_type=chat_type, user_id=str(author.id),
+                user_name=getattr(author, "display_name", None) or getattr(author, "name", None),
+                thread_id=str(channel.id) if is_thread else None, is_bot=bool(getattr(author, "bot", False)),
+                guild_id=str(guild.id) if guild else None, message_id=message_id or None,
+                parent_chat_id=(self._get_parent_channel_id(channel) if is_thread else None))
+            handler(source, getattr(message, "content", "") or "")
+        except Exception:
+            logger.warning("[%s] could not report a dropped person's message to the loop guard", self.name,
+                           exc_info=True)
 
     async def _send_prompt(
         self, chat_id: str, metadata: Optional[dict], build, *, fail_log: Optional[str] = None,
@@ -8078,6 +8188,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                         self.name, getattr(message, "id", None),
                         getattr(getattr(message, "author", None), "id", None), getattr(message.channel, "id", None),
                     )
+                    self._report_human_seen(message)
                     return False
         # Auto-thread: isolate each @mention in a text channel into its own thread (Slack-style).
         auto_threaded_channel = None
@@ -8119,6 +8230,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                             "[%s] Failed to notify user of auto-thread failure: %s", self.name,
                             notify_error,
                         )
+                    self._report_human_seen(message)
                     return False
         referenced_attachments = []
         reference = getattr(message, "reference", None)
@@ -8198,6 +8310,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     getattr(message.author, "display_name", getattr(message.author, "name", "unknown")),
                     getattr(message.channel, "id", "unknown"),
                 )
+                self._report_human_seen(message)
                 return False
             event_text = "(The user sent a message with no text content)"
         _chan = message.channel

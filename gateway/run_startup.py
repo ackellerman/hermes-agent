@@ -1546,6 +1546,8 @@ class GatewayStartupMixin(GatewayStartupSttMixin, GatewayStartupProbeMixin):
     async def _start_post_connect_services(self, connected_count: int) -> None:
         """Room worker, heartbeat, gateway:startup hook, channel directory, /update notice."""
         from gateway.run import _hermes_home
+        # The Discord hold's pump task and the report of what the last run lost.
+        getattr(self, "_bot_loop_hold_start", lambda: None)()
         try:
             await self._ensure_hosted_room_worker()
         except Exception:

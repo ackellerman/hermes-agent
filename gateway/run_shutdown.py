@@ -2171,6 +2171,8 @@ class GatewayShutdownMixin(GatewayShutdownWorkMixin, GatewaySessionEndMixin):
                 snapshot_fn=lambda: GatewayRunner._shutdown_watchdog_snapshot(self, ctx), exit_code=1,
             )
         try:
+            # End the Discord hold's pump and write what is still held, so the next start can name it.
+            getattr(self, "_bot_loop_hold_shutdown", lambda: None)()
             await GatewayRunner._stop_begin_teardown(self, ctx)
             timeout = effective_stop_drain_timeout(self)
             if timeout < self._restart_drain_timeout:

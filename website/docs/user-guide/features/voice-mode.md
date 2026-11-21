@@ -508,7 +508,7 @@ The bot automatically pauses its audio listener while playing TTS replies, preve
 
 Only users allowed by `DISCORD_ALLOWED_USERS` or `DISCORD_ALLOWED_ROLES` can interact via voice; a role is checked for the speaker each time they talk. Other users' audio is silently ignored.
 
-Speech from another bot account follows the same bot policy as its typed messages. An utterance cannot carry an @mention, so a bot speaker is heard only where a typed bot message needs none: `DISCORD_ALLOW_BOTS=all` with `discord.bots_require_inline_mention: false`. The gateway's bot loop guard then counts its turns.
+Speech from another bot account follows the same bot policy as its typed messages. An utterance cannot carry an @mention, so a bot speaker is heard only where a typed bot message needs none: `DISCORD_ALLOW_BOTS=all` with `discord.bots_require_inline_mention: false`. The gateway's bot loop guard then counts its turns: a bot's voice speech counts toward the Discord window and can be held like a typed message.
 
 Unless that policy admits bot speech, a seat never transcribes another bot's audio: an SSRC that belongs to a bot member (or to another seat's bot) is dropped before decryption, and bot utterances are dropped before STT. An unattributed audio stream is mapped to a speaker only when exactly one other member is in the channel and that member is allowlisted.
 
