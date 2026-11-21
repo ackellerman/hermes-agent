@@ -243,13 +243,40 @@ HOSTILE = [
 ]
 
 
+_ZERO_WIDTH = "\u200b\u200c\u200d\u2060\ufeff"
+
+
 def _readable(text):
     """The posted text with the escape characters (a backslash, zero-width characters) taken out."""
-    return re.sub("[\\\u200b\u200c\u200d\u2060\ufeff]", "", text)
+    return re.sub("[\\\\" + _ZERO_WIDTH + "]", "", text)
 
 
 def _words(name):
     return re.findall(r"[A-Za-z0-9]+", name)
+
+
+def _neutralised(text, raw):
+    """True when ``raw`` is absent from ``text``, or every occurrence of it is escaped: directly after a
+    zero-width character or after an odd run of backslashes. S6 names no escape form, so any of them counts; the
+    text is never stripped first, so a stripped escape cannot reassemble the raw token."""
+    start = text.find(raw)
+    while start != -1:
+        before = text[:start]
+        if not before:
+            return False
+        if before[-1] not in _ZERO_WIDTH:
+            run = len(before) - len(before.rstrip("\\"))
+            if run % 2 == 0:
+                return False
+        start = text.find(raw, start + 1)
+    return True
+
+
+def _assert_escaped_and_readable(text, name, raw):
+    assert _neutralised(text, raw), f"{raw!r} reaches the channel unescaped: {text!r}"  # no ping, link, format
+    clean = _readable(text)
+    for word in _words(name):
+        assert word in clean, f"{word!r} of the name is no longer readable"
 
 
 @pytest.mark.asyncio
@@ -260,10 +287,7 @@ async def test_T15_a_hostile_sender_name_is_escaped_in_the_posted_notice_and_sti
     runner = await _post_hold_notice(clock, [name])  # one sender, one notice: the 5-name cap hides nothing
     assert len(runner.adapter.notices) == 1
     text = runner.adapter.notices[0][1]
-    assert raw not in text, f"{raw!r} reaches the channel unescaped"  # no ping, channel link, format or link
-    clean = _readable(text)
-    for word in _words(name):
-        assert word in clean, f"{word!r} of the name is no longer readable"
+    _assert_escaped_and_readable(text, name, raw)
 
 
 @pytest.mark.asyncio
@@ -272,10 +296,8 @@ async def test_T15_five_hostile_names_in_one_notice_are_all_escaped_and_all_name
     runner = await _post_hold_notice(clock, [name for name, _raw in chosen])  # exactly 5: none falls into "and N more"
     text = runner.adapter.notices[0][1]
     assert not re.search(r"and \d+ more", text)
-    clean = _readable(text)
     for name, raw in chosen:
-        assert raw not in text
-        assert all(word in clean for word in _words(name))
+        _assert_escaped_and_readable(text, name, raw)
 
 
 @pytest.mark.asyncio
@@ -284,10 +306,8 @@ async def test_T15_the_other_four_hostile_names_in_one_notice_are_all_escaped_an
     runner = await _post_hold_notice(clock, [name for name, _raw in chosen])
     text = runner.adapter.notices[0][1]
     assert not re.search(r"and \d+ more", text)
-    clean = _readable(text)
     for name, raw in chosen:
-        assert raw not in text
-        assert all(word in clean for word in _words(name))
+        _assert_escaped_and_readable(text, name, raw)
 
 
 @pytest.mark.asyncio
