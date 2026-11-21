@@ -229,14 +229,65 @@ async def test_T15_at_most_5_senders_are_named_each_cut_to_32_characters_then_an
     assert "and 2 more" in text
 
 
+# Each name is under 32 characters, so the 32-character cut (S6) cannot hide its markup.
+HOSTILE = [
+    ("Zed @everyone", "@everyone"),
+    ("Zed @here", "@here"),
+    ("Chan #general", "#general"),
+    ("Bold **bbold**", "**bbold**"),
+    ("Code `ccode`", "`ccode`"),
+    ("Ital _iital_", "_iital_"),
+    ("Strike ~~sstrike~~", "~~sstrike~~"),
+    ("Link [llink](http://x.y)", "[llink](http://x.y)"),
+    ("Ping <@123456>", "<@123456>"),
+]
+
+
+def _readable(text):
+    """The posted text with the escape characters (a backslash, zero-width characters) taken out."""
+    return re.sub("[\\\u200b\u200c\u200d\u2060\ufeff]", "", text)
+
+
+def _words(name):
+    return re.findall(r"[A-Za-z0-9]+", name)
+
+
 @pytest.mark.asyncio
-async def test_T15_names_are_escaped_so_a_sender_cannot_ping_link_or_format_through_the_notice(clock):
-    hostile = "Evil @everyone @here #general **b** `c` _i_ ~~s~~ [l](http://x) <@123>"
-    runner = await _post_hold_notice(clock, [hostile])
+@pytest.mark.parametrize("name,raw", HOSTILE,
+                         ids=["everyone", "here", "channel", "bold", "code", "italic", "strike", "link", "mention"])
+async def test_T15_a_hostile_sender_name_is_escaped_in_the_posted_notice_and_still_readable(clock, name, raw):
+    assert len(name) < 32
+    runner = await _post_hold_notice(clock, [name])  # one sender, one notice: the 5-name cap hides nothing
+    assert len(runner.adapter.notices) == 1
     text = runner.adapter.notices[0][1]
-    for raw in ("@everyone", "@here", "#general", "**b**", "`c`", "_i_", "~~s~~", "[l](http://x)", "<@123>"):
-        assert raw not in text, f"{raw!r} reaches the channel unescaped"
-    assert "everyone" in text and "general" in text  # the name is still readable
+    assert raw not in text, f"{raw!r} reaches the channel unescaped"  # no ping, channel link, format or link
+    clean = _readable(text)
+    for word in _words(name):
+        assert word in clean, f"{word!r} of the name is no longer readable"
+
+
+@pytest.mark.asyncio
+async def test_T15_five_hostile_names_in_one_notice_are_all_escaped_and_all_named(clock):
+    chosen = HOSTILE[:5]
+    runner = await _post_hold_notice(clock, [name for name, _raw in chosen])  # exactly 5: none falls into "and N more"
+    text = runner.adapter.notices[0][1]
+    assert not re.search(r"and \d+ more", text)
+    clean = _readable(text)
+    for name, raw in chosen:
+        assert raw not in text
+        assert all(word in clean for word in _words(name))
+
+
+@pytest.mark.asyncio
+async def test_T15_the_other_four_hostile_names_in_one_notice_are_all_escaped_and_all_named(clock):
+    chosen = HOSTILE[5:]
+    runner = await _post_hold_notice(clock, [name for name, _raw in chosen])
+    text = runner.adapter.notices[0][1]
+    assert not re.search(r"and \d+ more", text)
+    clean = _readable(text)
+    for name, raw in chosen:
+        assert raw not in text
+        assert all(word in clean for word in _words(name))
 
 
 @pytest.mark.asyncio
