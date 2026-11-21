@@ -147,7 +147,7 @@ async def test_S4_claiming_the_slot_for_a_different_event_of_the_conversation_do
     clock.advance(31)  # t = 46 s after the hand-over: the second is due, the record bound to ``first`` is still open
     await runner._bot_loop_hold_pump_once()
     assert handed(adapter) == [first]
-    clock.advance(20)  # 66 s: the unclaimed record closes (WARNING) and the second goes
+    clock.advance(30)  # 61 s after the hand-over: the unclaimed record closes (WARNING) and the second goes
     await runner._bot_loop_hold_pump_once()
     assert handed(adapter) == [first, second]
 

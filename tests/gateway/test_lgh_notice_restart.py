@@ -30,6 +30,21 @@ _IDS = itertools.count(1572000000000000000)
 SELF_ID = 999
 
 
+class _AM:
+    """Local stand-in for ``discord.AllowedMentions``: ``none()`` returns one sentinel whose four flags are False.
+    Patched in by ``_real_adapter`` so the tests do not depend on what other test files did to ``discord``."""
+
+    def __init__(self, *, everyone=True, roles=True, users=True, replied_user=True):
+        self.everyone, self.roles, self.users, self.replied_user = everyone, roles, users, replied_user
+
+    @classmethod
+    def none(cls):
+        return cls._NONE
+
+
+_AM._NONE = _AM(everyone=False, roles=False, users=False, replied_user=False)
+
+
 class _Chan:
     def __init__(self, channel_id):
         self.id = int(channel_id)
@@ -67,6 +82,7 @@ def _real_adapter(monkeypatch, *, allow_bots="all", enabled=True, channel=None, 
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
     monkeypatch.setattr(mod.discord, "Thread", _Thread, raising=False)
+    monkeypatch.setattr(mod.discord, "AllowedMentions", _AM, raising=False)
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake-token"))
     me = SimpleNamespace(id=user_id or SELF_ID, bot=True)
     adapter._client = SimpleNamespace(user=me)
@@ -95,15 +111,13 @@ def _bot_msg(channel, content, *, author_id=SELF_ID, msg_id=None):
 
 @pytest.mark.asyncio
 async def test_T15_send_hold_notice_passes_allowed_mentions_none_and_no_reference(monkeypatch):
-    import discord
-
     adapter = _real_adapter(monkeypatch)
     result = await adapter.send_hold_notice(THREAD, "Messages from @Peer are delayed")
     assert result.success is True
     kwargs = adapter._channels[THREAD].sent[0]
     assert kwargs["content"] == "Messages from @Peer are delayed"
-    assert isinstance(kwargs["allowed_mentions"], discord.AllowedMentions)
     am = kwargs["allowed_mentions"]
+    assert am is _AM.none()  # the posted object is what AllowedMentions.none() returns, not a constructor call
     assert (am.everyone, am.users, am.roles, am.replied_user) == (False, False, False, False)
     assert kwargs.get("reference") is None
 

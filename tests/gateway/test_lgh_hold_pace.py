@@ -319,7 +319,7 @@ async def test_T38_a_released_message_carries_no_new_metadata_so_native_admissio
     await pump(runner, clock, advance=15)
     assert handed(runner.adapter) == [ev]
     assert dict(ev.metadata or {}) == before == {}  # the mark is in the guard's released set (S2), not on the event
-    assert _native_metadata(ev) is None and not ev.metadata  # no metadata: native admission has nothing to refuse
+    assert _native_metadata(ev) == {} and not ev.metadata  # no metadata: native admission has nothing to refuse
     seat = runner._adapter_profile_for_source(ev.source)
     assert runner._bot_loop_guard.is_released_event(seat, ev) is True
 

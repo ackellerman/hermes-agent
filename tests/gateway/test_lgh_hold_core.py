@@ -250,7 +250,11 @@ async def test_T16_the_pump_reads_each_entrys_own_profile_config(clock):
     runner._adapter_profile_for_source = lambda source: getattr(source, "profile", None) or "fast"
     held = {}
     for profile, chat in (("fast", "c-fast"), ("slow", "c-slow")):
-        await fill_window(runner, clock, 10, chat=chat)
+        for _ in range(10):  # fill_window's count and gap, but each filler carries the seat's profile
+            filler = event(BOT_A, chat=chat)
+            filler.source.profile = profile
+            assert await admit(runner, filler) is True
+            clock.advance(1.0)
         held[profile] = event(BOT_A, chat=chat)
         held[profile].source.profile = profile
         assert await admit(runner, held[profile]) is False

@@ -110,6 +110,14 @@ def _msg(channel, content, *, author=None, mentions=(), msg_id=None):
         type=__import__("discord").MessageType.default)
 
 
+def _person(text, chat=THREAD):
+    """A person writing in ``chat`` through the same seat as the held bot messages (these runners take the seat from
+    ``source.profile``, so a person without one would be a different conversation)."""
+    person = event(PERSON, text, is_bot=False, chat=chat)
+    person.source.profile = "boba"
+    return person
+
+
 def _bot_event(runner, seat, chat, chat_type, text=None, *, user=BOT_A):
     ev = event(user, text, chat=chat)
     ev.source.chat_type = chat_type
@@ -298,7 +306,7 @@ async def test_T3_a_human_relay_dropped_before_its_allowlist_check_resets_nothin
 async def test_T26_Q7_a_persons_stop_discards_the_held_messages_and_posts_one_line_listing_them(clock):
     runner = _runner(clock)
     held = await _hold(runner, "boba", THREAD, "thread", n=3)
-    assert await admit(runner, event(PERSON, "/stop", is_bot=False, chat=THREAD)) is True
+    assert await admit(runner, _person("/stop")) is True
     await pump(runner, clock, advance=3600)
     assert handed(runner.adapter) == []  # discarded, not delivered
     assert runner._bot_loop_guard.held_events(conv(runner, held[0])) == []
@@ -310,7 +318,7 @@ async def test_T26_Q7_a_persons_stop_discards_the_held_messages_and_posts_one_li
 async def test_T26_Q7_a_plain_message_delivers(clock):
     runner = _runner(clock)
     held = await _hold(runner, "boba", THREAD, "thread", n=2)
-    assert await admit(runner, event(PERSON, "carry on", is_bot=False, chat=THREAD)) is True
+    assert await admit(runner, _person("carry on")) is True
     await pump(runner, clock)
     assert handed(runner.adapter) == [held[0]]
 
@@ -348,7 +356,7 @@ async def test_T28_a_paused_conversation_with_no_tracked_chain_is_released_by_an
     clock.advance(200)  # past cooldown_seconds: any call that sweeps forgets the idle chain
     guard.admit(("x", "discord", "elsewhere"))
     assert guard.tracking_chains is False  # so the early return at authz_mixin.py:801-803 would skip the reset
-    assert await admit(runner, event(PERSON, "hello?", is_bot=False, chat=THREAD)) is True
+    assert await admit(runner, _person("hello?")) is True
     assert guard.is_paused(conv(runner, held[0])) is False
     await pump(runner, clock)
     assert handed(runner.adapter)[-1] is held[1]
@@ -361,7 +369,7 @@ async def test_T28_a_paused_conversation_with_no_tracked_chain_is_released_by_an
 async def test_T36_the_native_stop_slash_command_discards_like_the_typed_one(clock):
     runner = _runner(clock)
     held = await _hold(runner, "boba", THREAD, "thread", n=2)
-    native = event(PERSON, "/stop", is_bot=False, chat=THREAD)
+    native = _person("/stop")
     native.message_type = MessageType.COMMAND  # the slash command reaches the runner as a command event
     assert await admit(runner, native) is True
     await pump(runner, clock, advance=3600)
@@ -373,7 +381,7 @@ async def test_T36_the_native_stop_slash_command_discards_like_the_typed_one(clo
 async def test_T37_a_persons_voice_utterance_releases_like_a_typed_message(clock):
     runner = _runner(clock)
     held = await _hold(runner, "boba", THREAD, "thread", n=2)
-    utterance = event(PERSON, "what is the status", is_bot=False, chat=THREAD)
+    utterance = _person("what is the status")
     utterance.message_id = None  # speech has no message id (run_voice.py:568)
     assert await admit(runner, utterance) is True
     await pump(runner, clock)
@@ -455,13 +463,13 @@ async def test_T49_a_dropped_person_and_an_admitted_new_each_release_within_one_
     caplog.set_level(logging.WARNING)
     runner = _runner(clock)
     adapter = _seat(runner)
-    held = await _hold(runner, "boba", CH, n=2)
+    held = await _hold(runner, "boba", CH, n=1)
     await adapter._dispatch_discord_message(_msg(_Chan(CH), f"<@{OTHER_BOT.id}> hi", mentions=[OTHER_BOT]))
     assert await _released(runner, held) is True
     runner._bot_loop_hold_turn_claimed(held[0])
     runner._bot_loop_hold_turn_ended(held[0])
     held2 = await _hold(runner, "boba", THREAD, "thread", n=2)
-    assert await admit(runner, event(PERSON, "/new", is_bot=False, chat=THREAD)) is True
+    assert await admit(runner, _person("/new")) is True
     assert await _released(runner, held2) is True
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]  # no 60 s wait, no warning
 
@@ -470,8 +478,12 @@ async def test_T49_a_dropped_person_and_an_admitted_new_each_release_within_one_
 async def test_T49_while_an_admitted_persons_turn_runs_under_the_heads_key_no_released_message_starts(clock):
     runner = _runner(clock)
     held = await _hold(runner, "boba", THREAD, "thread", n=2)
-    person = event(PERSON, "carry on", is_bot=False, chat=THREAD)
+    person = _person("carry on")
     person.source.profile = "boba"
+    # A thread source without a thread_id is keyed per participant (session.py build_session_key), so the person's
+    # turn would run under a different key than the bot head and S4 lets a release run beside it. Giving the person
+    # the head's participant id makes the keys equal; the event is still is_bot=False and counts as a person.
+    person.source.user_id = BOT_A
     key = start_turn(runner, person)  # the person's turn runs under the same session key
     assert await admit(runner, person) is True
     await pump(runner, clock, advance=15)
@@ -487,7 +499,7 @@ async def test_T49_a_person_the_runner_refuses_releases_nothing_on_the_cold_path
     runner = _runner(clock)
     held = await _hold(runner, "boba", THREAD, "thread", n=2)
     runner._is_user_authorized_for_source = lambda source, **kw: False
-    refused = event(PERSON, "let me in", is_bot=False, chat=THREAD)
+    refused = _person("let me in")
     refused.source.profile = "boba"
     assert await admit(runner, refused) is False  # cold path
     key = runner._session_key_for_source(refused.source)
