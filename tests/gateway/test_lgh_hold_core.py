@@ -200,12 +200,35 @@ async def test_T16_each_key_changes_behaviour_and_an_edit_applies_without_a_rest
     assert await admit(runner3, held) is False
     await pump(runner3, clock, advance=5)
     assert handed(runner3.adapter) == [held]  # hold_initial_seconds
-    cfg.set(hold_after_messages=1000)  # live edit: no new hold for the next message
-    assert await admit(runner, event(BOT_B, chat="other-chat")) is True
     runner4 = make_runner(clock, Cfg(hold_runaway_at_cap=1, hold_initial_seconds=15, hold_max_seconds=15))
     held4 = await _runaway(runner4, clock, extra=3)
     await _deliver_one(runner4, clock, runner4.adapter, 15)
     assert runner4._bot_loop_guard.is_paused(conv(runner4, held4[0])) is True  # hold_runaway_at_cap=1, wait == cap
+
+
+@pytest.mark.asyncio
+async def test_T16_an_edit_raising_hold_after_messages_admits_the_next_message_of_a_conversation_full_at_the_old_value(clock):
+    cfg = Cfg(hold_after_messages=3)
+    runner = make_runner(clock, cfg)
+    await fill_window(runner, clock, 3)  # the window is full at 3 (nothing held, so nothing keeps holding)
+    probe = event(BOT_A)
+    cfg.set(hold_after_messages=1000)  # no restart, the same conversation: the 4th is now inside the limit
+    assert await admit(runner, probe) is True
+    assert runner._bot_loop_guard.held_events(conv(runner, probe)) == []
+    control = make_runner(clock, Cfg(hold_after_messages=3))  # the unedited value holds that very message
+    await fill_window(control, clock, 3)
+    assert await admit(control, event(BOT_A)) is False
+
+
+@pytest.mark.asyncio
+async def test_T16_an_edit_lowering_hold_after_messages_holds_the_next_message_of_a_conversation_inside_the_old_value(clock):
+    cfg = Cfg(hold_after_messages=1000)
+    runner = make_runner(clock, cfg)
+    await fill_window(runner, clock, 3)
+    cfg.set(hold_after_messages=3)  # the same conversation, three already in the window
+    held = event(BOT_A)
+    assert await admit(runner, held) is False
+    assert runner._bot_loop_guard.held_events(conv(runner, held)) == [held]
 
 
 @pytest.mark.asyncio

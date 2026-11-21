@@ -5,10 +5,12 @@ DiscordAdapter is used for ``send_hold_notice`` and for recognition at ingress.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 import logging
 import os
+import re
 import stat
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -53,7 +55,7 @@ class _Thread(_Chan):
     pass
 
 
-def _real_adapter(monkeypatch, *, allow_bots="all", enabled=True, channel=None):
+def _real_adapter(monkeypatch, *, allow_bots="all", enabled=True, channel=None, user_id=None):
     import plugins.platforms.discord.adapter as mod
     from plugins.platforms.discord.adapter import DiscordAdapter
 
@@ -66,7 +68,7 @@ def _real_adapter(monkeypatch, *, allow_bots="all", enabled=True, channel=None):
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
     monkeypatch.setattr(mod.discord, "Thread", _Thread, raising=False)
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake-token"))
-    me = SimpleNamespace(id=SELF_ID, bot=True)
+    me = SimpleNamespace(id=user_id or SELF_ID, bot=True)
     adapter._client = SimpleNamespace(user=me)
     adapter._text_batch_delay_seconds = 0
     adapter.handle_message = AsyncMock()
@@ -178,44 +180,108 @@ async def test_T15_a_notice_posted_in_a_thread_is_recognised_in_that_thread_and_
     assert "Messages are being delayed" not in context
 
 
-def test_T15_the_notice_names_the_peer_and_this_seat_escaped_and_cut_to_32_chars_with_at_most_5_named():
-    from gateway.bot_loop_guard import format_hold_notice
-
-    names = [f"Bot{n}_" + "x" * 40 for n in range(7)]
-    text = format_hold_notice(senders=names, seat="Boba #1 @here **", delay_seconds=15, held=3, replies_to_replies=False)
-    assert "@everyone" not in text and "@here" not in text.replace("\\@here", "")
-    assert "Bot0_" + "x" * 27 in text and "Bot0_" + "x" * 28 not in text  # cut to 32
-    assert "Bot4_" in text and "Bot5_" not in text and "and 2 more" in text
-    assert "delayed" in text and "not dropped" in text
-    assert "from the same sender" in text
-    assert "/stop" in text and "discard" in text
-    assert "reply_to_reply" not in text  # named only on a seat where it is on
-    on = format_hold_notice(senders=["Peer"], seat="Boba", delay_seconds=15, held=1, replies_to_replies=True)
-    assert "reply_to_reply" in on or "answering the reply" in on
+async def _post_hold_notice(clock, senders, *, cfg=None, chat=THREAD, held_each=1):
+    """A runner whose window is full; ``senders`` (user names) each have messages held; one pump wake posts the notice."""
+    runner = make_runner(clock, cfg or Cfg(), profile="boba")
+    await fill_window(runner, clock, 10, chat=chat)
+    for n, name in enumerate(senders):
+        for _ in range(held_each):
+            assert await admit(runner, event(f"20000000000000{n:04d}", chat=chat, name=name)) is False
+    await asyncio.sleep(0)  # a send the guard scheduled onto the loop runs here (S13)
+    await pump(runner, clock)
+    return runner
 
 
 @pytest.mark.asyncio
-async def test_T15_once_per_episode_per_seat_plus_once_on_pause_and_a_late_holder_posts_its_own(clock):
-    runner = make_runner(clock, Cfg(hold_runaway_at_cap=1, hold_initial_seconds=15, hold_max_seconds=15))
+async def test_T15_the_notice_the_runner_posts_names_the_senders_the_seat_the_delay_and_the_count_and_every_clause(clock):
+    runner = await _post_hold_notice(clock, ["Peer Bot", "Other Bot"], cfg=Cfg(bot_replies_expect_reply=False),
+                                     held_each=2)
+    assert [chat for chat, _text in runner.adapter.notices] == [THREAD]  # one message, to the conversation
+    text = runner.adapter.notices[0][1]
+    assert "Peer Bot" in text and "Other Bot" in text  # the sender bots
+    assert "boba" in text.lower()  # this seat
+    assert re.search(r"\b15\s*(s\b|sec)", text)  # the delay
+    assert re.search(r"\b4\b", text)  # the number held
+    assert "delayed" in text and "not dropped" in text  # held messages are delayed, not dropped
+    assert "from the same sender" in text  # the repeat rule that still drops
+    assert "reply_to_reply" in text or "answering the reply" in text  # this seat has the rule on
+    assert re.search(r"person", text) and re.search(r"releas", text)  # a person's message releases them
+    assert "/stop" in text and "discard" in text  # a person's /stop discards them
+    assert "answer" in text and "resend" in text  # bots must not answer or resend
+
+
+@pytest.mark.asyncio
+async def test_T15_the_reply_to_reply_clause_is_named_only_where_that_rule_is_on(clock):
+    on = await _post_hold_notice(clock, ["Peer"], cfg=Cfg(bot_replies_expect_reply=False))
+    off = await _post_hold_notice(clock, ["Peer"], cfg=Cfg(bot_replies_expect_reply=True))
+    assert "reply_to_reply" in on.adapter.notices[0][1] or "answering the reply" in on.adapter.notices[0][1]
+    assert "reply_to_reply" not in off.adapter.notices[0][1] and "answering the reply" not in off.adapter.notices[0][1]
+    assert "from the same sender" in off.adapter.notices[0][1]  # the repeat rule is always named
+
+
+@pytest.mark.asyncio
+async def test_T15_at_most_5_senders_are_named_each_cut_to_32_characters_then_and_n_more(clock):
+    names = [f"Bot{n}_" + "x" * 40 for n in range(7)]
+    runner = await _post_hold_notice(clock, names)
+    text = runner.adapter.notices[0][1]
+    assert "Bot0_" + "x" * 27 in text and "Bot0_" + "x" * 28 not in text  # cut to 32
+    assert "Bot4_" in text and "Bot5_" not in text and "Bot6_" not in text
+    assert "and 2 more" in text
+
+
+@pytest.mark.asyncio
+async def test_T15_names_are_escaped_so_a_sender_cannot_ping_link_or_format_through_the_notice(clock):
+    hostile = "Evil @everyone @here #general **b** `c` _i_ ~~s~~ [l](http://x) <@123>"
+    runner = await _post_hold_notice(clock, [hostile])
+    text = runner.adapter.notices[0][1]
+    for raw in ("@everyone", "@here", "#general", "**b**", "`c`", "_i_", "~~s~~", "[l](http://x)", "<@123>"):
+        assert raw not in text, f"{raw!r} reaches the channel unescaped"
+    assert "everyone" in text and "general" in text  # the name is still readable
+
+
+@pytest.mark.asyncio
+async def test_T15_a_second_notice_is_posted_once_when_the_conversation_pauses_and_none_per_message(clock):
+    runner = make_runner(clock, Cfg(hold_runaway_at_cap=1, hold_initial_seconds=15, hold_max_seconds=15),
+                         profile="boba")
     await fill_window(runner, clock, 10)
     for _ in range(3):
-        assert await admit(runner, event(BOT_A)) is False
+        assert await admit(runner, event(BOT_A, name="Peer")) is False
+    await asyncio.sleep(0)
     await pump(runner, clock)
     assert len(runner.adapter.notices) == 1  # one when it started holding, not one per message
-    await pump(runner, clock, advance=15)
+    await pump(runner, clock, advance=15)  # the head is handed over after a full-cap wait
     ev = handed(runner.adapter)[0]
-    runner._bot_loop_hold_turn_claimed(ev)
+    runner._bot_loop_hold_turn_claimed(ev)  # its turn starts and ends (the live path is pinned in test_lgh_live_wiring)
     runner._bot_loop_hold_turn_ended(ev)
-    await pump(runner, clock)
-    assert len(runner.adapter.notices) == 2  # once more when it paused
+    await asyncio.sleep(0)
+    await pump(runner, clock)  # hold_runaway_at_cap=1: one capped wait pauses it
+    paused = [text for _chat, text in runner.adapter.notices[1:] if "paus" in text.lower()]
+    assert len(paused) == 1 and len(runner.adapter.notices) == 2
     await pump(runner, clock, advance=3600)
-    assert len(runner.adapter.notices) == 2
-    # a seat that merely saw a peer's notice (recognised, never held) posts its own when it later starts holding
-    other = make_runner(clock, Cfg())
-    await fill_window(other, clock, 10, chat="elsewhere")
-    assert await admit(other, event(BOT_A, chat="elsewhere")) is False
-    await pump(other, clock)
-    assert len(other.adapter.notices) == 1
+    assert len(runner.adapter.notices) == 2  # nothing more while paused
+
+
+@pytest.mark.asyncio
+async def test_T15_a_seat_that_saw_a_peers_notice_but_never_held_posts_its_own_when_it_later_starts_holding(
+        clock, monkeypatch):
+    peer = _real_adapter(monkeypatch)  # seat A: posts a notice through the real send path
+    seat = _real_adapter(monkeypatch, user_id=SELF_ID + 1)  # seat B: sees it as an inbound bot message
+    sent = await peer.send_hold_notice(THREAD, "Peer is held: delayed, not dropped. A person's /stop discards them.")
+    seen = []
+    seat.handle_message = AsyncMock(side_effect=lambda ev: seen.append(ev))
+    echo = _bot_msg(seat._channels.setdefault(THREAD, _Chan(THREAD)),
+                    "Peer is held: delayed, not dropped. A person's /stop discards them.",
+                    author_id=SELF_ID, msg_id=int(sent.message_id))
+    assert await seat._dispatch_discord_message(echo) is False  # recognised and dropped: B never counted it
+    assert seen == []
+    runner = make_runner(clock, Cfg(), adapter=seat, profile="tars")  # B has held nothing so far
+    assert seat._channels[THREAD].sent == []
+    await fill_window(runner, clock, 10)
+    assert await admit(runner, event(BOT_A, name="Peer")) is False  # B starts holding
+    await asyncio.sleep(0)
+    await runner._bot_loop_hold_pump_once()
+    own = [kwargs["content"] for kwargs in seat._channels[THREAD].sent]
+    assert len(own) == 1 and "delayed" in own[0]  # B's own notice: the peer's did not stand in for it
 
 
 # --- T47: lost and discard lines are recognised like the notice -----------------------------------------------
@@ -229,8 +295,14 @@ async def test_T47_lost_and_discard_lines_are_sent_by_send_hold_notice_and_recog
     held = [event(BOT_A) for _ in range(2)]
     for ev in held:
         assert await admit(runner, ev) is False
+    await asyncio.sleep(0)  # sends scheduled from the guard's sync code run on the loop (S13), not under admit
+    await pump(runner, clock)
+    assert len(runner.adapter.notices) == 1  # the hold notice
     assert await admit(runner, event(PERSON, "/stop", is_bot=False)) is True  # discard line
+    await asyncio.sleep(0)
+    await pump(runner, clock)
     assert len(runner.adapter.notices) == 2  # the hold notice and the discard line, both through send_hold_notice
+    assert all(ev.message_id in runner.adapter.notices[1][1] for ev in held)
     adapter = _real_adapter(monkeypatch)
     seen = []
     adapter.handle_message = AsyncMock(side_effect=lambda ev: seen.append(ev))
@@ -246,6 +318,12 @@ async def test_T47_lost_and_discard_lines_are_sent_by_send_hold_notice_and_recog
 
 def _refs_path(tmp_path):
     return tmp_path / "gateway" / "bot_loop_hold_refs.json"
+
+
+def _refs_text(tmp_path):
+    """The refs file's text; "" when a build removes the file once it lists nothing (the spec removes entries)."""
+    path = _refs_path(tmp_path)
+    return path.read_text() if path.exists() else ""
 
 
 async def _hold_n(runner, clock, n, *, chat=THREAD):
@@ -274,7 +352,7 @@ async def test_T9_the_refs_file_lists_held_messages_without_text_mode_0600_and_a
     lines = [text for _chat, text in after.adapter.notices if THREAD in text or held[0].message_id in text]
     assert len(lines) == 1  # one line per conversation
     assert all(ev.message_id in lines[0] for ev in held) and "Peer" in lines[0]
-    assert json.loads(path.read_text()) in ([], {}) or not json.loads(path.read_text()).get("entries")  # the file empties
+    assert not any(ev.message_id in _refs_text(tmp_path) for ev in held)  # the file empties (or goes)
 
 
 @pytest.mark.asyncio
@@ -322,7 +400,7 @@ async def test_T35_60_lost_messages_post_in_messages_of_at_most_1900_chars_and_a
     sent = [text for _chat, text in after.adapter.notices]
     assert sent and all(len(text) <= 1900 for text in sent)
     assert len(sent) <= 5  # at most 5 messages per conversation per start
-    left = json.loads(_refs_path(tmp_path).read_text())
+    left = json.loads(_refs_text(tmp_path))
     listed = json.dumps(left)
     named_sent = {ev.message_id for ev in held if any(ev.message_id in text for text in sent)}
     assert named_sent and named_sent != {ev.message_id for ev in held}
@@ -349,16 +427,16 @@ async def test_T43_an_entry_is_gone_after_handover_after_a_stop_discard_and_afte
     runner = make_runner(clock, Cfg())
     held = await _hold_n(runner, clock, 3)
     runner._bot_loop_hold_flush_refs()
-    assert all(ev.message_id in _refs_path(tmp_path).read_text() for ev in held)
+    assert all(ev.message_id in _refs_text(tmp_path) for ev in held)
     await pump(runner, clock, advance=15)  # held[0] handed over and accepted
     runner._bot_loop_hold_flush_refs()
-    raw = _refs_path(tmp_path).read_text()
+    raw = _refs_text(tmp_path)
     assert held[0].message_id not in raw and held[1].message_id in raw
     runner._bot_loop_hold_turn_claimed(held[0])
     runner._bot_loop_hold_turn_ended(held[0])
     assert await admit(runner, event(PERSON, "/stop", is_bot=False)) is True  # discard held[1], held[2]
     runner._bot_loop_hold_flush_refs()
-    assert not any(ev.message_id in _refs_path(tmp_path).read_text() for ev in held)
+    assert not any(ev.message_id in _refs_text(tmp_path) for ev in held)
     # third failed hand-over
     runner2 = make_runner(clock, Cfg())
     held2 = await _hold_n(runner2, clock, 1, chat="chat-two")
@@ -366,13 +444,13 @@ async def test_T43_an_entry_is_gone_after_handover_after_a_stop_discard_and_afte
     for _ in range(4):
         await pump(runner2, clock, advance=70)
     runner2._bot_loop_hold_flush_refs()
-    assert held2[0].message_id not in _refs_path(tmp_path).read_text()
+    assert held2[0].message_id not in _refs_text(tmp_path)
     # a graceful stop lists exactly what is still held; a restart posts no line for a delivered one
     runner3 = make_runner(clock, Cfg())
     kept = await _hold_n(runner3, clock, 2, chat="chat-three")
     await pump(runner3, clock, advance=15)  # kept[0] delivered
     runner3._bot_loop_hold_flush_refs()
-    raw = _refs_path(tmp_path).read_text()
+    raw = _refs_text(tmp_path)
     assert kept[1].message_id in raw and kept[0].message_id not in raw
     after = make_runner(clock, Cfg())
     await after._bot_loop_hold_report_lost()
