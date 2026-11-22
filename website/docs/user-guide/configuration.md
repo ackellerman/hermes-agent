@@ -1326,6 +1326,24 @@ context:
 
 Plugin engines are **never auto-activated** — you must explicitly set `context.engine` to the plugin name. Available engines can be browsed and selected via `hermes plugins` → Provider Plugins → Context Engine.
 
+### ctxpkg
+
+`ctxpkg` is a bundled engine that turns compaction lossy-once instead of lossy-forever. At each compaction it cuts the compacted turns into episodes (one per turn), writes each episode whole to `~/.hermes/ctxpkg/<lineage>/ep-<NNNN>.md`, and leaves one reference line per episode in the prompt — its turns, size, summary and ids. When the model needs the detail back it calls the `recall` tool; the episode returns as an ordinary tool result and stays warm for a few turns before it shrinks back to its reference line.
+
+```yaml
+context:
+  engine: "ctxpkg"
+
+ctxpkg:
+  warm_turns: 8          # turns a recalled episode stays verbatim after its last use
+  max_episode_chars: 60000   # a longer turn is split into several episodes at assistant tool-call boundaries
+  summary_max_chars: 300     # cap on a flash-written episode summary
+```
+
+`ctxpkg.warm_turns` sets how long a recalled episode stays warm after its last use, counted in turns rather than API calls; `0` means an episode is never kept warm. `ctxpkg.max_episode_chars` bounds one episode file — a turn past it is split only at an assistant tool-call boundary, so a cut never lands inside a tool run. `ctxpkg.summary_max_chars` bounds the per-episode summary the flash compression model writes; ids, shas and paths are copied out by script and are never trimmed.
+
+The engine takes the same `compression.*` settings as the built-in `compressor` (`threshold`, `threshold_tokens`, `protect_first_n`, `protect_last_n`, `target_ratio`, `proactive_prune_*`, `tail_mode`), and its tools (here, `recall`) are injected only when the `context_engine` toolset is enabled for the platform. Episode files are never deleted; they grow the way `state.db` does.
+
 See [Memory Providers](./features/memory-providers.md) for the analogous single-select system for memory plugins.
 
 ## Iteration Budget

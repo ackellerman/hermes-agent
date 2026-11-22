@@ -1839,6 +1839,19 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
         # resolution already sees them.
         if cs.model_thresholds:
             agent.context_compressor.model_thresholds = cs.model_thresholds
+        # A plugin engine that declares the same knobs as the built-in compressor takes the
+        # compression.* settings here, BEFORE update_model() derives the trigger from them.
+        _apply_settings = getattr(agent.context_compressor, "apply_compression_settings", None)
+        if callable(_apply_settings):
+            try:
+                _apply_settings(cs, max_tokens=_compressor_max_tokens(agent))
+            except Exception:
+                # Not silent: without the hook the thresholds stay at their defaults (50%) and nothing
+                # would say why the configured ones did not take.
+                _ra().logger.warning(
+                    "context engine %s apply_compression_settings failed; compression.* settings not applied",
+                    _selected_engine.name, exc_info=True,
+                )
         agent.context_compressor.update_model(
             model=agent.model, context_length=_plugin_ctx_len, base_url=agent.base_url,
             api_key=getattr(agent, "api_key", ""), provider=agent.provider, api_mode=agent.api_mode,
@@ -1884,7 +1897,8 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     ):
         if hasattr(_cc, _attr):
             setattr(_cc, _attr, _value)
-    if cs.prepare_ahead and isinstance(_cc, ContextCompressor):
+    if (cs.prepare_ahead and isinstance(_cc, ContextCompressor)
+            and getattr(_cc, "supports_prepared_compaction", True)):
         from agent.prepared_compaction import PreparedCompaction
         _cc.prepared_compaction = PreparedCompaction()
     agent.compression_checkpoint_required = cs.checkpoint_required

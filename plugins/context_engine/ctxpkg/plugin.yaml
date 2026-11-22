@@ -1,0 +1,3 @@
+name: ctxpkg
+version: 1.0.0
+description: "Structured driver context: compacted turns are written out as episode files, kept in the prompt as a reference block, and read back in full with the recall tool."
