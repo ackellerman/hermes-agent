@@ -932,6 +932,31 @@ def _routed_reasoning_config(task_cfg: Optional[dict[str, Any]]) -> Optional[dic
     return parsed
 
 
+def _routed_fallback_chain(task_cfg: Optional[dict[str, Any]]) -> Optional[list[dict[str, Any]]]:
+    """The ROUTED fork's fallback chain from ``auxiliary.background_review.fallback_chain`` (#93592).
+    The fork is a full AIAgent, so a 429/outage on the routed primary is recovered by its own
+    ``_fallback_chain`` (``try_activate_fallback``), never by the auxiliary client's
+    ``_try_configured_fallback_chain`` that reads the same key for ``call_llm`` tasks. Same shape as
+    those tasks (a list of ``{provider, model, ...}``), normalized like delegation/cron
+    (``scoped_fallback_chain``, pinned: the parent's chain is never borrowed). The AIAgent chain needs
+    a model on every entry, so an entry without one is dropped. None = unset, ``[]`` or nothing usable."""
+    declared = _background_review_task_config(task_cfg).get("fallback_chain")
+    if declared is None or declared == []:
+        return None
+    if not isinstance(declared, list):
+        logger.warning("auxiliary.background_review.fallback_chain must be a list of {provider, model} "
+                       "entries, got %s; the routed review fork runs without a fallback",
+                       type(declared).__name__)
+        return None
+    from hermes_cli.fallback_config import scoped_fallback_chain
+    chain = scoped_fallback_chain(None, copy.deepcopy(declared), pinned=True,
+                                  owner="auxiliary.background_review.fallback_chain") or []
+    if len(chain) < len(declared):
+        logger.warning("auxiliary.background_review.fallback_chain: ignored %d of %d entries (each needs a "
+                       "provider and a model; repeats are dropped)", len(declared) - len(chain), len(declared))
+    return chain or None
+
+
 def _fork_init_kwargs(agent: Any, rt: dict[str, Any], routed: bool, max_iterations: int,
                       task_cfg: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """AIAgent constructor kwargs for the review fork. skip_memory=True: an external memory plugin
@@ -953,9 +978,13 @@ def _fork_init_kwargs(agent: Any, rt: dict[str, Any], routed: bool, max_iteratio
     if isinstance(rt.get("command"), str) and rt["command"]:
         kwargs.update(acp_command=rt["command"], acp_args=rt.get("args") or [])
     if not routed:
+        # Same-model path: no fallback_model on purpose — its kwargs stay exactly as before.
         kwargs.update(_same_model_parity_kwargs(agent))
-    elif (routed_cfg := _routed_reasoning_config(task_cfg)) is not None:
+        return kwargs
+    if (routed_cfg := _routed_reasoning_config(task_cfg)) is not None:
         kwargs["reasoning_config"] = routed_cfg
+    if fallback_chain := _routed_fallback_chain(task_cfg):
+        kwargs["fallback_model"] = fallback_chain
     return kwargs
 
 

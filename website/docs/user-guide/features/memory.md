@@ -416,6 +416,13 @@ identical and skill capture near-identical to the main-model review.
 Leave it at `auto` (or set it to your main model) and nothing changes — the
 review keeps running on the main model with the full warm-cache replay.
 
+A routed review has no fallback unless you declare one: set
+`auxiliary.background_review.fallback_chain` (a list of `provider` + `model`
+entries) and the review switches to those entries when the routed model
+returns a 429 or is down. See
+[fallback providers](./fallback-providers.md#optional-per-task-fallback-chain).
+The key is not used for a review on the main model.
+
 ### Same-model review reasoning
 
 A review using the same model as the parent **always inherits the parent's reasoning effort**. Setting `auxiliary.background_review.reasoning_effort` does not override it, whether the route is `auto` or explicitly selects the parent provider/model.
