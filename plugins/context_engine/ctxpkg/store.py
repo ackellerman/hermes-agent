@@ -5,6 +5,8 @@ Layout, under ``<HERMES_HOME>/ctxpkg/<compression-lineage root>/`` (mode 0700):
 * ``ep-<NNNN>.md`` — the rendered episode, mode 0600, written atomically (temp file then ``os.replace``), so a
   crash mid-write leaves the previous file intact;
 * ``index.jsonl`` — one JSON object per episode: ``ref, created_at, turn_first, turn_last, chars, ids, summary``;
+* ``blocks.jsonl`` — one JSON string per reference block, the exact ``user`` text each compaction emitted, so
+  ``on_session_start`` can re-register them as cache anchors in a fresh process;
 * ``warm.json`` — the turn counter and each ref's last-use turn; ``recall`` and a mention in the assistant text of
   a finished turn renew it.
 
@@ -39,9 +41,15 @@ _DIR_MODE = 0o700
 _FILE_MODE = 0o600
 _INDEX_NAME = "index.jsonl"
 _WARM_NAME = "warm.json"
+_BLOCKS_NAME = "blocks.jsonl"
 # One engine per process writes a store; this lock keeps a recall (tool thread) and a finished turn from losing
 # each other's ``warm.json`` update. It is not a cross-process lock.
 _WARM_LOCK = threading.Lock()
+# Highest ref number this process has handed out, per store root. ``take_refs`` reserves numbers before the
+# text that needs them exists (a compaction names its refs in the summariser's prompt), so plain allocation
+# starts above this too: a second writer in the same process, e.g. the retry a host timeout starts while the
+# first attempt is still inside its flash call, is never handed a reserved ref.
+_REF_RESERVATIONS: dict[str, int] = {}
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -140,12 +148,25 @@ class EpisodeStore:
         return sorted(found)
 
     def next_ref(self) -> str:
-        """``ep-<highest existing number + 1>``, zero-padded to four digits."""
-        highest = 0
+        """``ep-<highest existing number + 1>``, zero-padded to four digits.
+
+        Reads only: a number this returns is not reserved, so asking twice gives the same answer. A
+        writer that must hold its numbers across a slow call reserves them with ``take_refs``.
+        """
+        with _WARM_LOCK:
+            return f"ep-{self._next_number_locked():04d}"
+
+    def _next_number_locked(self) -> int:
+        """One above both the highest stored episode and the highest ref this process has reserved.
+
+        Caller holds ``_WARM_LOCK``: reading the directory and the reservation table must be one step, or
+        two writers can each see the same highest number.
+        """
+        highest = _REF_RESERVATIONS.get(str(self.root), 0)
         for ref in self.refs():
             with suppress(ValueError):
                 highest = max(highest, int(ref.rsplit("-", 1)[1]))
-        return f"ep-{highest + 1:04d}"
+        return highest + 1
 
     def exists(self, ref: str) -> bool:
         """True when *ref* names a regular episode file here (a symlink planted in the dir is not one)."""
@@ -167,22 +188,99 @@ class EpisodeStore:
     # ── episodes ────────────────────────────────────────────────────────────
 
     def write_episode(self, text: str, *, turn_first: int, turn_last: int, ids: Iterable[str] = (),
-                      summary: str = "", created_at: float | None = None) -> str:
-        """Write one episode (atomically) and append its index row; returns its ref."""
+                      summary: str = "", created_at: float | None = None, ref: str | None = None) -> str:
+        """Write one episode (atomically) and append its index row; returns its ref.
+
+        Allocation, the existence check and the write are one step under the store's in-process lock, so
+        two writers in one process (a compaction and a recall) cannot take the same ref. A ``ref`` handed
+        in, as ``take_refs`` hands one, is refused when it already names a file: the previous round's
+        silent overwrite lost an episode when two compactions took the same ref. Cross-process writers are
+        out of scope: nothing but one gateway writes a store.
+        """
         self.ensure()
-        ref = self.next_ref()
-        atomic_write_text(self._episode_path(ref), text)
-        row = {
-            "ref": ref,
-            "created_at": time.time() if created_at is None else float(created_at),
-            "turn_first": int(turn_first),
-            "turn_last": int(turn_last),
-            "chars": len(text),
-            "ids": list(ids),
-            "summary": summary,
-        }
-        self._append_index(row)
+        with _WARM_LOCK:
+            if ref is None:
+                ref = f"ep-{self._next_number_locked():04d}"
+            elif self.exists(ref):
+                raise FileExistsError(f"ctxpkg store already holds {ref}; refusing to overwrite it")
+            atomic_write_text(self._episode_path(ref), text)
+            row = {
+                "ref": ref,
+                "created_at": time.time() if created_at is None else float(created_at),
+                "turn_first": int(turn_first),
+                "turn_last": int(turn_last),
+                "chars": len(text),
+                "ids": list(ids),
+                "summary": summary,
+            }
+            self._append_index(row)
         return ref
+
+    def take_refs(self, count: int) -> list[str]:
+        """*count* consecutive free refs, reserved under the same lock ``write_episode`` holds.
+
+        A caller that needs refs before the text exists (a compaction names them in the summary prompt)
+        reserves them here and passes each back as ``write_episode(..., ref=...)``. The reservation is a
+        high-water mark this process keeps per store (``_REF_RESERVATIONS``), so a second ``take_refs``
+        and every plain write start above it: two compactions in flight at once, which a host timeout and
+        retry produces, never take the same refs. Cross-process reservation stays out of scope, as it does
+        for the lock itself.
+        """
+        if count <= 0:
+            return []
+        with _WARM_LOCK:
+            start = self._next_number_locked()
+            _REF_RESERVATIONS[str(self.root)] = start + count - 1
+            return [f"ep-{number:04d}" for number in range(start, start + count)]
+
+    def episode_row(self, ref: str) -> dict[str, Any] | None:
+        """The index row for *ref*, newest first (a ref can be indexed twice only after a crash)."""
+        if not RECALL_REF_RE.fullmatch(ref or ""):
+            return None
+        for row in reversed(self.index()):
+            if row.get("ref") == ref:
+                return row
+        return None
+
+    def summary_of(self, ref: str) -> str:
+        """The stored summary for *ref*, or ``""`` when the ref is unknown or unsummarised."""
+        row = self.episode_row(ref) or {}
+        summary = row.get("summary")
+        return summary if isinstance(summary, str) else ""
+
+    # ── reference blocks ────────────────────────────────────────────────────
+
+    def append_block(self, text: str) -> None:
+        """Record one reference block's exact text, in ``blocks.jsonl`` (one JSON string per line).
+
+        ``on_session_start`` replays this file into the anchor registry, so a restarted process keeps
+        marking the newest block instead of rewriting the whole prefix.
+        """
+        if not text:
+            return
+        self.ensure()
+        line = (json.dumps(text, ensure_ascii=False) + "\n").encode("utf-8")
+        with _WARM_LOCK:
+            descriptor = os.open(str(self.root / _BLOCKS_NAME),
+                                 os.O_CREAT | os.O_WRONLY | os.O_APPEND, _FILE_MODE)
+            try:
+                os.write(descriptor, line)
+            finally:
+                os.close(descriptor)
+
+    def blocks(self) -> list[str]:
+        """Every recorded block text, in the order compactions emitted them (a bad line is skipped)."""
+        try:
+            text = (self.root / _BLOCKS_NAME).read_text(encoding="utf-8")
+        except OSError:
+            return []
+        found: list[str] = []
+        for line in text.splitlines():
+            with suppress(ValueError):
+                value = json.loads(line)
+                if isinstance(value, str) and value:
+                    found.append(value)
+        return found
 
     def _append_index(self, row: dict[str, Any]) -> None:
         line = (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")

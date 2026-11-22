@@ -3,8 +3,8 @@
 Each compaction cuts the compacted span into episodes (one per user turn), writes each one whole to
 ``<HERMES_HOME>/ctxpkg/<lineage>/ep-<NNNN>.md`` and keeps only a reference line in the prompt. ``recall(ref)``
 brings an episode back in full as an ordinary tool result, and that use keeps it warm for
-``ctxpkg.warm_turns`` turns. Step 3 builds the engine, the store and the tool; the compaction itself, the
-extend-only reference prefix and warm protection land in step 4.
+``ctxpkg.warm_turns`` turns. Compaction (``compaction.py``) appends one reference block per compaction and
+leaves every earlier block byte-identical, so the prefix up to the newest block stays a prompt-cache read.
 
 The engine subclasses the built-in ``ContextCompressor`` so the host's token accounting, micro-compaction
 settings and ``should_compress`` keep working. The host's ``compression.*`` knobs reach it through
@@ -21,6 +21,7 @@ from typing import Any
 
 from agent.context_compressor import ContextCompressor, _PRUNE_MIN_CHARS
 
+from .compaction import CtxpkgCompactionMixin
 from .episodes import message_text
 from .store import MAX_PART_CHARS, RECALL_REF_RE, EpisodeStore, split_parts
 
@@ -44,8 +45,8 @@ _RECALL_TOOL = {
 }
 
 
-class CtxpkgEngine(ContextCompressor):
-    """Episode store and ``recall`` for a compacted context (compaction itself: step 4)."""
+class CtxpkgEngine(CtxpkgCompactionMixin, ContextCompressor):
+    """Episode store, ``recall`` tool and episode compaction for a compacted context."""
 
     @property
     def name(self) -> str:
