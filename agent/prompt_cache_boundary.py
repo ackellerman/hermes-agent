@@ -56,3 +56,47 @@ def find_stable_prefix(content: str) -> Optional[str]:
         if best is not None:
             _prefixes.move_to_end(best)  # after the scan: never mutate mid-iteration
         return best
+
+
+# A context engine's stable block: the exact text of the newest reference message its
+# compaction emitted. Matching is exact and whole-message (never a prefix), so a block is
+# found again on every later request as long as the planner keeps it in history. One entry
+# per compaction and a block is a few hundred bytes, so the entry count is the only bound.
+_MAX_ANCHORS = 64
+
+# Shares ``_lock`` with the scaffold registry: both are small dicts mutated by the same
+# request path, and one lock keeps the two registries from ever being read half-updated.
+_anchors: "OrderedDict[str, None]" = OrderedDict()
+
+
+def register_cache_anchor(text: str) -> None:
+    """Record ``text`` as the exact text of a stable block's message.
+
+    Called by a context engine right after it emits a new reference block, and re-called for
+    every stored block at session start (the registry is process-local). An empty text is
+    ignored: no message can carry it, and it would match every empty message.
+    """
+    if not text:
+        return
+    with _lock:
+        _anchors[text] = None
+        _anchors.move_to_end(text)
+        while len(_anchors) > _MAX_ANCHORS:
+            _anchors.popitem(last=False)
+
+
+def is_cache_anchor(text: str) -> bool:
+    """Whether ``text`` is a registered anchor (a hit refreshes the entry's LRU position)."""
+    if not text:
+        return False
+    with _lock:
+        if text not in _anchors:
+            return False
+        _anchors.move_to_end(text)
+        return True
+
+
+def clear_cache_anchors() -> None:
+    """Forget every anchor (a session's own end, or a test's isolation)."""
+    with _lock:
+        _anchors.clear()
