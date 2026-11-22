@@ -87,6 +87,21 @@ def test_partly_bad_chain_keeps_the_usable_entries_and_warns(caplog):
     assert "auxiliary.background_review.fallback_chain" in caplog.text
 
 
+def test_routed_side_question_fork_reads_and_names_its_own_block(caplog):
+    """``build_cache_parity_fork`` is shared with a routed /btw: the chain comes from the block the
+    caller passed (``auxiliary.side_question``), and the warning names that block, not the review's."""
+    captured = {}
+    agent = _make_agent_stub(run_agent.AIAgent)
+    with patch.object(run_agent, "AIAgent", _make_recorder_class(captured)), \
+            patch.object(bg_review, "_resolve_review_runtime", return_value=dict(ROUTED_RUNTIME)), \
+            caplog.at_level(logging.WARNING, logger="agent.background_review"):
+        build_cache_parity_fork(agent, {"fallback_chain": [CHAIN[0], {"model": "x"}]}, max_iterations=1,
+                                write_origin="side_question")
+    assert captured["init_kwargs"]["fallback_model"] == CHAIN
+    assert "auxiliary.side_question.fallback_chain" in caplog.text
+    assert "auxiliary.background_review" not in caplog.text
+
+
 def test_real_routed_fork_arms_the_chain(monkeypatch, tmp_path):
     """Delivery: through the real AIAgent constructor, the routed fork's ``_fallback_chain`` (what
     ``try_activate_fallback`` walks on a 429) holds the configured entry."""
