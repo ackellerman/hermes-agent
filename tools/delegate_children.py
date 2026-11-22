@@ -438,19 +438,40 @@ def _visible_clause(conversations: Iterable[str]) -> tuple[str, tuple[Any, ...]]
 
 
 def list_entry(row: dict[str, Any], *, conversations: Iterable[str] = (), profile: Optional[str] = None,
-               holder_label: Optional[str] = None) -> dict[str, Any]:
+               holder_label: Optional[str] = None, resume: Optional[dict[str, Any]] = None,
+               resume_window_seconds: Optional[int] = None, now: Optional[float] = None) -> dict[str, Any]:
     """One ``action='list'`` entry for a kept row: the ids the parent addresses it by, its status and whether
     this session may act on it. No brief, route or transcript: a listing stays small.
 
     ``read_only`` is True when the session may see the child but not resume, steer or stop it: another
     conversation of the profile holds it, or it ran as another profile (a ``profile_routes`` child, ``profile``
     on the row). A released child stays readable here; ``claim`` is what moves it.
+
+    *resume* is the child's durable record (``delegate_tool_resumable.read_records``), given for an IDLE child.
+    From it (else from the row's ``idle_since``, which a resumed child leaves hours stale) the entry reports
+    ``idle_seconds``, ``last_run_seconds`` (the run's length; None when unknown) and, over the profile's
+    ``delegation.resume_window_seconds`` (resolved here when not passed, from the row's own profile), ``warm``:
+    the child may still be continued while its prompt cache is warm. A window of 0 is no window, so it is warm.
     """
     convs = [c for c in conversations if c]
     held_here = row.get("conversation_id") in convs or bool(
         set(row.get("prior_conversations") or ()) & set(convs))
     other_profile = bool(row.get("profile")) and bool(profile) and row.get("profile") != profile
     read_only = (not held_here) or other_profile
+    window = resume_window_seconds
+    if window is None:
+        from tools.delegate_tool_config import _resume_window_seconds
+        window = _resume_window_seconds(row.get("profile"))
+    at = time.time() if now is None else now
+    record = resume if isinstance(resume, dict) else {}
+    stopped_at = record.get("stopped_at")
+    if isinstance(stopped_at, (int, float)) and not isinstance(stopped_at, bool):
+        idle_seconds: Optional[int] = max(0, int(at - stopped_at))
+    else:
+        idle_since = row.get("idle_since")
+        idle_seconds = max(0, int(at - float(idle_since))) if isinstance(
+            idle_since, (int, float)) and not isinstance(idle_since, bool) else None
+    last_run = record.get("last_run_seconds")
     entry: dict[str, Any] = {
         "child_id": row.get("child_id"),
         "subagent_id": row.get("subagent_id"),
@@ -460,6 +481,11 @@ def list_entry(row: dict[str, Any], *, conversations: Iterable[str] = (), profil
         "resumable": (not read_only) and row.get("status") == IDLE,
         "holder_session_id": row.get("holder_session_id"),
         "read_only": read_only,
+        "idle_seconds": idle_seconds,
+        "last_run_seconds": (int(last_run) if isinstance(last_run, (int, float))
+                             and not isinstance(last_run, bool) else None),
+        "resume_window_seconds": window,
+        "warm": bool(window == 0 or (idle_seconds is not None and idle_seconds < window)),
     }
     if row.get("title"):
         entry["title"] = row["title"]

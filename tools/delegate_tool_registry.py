@@ -324,7 +324,9 @@ def _list_payload(parent_agent: Any, *, scope: Optional[str] = None, query: Opti
     registry can only narrow it. Another profile's ``state.db`` is never opened.
     """
     from agent.prompt_cache_scope import conversation_id
-    from tools.delegate_children import LIST_LIMIT, ChildStore, list_entry
+    from tools.delegate_children import IDLE, LIST_LIMIT, ChildStore, list_entry
+    from tools.delegate_tool_config import _resume_window_seconds
+    from tools.delegate_tool_resumable import read_records
     with _active_subagents_lock:
         records = list(_active_subagents.values())
     entries = []
@@ -355,18 +357,28 @@ def _list_payload(parent_agent: Any, *, scope: Optional[str] = None, query: Opti
             conversation = ""
         conversations = [conversation] if conversation else []
         profile = store.profile
+
+        def entries_of(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            """This block's entries, with each IDLE child's durable record (one read) and its profile's window:
+            the listing shows how long it has been idle, how long its last run took, and whether it is warm."""
+            labels = store.holder_labels([r.get("holder_session_id") for r in rows])
+            idle_ids = [r["subagent_id"] for r in rows
+                        if r.get("status") == IDLE and isinstance(r.get("subagent_id"), str)]
+            resumes = read_records(parent_agent, idle_ids)
+            return [list_entry(r, conversations=conversations, profile=profile,
+                               holder_label=labels.get(str(r.get("holder_session_id") or "")),
+                               resume=resumes.get(str(r.get("subagent_id") or "")),
+                               resume_window_seconds=_resume_window_seconds(r.get("profile") or profile))
+                    for r in rows]
+
         if conversations:
             live_ids = [e["subagent_id"] for e in entries if isinstance(e.get("subagent_id"), str)]
             rows, omitted = store.kept_children(conversations=conversations, exclude_subagent_ids=live_ids,
                                                 query=query)
-            labels = store.holder_labels([r.get("holder_session_id") for r in rows])
-            children = [list_entry(r, conversations=conversations, profile=profile,
-                                   holder_label=labels.get(str(r.get("holder_session_id") or ""))) for r in rows]
+            children = entries_of(rows)
             if scope_name == "profile":
                 rows, omitted_others = store.kept_children(exclude_conversations=conversations, query=query)
-                labels = store.holder_labels([r.get("holder_session_id") for r in rows])
-                others = [list_entry(r, conversations=conversations, profile=profile,
-                                     holder_label=labels.get(str(r.get("holder_session_id") or ""))) for r in rows]
+                others = entries_of(rows)
     payload: dict[str, Any] = {
         "action": "list", "scope": scope_name, "count": len(entries) + len(children) + len(others),
         "subagents": entries,
