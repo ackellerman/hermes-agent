@@ -581,7 +581,7 @@ def _init_prompt_cache_config(agent):
             agent._cache_ttl = _ttl
         elif _ttl == AUTO_CACHE_TTL:
             # Decided once per session from its source (a delegated child is clamped to 5m again
-            # in delegate_tool regardless).
+            # in delegate_tool unless its own profile sets a literal 1h; see _apply_child_cache_ttl).
             from agent.session_source import session_source_for
             agent._cache_ttl = auto_cache_ttl_for_source(session_source_for(getattr(agent, "platform", None)))
         elif cache_ttl_means_disabled(_ttl):

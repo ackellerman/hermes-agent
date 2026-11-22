@@ -153,13 +153,34 @@ def _open_child_session_db(parent_agent) -> Any:
         return acquire(_parent_db_path) if _parent_db_path is not None else acquire()
     return None
 
-def _apply_child_cache_ttl(child) -> None:
-    """A delegated child never uses the 1h cache tier. The tier is priced for a person who steps
-    away between turns (2x write vs 1.25x for 5m, #14971); a subagent calls every few seconds for
-    minutes and is gone, so it pays the 2x on every tool result and never collects the retention.
-    Caching itself stays exactly as configured (disabled stays disabled)."""
-    if getattr(child, "_cache_ttl", None) == "1h":
+def _apply_child_cache_ttl(child, *, profile_pins_1h: bool = False) -> None:
+    """A delegated child does not use the 1h cache tier unless its own profile asks for it. The tier
+    is priced for a person who steps away between turns (2x write vs 1.25x for 5m, #14971); a
+    subagent calls every few seconds for minutes and is gone, so it usually pays the 2x on every
+    tool result and never collects the retention.
+
+    The one opt-in is ``profile_pins_1h``: a profile-routed child (``profile_home``) whose OWN
+    profile config.yaml sets ``prompt_caching.cache_ttl: 1h`` literally (see
+    ``_profile_pins_child_1h``). That profile was configured for long, slow sessions (a reviewer that
+    reads for a long time between calls), and the operator chose 1h for it explicitly. ``auto`` is not
+    an opt-in (it means "let the session source decide", and a child is machine-paced), and the
+    launching profile's 1h never carries over to its children. Caching itself stays exactly as
+    configured (disabled stays disabled; the opt-in never raises a 5m child to 1h)."""
+    if getattr(child, "_cache_ttl", None) == "1h" and not profile_pins_1h:
         child._cache_ttl = "5m"
+
+
+def _profile_pins_child_1h(profile_home) -> bool:
+    """True when a profile-routed child's own profile sets ``prompt_caching.cache_ttl`` to the literal
+    ``"1h"``. Call it INSIDE ``delegated_profile_scope(profile_home)`` so it reads the config the child
+    itself was built from. A child without a profile route (``profile_home`` None) never opts in."""
+    if profile_home is None:
+        return False
+    with _quiet("subagent: could not read the profile's prompt_caching.cache_ttl; keeping the 5m clamp"):
+        from hermes_cli.config import load_config_readonly
+        pc = (load_config_readonly() or {}).get("prompt_caching")
+        return isinstance(pc, dict) and pc.get("cache_ttl") == "1h"
+    return False
 
 _CHILD_CAP_MIN = 16_000  # below this a child compresses on every call; treat as a config error
 
@@ -342,8 +363,10 @@ def _build_child_agent(
             rt["provider"], None if profile_home is not None else parent_agent, rt["base_url"],
             effective_requested_provider=rt.get("requested_provider"),
         )
+        # Read in the child's own profile scope, as the child's cache tier was.
+        child_profile_pins_1h = _profile_pins_child_1h(profile_home)
     child._print_fn = getattr(parent_agent, "_print_fn", None)
-    _apply_child_cache_ttl(child)
+    _apply_child_cache_ttl(child, profile_pins_1h=child_profile_pins_1h)
     if child_session_db is not None:
         child._owns_session_db = True  # released by the child's close(), never by the parent
     _reserve_child_transcript(child)
