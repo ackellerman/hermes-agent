@@ -21,7 +21,7 @@ from typing import Any
 
 from agent.context_compressor import ContextCompressor, _PRUNE_MIN_CHARS
 
-from .compaction import CtxpkgCompactionMixin
+from .compaction import VIEW_STRUCTURED, CtxpkgCompactionMixin, load_settings
 from .episodes import message_text
 from .store import MAX_PART_CHARS, RECALL_REF_RE, EpisodeStore, split_parts
 
@@ -57,6 +57,26 @@ class CtxpkgEngine(CtxpkgCompactionMixin, ContextCompressor):
 
     def __init__(self, model: str = ""):
         super().__init__(model=model)
+        # The host sets these before every ``select_context`` (``agent/conversation_loop.py``); the defaults
+        # are the not-allowed state, so an engine driven directly (a test, an older host) serves nothing.
+        self.view_allowed = False
+        self.request_uids: list[str | None] | None = None
+        self.prefill_count = 0
+        self.cache_ttl_seconds: int | None = None
+        self._view_tool_ids: set[str] | None = None
+        self._view_anchor_registered = False
+        self._view_off_logged = False
+        self._rough_tokens = 0
+        self._structured_latch = False
+        try:
+            self._view_settings = load_settings()
+        except Exception:  # a config read must never break constructing the engine
+            logger.debug("ctxpkg settings unreadable at construction", exc_info=True)
+            self._view_settings = None
+        if self._view_settings is None or self._view_settings.view != VIEW_STRUCTURED:
+            # ``view: off`` keeps today's behaviour byte for byte: the host's override check reads this
+            # attribute, sees a non-callable and skips the hook — the per-request clone is not even paid.
+            self.select_context = None
 
     # ── host settings ───────────────────────────────────────────────────────
 
@@ -94,6 +114,125 @@ class CtxpkgEngine(CtxpkgCompactionMixin, ContextCompressor):
         """The episode store for this engine's session (resolved per call; cheap and rotation-stable)."""
         return EpisodeStore.for_session(self._session_id, self._session_db)
 
+    # ── the structured view (``ctxpkg.view: structured``) ───────────────────
+
+    def select_context(self, request_messages: list[dict[str, Any]], *,
+                       conversation_messages: list[dict[str, Any]] | None = None,
+                       incoming_message: dict[str, Any] | None = None,
+                       budget_tokens: int = 0, **kwargs: Any) -> list[dict[str, Any]] | None:
+        """Serve the request as the structured view, or None to leave it exactly as assembled.
+
+        Returns None unless the host allowed the view for this request (``view_allowed``), and unless the
+        request aligns with the uid list the host recorded. Between passes nothing here moves: the view is a
+        function of the request, the uid list and ``view.json``, so a new request only appends to the tail.
+        """
+        if not self.view_allowed:
+            return None
+        from . import view as view_module
+
+        try:
+            store = self.store
+        except Exception:
+            logger.debug("ctxpkg view: no store for this session; serving the request unchanged", exc_info=True)
+            return None
+        now = view_module.now_epoch()
+        state = view_module.ViewState.load(store)
+        self._structured_latch = True
+
+        _offset, reason = view_module.alignment(request_messages, self.request_uids, self.prefill_count)
+        if _offset is None:
+            view_module.append_row(store, view_module.PASSES_NAME,
+                                   view_module.view_off_row(state, reason, now))
+            if not self._view_off_logged:
+                self._view_off_logged = True
+                logger.info("ctxpkg structured view off for this request: %s (session=%s)",
+                            reason, self._session_id or "-")
+            view_module.stamp_request(store, state, now)
+            return None
+
+        self._record_reruns(request_messages, state, store, now)
+        self._register_newest_anchor(state)
+        self._rough_tokens = view_module.rough(conversation_messages)
+        if view_module.should_pass(state, self.cache_ttl_seconds, now):
+            view_module.run_pass(
+                request_messages, self.request_uids or [], conversation_messages, state, store,
+                self._judge(), now, settings=self._view_settings,
+                prefill_count=int(self.prefill_count or 0), ttl_s=self.cache_ttl_seconds,
+            )
+        view_module.stamp_request(store, state, now)
+        return view_module.build_view(request_messages, self.request_uids, self.prefill_count, state)
+
+    def _judge(self) -> Any:
+        """The pass judge: ``keep_all`` in this step; step 5 swaps in the flash judge."""
+        from . import view as view_module
+
+        return view_module.keep_all
+
+    def _record_reruns(self, request_messages: list[dict[str, Any]], state: Any, store: Any,
+                       now: float) -> None:
+        """One ``reruns.jsonl`` row per call this request makes again whose result a pass stubbed."""
+        from . import view as view_module
+
+        try:
+            current = view_module.tool_call_ids(request_messages)
+            previous, self._view_tool_ids = self._view_tool_ids, current
+            if previous is None:
+                return  # the first allowed request only records the set
+            for row in view_module.rerun_rows(request_messages, current - previous, state, now):
+                view_module.append_row(store, view_module.RERUNS_NAME, row)
+        except Exception:
+            logger.debug("ctxpkg rerun detection failed", exc_info=True)
+
+    def _register_newest_anchor(self, state: Any) -> None:
+        """Re-register the newest stored block once per engine instance (the registry is process-local)."""
+        if self._view_anchor_registered:
+            return
+        self._view_anchor_registered = True
+        if state.blocks:
+            from . import view as view_module
+
+            view_module.register_anchor(state.blocks[-1])
+
+    # ── compaction and the backstop (the latch) ─────────────────────────────
+
+    def should_compress_info(self, prompt_tokens: int | None = None) -> tuple[bool, str | None]:
+        """Judge the larger of the provider figure and the raw history's rough size, once latched.
+
+        The served view can be a fraction of the history, so the provider figure alone would never fire
+        again; ``select_context`` records the raw estimate on every allowed request.
+        """
+        if not self._structured_latch:
+            return super().should_compress_info(prompt_tokens)
+        base = prompt_tokens if prompt_tokens is not None else getattr(self, "last_prompt_tokens", 0)
+        try:
+            tokens = max(int(base or 0), int(self._rough_tokens or 0))
+        except (TypeError, ValueError):
+            tokens = base
+        return super().should_compress_info(tokens)
+
+    def compress(self, messages: list[dict[str, Any]], current_tokens: int | None = None,
+                 focus_topic: str | None = None, force: bool = False, memory_context: str = "",
+                 bypass_cooldown: bool = False) -> list[dict[str, Any]]:
+        """The built-in handoff compaction once the view latched; the estimate resets after a compaction."""
+        if not self._structured_latch:
+            return super().compress(messages, current_tokens, focus_topic, force, memory_context,
+                                    bypass_cooldown)
+        result = ContextCompressor.compress(self, messages, current_tokens, focus_topic, force,
+                                            memory_context, bypass_cooldown)
+        self._rough_tokens = 0
+        return result
+
+    def on_session_start(self, session_id: str, **kwargs: Any) -> None:
+        super().on_session_start(session_id, **kwargs)
+        self._rough_tokens = 0
+        self._view_tool_ids = None
+        self._view_anchor_registered = False
+        self._view_off_logged = False
+
+    def on_session_reset(self) -> None:
+        super().on_session_reset()
+        self._rough_tokens = 0
+
     # ── the recall tool ─────────────────────────────────────────────────────
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
@@ -102,6 +241,11 @@ class CtxpkgEngine(CtxpkgCompactionMixin, ContextCompressor):
     def handle_tool_call(self, name: str, args: dict[str, Any], **kwargs) -> str:
         if name != "recall":
             return json.dumps({"error": f"Unknown context engine tool: {name}"})
+        response = self._recall(args)
+        self._record_recall(args, response)
+        return response
+
+    def _recall(self, args: dict[str, Any]) -> str:
         ref = args.get("ref")
         if not isinstance(ref, str) or not RECALL_REF_RE.fullmatch(ref):
             # Refused before any path is built: a ref is never interpolated into one.
@@ -129,9 +273,36 @@ class CtxpkgEngine(CtxpkgCompactionMixin, ContextCompressor):
             return json.dumps({"error": f"could not read {ref}: {exc}"})
         return json.dumps({"ref": ref, "part": part, "parts": len(parts), "text": parts[part - 1]})
 
+    def _record_recall(self, args: dict[str, Any], response: str) -> None:
+        """One ``recalls.jsonl`` row for a recall of a ref a pass wrote (only while the view is allowed)."""
+        if not self.view_allowed:
+            return
+        from . import view as view_module
+
+        try:
+            ref = args.get("ref")
+            if not isinstance(ref, str):
+                return
+            try:
+                payload = json.loads(response)
+            except (TypeError, ValueError):
+                payload = {}
+            status = "ok" if isinstance(payload, dict) and "text" in payload else "error"
+            store = self.store
+            row = view_module.recall_row(view_module.ViewState.load(store), ref, status,
+                                         view_module.now_epoch())
+            if row is not None:
+                view_module.append_row(store, view_module.RECALLS_NAME, row)
+        except Exception:
+            logger.debug("ctxpkg recall row failed", exc_info=True)
+
     def on_turn_complete(self, messages: list[dict[str, Any]], usage: dict[str, Any] | None = None,
                          **kwargs: Any) -> None:
-        """Advance the persisted turn counter and renew every known ref the turn's assistant text names."""
+        """Advance the persisted turn counter and renew every known ref the turn's assistant text names.
+
+        While the view is allowed this also advances ``view_turn`` and records the first-seen turn and epoch
+        of every uid the finished turn carries — the clock the never-candidate rules and the live gate use.
+        """
         try:
             store = self.store
             turn = store.bump_turn()
@@ -143,6 +314,23 @@ class CtxpkgEngine(CtxpkgCompactionMixin, ContextCompressor):
         except Exception:
             # Best-effort observation hook: a store failure must not fail the finished turn.
             logger.debug("ctxpkg warmth update failed", exc_info=True)
+
+        if not self.view_allowed:
+            return
+        from . import view as view_module
+
+        try:
+            store = self.store
+            state = view_module.ViewState.load(store)
+            state.view_turn += 1
+            epoch = view_module.now_epoch()
+            for message in messages or []:
+                uid = message.get("message_uid") if isinstance(message, dict) else None
+                if isinstance(uid, str) and uid and uid not in state.seen:
+                    state.seen[uid] = [int(state.view_turn), float(epoch)]
+            view_module.save_state(store, state)
+        except Exception:
+            logger.debug("ctxpkg view turn update failed", exc_info=True)
 
 
 def register(ctx) -> None:

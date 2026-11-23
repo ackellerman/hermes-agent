@@ -444,18 +444,44 @@ def test_segment_first_turn_offset(tmp_path, monkeypatch):
 # ── config defaults ─────────────────────────────────────────────────────────
 
 def test_ctxpkg_config_defaults():
-    """The three ``ctxpkg`` leaves and the segmenter's default agree (kills c1-c4: a wrong or missing block)."""
+    """The ``ctxpkg`` leaves and the segmenter's default agree (kills c1-c4: a wrong or missing block)."""
     from hermes_cli.config_defaults import DEFAULT_CONFIG
 
-    assert DEFAULT_CONFIG["ctxpkg"] == {"warm_turns": 8, "max_episode_chars": 60000,
-                                        "summary_max_chars": 300}
+    # One exact comparison: a stray, misspelled or missing key anywhere in the block fails here.
+    assert DEFAULT_CONFIG["ctxpkg"] == {
+        "warm_turns": 8,
+        "max_episode_chars": 60000,
+        "summary_max_chars": 300,
+        # The structured view ships off, and its leaves are the ones the plan fixes.
+        "view": "off",
+        "structure": {"keep_turns": 8, "old_after_minutes": 120, "min_stub_chars": 2000,
+                      "max_candidates": 40, "candidate_chars": 4000,
+                      "state_note_chars": 1200, "timeout_seconds": 45},
+    }
     assert DEFAULT_MAX_EPISODE_CHARS == DEFAULT_CONFIG["ctxpkg"]["max_episode_chars"]
 
-    # the leaves are documented, and the docs name the engine's knobs
+    # The leaves are documented, and the docs name the engine's knobs.
     docs = Path(__file__).resolve().parents[2] / "website" / "docs" / "user-guide" / "configuration.md"
     text = docs.read_text(encoding="utf-8")
-    for leaf in ("ctxpkg.warm_turns", "ctxpkg.max_episode_chars", "ctxpkg.summary_max_chars"):
+    for leaf in ("ctxpkg.warm_turns", "ctxpkg.max_episode_chars", "ctxpkg.summary_max_chars",
+                 "ctxpkg.view", "ctxpkg.structure", "structure.keep_turns"):
         assert leaf in text, f"{leaf} is undocumented"
+    # Every new leaf is spelled out WITH its default in the sample block, so a dropped line fails
+    # even when the leaf is still named in prose.
+    block = DEFAULT_CONFIG["ctxpkg"]
+    for leaf, value in block["structure"].items():
+        assert f"{leaf}: {value}" in text, f"ctxpkg.structure.{leaf} is undocumented"
+    # The judge's route is the auxiliary task, not a ctxpkg leaf: `auto` there would be the main model.
+    assert "auxiliary.context_structure" in text, "the context_structure auxiliary task is undocumented"
+    route_lines = [line for line in text.splitlines() if "context_structure" in line]
+    assert route_lines and all(name in route_lines[0]
+                               for name in ("provider", "model", "reasoning_effort", "timeout", "fallback_chain")), (
+        "the auxiliary.context_structure paragraph must name provider, model, reasoning_effort, timeout, "
+        "fallback_chain")
+    assert "context_structure" not in DEFAULT_CONFIG.get("auxiliary", {}), (
+        "the structured judge's route must not ship a default: auto would mean the main model")
+    # Each structured item's full text is kept as an episode, not only as the line served in the view.
+    assert "episode file" in text and "kept whole" in text, "the episode copy of a structured item is undocumented"
 
 
 def test_extract_ids_cap_boundary_at_store_default():

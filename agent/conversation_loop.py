@@ -7,6 +7,7 @@ retries, fallbacks, compression, post-turn hooks). Symbols that callers patch on
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import json
 import logging
@@ -1355,6 +1356,69 @@ def _engine_overrides_hook(engine: Any, name: str) -> bool:
         return True
 
 
+def _engine_cache_ttl_seconds(agent: Any) -> Optional[int]:
+    """The tier the session's prompt cache holds the prefix for, in seconds (300/3600), or None.
+
+    Caching off or ``prompt_caching.cache_ttl`` unset/disabled means no tier exists, so a gap can never be
+    measured against one and a pass never runs.
+    """
+    if not getattr(agent, "_use_prompt_caching", False):
+        return None
+    ttl = getattr(agent, "_cache_ttl", None)
+    if ttl is None:
+        return None
+    effective = effective_cache_ttl(
+        ttl, model=getattr(agent, "model", "") or "", provider=getattr(agent, "provider", "") or "",
+    )
+    return 3600 if effective == "1h" else 300
+
+
+def _engine_view_allowed(agent: Any) -> bool:
+    """Whether this session may serve the structured view and write its state.
+
+    A delegated child, a review fork, a one-shot run and a webhook must write nothing: ``recall`` has to be a
+    registered tool (otherwise the view's own block is the only way back to an episode and the model cannot
+    follow it), the session source must be paced by a person, the turn must be a foreground turn (a
+    background review's writes are staged), persistence must not be disabled, and the session needs an id to
+    key its episode store on.
+    """
+    from agent.prompt_caching import MACHINE_PACED_SOURCES
+    from agent.session_source import session_source_for
+
+    if "recall" not in (getattr(agent, "_context_engine_tool_names", None) or ()):
+        return False
+    if session_source_for(getattr(agent, "platform", None)) in MACHINE_PACED_SOURCES:
+        return False
+    if getattr(agent, "_memory_write_context", "foreground") != "foreground":
+        return False
+    if getattr(agent, "_persist_disabled", False):
+        return False
+    return bool(getattr(agent, "session_id", "") or "")
+
+
+def _set_engine_view_attributes(engine: Any, ttl_seconds: Optional[int], request_uids: Optional[list[str]],
+                                prefill_count: int, view_allowed: bool, *, logger: Any = None) -> None:
+    """Set the four view facts on *engine* in one go; the caller wraps this (an engine may refuse a name).
+
+    A third-party engine that implements ``select_context`` may refuse one of these names (``__slots__``,
+    a read-only property, a validating setter). At base such an engine was served unchanged and no
+    attribute was touched; here the writes are sequential, so a refusal raises on that name and costs the
+    names after it, and the caller's fallback then writes the safe values one name at a time, so request
+    assembly never raises where it did not at base. The refused name is logged at DEBUG before it is
+    re-raised, so an operator sees WHICH fact cost the engine its view, not only the traceback.
+    """
+    for name, value in zip(
+        ("cache_ttl_seconds", "request_uids", "prefill_count", "view_allowed"),
+        (ttl_seconds, request_uids, prefill_count, view_allowed),
+    ):
+        try:
+            setattr(engine, name, value)
+        except Exception:
+            if logger is not None:
+                logger.debug("Context engine refused the view attribute %s; its view stays off", name)
+            raise
+
+
 def _apply_context_engine_selection(
     agent: Any, api_messages: list[dict[str, Any]], conversation_messages: list[dict[str, Any]],
     incoming_message: Optional[dict[str, Any]], *, logger: Any,
@@ -1364,6 +1428,39 @@ def _apply_context_engine_selection(
     engine = getattr(agent, "context_compressor", None)
     if not _engine_overrides_hook(engine, "select_context"):
         return api_messages
+
+    # The facts a selection needs about THIS request, handed over only to an engine that implements the
+    # hook: the tier this session's cache holds, the uid list the request was assembled from
+    # (``agent/turn_context.py``), the prefill rows that sit between the system message and the uids, and
+    # whether this session may write. The first call sets all four at once, so a failure during derivation
+    # or a name the engine refuses (``__slots__``, a read-only property) lands in the ``except``; that
+    # fallback then writes the four safe values one name at a time, each in its own guard, so a name the
+    # engine refuses does not cost the names after it their safe value. Request assembly never raises
+    # where it did not at base.
+    ttl_seconds: Optional[int] = None
+    request_uids: Optional[list[str]] = None
+    prefill_count = 0
+    view_allowed = False
+    try:
+        ttl_seconds = _engine_cache_ttl_seconds(agent)
+        uids = getattr(agent, "_request_message_uids", None)
+        request_uids = list(uids) if isinstance(uids, (list, tuple)) else None
+        prefill_count = len(getattr(agent, "prefill_messages", None) or [])
+        view_allowed = _engine_view_allowed(agent)
+        _set_engine_view_attributes(engine, ttl_seconds, request_uids, prefill_count, view_allowed,
+                                    logger=logger)
+    except Exception:
+        logger.debug("Context engine view attributes could not be derived or set; using the safe values",
+                     exc_info=True)
+        ttl_seconds, request_uids, prefill_count, view_allowed = None, None, 0, False
+        for name, safe_value in (
+            ("cache_ttl_seconds", ttl_seconds),
+            ("request_uids", request_uids),
+            ("prefill_count", prefill_count),
+            ("view_allowed", view_allowed),
+        ):
+            with contextlib.suppress(Exception):
+                setattr(engine, name, safe_value)
 
     session_label = getattr(agent, "session_id", None) or "-"
     # Structural clones: the engine must not be able to write through nested
