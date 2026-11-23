@@ -513,7 +513,11 @@ def test_no_pass_while_cache_warm(tmp_path, monkeypatch):
 
 
 def test_pass_after_ttl_since_last_request(tmp_path, monkeypatch):
-    """The next request at or past the tier runs exactly one pass."""
+    """The next request at or past the tier runs exactly one pass.
+
+    No ``auxiliary.context_structure`` route is pinned here, so since step 5 the pass's judge is the flash
+    judge with no route: it makes no call and keeps every candidate, and the row says ``no_route``.
+    """
     clock = _clock(monkeypatch)
     engine = _engine(tmp_path, monkeypatch)
     conversation = _superseded_history()
@@ -524,9 +528,9 @@ def test_pass_after_ttl_since_last_request(tmp_path, monkeypatch):
 
     rows = _rows(tmp_path, "passes.jsonl")
     assert len(rows) == 1, "one pass for the expired gap"
-    assert rows[0]["status"] == "ok"
+    assert rows[0]["status"] == "no_route", "no route pinned: the pass records it and moves nothing"
     assert rows[0]["candidates"] == 1, "only turn 2's superseded result is a candidate"
-    assert rows[0]["structured"] == 0, "the step's judge keeps everything"
+    assert rows[0]["structured"] == 0, "the judge keeps everything"
     assert rows[0]["ttl_s"] == TTL
     assert rows[0]["idle_s"] == pytest.approx(TTL)
     assert served is not None
@@ -539,7 +543,7 @@ def test_pass_after_ttl_since_last_request(tmp_path, monkeypatch):
     clock.advance(TTL)
     _ask(engine, conversation, prefill=1, request=[_system(), prefill, *conversation])
     rows = _rows(tmp_path, "passes.jsonl")
-    assert [row["status"] for row in rows] == ["ok", "ok"]
+    assert [row["status"] for row in rows] == ["no_route", "no_route"]
     assert rows[1]["candidates"] == 1, "run_pass aligns with the prefill rows between the system and the uids"
 
     # A cold ``recall`` result is a candidate through a real pass: run_pass hands candidates the store.
@@ -550,7 +554,7 @@ def test_pass_after_ttl_since_last_request(tmp_path, monkeypatch):
     clock.advance(TTL)
     _ask(engine, recalled)
     rows = _rows(tmp_path, "passes.jsonl")
-    assert rows[-1]["status"] == "ok" and rows[-1]["candidates"] == 1, (
+    assert rows[-1]["status"] == "no_route" and rows[-1]["candidates"] == 1, (
         "a cold recall result is offered to the pass; a pass that dropped the store would see none")
 
 

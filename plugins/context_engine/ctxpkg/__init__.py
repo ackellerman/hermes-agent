@@ -66,6 +66,7 @@ class CtxpkgEngine(CtxpkgCompactionMixin, ContextCompressor):
         self._view_tool_ids: set[str] | None = None
         self._view_anchor_registered = False
         self._view_off_logged = False
+        self._view_recent = ""
         self._rough_tokens = 0
         self._structured_latch = False
         try:
@@ -154,6 +155,9 @@ class CtxpkgEngine(CtxpkgCompactionMixin, ContextCompressor):
         self._register_newest_anchor(state)
         self._rough_tokens = view_module.rough(conversation_messages)
         if view_module.should_pass(state, self.cache_ttl_seconds, now):
+            self._view_recent = view_module.recent_text(
+                request_messages, self.request_uids or [], self._view_settings,
+                prefill_count=int(self.prefill_count or 0))
             view_module.run_pass(
                 request_messages, self.request_uids or [], conversation_messages, state, store,
                 self._judge(), now, settings=self._view_settings,
@@ -163,10 +167,10 @@ class CtxpkgEngine(CtxpkgCompactionMixin, ContextCompressor):
         return view_module.build_view(request_messages, self.request_uids, self.prefill_count, state)
 
     def _judge(self) -> Any:
-        """The pass judge: ``keep_all`` in this step; step 5 swaps in the flash judge."""
+        """The pass judge: one flash call per pass, its usage read back as ``flash_in``/``flash_out``."""
         from . import view as view_module
 
-        return view_module.keep_all
+        return view_module.FlashJudge(self._view_settings, recent=self._view_recent)
 
     def _record_reruns(self, request_messages: list[dict[str, Any]], state: Any, store: Any,
                        now: float) -> None:
@@ -228,6 +232,7 @@ class CtxpkgEngine(CtxpkgCompactionMixin, ContextCompressor):
         self._view_tool_ids = None
         self._view_anchor_registered = False
         self._view_off_logged = False
+        self._view_recent = ""
 
     def on_session_reset(self) -> None:
         super().on_session_reset()
