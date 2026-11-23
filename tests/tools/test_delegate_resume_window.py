@@ -341,9 +341,11 @@ def test_in_process_spec_uses_spec_session(monkeypatch, tmp_path):
     assert len(other.builds) == 1 and len(other.turns) == 1
 
 
-def test_recovered_child_not_warm(monkeypatch, tmp_path):
-    """A child boot recovery finished, whose session ended two hours before the recovery, is refused at
-    ``recovery + 10``: ``recover_abandoned`` must not stamp ``stopped_at`` on it."""
+def test_recovered_child_resumes_past_window(monkeypatch, tmp_path):
+    """A child boot recovery finished, whose session ended two hours before the recovery, RESUMES at
+    ``recovery + 10``: ``recover_abandoned`` must not stamp ``stopped_at`` on it (a boot would make a long-dead
+    child read as just stopped), and its record's ``unknown`` outcome exempts it from the window whatever its idle
+    age — the window prices a run that ended on its own terms and then sat idle."""
     clock = _Clock()
     model, parent, sid = _spawned(tmp_path)
     _set_session(parent, model.turns[0]["session_id"], ended_at=clock.now - 7200)
@@ -358,9 +360,10 @@ def test_recovered_child_not_warm(monkeypatch, tmp_path):
     _use_clock(monkeypatch, dtc, clock)
     with patch("run_agent.AIAgent", side_effect=model):
         cont = _continue(parent, sid, "go on")
-    assert "has been idle 120 min, past its 4 min resume window" in cont.get("error", ""), cont
-    assert len(model.builds) == 1 and len(model.turns) == 1
-    assert _durable(parent, sid)["state"] == "resumable"
+        assert cont.get("status") == "dispatched", cont
+        _completion(cont["delegation_id"])
+    assert len(model.builds) == 2 and len(model.turns) == 2
+    assert _durable(parent, sid)["state"] == "completed"
 
 
 # ── config ──────────────────────────────────────────────────────────────────

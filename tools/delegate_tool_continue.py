@@ -217,7 +217,9 @@ def _idle_seconds(spec: dict[str, Any], record: Optional[dict[str, Any]], parent
                   now: float) -> Optional[float]:
     """How long the child has been idle. ``_finish`` writes ``stopped_at`` at the run's own end, so it is the
     signal; a record without one (boot recovery and the dead-owner reclaim do not stamp it) falls back to the
-    ``ended_at`` of the session the spec names. None when neither can be read: the caller fails closed."""
+    ``ended_at`` of the session the spec names. None when neither can be read: the caller fails closed — unless the
+    record's outcome says the run was interrupted, in which case the window does not apply at all and this is never
+    asked (``_window_exempt``)."""
     stopped = (record or {}).get("stopped_at")
     if isinstance(stopped, (int, float)) and not isinstance(stopped, bool):
         return max(0.0, now - float(stopped))
@@ -234,6 +236,18 @@ def _idle_seconds(spec: dict[str, Any], record: Optional[dict[str, Any]], parent
             return None
     ended = (row or {}).get("ended_at")
     return max(0.0, now - float(ended)) if isinstance(ended, (int, float)) and not isinstance(ended, bool) else None
+
+
+def _window_exempt(record: Optional[dict[str, Any]]) -> bool:
+    """Whether the resume window does not apply to this child at all: true exactly when *record* says its run was
+    interrupted (``outcome`` ``interrupted`` or ``unknown``).
+
+    The window prices a cold prompt cache against a run that ENDED and then sat idle. A child whose durable record
+    says ``interrupted`` (a gateway restart, a parent ``stop``, a kill mid-run) or ``unknown`` (boot recovery and the
+    dead-owner reclaim finish a run whose owner process died) never ended on its own terms, so its age says nothing
+    about whether its context is stale: it is resumable whatever the age, including when no age can be read. A spec
+    with no durable record (in-process only) is not exempt, and neither is a finished run."""
+    return isinstance(record, dict) and record.get("outcome") in ("interrupted", "unknown")
 
 
 def _window_refusal(sid: str, profile: Optional[str], idle: Optional[float], window: int) -> Optional[str]:
@@ -269,10 +283,18 @@ def continue_subagent(subagent_id: Optional[str], message: Optional[str], parent
     from tools.delegate_tool_config import _resume_window_seconds
     profile = _child_profile(spec, parent_agent)
     window = _resume_window_seconds(profile)
-    # A cold prompt cache is not worth paying for: past the window (or with no idle age at all) refuse, and hand
-    # the claim back exactly as the failure path below does.
-    idle = _idle_seconds(spec, record, parent_agent, time.time()) if window > 0 else None
-    stale = _window_refusal(sid, profile, idle, window)
+    # A cold prompt cache is not worth paying for: past the window (or with no idle age at all) refuse, and hand the
+    # claim back exactly as the failure path below does. The window prices a run that ENDED and then sat idle only:
+    # an interrupted one (its record's outcome ``interrupted`` or ``unknown``: a gateway restart, a crash, a stop
+    # mid-run) is resumed whatever its age, as a warm child is.
+    exempt = _window_exempt(record)
+    idle: Optional[float] = None
+    stale: Optional[str] = None
+    if window > 0 and exempt:
+        logger.info("resume window: %s exempt (outcome %s)", sid, (record or {}).get("outcome"))
+    elif window > 0:
+        idle = _idle_seconds(spec, record, parent_agent, time.time())
+        stale = _window_refusal(sid, profile, idle, window)
     if stale:
         _release_resume(sid, spec)
         if record is not None:
