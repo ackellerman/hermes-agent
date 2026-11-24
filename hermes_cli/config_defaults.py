@@ -1572,9 +1572,11 @@ DEFAULT_CONFIG = {
         # See #12136.
         "dm_role_auth_guild": "",
         # discord / discord_admin tools: allowed actions (comma string or YAML list; empty = all,
-        # subject to bot intents; unknown names dropped with a warning): list_guilds, server_info,
-        # list_channels, channel_info, list_roles, member_info, search_members, fetch_messages,
-        # list_pins, pin_message, unpin_message, create_thread, add_role, remove_role.
+        # subject to bot intents; unknown names dropped with a warning). The full set is
+        # tools/discord_tool.py::_ACTION_MANIFEST, split by _CORE_ACTION_NAMES (core: fetch_messages,
+        # search_members, create_thread, send_message, react, archive_thread, rename_thread,
+        # add_thread_member, list_forum_tags — the rest is discord_admin). Narrowing this list drops
+        # any action it does not name, including new ones.
         "server_actions": "",
         # DEPRECATED no-op (uploads are always cached; messaging auth is the gate). Kept so existing
         # configs don't error. Env: DISCORD_ALLOW_ANY_ATTACHMENT.

@@ -504,7 +504,14 @@ def _rename_thread(
             f"discord(action=\"archive_thread\", channel_id=\"{channel_id}\", archived=false) — "
             "then call rename_thread again.")
     from gateway.platforms.base import _prefix_within_utf16_limit, utf16_len
-    if utf16_len(cleaned) > 100:
+    try:
+        over_budget = utf16_len(cleaned) > 100
+    except UnicodeEncodeError:
+        # A JSON-legal lone surrogate (\ud83c) decodes but cannot be UTF-16 encoded.
+        return tool_error(
+            "rename_thread: `name` contains an unpaired surrogate (half an emoji), "
+            "which cannot be encoded for Discord; send the whole character.")
+    if over_budget:
         cleaned = _prefix_within_utf16_limit(cleaned, 100).rstrip()
     thread = _discord_request(
         "PATCH", f"/channels/{channel_id}", token, body={"name": cleaned}) or {}
@@ -612,7 +619,7 @@ _ACTION_MANIFEST = [
     ("archive_thread", _archive_thread, "(channel_id)",
      "archive (close) a thread; optional archived=false reopens it — archive only, never locks"),
     ("rename_thread", _rename_thread, "(channel_id, name)",
-     "rename a thread or forum post — its title (truncated to 100 characters)"),
+     "rename a thread or forum post — its title (capped at 100 UTF-16 units, truncated)"),
     ("edit_message", _edit_message, "(channel_id, message_id, content)",
      "edit a message the bot authored"),
     ("add_thread_member", _add_thread_member, "(channel_id, user_id)",

@@ -783,6 +783,8 @@ class TestRenameThread:
         ))
         assert "error" in result
         assert "MANAGE_THREADS" in result["error"]
+        assert "cannot view" in result["error"]      # the probe-side cause, not just a permission
+        assert "so this is a thread permission" not in result["error"]
         assert "50001" in result["error"]      # raw body preserved
 
     @patch("tools.discord_tool._discord_request")
@@ -812,6 +814,36 @@ class TestRenameThread:
     def test_rename_thread_is_in_the_core_tool(self):
         """An admin-only action would not have fixed the seat that hit the wall."""
         assert "rename_thread" in _CORE_ACTIONS
+
+    @patch("tools.discord_tool._discord_request")
+    def test_rename_thread_accepts_a_real_shaped_thread_probe(self, mock_req, monkeypatch):
+        """Discord always returns thread_metadata on a thread; the guard must read it,
+        not treat its presence as 'archived'."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "900", "type": 11, "name": "old", "parent_id": "55", "owner_id": "77",
+             "thread_metadata": {"archived": False, "auto_archive_duration": 1440,
+                                 "archive_timestamp": "2026-11-01T00:00:00Z", "locked": False}},
+            {"id": "900", "name": "Title"},
+        ]
+        result = json.loads(discord_core(
+            action="rename_thread", channel_id="900", name="Title",
+        ))
+        assert result["success"] is True
+        assert result["name_verified"] is True
+        assert mock_req.call_args_list[1].args[:2] == ("PATCH", "/channels/900")
+
+    @patch("tools.discord_tool._discord_request")
+    def test_rename_thread_refuses_a_lone_surrogate(self, mock_req, monkeypatch):
+        """A JSON-legal half-emoji cannot be UTF-16 encoded; refuse it, do not raise."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "900", "type": 11, "name": "old"}
+        result = json.loads(discord_core(
+            action="rename_thread", channel_id="900", name="\ud83c",
+        ))
+        assert "error" in result
+        assert "surrogate" in result["error"]
+        assert mock_req.call_count == 1        # the probe only
 
     @patch("tools.discord_tool._discord_request")
     def test_rename_thread_does_not_call_a_sent_name_verified(self, mock_req, monkeypatch):
