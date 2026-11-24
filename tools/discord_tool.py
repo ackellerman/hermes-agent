@@ -457,6 +457,9 @@ def _set_thread_tags(
         "applied_tags": thread.get("applied_tags", tags)})
 
 
+_INVISIBLE_ONLY = frozenset("\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\u2064\ufeff")
+
+
 def _rename_thread(
     token: str, channel_id: str, name: str = "", **_kwargs: Any) -> str:
     """Rename a thread or forum post — set its ``name`` (the post title).
@@ -467,29 +470,55 @@ def _rename_thread(
     non-thread refused, so an agent asked to retitle a post cannot rename a
     server channel by passing the wrong id.
 
-    Names are budgeted at 100 characters; longer input is truncated rather than
-    refused, so a caller that assembled a title from a filename never eats a 400.
-    Discord answers with the updated channel object, and ``name`` in the result
-    is the one it echoes back (the server may trim further), not necessarily the
-    string we sent.
+    Names are whitespace-collapsed and budgeted at 100 UTF-16 units (the unit the
+    platform adapter measures the same field in); longer input is truncated rather
+    than refused, so a caller that assembled a title from a filename never eats a
+    400. Discord answers with the updated channel object, and ``name`` carries the
+    title it echoes back — so ``name_verified`` says whether the result is a
+    readback or only what we sent.
+
+    An archived thread cannot be edited (Discord answers 400 / 50083), and
+    auto-archived posts are the common case for older ones: archived is reported
+    as an actionable error instead of a raw failure, and the thread is not
+    reopened behind the caller's back.
     """
     cleaned = " ".join(str(name or "").split())
-    if not cleaned:
+    if not cleaned or all(ch in _INVISIBLE_ONLY for ch in cleaned):
         return tool_error("rename_thread: `name` must contain a non-space character.")
     info = _discord_request("GET", f"/channels/{channel_id}", token) or {}
     channel_type = info.get("type")
     # 10 = NEWS_THREAD, 11 = PUBLIC_THREAD, 12 = PRIVATE_THREAD. A FORUM channel (15)
     # is the container, not a post; its posts are threads and pass this check.
     if channel_type not in (10, 11, 12):
-        kind = _channel_type_name(channel_type if channel_type is not None else -1)
+        if channel_type is None:
+            where = "the channel object carried no type"
+        else:
+            where = f"type={channel_type} → {_channel_type_name(channel_type)}"
         return tool_error(
-            f"rename_thread: channel {channel_id} is not a thread (type={channel_type} → {kind}); "
+            f"rename_thread: channel {channel_id} is not a thread ({where}); "
             "this action renames threads and forum posts only.")
+    if (info.get("thread_metadata") or {}).get("archived"):
+        return tool_error(
+            f"rename_thread: thread {channel_id} is archived, and Discord refuses edits on "
+            "archived threads (400, code 50083). Reopen it first — "
+            f"discord(action=\"archive_thread\", channel_id=\"{channel_id}\", archived=false) — "
+            "then call rename_thread again.")
+    from gateway.platforms.base import _prefix_within_utf16_limit, utf16_len
+    if utf16_len(cleaned) > 100:
+        cleaned = _prefix_within_utf16_limit(cleaned, 100).rstrip()
     thread = _discord_request(
-        "PATCH", f"/channels/{channel_id}", token, body={"name": cleaned[:100]}) or {}
-    return json.dumps({
+        "PATCH", f"/channels/{channel_id}", token, body={"name": cleaned}) or {}
+    live_name = thread.get("name")
+    result: dict[str, Any] = {
         "success": True, "thread_id": thread.get("id", channel_id),
-        "name": thread.get("name", cleaned[:100])})
+        "name_verified": isinstance(live_name, str) and bool(live_name)}
+    if result["name_verified"]:
+        result["name"] = live_name
+    else:
+        # The response carried no name: report what we sent, labelled as such,
+        # never as a readback.
+        result["name_sent"] = cleaned
+    return json.dumps(result)
 
 
 def _add_thread_member(token: str, channel_id: str, user_id: str, **_kwargs: Any) -> str:
@@ -656,7 +685,9 @@ _TOOL_DESCRIPTIONS = {
         "Use search_members to look up user IDs by name prefix. "
         "create_thread with user_id adds that person as a thread member — Discord only lists a "
         "thread in someone's sidebar once they are a member, so always pass it when the thread "
-        "is for a human. archive_thread closes a thread (archive only; archived=false reopens).",
+        "is for a human. archive_thread closes a thread (archive only; archived=false reopens). "
+        "rename_thread sets a post's title (100 UTF-16 units, truncated), and refuses a "
+        "non-thread channel or an archived thread.",
     ),
 }
 
@@ -670,8 +701,9 @@ _SCHEMA_PROPERTIES: dict[str, Any] = {
     "name": {
         "type": "string",
         "description": (
-            "Thread name: the title of a new thread (create_thread) or the new title for an "
-            "existing one (rename_thread). Capped at 100 characters; longer input is truncated."
+            "Thread name: the title of a new thread (create_thread, sent as given) or the new "
+            "title for an existing one (rename_thread, whitespace-collapsed and capped at 100 "
+            "UTF-16 units; longer input is truncated, not refused)."
         ),
     },
     "applied_tags": {
@@ -781,8 +813,8 @@ _ACTION_403_HINT = {
     "react": "Bot lacks ADD_REACTIONS in this channel, or the emoji/id is invalid.",
     "archive_thread": "Bot lacks MANAGE_THREADS (or is not a thread member) on this thread.",
     "rename_thread": (
-        "Bot lacks MANAGE_THREADS on this thread (or is not its owner or a thread member). "
-        "A non-thread channel is refused before the PATCH, so this is a thread permission."),
+        "Bot lacks MANAGE_THREADS on this thread, or cannot view that channel id at all — "
+        "a wrong or stale id lands here too, from the type probe before any PATCH."),
     "add_thread_member": "Bot cannot add members to this thread (it must be a member itself, and the thread must not be archived).",
     "set_thread_tags": (
         "Bot lacks MANAGE_THREADS in this forum (or is not the thread owner). "

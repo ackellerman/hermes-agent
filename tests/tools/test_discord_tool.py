@@ -700,6 +700,7 @@ class TestRenameThread:
         assert result["success"] is True
         assert result["thread_id"] == "900"
         assert result["name"] == "Rover NGSS — Spark Design Draft 3"
+        assert result["name_verified"] is True
         # GET first (is it a thread?), then the PATCH that sets the title.
         assert mock_req.call_args_list[0].args[:2] == ("GET", "/channels/900")
         assert mock_req.call_args_list[1].args[:2] == ("PATCH", "/channels/900")
@@ -720,18 +721,30 @@ class TestRenameThread:
         assert result["name"] == "Trimmed by the server"
 
     @patch("tools.discord_tool._discord_request")
-    def test_rename_thread_truncates_at_the_100_char_cap(self, mock_req, monkeypatch):
-        """A title assembled from a filename must not earn a 400."""
+    def test_rename_thread_truncates_at_the_100_utf16_unit_cap(self, mock_req, monkeypatch):
+        """A title assembled from a filename must not earn a 400.
+
+        Measured in UTF-16 units, the unit the platform adapter measures this field
+        in and the stricter reading of Discord's "1-100 characters" — so the cut is
+        never under-budget on an emoji title, and never leaves a trailing space.
+        """
+        from gateway.platforms.base import utf16_len
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
         mock_req.side_effect = [
             {"id": "900", "type": 11, "name": "old"},
             {"id": "900", "name": "x" * 100},
         ]
-        result = json.loads(discord_core(
-            action="rename_thread", channel_id="900", name="word " * 40,
-        ))
-        assert "error" not in result
-        assert len(mock_req.call_args.kwargs["body"]["name"]) == 100
+        json.loads(discord_core(action="rename_thread", channel_id="900", name="word " * 40))
+        sent = mock_req.call_args.kwargs["body"]["name"]
+        assert utf16_len(sent) <= 100
+        assert not sent.endswith(" ")          # the collapse invariant survives the cut
+        assert sent.startswith("word word")    # and the text is what was asked for
+        # 80 astral emoji are 160 UTF-16 units: a code-point cap would have sent 80.
+        mock_req.side_effect = [{"id": "900", "type": 11}, {"id": "900", "name": "ok"}]
+        json.loads(discord_core(action="rename_thread", channel_id="900", name="🎨" * 80))
+        sent = mock_req.call_args.kwargs["body"]["name"]
+        assert utf16_len(sent) <= 100
+        assert len(sent) < 80
 
     @patch("tools.discord_tool._discord_request")
     def test_rename_thread_collapses_whitespace(self, mock_req, monkeypatch):
@@ -799,6 +812,61 @@ class TestRenameThread:
     def test_rename_thread_is_in_the_core_tool(self):
         """An admin-only action would not have fixed the seat that hit the wall."""
         assert "rename_thread" in _CORE_ACTIONS
+
+    @patch("tools.discord_tool._discord_request")
+    def test_rename_thread_does_not_call_a_sent_name_verified(self, mock_req, monkeypatch):
+        """An empty PATCH response must not read as a readback of the new title."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [{"id": "900", "type": 11, "name": "old"}, {}]
+        result = json.loads(discord_core(
+            action="rename_thread", channel_id="900", name="Title",
+        ))
+        assert result["success"] is True
+        assert result["name_verified"] is False
+        assert result["name_sent"] == "Title"
+        assert "name" not in result
+
+    @patch("tools.discord_tool._discord_request")
+    def test_rename_thread_refuses_an_archived_thread(self, mock_req, monkeypatch):
+        """Edits on archived threads fail 50083; say so with the call that unblocks it."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {
+            "id": "900", "type": 11, "name": "old",
+            "thread_metadata": {"archived": True, "archive_timestamp": "2026-01-01T00:00:00Z"},
+        }
+        result = json.loads(discord_core(
+            action="rename_thread", channel_id="900", name="Title",
+        ))
+        assert "error" in result
+        assert "archived" in result["error"]
+        assert "archived=false" in result["error"]
+        assert mock_req.call_count == 1          # the probe only — no PATCH, no reopen
+
+    @patch("tools.discord_tool._discord_request")
+    def test_rename_thread_fails_closed_without_a_type(self, mock_req, monkeypatch):
+        """A channel object with no usable type must refuse, not fall through to PATCH."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        for probe in ({}, {"id": "900"}, {"id": "900", "type": None}, {"id": "900", "type": "11"}):
+            mock_req.reset_mock()
+            mock_req.return_value = probe
+            result = json.loads(discord_core(
+                action="rename_thread", channel_id="900", name="Title",
+            ))
+            assert "error" in result, probe
+            assert "not a thread" in result["error"], probe
+            assert mock_req.call_count == 1, probe
+
+    @patch("tools.discord_tool._discord_request")
+    def test_rename_thread_refuses_a_visually_blank_name(self, mock_req, monkeypatch):
+        """A zero-width-only title is blank to a reader; the guard must catch it."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        for name in ("\u200b", "\u200b\u200c", " \u200d "):
+            result = json.loads(discord_core(
+                action="rename_thread", channel_id="900", name=name,
+            ))
+            assert "error" in result, repr(name)
+            assert "non-space" in result["error"], repr(name)
+        mock_req.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
