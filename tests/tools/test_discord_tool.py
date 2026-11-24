@@ -675,6 +675,133 @@ class TestSetThreadTags:
 
 
 # ---------------------------------------------------------------------------
+# Action: rename_thread
+# ---------------------------------------------------------------------------
+
+class TestRenameThread:
+    """A post's title is set with one PATCH, after a type check.
+
+    The seat that needs this (an agent retitling a post it opened) carries the
+    CORE `discord` tool only, so the action has to live there.
+    """
+
+    @patch("tools.discord_tool._discord_request")
+    def test_rename_thread_sets_the_name_and_reports_the_readback(self, mock_req, monkeypatch):
+        """The PATCH response is the readback: the name Discord stored."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "900", "type": 11, "name": "old title"},
+            {"id": "900", "type": 11, "name": "Rover NGSS — Spark Design Draft 3"},
+        ]
+        result = json.loads(discord_core(
+            action="rename_thread", channel_id="900",
+            name="Rover NGSS — Spark Design Draft 3",
+        ))
+        assert result["success"] is True
+        assert result["thread_id"] == "900"
+        assert result["name"] == "Rover NGSS — Spark Design Draft 3"
+        # GET first (is it a thread?), then the PATCH that sets the title.
+        assert mock_req.call_args_list[0].args[:2] == ("GET", "/channels/900")
+        assert mock_req.call_args_list[1].args[:2] == ("PATCH", "/channels/900")
+        assert mock_req.call_args_list[1].kwargs["body"] == {
+            "name": "Rover NGSS — Spark Design Draft 3"}
+
+    @patch("tools.discord_tool._discord_request")
+    def test_rename_thread_reports_the_servers_name_not_the_sent_one(self, mock_req, monkeypatch):
+        """If Discord trims the name, the result says what is live, not what we asked for."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "900", "type": 11, "name": "old"},
+            {"id": "900", "name": "Trimmed by the server"},
+        ]
+        result = json.loads(discord_core(
+            action="rename_thread", channel_id="900", name="Something longer",
+        ))
+        assert result["name"] == "Trimmed by the server"
+
+    @patch("tools.discord_tool._discord_request")
+    def test_rename_thread_truncates_at_the_100_char_cap(self, mock_req, monkeypatch):
+        """A title assembled from a filename must not earn a 400."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "900", "type": 11, "name": "old"},
+            {"id": "900", "name": "x" * 100},
+        ]
+        result = json.loads(discord_core(
+            action="rename_thread", channel_id="900", name="word " * 40,
+        ))
+        assert "error" not in result
+        assert len(mock_req.call_args.kwargs["body"]["name"]) == 100
+
+    @patch("tools.discord_tool._discord_request")
+    def test_rename_thread_collapses_whitespace(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [{"id": "900", "type": 11}, {"id": "900", "name": "A B"}]
+        discord_core(action="rename_thread", channel_id="900", name="  A\n\t B  ")
+        assert mock_req.call_args.kwargs["body"] == {"name": "A B"}
+
+    def test_rename_thread_requires_a_name(self, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        result = json.loads(discord_core(action="rename_thread", channel_id="900"))
+        assert "error" in result
+        assert "Missing required parameters" in result["error"]
+        assert "name" in result["error"]
+
+    @patch("tools.discord_tool._discord_request")
+    def test_rename_thread_refuses_a_blank_name(self, mock_req, monkeypatch):
+        """Whitespace only passes the required-param check; it must not reach Discord."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        result = json.loads(discord_core(
+            action="rename_thread", channel_id="900", name="   ",
+        ))
+        assert "error" in result
+        assert "non-space" in result["error"]
+        mock_req.assert_not_called()
+
+    @patch("tools.discord_tool._discord_request")
+    def test_rename_thread_403_names_manage_threads(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "900", "type": 11},
+            DiscordAPIError(403, '{"message": "Missing Permissions", "code": 50001}'),
+        ]
+        result = json.loads(discord_core(
+            action="rename_thread", channel_id="900", name="Title",
+        ))
+        assert "error" in result
+        assert "MANAGE_THREADS" in result["error"]
+        assert "50001" in result["error"]      # raw body preserved
+
+    @patch("tools.discord_tool._discord_request")
+    def test_rename_thread_refuses_a_plain_channel(self, mock_req, monkeypatch):
+        """PATCH /channels/{id} would rename a server channel; the type probe stops it."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "11", "type": 0, "name": "general"}
+        result = json.loads(discord_core(
+            action="rename_thread", channel_id="11", name="renamed",
+        ))
+        assert "error" in result
+        assert "not a thread" in result["error"]
+        assert mock_req.call_count == 1          # the probe only — no PATCH
+
+    @patch("tools.discord_tool._discord_request")
+    def test_rename_thread_refuses_a_forum_channel(self, mock_req, monkeypatch):
+        """A FORUM channel (15) is the container; its posts are the threads."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "55", "type": 15, "name": "support"}
+        result = json.loads(discord_core(
+            action="rename_thread", channel_id="55", name="renamed",
+        ))
+        assert "error" in result
+        assert "forum" in result["error"]
+        assert mock_req.call_count == 1
+
+    def test_rename_thread_is_in_the_core_tool(self):
+        """An admin-only action would not have fixed the seat that hit the wall."""
+        assert "rename_thread" in _CORE_ACTIONS
+
+
+# ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
 

@@ -457,6 +457,41 @@ def _set_thread_tags(
         "applied_tags": thread.get("applied_tags", tags)})
 
 
+def _rename_thread(
+    token: str, channel_id: str, name: str = "", **_kwargs: Any) -> str:
+    """Rename a thread or forum post — set its ``name`` (the post title).
+
+    ``channel_id`` is the thread / forum-post ID. Threads are channels under the
+    API, so ``PATCH /channels/{id}`` with ``{"name": ...}`` is also the call that
+    renames a plain server channel: the target's ``type`` is probed first and a
+    non-thread refused, so an agent asked to retitle a post cannot rename a
+    server channel by passing the wrong id.
+
+    Names are budgeted at 100 characters; longer input is truncated rather than
+    refused, so a caller that assembled a title from a filename never eats a 400.
+    Discord answers with the updated channel object, and ``name`` in the result
+    is the one it echoes back (the server may trim further), not necessarily the
+    string we sent.
+    """
+    cleaned = " ".join(str(name or "").split())
+    if not cleaned:
+        return tool_error("rename_thread: `name` must contain a non-space character.")
+    info = _discord_request("GET", f"/channels/{channel_id}", token) or {}
+    channel_type = info.get("type")
+    # 10 = NEWS_THREAD, 11 = PUBLIC_THREAD, 12 = PRIVATE_THREAD. A FORUM channel (15)
+    # is the container, not a post; its posts are threads and pass this check.
+    if channel_type not in (10, 11, 12):
+        kind = _channel_type_name(channel_type if channel_type is not None else -1)
+        return tool_error(
+            f"rename_thread: channel {channel_id} is not a thread (type={channel_type} → {kind}); "
+            "this action renames threads and forum posts only.")
+    thread = _discord_request(
+        "PATCH", f"/channels/{channel_id}", token, body={"name": cleaned[:100]}) or {}
+    return json.dumps({
+        "success": True, "thread_id": thread.get("id", channel_id),
+        "name": thread.get("name", cleaned[:100])})
+
+
 def _add_thread_member(token: str, channel_id: str, user_id: str, **_kwargs: Any) -> str:
     """Add a user to a thread so it appears in their sidebar."""
     _discord_request("PUT", f"/channels/{channel_id}/thread-members/{user_id}", token)
@@ -547,6 +582,8 @@ _ACTION_MANIFEST = [
     ("react", _react, "(channel_id, message_id, emoji)", "add the bot's reaction to a message"),
     ("archive_thread", _archive_thread, "(channel_id)",
      "archive (close) a thread; optional archived=false reopens it — archive only, never locks"),
+    ("rename_thread", _rename_thread, "(channel_id, name)",
+     "rename a thread or forum post — its title (truncated to 100 characters)"),
     ("edit_message", _edit_message, "(channel_id, message_id, content)",
      "edit a message the bot authored"),
     ("add_thread_member", _add_thread_member, "(channel_id, user_id)",
@@ -563,7 +600,7 @@ _REQUIRED_PARAMS: dict[str, list[str]] = {
 # user wants) and ``discord_admin`` (everything else).
 _CORE_ACTION_NAMES = frozenset({
     "fetch_messages", "search_members", "create_thread", "send_message", "react",
-    "archive_thread", "add_thread_member", "list_forum_tags"})
+    "archive_thread", "rename_thread", "add_thread_member", "list_forum_tags"})
 _CORE_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _CORE_ACTION_NAMES}
 _ADMIN_ACTIONS = {k: v for k, v in _ACTIONS.items() if k not in _CORE_ACTION_NAMES}
 
@@ -630,7 +667,13 @@ _SCHEMA_PROPERTIES: dict[str, Any] = {
     "role_id": {"type": "string", "description": "Discord role ID."},
     "message_id": {"type": "string", "description": "Discord message ID."},
     "query": {"type": "string", "description": "Member name prefix to search for (search_members)."},
-    "name": {"type": "string", "description": "New thread name (create_thread)."},
+    "name": {
+        "type": "string",
+        "description": (
+            "Thread name: the title of a new thread (create_thread) or the new title for an "
+            "existing one (rename_thread). Capped at 100 characters; longer input is truncated."
+        ),
+    },
     "applied_tags": {
         "type": "array",
         "items": {"type": "string"},
@@ -737,6 +780,9 @@ _ACTION_403_HINT = {
     "edit_message": "Only messages the bot itself authored can be edited.",
     "react": "Bot lacks ADD_REACTIONS in this channel, or the emoji/id is invalid.",
     "archive_thread": "Bot lacks MANAGE_THREADS (or is not a thread member) on this thread.",
+    "rename_thread": (
+        "Bot lacks MANAGE_THREADS on this thread (or is not its owner or a thread member). "
+        "A non-thread channel is refused before the PATCH, so this is a thread permission."),
     "add_thread_member": "Bot cannot add members to this thread (it must be a member itself, and the thread must not be archived).",
     "set_thread_tags": (
         "Bot lacks MANAGE_THREADS in this forum (or is not the thread owner). "
