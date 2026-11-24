@@ -1299,6 +1299,17 @@ DEFAULT_CONFIG = {
             "info_log_min_delta_mb": 0.0,
         },
     },
+    # ctxpkg context engine (context.engine: ctxpkg): each compaction writes the compacted turns out as
+    # episode files and leaves a reference block in the prompt; recall(ref) reads one back in full.
+    "ctxpkg": {
+        # Turns an episode stays warm (kept verbatim through prune, micro-compaction and compaction) after its
+        # last use; 0 = never warm. Governs the engine's episode compaction.
+        "warm_turns": 8,
+        # A turn over this many rendered chars is split into several episodes at assistant tool-call boundaries.
+        "max_episode_chars": 60000,
+        # Cap on a flash-written episode summary; longer replies are cut at a word boundary.
+        "summary_max_chars": 300,
+    },
     "memory": {  # Persistent memory — bounded curated memory injected into the system prompt
         "memory_enabled": True,
         "user_profile_enabled": True,

@@ -1,0 +1,565 @@
+{
+  "generated_by": "tests/agent/fixtures/make_prompt_cache_anchor_golden.py",
+  "note": "base apply_anthropic_cache_control / build_prompt_cache_plan output, no anchor registered",
+  "cases": [
+    {
+      "name": "plain",
+      "entry": "messages",
+      "stable_prefix": null,
+      "kwargs": {},
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are Hermes, an agent."
+        },
+        {
+          "role": "user",
+          "content": "first question"
+        },
+        {
+          "role": "assistant",
+          "content": "first answer"
+        },
+        {
+          "role": "user",
+          "content": "second question"
+        }
+      ],
+      "output": [
+        {
+          "role": "system",
+          "content": [
+            {
+              "type": "text",
+              "text": "You are Hermes, an agent.",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "first question",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "first answer",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "second question",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tool_runs",
+      "entry": "messages",
+      "stable_prefix": null,
+      "kwargs": {
+        "native_anthropic": true
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are Hermes, an agent."
+        },
+        {
+          "role": "user",
+          "content": "look at the tree"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "terminal",
+                "arguments": "{\"command\": \"ls\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": "alpha\nbeta"
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": "gamma"
+        },
+        {
+          "role": "assistant",
+          "content": "three entries"
+        },
+        {
+          "role": "user",
+          "content": "and now the rest"
+        }
+      ],
+      "output": [
+        {
+          "role": "system",
+          "content": [
+            {
+              "type": "text",
+              "text": "You are Hermes, an agent.",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": "look at the tree"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "terminal",
+                "arguments": "{\"command\": \"ls\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": "alpha\nbeta"
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": "gamma",
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "three entries",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "and now the rest",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tool_runs/tool-cache-plan",
+      "entry": "plan",
+      "stable_prefix": null,
+      "kwargs": {
+        "native_anthropic": true,
+        "direct_native_tool_cache": true
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are Hermes, an agent."
+        },
+        {
+          "role": "user",
+          "content": "look at the tree"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "terminal",
+                "arguments": "{\"command\": \"ls\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": "alpha\nbeta"
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": "gamma"
+        },
+        {
+          "role": "assistant",
+          "content": "three entries"
+        },
+        {
+          "role": "user",
+          "content": "and now the rest"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "terminal",
+            "parameters": {
+              "type": "object"
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "parameters": {
+              "type": "object"
+            }
+          }
+        }
+      ],
+      "output": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are Hermes, an agent."
+          },
+          {
+            "role": "user",
+            "content": "look at the tree"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                  "name": "terminal",
+                  "arguments": "{\"command\": \"ls\"}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "alpha\nbeta"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "gamma"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "three entries",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "and now the rest",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "terminal",
+              "parameters": {
+                "type": "object"
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "parameters": {
+                "type": "object"
+              }
+            },
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "skill_scaffold",
+      "entry": "messages",
+      "stable_prefix": "Stable skill scaffold: inspect the report and preserve the instructions.\n\n",
+      "kwargs": {},
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are Hermes, an agent."
+        },
+        {
+          "role": "user",
+          "content": "Stable skill scaffold: inspect the report and preserve the instructions.\n\nticket=one time=10:00"
+        },
+        {
+          "role": "assistant",
+          "content": "working on ticket one"
+        },
+        {
+          "role": "user",
+          "content": "continue"
+        }
+      ],
+      "output": [
+        {
+          "role": "system",
+          "content": [
+            {
+              "type": "text",
+              "text": "You are Hermes, an agent.",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "Stable skill scaffold: inspect the report and preserve the instructions.\n\n",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            },
+            {
+              "type": "text",
+              "text": "ticket=one time=10:00"
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "working on ticket one",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "continue",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "static_prefix",
+      "entry": "messages",
+      "stable_prefix": null,
+      "kwargs": {
+        "static_system_prefix": "You are Hermes.\n"
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are Hermes.\n## Tools\n- terminal\n- read_file\n"
+        },
+        {
+          "role": "user",
+          "content": "first question"
+        },
+        {
+          "role": "assistant",
+          "content": "first answer"
+        },
+        {
+          "role": "user",
+          "content": "second question"
+        }
+      ],
+      "output": [
+        {
+          "role": "system",
+          "content": [
+            {
+              "type": "text",
+              "text": "You are Hermes.\n",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            },
+            {
+              "type": "text",
+              "text": "## Tools\n- terminal\n- read_file\n",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": "first question"
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "first answer",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "second question",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ephemeral_tail",
+      "entry": "messages",
+      "stable_prefix": null,
+      "kwargs": {
+        "static_system_prefix": "You are Hermes.\n",
+        "session_system_prompt": "You are Hermes.\n## Skills\n- alpha: does a thing\n"
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are Hermes.\n## Skills\n- alpha: does a thing\n\n\nYou are a focused subagent.\nCONTEXT:\ntask-specific text"
+        },
+        {
+          "role": "user",
+          "content": "goal"
+        }
+      ],
+      "output": [
+        {
+          "role": "system",
+          "content": [
+            {
+              "type": "text",
+              "text": "You are Hermes.\n",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            },
+            {
+              "type": "text",
+              "text": "## Skills\n- alpha: does a thing\n",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            },
+            {
+              "type": "text",
+              "text": "\n\nYou are a focused subagent.\nCONTEXT:\ntask-specific text",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "goal",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

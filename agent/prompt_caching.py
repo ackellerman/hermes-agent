@@ -2,14 +2,16 @@
 
 Default layout: 4 cache_control breakpoints — the static system prefix, the end of the
 system prompt, and the last 2 non-system messages (without a static prefix: one system
-breakpoint plus the last 3 messages). All markers share one TTL (5m or 1h).
+breakpoint plus the last 3 messages). All markers share one TTL (5m or 1h). A registered
+cache anchor takes one of them, on the context engine's newest stable block instead of the
+static prefix, so the block's prefix stays a cache read across a compaction.
 """
 
 import copy
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-from agent.prompt_cache_boundary import find_stable_prefix
+from agent.prompt_cache_boundary import find_stable_prefix, is_cache_anchor
 
 
 @dataclass(frozen=True)
@@ -330,6 +332,38 @@ def _completed_transaction_endpoint_indexes(messages: list[dict[str, Any]], *, n
     return endpoints
 
 
+def _anchor_text(msg: dict) -> str | None:
+    """The exact text a cache anchor can match: a string content, or the join of plain text parts.
+
+    A message carrying any other part type (an image block, a tool_result envelope) is never an
+    anchor: joining around a non-text part would compare bytes the provider never sends as one
+    text block.
+    """
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and content and all(
+        isinstance(part, dict) and part.get("type", "text") == "text" and isinstance(part.get("text"), str)
+        for part in content
+    ):
+        return "".join(part["text"] for part in content)
+    return None
+
+
+def _cache_anchor_index(messages: list[dict[str, Any]], candidates: list[int]) -> int | None:
+    """Index of the LAST candidate message whose text is a registered anchor, else None.
+
+    A context engine emits one reference block per compaction and registers its text; marking
+    the newest one is what keeps the whole prefix up to it a cache read after the compaction.
+    Older blocks stay unmarked: their bytes are a prefix of the newest block's request anyway.
+    """
+    for index in reversed(candidates):
+        text = _anchor_text(messages[index])
+        if text is not None and is_cache_anchor(text):
+            return index
+    return None
+
+
 def build_prompt_cache_plan(
     api_messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, *,
     cache_ttl: str = "5m", native_anthropic: bool = False, static_system_prefix: str | None = None,
@@ -349,14 +383,24 @@ def build_prompt_cache_plan(
 
     messages = _strip_prior_decoration(list(api_messages or []))
     marker = _build_marker(cache_ttl)
+    non_system = [i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") != "system"]
+    anchor = _cache_anchor_index(messages, non_system)
     if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
-        # Tool-cache layout: only the static prefix carries a system-side marker; the
-        # volatile suffix's budget is spent on the tools array.
         messages[0] = copy.deepcopy(messages[0])
-        _apply_system_cache_markers(messages[0], marker, static_system_prefix,
-                                    native_anthropic=True, mark_suffix=False, fallback_to_whole=False)
+        if anchor is None:
+            # Tool-cache layout: only the static prefix carries a system-side marker; the
+            # volatile suffix's budget is spent on the tools array.
+            _apply_system_cache_markers(messages[0], marker, static_system_prefix,
+                                        native_anthropic=True, mark_suffix=False, fallback_to_whole=False)
     planned_tools[-1]["cache_control"] = dict(marker)
-    for endpoint in _completed_transaction_endpoint_indexes(messages, native_anthropic=True)[-2:]:
+    # With an anchor the block's message takes the system-side slot, so the tools marker and
+    # the last two endpoints are the whole remaining budget of four.
+    endpoints = [index for index in _completed_transaction_endpoint_indexes(messages, native_anthropic=True)
+                 if index != anchor][-2:]
+    if anchor is not None:
+        messages[anchor] = copy.deepcopy(messages[anchor])
+        _apply_cache_marker(messages[anchor], marker, native_anthropic=True)
+    for endpoint in endpoints:
         messages[endpoint] = copy.deepcopy(messages[endpoint])
         _apply_cache_marker(messages[endpoint], marker, native_anthropic=True)
     _split_unmarked_scaffolds(messages)
@@ -377,6 +421,10 @@ def apply_anthropic_cache_control(
     per-message copy first, so a second call (or messages a prior call already planned) can never
     accumulate past 4 markers (#90971). Returns a shallow list copy with deep copies of modified
     messages.
+
+    A registered cache anchor (a context engine's newest stable block) changes the split, not the
+    budget: its message takes one marker, the system prompt gets exactly one at its end as a
+    single block, and the last cacheable messages after the anchor take the rest.
     """
     if not api_messages:
         return api_messages
@@ -386,17 +434,34 @@ def apply_anthropic_cache_control(
 
     non_sys = [i for i, m in enumerate(messages) if m.get("role") != "system"
                and _can_carry_marker(m, native_anthropic=native_anthropic, tool_part_markers=tool_part_markers)]
+    anchor = _cache_anchor_index(messages, non_sys)
     breakpoints_used = 0
     if messages[0].get("role") == "system":
         messages[0] = copy.deepcopy(messages[0])
-        # The session-prompt boundary takes the breakpoint a first call has spare (it has a single
-        # message to mark): that write is what lets a session with a different tail read the index.
-        breakpoints_used = _apply_system_cache_markers(
-            messages[0], marker, static_system_prefix, native_anthropic=native_anthropic,
-            session_system_prompt=session_system_prompt, mark_session_end=len(non_sys) < 2)
-    for idx in non_sys[-(4 - breakpoints_used):]:
-        messages[idx] = copy.deepcopy(messages[idx])
-        _apply_cache_marker(messages[idx], marker, native_anthropic=native_anthropic, tool_part_markers=tool_part_markers)
+        if anchor is None:
+            # The session-prompt boundary takes the breakpoint a first call has spare (it has a single
+            # message to mark): that write is what lets a session with a different tail read the index.
+            breakpoints_used = _apply_system_cache_markers(
+                messages[0], marker, static_system_prefix, native_anthropic=native_anthropic,
+                session_system_prompt=session_system_prompt, mark_session_end=len(non_sys) < 2)
+        else:
+            # One block, one marker at its end: a static-prefix split would spend up to three
+            # breakpoints inside the system prompt and leave none for the block and the tail.
+            breakpoints_used = _apply_system_cache_markers(
+                messages[0], marker, None, native_anthropic=native_anthropic)
+    if anchor is not None:
+        messages[anchor] = copy.deepcopy(messages[anchor])
+        _apply_cache_marker(messages[anchor], marker, native_anthropic=native_anthropic,
+                            tool_part_markers=tool_part_markers)
+        breakpoints_used += 1
+        non_sys = non_sys[non_sys.index(anchor) + 1:]
+    remaining = 4 - breakpoints_used
+    if remaining > 0:
+        # Every marker goes to a distinct message: an index already carrying one is not in
+        # `non_sys` any more, so no message can be marked twice.
+        for idx in non_sys[-remaining:]:
+            messages[idx] = copy.deepcopy(messages[idx])
+            _apply_cache_marker(messages[idx], marker, native_anthropic=native_anthropic, tool_part_markers=tool_part_markers)
     _split_unmarked_scaffolds(messages)
 
     return messages
