@@ -201,6 +201,39 @@ def _get_child_timeout() -> Optional[float]:
         "delegation.child_timeout_seconds=%r is not a valid number; using default (no timeout)",
     )
 
+#: ``delegation.resume_window_seconds``' built-in window (seconds). It sits below a child's 5-minute prompt-cache
+#: TTL, so a child resumed inside it still reads its prompt from cache instead of writing it again.
+DEFAULT_RESUME_WINDOW_SECONDS = 270
+
+
+def _resume_window_seconds(profile: Optional[str] = None) -> int:
+    """delegation.resume_window_seconds (seconds): how long a kept child may sit idle and still be resumed.
+
+    A mapping of profile name (or ``default``) to a whole number of seconds; a profile with no entry takes
+    ``default``, and ``0`` means no window for that profile (its children are resumed whatever their age). Absent
+    is the built-in 270 s. A value that is not a mapping, and an entry that is not a non-negative integer (a bool
+    included, and a float: 3540.5 is not a number of seconds this reads), logs one warning and uses the built-in
+    270 s. The window must sit below the child's prompt-cache TTL: 270 s for a child whose cache lives 5 minutes.
+    A profile whose children keep a 1 h cache gets its own entry, e.g. ``reviewer: 3540``, set only once that
+    longer TTL is live.
+    """
+    raw = _cfg().get("resume_window_seconds")
+    if raw is None:
+        return DEFAULT_RESUME_WINDOW_SECONDS
+    if not isinstance(raw, dict):
+        logger.warning("delegation.resume_window_seconds=%r is not a mapping of profile to seconds; using the "
+                       "default %d s", raw, DEFAULT_RESUME_WINDOW_SECONDS)
+        return DEFAULT_RESUME_WINDOW_SECONDS
+    name = profile or "default"
+    key = name if name in raw else "default"  # an unlisted profile takes `default`
+    value = raw.get(key, DEFAULT_RESUME_WINDOW_SECONDS)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        logger.warning("delegation.resume_window_seconds.%s=%r is not a whole number of seconds, 0 or more; using "
+                       "the default %d s", key, value, DEFAULT_RESUME_WINDOW_SECONDS)
+        return DEFAULT_RESUME_WINDOW_SECONDS
+    return value
+
+
 def _get_max_spawn_depth() -> int:
     """delegation.max_spawn_depth floored at 1 (no ceiling). Depth 0 is the parent; agents at depths 0..N-1 may spawn,
     depth N is the leaf floor. Default 1 is flat. Each extra level multiplies API cost."""

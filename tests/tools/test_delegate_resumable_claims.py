@@ -228,6 +228,14 @@ def test_claim_reclaims_a_row_whose_owner_died_after_boot_recovery(owner):
         pid = _DEAD_PID if owner == "dead" else os.getpid()
         _set_row(parent, sid, state="running", owner_pid=pid,
                  owner_started_at=None if owner == "dead" else get_process_start_time(pid))
+        if owner == "dead":
+            # The resume window reads a reclaimed record's idle age from the child's session: recovery and the
+            # reclaim do not stamp ``stopped_at`` (a boot would make a long-dead child read as just stopped). A run
+            # that died had its session end around then, so this stands in for that.
+            conn = sqlite3.connect(parent._session_db.db_path)  # health: allow HX015 -- test edits a temp-home store
+            with conn:
+                conn.execute("UPDATE sessions SET ended_at=? WHERE id=?", (time.time(), model.turns[0]["session_id"]))
+            conn.close()
         _forget_process_state()
         cont = json.loads(delegate_task(action="continue", subagent_id=sid, message="go on", background=True,
                                         parent_agent=parent))

@@ -293,6 +293,8 @@ def record_start(run: Any) -> None:
                   "unit_id": getattr(child, "_delegation_unit_id", None),
                   "start_cwd": start_cwd, "cwd": durable["cwd"], "worktree": prev.get("worktree")
                   or run.worktree_info, "outcome": "running", "resume_mode": None,
+                  # The run's own clock: `_finish` turns it into `last_run_seconds`, and a continue restarts it.
+                  "run_started_at": time.time(),
                   # Kept across continues: a tree the child made in an earlier run is still its own.
                   "worktrees_at_start": prev.get("worktrees_at_start") or start_trees,
                   "auto_attempts": prev.get("auto_attempts", 0)}
@@ -418,15 +420,30 @@ def record_stop(run: Any, entry: Optional[dict[str, Any]]) -> None:
 
 
 def _finish(conn, sid: str, record: dict[str, Any], entry: dict[str, Any], cause: Optional[str], *,
-            cwd: Optional[str], pins: Optional[list[str]] = None) -> None:
+            cwd: Optional[str], pins: Optional[list[str]] = None, stamp_stopped: bool = True) -> None:
     """Write the stopped record. *pins*: its pin paths computed BEFORE the caller's write transaction opened (git
-    probes take seconds; boot recovery and the claim reclaim must not hold the state.db write lock through them)."""
+    probes take seconds; boot recovery and the claim reclaim must not hold the state.db write lock through them).
+
+    *stamp_stopped*: False for a caller finishing a run that ended earlier (boot recovery, the dead-owner
+    reclaim). Such a record carries no ``stopped_at`` (and no run length): the child did not stop now, and a
+    ``stopped_at`` taken at boot would make a long-dead child read as just stopped to the resume window. Its idle
+    age is then the session's ``ended_at``, or nothing (the window refuses)."""
     ttl, _cap = _settings()
     state, mode, next_at = classify(entry, cause)
+    stopped_at = time.time()
+    started_at = record.get("run_started_at")
     record = {**record, "cwd": cwd or record.get("cwd"), "outcome": entry.get("status"), "resume_mode": mode,
               "next_attempt_at": next_at, "failure_reason": entry.get("failure_reason"),
-              "failure_resets_at": entry.get("failure_resets_at"), "usage_limit": entry.get("usage_limit"),
-              "stopped_at": time.time()}
+              "failure_resets_at": entry.get("failure_resets_at"), "usage_limit": entry.get("usage_limit")}
+    if stamp_stopped:
+        record["stopped_at"] = stopped_at
+        # The run's length, for the listing and for a caller judging a resume: None without its start.
+        record["last_run_seconds"] = (stopped_at - float(started_at)
+                                      if isinstance(started_at, (int, float))
+                                      and not isinstance(started_at, bool) else None)
+    else:
+        record.pop("stopped_at", None)  # a run that ended hours ago did not stop now
+        record["last_run_seconds"] = None  # ... and how long it ran is not known either
     if isinstance(entry.get("worktree"), dict):
         record["worktree"] = {**(record.get("worktree") or {}), **entry["worktree"]}
     record["pin_paths"] = (_pin_paths(record) if pins is None else pins) if state == "resumable" else []
@@ -499,7 +516,7 @@ def recover_abandoned(conn, plan: dict[str, tuple[Any, Any, list[str]]]) -> None
         if record is None:
             continue
         entry, cause = _abandoned_entry(record)
-        _finish(conn, sid, record, entry, cause, cwd=record.get("cwd"), pins=pins)
+        _finish(conn, sid, record, entry, cause, cwd=record.get("cwd"), pins=pins, stamp_stopped=False)
 
 
 def continuable_of(conn, unit_id: str) -> list[str]:
@@ -528,12 +545,22 @@ def _reclaim_dead_owner(path: Optional[Path], sid: str, record: dict[str, Any]) 
         if current is None:
             return None
         entry, cause = _abandoned_entry(current)
-        _finish(conn, sid, current, entry, cause, cwd=current.get("cwd"), pins=pins)
+        _finish(conn, sid, current, entry, cause, cwd=current.get("cwd"), pins=pins, stamp_stopped=False)
         return _row(conn, sid)
     return _write(path, _do)
 
 
 # ── continue ───────────────────────────────────────────────────────────────
+def read_records(parent_agent: Any, subagent_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+    """The durable records for *subagent_ids* in the parent's store, keyed by id and missing ones left out: the
+    reader ``action='list'`` shows each kept child's idle age and last run from, in one short transaction."""
+    ids = [sid for sid in dict.fromkeys(subagent_ids) if sid]
+    if not ids:
+        return {}
+    got = _write(_db_path_for(parent_agent), lambda conn: {sid: _row(conn, sid) for sid in ids}) or {}
+    return {sid: record for sid, record in got.items() if record is not None}
+
+
 def claim(parent_agent: Any, sid: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
     """Take a finished child's durable record for ``continue`` (``(record, None)``, or ``(None, error)``). The
     state flip to ``claimed`` is one guarded UPDATE, so two continues never run one conversation twice."""
@@ -585,7 +612,7 @@ def release_unstarted(child: Any) -> None:
 
 def last_workspace(parent_agent: Any, sid: str) -> Optional[dict[str, Any]]:
     """``{cwd, worktree}`` the child stopped in, for a continue to start there instead of the parent's cwd."""
-    record = _write(_db_path_for(parent_agent), lambda conn: _row(conn, sid)) or {}
+    record = read_records(parent_agent, [sid]).get(sid) or {}
     cwd = record.get("cwd")
     if not (isinstance(cwd, str) and os.path.isdir(cwd)):
         return None

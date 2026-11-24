@@ -203,6 +203,69 @@ def _discard_unstarted(parent_agent: Any, built: list[Any]) -> None:
             _release_unstarted_child(SimpleNamespace(parent_agent=parent_agent), child)
 
 
+def _child_profile(spec: dict[str, Any], parent_agent: Any) -> Optional[str]:
+    """The child's own profile name: ``delegate_children._profile_for`` over its route's home (the function that
+    fills a kept row's ``profile``), so a ``reviewer`` child reads the ``reviewer`` window. None without a store."""
+    from tools.delegate_children import _profile_for, parent_db_path
+    db_path = parent_db_path(parent_agent)
+    if db_path is None:
+        return None
+    return _profile_for(db_path, getattr(spec.get("route"), "profile_home", None))
+
+
+def _idle_seconds(spec: dict[str, Any], record: Optional[dict[str, Any]], parent_agent: Any,
+                  now: float) -> Optional[float]:
+    """How long the child has been idle. ``_finish`` writes ``stopped_at`` at the run's own end, so it is the
+    signal; a record without one (boot recovery and the dead-owner reclaim do not stamp it) falls back to the
+    ``ended_at`` of the session the spec names. None when neither can be read: the caller fails closed — unless the
+    record's outcome says the run was interrupted, in which case the window does not apply at all and this is never
+    asked (``_window_exempt``)."""
+    stopped = (record or {}).get("stopped_at")
+    if isinstance(stopped, (int, float)) and not isinstance(stopped, bool):
+        return max(0.0, now - float(stopped))
+    session_id = spec.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    with _transcript_store(parent_agent) as db:
+        if db is None:
+            return None
+        try:
+            row = db.get_session(session_id)
+        except Exception:
+            logger.debug("resume window: session %s unreadable", session_id, exc_info=True)
+            return None
+    ended = (row or {}).get("ended_at")
+    return max(0.0, now - float(ended)) if isinstance(ended, (int, float)) and not isinstance(ended, bool) else None
+
+
+def _window_exempt(record: Optional[dict[str, Any]]) -> bool:
+    """Whether the resume window does not apply to this child at all: true exactly when *record* says its run was
+    interrupted (``outcome`` ``interrupted`` or ``unknown``).
+
+    The window prices a cold prompt cache against a run that ENDED and then sat idle. A child whose durable record
+    says ``interrupted`` (a gateway restart, a parent ``stop``, a kill mid-run) or ``unknown`` (boot recovery and the
+    dead-owner reclaim finish a run whose owner process died) never ended on its own terms, so its age says nothing
+    about whether its context is stale: it is resumable whatever the age, including when no age can be read. A spec
+    with no durable record (in-process only) is not exempt, and neither is a finished run."""
+    return isinstance(record, dict) and record.get("outcome") in ("interrupted", "unknown")
+
+
+def _window_refusal(sid: str, profile: Optional[str], idle: Optional[float], window: int) -> Optional[str]:
+    """The resume window's refusal text, or None when the continue may run. *idle* None = no idle age could be
+    read, which refuses (fail closed). A window of 0 is no window for that profile, so it never refuses."""
+    if window <= 0:
+        return None
+    name = profile or "unknown"
+    if idle is None:
+        return (f"Subagent '{sid}' (profile {name}) has no recorded idle age, so its {window // 60} min resume "
+                "window cannot be checked: its prompt cache may be cold. Spawn a fresh task instead, with a "
+                "package of what it needs.")
+    if idle <= window:
+        return None
+    return (f"Subagent '{sid}' (profile {name}) has been idle {int(idle) // 60} min, past its {window // 60} min "
+            "resume window: its prompt cache is cold. Spawn a fresh task instead, with a package of what it needs.")
+
+
 def continue_subagent(subagent_id: Optional[str], message: Optional[str], parent_agent: Any, *, background: bool) -> str:
     """delegate_task(action='continue'): validate ownership and finished state, then run ``message`` as the
     child's next turn. Returns the usual dispatch handle (new delegation_id, same subagent_id) or, where the
@@ -217,6 +280,27 @@ def continue_subagent(subagent_id: Optional[str], message: Optional[str], parent
     spec, record, err = _claim(sid, parent_agent)
     if spec is None:
         return tool_error(err or _NOT_FOUND.format(sid=sid))
+    from tools.delegate_tool_config import _resume_window_seconds
+    profile = _child_profile(spec, parent_agent)
+    window = _resume_window_seconds(profile)
+    # A cold prompt cache is not worth paying for: past the window (or with no idle age at all) refuse, and hand the
+    # claim back exactly as the failure path below does. The window prices a run that ENDED and then sat idle only:
+    # an interrupted one (its record's outcome ``interrupted`` or ``unknown``: a gateway restart, a crash, a stop
+    # mid-run) is resumed whatever its age, as a warm child is.
+    exempt = _window_exempt(record)
+    idle: Optional[float] = None
+    stale: Optional[str] = None
+    if window > 0 and exempt:
+        logger.info("resume window: %s exempt (outcome %s)", sid, (record or {}).get("outcome"))
+    elif window > 0:
+        idle = _idle_seconds(spec, record, parent_agent, time.time())
+        stale = _window_refusal(sid, profile, idle, window)
+    if stale:
+        _release_resume(sid, spec)
+        if record is not None:
+            from tools.delegate_tool_resumable import release
+            release(parent_agent, sid, record)
+        return tool_error(stale)
     built: list[Any] = []
     try:
         result, err = _start(sid, text, spec, parent_agent, background, record, built)

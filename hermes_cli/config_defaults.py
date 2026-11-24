@@ -1383,6 +1383,12 @@ DEFAULT_CONFIG = {
         # = DEFAULT_KEEP_SOURCES; never /review, plugin, cron, one-shot); idle expiry, orphan rule, prune protection.
         "keep_sources": None, "keep_idle_days": 7, "orphan_after_s": 300, "keep_protects_transcripts": True,
         "resumable_ttl_hours": 48, "max_resumable": 32, "auto_resume": False,  # stopped-child records; auto: opt-in
+        # Resume window for `delegate_task action='continue'`, in seconds, per profile name (or `default`; 0 = no
+        # window for that profile). A kept child idle past it is refused and told to spawn fresh: its prompt cache
+        # is cold. It must sit below the child's prompt-cache TTL — 270 s for a child whose cache lives 5 minutes.
+        # A profile whose children keep a 1 h cache (TARS's per-profile opt-in) gets its own entry, e.g.
+        # `reviewer: 3540`, set only once that longer TTL is live.
+        "resume_window_seconds": {"default": 270},
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
     # every API call for few-shot priming. Never saved to sessions/logs/trajectories.
