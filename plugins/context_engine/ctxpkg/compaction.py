@@ -558,7 +558,7 @@ class CtxpkgCompactionMixin:
         protected: set[int] = set()
         pairs = self._block_pairs(messages)
         if pairs:
-            protected.update(range(0, min(pairs[-1][1] + 1, len(messages))))
+            protected.update(range(min(pairs[-1][1] + 1, len(messages))))
         for user_index, ack_index in pairs:
             protected.update((user_index, ack_index))
         for index, message in enumerate(messages):
