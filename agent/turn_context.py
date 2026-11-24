@@ -1451,6 +1451,10 @@ def build_api_messages(
     turn_now = agent._current_turn_timestamp
     split = current_turn_user_idx if has_current else 0
     canonical_messages = canonicalize_replay_history(messages[:split], now=turn_now) + messages[split:]
+    # The structured view (an engine's ``select_context``) aligns the request this function builds with one
+    # uid per canonical message. Recorded here, BEFORE the persistence fields are stripped below, because the
+    # uids are the only handle a later pass has on a message it wants to keep across requests.
+    agent._request_message_uids = [m.get("message_uid") for m in canonical_messages if isinstance(m, dict)]
 
     api_messages = []
     for idx, msg in enumerate(canonical_messages):

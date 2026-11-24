@@ -1309,6 +1309,28 @@ DEFAULT_CONFIG = {
         "max_episode_chars": 60000,
         # Cap on a flash-written episode summary; longer replies are cut at a word boundary.
         "summary_max_chars": 300,
+        # off: the engine compacts as above and serves the request as assembled (the built-in path).
+        # structured: the engine serves each request as system | head | marker blocks | state note | tail and
+        # moves a turn out of it only on the first request after this session's cache tier expired. Needs an
+        # interactive session: children, forks, cron, one-shots and background reviews always keep off.
+        "view": "off",
+        # What a structured view's pass may move. Ignored while view is off.
+        "structure": {
+            # The last N finished turns (and the turn in flight) are never candidates, whatever their age.
+            "keep_turns": 8,
+            # An older turn becomes a candidate after this many minutes since its own message timestamp.
+            "old_after_minutes": 120,
+            # A tool result smaller than this many chars is never replaced by a stub.
+            "min_stub_chars": 2000,
+            # Cap on candidates offered to one pass (oldest first).
+            "max_candidates": 40,
+            # Rendered chars of a turn's text offered to the judge; longer turns are cut at a word boundary.
+            "candidate_chars": 4000,
+            # Cap on the goal + next step the state note carries.
+            "state_note_chars": 1200,
+            # Seconds one judge call may take; overtime ends the pass with no change.
+            "timeout_seconds": 45,
+        },
     },
     "memory": {  # Persistent memory — bounded curated memory injected into the system prompt
         "memory_enabled": True,

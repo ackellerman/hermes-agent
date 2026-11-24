@@ -62,6 +62,30 @@ _ID_SUMMARY_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{40}(?![0-9A-Za-z])|sa-[0-
 DEFAULT_WARM_TURNS = 8
 DEFAULT_MAX_EPISODE_CHARS = 60_000
 DEFAULT_SUMMARY_MAX_CHARS = 300
+# ``ctxpkg.view``: ``off`` keeps today's behaviour byte for byte; ``structured`` serves the request through
+# ``view.py``. ``ctxpkg.structure.*`` bounds what a pass may move and what its judge may write.
+VIEW_OFF = "off"
+VIEW_STRUCTURED = "structured"
+DEFAULT_KEEP_TURNS = 8
+DEFAULT_OLD_AFTER_MINUTES = 120
+DEFAULT_MIN_STUB_CHARS = 2_000
+DEFAULT_MAX_CANDIDATES = 40
+DEFAULT_CANDIDATE_CHARS = 4_000
+DEFAULT_STATE_NOTE_CHARS = 1_200
+DEFAULT_TIMEOUT_SECONDS = 45
+
+
+@dataclass(frozen=True)
+class StructureSettings:
+    """The ``ctxpkg.structure`` leaves: the never-candidate window and the candidate/judge bounds."""
+
+    keep_turns: int = DEFAULT_KEEP_TURNS
+    old_after_minutes: int = DEFAULT_OLD_AFTER_MINUTES
+    min_stub_chars: int = DEFAULT_MIN_STUB_CHARS
+    max_candidates: int = DEFAULT_MAX_CANDIDATES
+    candidate_chars: int = DEFAULT_CANDIDATE_CHARS
+    state_note_chars: int = DEFAULT_STATE_NOTE_CHARS
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
 
 
 @dataclass(frozen=True)
@@ -71,12 +95,56 @@ class CtxpkgSettings:
     warm_turns: int = DEFAULT_WARM_TURNS
     max_episode_chars: int = DEFAULT_MAX_EPISODE_CHARS
     summary_max_chars: int = DEFAULT_SUMMARY_MAX_CHARS
+    view: str = VIEW_OFF
+    structure: StructureSettings = StructureSettings()
 
 
 def _coerce_int(value: Any, default: int, minimum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         return default
     return max(minimum, value)
+
+
+def _strict_int(value: Any, minimum: int) -> int | None:
+    """*value* when it is an int of at least *minimum*, else None (a bool is not an int here)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        return None
+    return value
+
+
+def _read_view(raw: Any) -> tuple[str, bool]:
+    """``(view, invalid)``: only ``off`` and ``structured`` are understood."""
+    if raw is None:
+        return VIEW_OFF, False
+    text = raw.strip().lower() if isinstance(raw, str) else ""
+    if text in (VIEW_OFF, VIEW_STRUCTURED):
+        return text, False
+    return VIEW_OFF, True
+
+
+def _read_structure(raw: Any) -> tuple[StructureSettings, list[str]]:
+    """``(structure, invalid leaves)``: every leaf falls back to its default on its own."""
+    if raw is None:
+        return StructureSettings(), []
+    if not isinstance(raw, dict):
+        return StructureSettings(), ["structure"]
+    values: dict[str, int] = {}
+    invalid: list[str] = []
+    for name, default, minimum in (
+        ("keep_turns", DEFAULT_KEEP_TURNS, 0),
+        ("old_after_minutes", DEFAULT_OLD_AFTER_MINUTES, 1),
+        ("min_stub_chars", DEFAULT_MIN_STUB_CHARS, 1),
+        ("max_candidates", DEFAULT_MAX_CANDIDATES, 1),
+        ("candidate_chars", DEFAULT_CANDIDATE_CHARS, 1),
+        ("state_note_chars", DEFAULT_STATE_NOTE_CHARS, 1),
+        ("timeout_seconds", DEFAULT_TIMEOUT_SECONDS, 1),
+    ):
+        coerced = _strict_int(raw.get(name, default), minimum)
+        if coerced is None:
+            invalid.append(f"structure.{name}")
+            coerced = default
+        values[name] = coerced
+    return StructureSettings(**values), invalid
 
 
 def load_settings() -> CtxpkgSettings:
@@ -89,10 +157,19 @@ def load_settings() -> CtxpkgSettings:
     except Exception:  # a config read must never break a compaction
         logger.debug("ctxpkg settings unreadable; using defaults", exc_info=True)
     block = block if isinstance(block, dict) else {}
+    view, view_invalid = _read_view(block.get("view"))
+    structure, structure_invalid = _read_structure(block.get("structure"))
+    if view_invalid or structure_invalid:
+        logger.warning(
+            "ctxpkg config: %s not understood; using the default. Fix the ``ctxpkg`` block in config.yaml.",
+            ", ".join((["view"] if view_invalid else []) + structure_invalid),
+        )
     return CtxpkgSettings(
         warm_turns=_coerce_int(block.get("warm_turns"), DEFAULT_WARM_TURNS, 0),
         max_episode_chars=_coerce_int(block.get("max_episode_chars"), DEFAULT_MAX_EPISODE_CHARS, 1),
         summary_max_chars=_coerce_int(block.get("summary_max_chars"), DEFAULT_SUMMARY_MAX_CHARS, 1),
+        view=view,
+        structure=structure,
     )
 
 

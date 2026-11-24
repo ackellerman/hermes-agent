@@ -1338,9 +1338,32 @@ ctxpkg:
   warm_turns: 8          # turns a recalled episode stays verbatim after its last use
   max_episode_chars: 60000   # a longer turn is split into several episodes at assistant tool-call boundaries
   summary_max_chars: 300     # cap on a flash-written episode summary
+  view: "off"            # off | structured
+  structure:
+    keep_turns: 8            # last N turns (and the turn in flight) are never candidates
+    old_after_minutes: 120   # an older turn may move after this many minutes
+    min_stub_chars: 2000     # a smaller tool result is never replaced by a stub
+    max_candidates: 40       # candidates offered to one pass, oldest first
+    candidate_chars: 4000    # rendered chars of a turn offered to the judge
+    state_note_chars: 1200   # cap on the state note's goal + next step
+    timeout_seconds: 45      # one judge call's budget; overtime ends the pass with no change
 ```
 
 `ctxpkg.warm_turns` sets how long a recalled episode stays warm after its last use, counted in turns rather than API calls; `0` means an episode is never kept warm. `ctxpkg.max_episode_chars` bounds one episode file — a turn past it is split only at an assistant tool-call boundary, so a cut never lands inside a tool run. `ctxpkg.summary_max_chars` bounds the per-episode summary the flash compression model writes; ids, shas and paths are copied out by script and are never trimmed.
+
+`ctxpkg.view` selects how a request is served. `off` (the default) leaves the request exactly as assembled and keeps the engine's compaction above. `structured` serves each request as the system prompt, the session's first turn, a block per pass, the state note, then the rest of the request; a structured turn leaves the request whole (its marker line stays in the block that was written when it moved) and a structured tool result is served in place as one line that keeps its call's result and offers `recall("ep-NNNN")` for the full text. Material moves only on the first request after this session's prompt-cache tier expired (5m or 1h, as `prompt_caching.cache_ttl` resolves), so between passes a request only appends to the tail and the prefix stays a cache read. `ctxpkg.structure.*` bounds what one pass may move (see the comments above); `structure.keep_turns`, the turn in flight, any turn holding a message with no uid, anything already structured, and anything whose ids appear in the state note are never moved. The view needs an interactive session paced by a person and the `recall` tool in the session's toolset: delegated children, review forks, cron, one-shot runs and background reviews always keep `off`, and they write no view state. The view's files (`view.json`, `passes.jsonl`, `recalls.jsonl`, `reruns.jsonl`) sit beside the episodes in `~/.hermes/ctxpkg/<lineage>/`, mode 0600. Each structured item's full text — which may hold whatever the tool returned — is kept whole as an episode file under the profile's `ctxpkg` store, so `recall` can serve it after a later compaction archives the rows.
+
+The `structured` view's judge runs as the auxiliary task `context_structure`, configured in its own `auxiliary` block (`provider`, `model`, `reasoning_effort`, `timeout`, `fallback_chain`). It is deliberately not a `ctxpkg` default: an auxiliary task left on `auto` resolves to your **main** model, which is exactly the expensive route this engine avoids, so no pass runs until `auxiliary.context_structure.provider` is set to a real provider. A `timeout` here bounds one judge call; overtime ends the pass with no change.
+
+```yaml
+auxiliary:
+  context_structure:
+    provider: "ollama-cloud"
+    model: "deepseek-v4.1-flash"
+    reasoning_effort: "medium"     # reaches routes that accept a top-level reasoning effort
+    timeout: 45
+    fallback_chain: []
+```
 
 The engine takes the same `compression.*` settings as the built-in `compressor` (`threshold`, `threshold_tokens`, `protect_first_n`, `protect_last_n`, `target_ratio`, `proactive_prune_*`, `tail_mode`), and its tools (here, `recall`) are injected only when the `context_engine` toolset is enabled for the platform. Episode files are never deleted; they grow the way `state.db` does.
 
